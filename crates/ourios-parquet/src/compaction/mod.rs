@@ -218,8 +218,7 @@ impl std::error::Error for CompactionError {
 /// (nothing to consolidate), or when a manifest compare-and-swap is lost to a
 /// concurrent compactor (S3 only). A lost commit, the first create-if-absent
 /// included, sets [`CompactionOutcome::commit_lost`]: the consolidated file no
-/// manifest names
-/// is deleted immediately (a failed delete is counted in
+/// manifest names is deleted immediately (a failed delete is counted in
 /// [`CompactionOutcome::gc_failures`]), the inputs stay live, and the
 /// compaction sweep surfaces the loss as a sweep error so it is retried.
 ///

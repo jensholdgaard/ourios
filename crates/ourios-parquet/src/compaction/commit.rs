@@ -81,16 +81,35 @@ pub fn gc_orphans(store: &Store, partition: &PartitionKey) -> Result<OrphanGc, C
         .list_blocking(Some(&prefix))
         .map_err(|e| store_io("list", &prefix, e))?;
     let mut gc = OrphanGc::default();
-    for object in keys {
-        if is_orphan(basename(&object), manifest.as_ref()) {
-            match store.delete_blocking(&object) {
-                Ok(()) => gc.reclaimed += 1,
-                Err(e) if e.is_not_found() => {}
-                Err(_) => gc.failures += 1,
-            }
+    let orphans = keys
+        .iter()
+        .filter(|object| is_orphan(basename(object), manifest.as_ref()));
+    for object in orphans {
+        match unlink(store, object) {
+            Unlink::Removed => gc.reclaimed += 1,
+            Unlink::AlreadyGone => {}
+            Unlink::Failed => gc.failures += 1,
         }
     }
     Ok(gc)
+}
+
+/// What deleting one orphan did.
+enum Unlink {
+    Removed,
+    /// Not found: already reclaimed (S3 `DELETE` is idempotent; the local
+    /// backend reports not-found).
+    AlreadyGone,
+    /// Left for a later pass.
+    Failed,
+}
+
+fn unlink(store: &Store, object: &str) -> Unlink {
+    match store.delete_blocking(object) {
+        Ok(()) => Unlink::Removed,
+        Err(e) if e.is_not_found() => Unlink::AlreadyGone,
+        Err(_) => Unlink::Failed,
+    }
 }
 
 /// Whether the object `name` in a partition is dead under `manifest`.

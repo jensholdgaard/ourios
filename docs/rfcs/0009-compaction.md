@@ -210,11 +210,19 @@ re-runnable (§3.5).
 > size. The result is the same as the per-partition reads would give on
 > the same objects (RFC0009.9). The listing replaces those reads; it does
 > not summarise them, so there is nothing to persist, invalidate or keep
-> consistent between compactor processes. A write that lands after the
-> listing is seen by the next sweep's listing, which is when today's
-> per-partition reads would see it too (RFC0009.10).
+> consistent between compactor processes.
 >
-> **Cost.** Per tenant per sweep: ⌈objects ÷ 1,000⌉ listing pages, plus
+> **Visibility timing changes slightly.** The per-partition reads looked
+> at each partition when the walk reached it, so a write that landed
+> before then was seen in the same sweep. Now the tenant is read once, at
+> the start of its planning: a write that lands after that listing waits
+> for the next sweep, even if the partition comes later in the walk. The
+> delay is at most one sweep interval. A late write is never lost and
+> never skipped for good: every sweep lists the tenant afresh
+> (RFC0009.10).
+>
+> **Cost.** Per tenant per sweep: one logical listing, served as
+> ⌈objects ÷ 1,000⌉ page requests on S3, plus
 > one manifest read per sealed partition that holds two or more committed
 > files and a manifest. A settled partition costs nothing beyond its two
 > keys in the listing. At the H4 steady state of one file and one
@@ -518,9 +526,11 @@ bytes, not a base metric.
   - **Given** a tenant with many sealed partitions, each holding one
     committed `*.parquet` (some with a `manifest.json`, some without)
   - **When** its candidates are planned
-  - **Then** none is selected, the store sees list requests only (no
-    `GET`), and the number of list requests does not grow with the
-    number of partitions.
+  - **Then** none is selected, and planning makes exactly one logical
+    recursive listing of the tenant's prefix: no request per partition
+    and no `GET`. The backend may serve that listing as several page
+    requests (1,000 keys per page on S3); the page count follows the
+    tenant's object count, not its partition count.
 
 - **RFC0009.9 — the selection is unchanged `[H4 / RFC0009.1]`**
   - **Given** any set of sealed and unsealed partitions, each with any
@@ -539,9 +549,12 @@ bytes, not a base metric.
   `[H4 / §3.3]`**
   - **Given** a sealed partition with no manifest and one committed file
     at or above the small-file size, which a planning pass did not select
-  - **When** a writer later lands a second committed file in it, and
-    candidates are planned again
-  - **Then** the partition is selected.
+  - **When** a writer later lands a second committed file in it, below
+    the small-file size, and candidates are planned again
+  - **Then** the partition is selected. (A late file at or above the
+    small-file size leaves two large files, which §3.3 does not select
+    until there are more than `compaction_min_files`; see
+    `plan_skips_when_files_are_large_and_few`.)
   - **And** given a compacted partition (a manifest naming its one file)
     that receives a late file, the next pass reads its manifest rather
     than skipping it. Whether it is then selected is #1026's to decide;
@@ -579,14 +592,16 @@ Mapped to `CLAUDE.md` §6.2:
 
 > **Amendment 2026-10-16 (`drafted`) — test map for RFC0009.8–.11.** All
 > in `ourios-parquet`'s compaction suite, against a local store seen
-> through a request-counting `ObjectStore` wrapper.
+> through a request-counting `ObjectStore` wrapper. On the local backend
+> one logical listing is one `list` call on the wrapper, so the wrapper
+> counts logical listings, not the S3 pages behind them.
 >
 > | Scenario | Test | Kind |
 > |---|---|---|
-> | RFC0009.8 | `rfc0009_8_settled_partitions_cost_no_request_of_their_own` — 48 settled partitions (half with a manifest): no `GET`, and the list count equals that of a 1-partition tenant | integration |
+> | RFC0009.8 | `rfc0009_8_settled_partitions_cost_no_request_of_their_own` — 48 settled partitions (half with a manifest): no `GET`, exactly one logical listing, the same as a 1-partition tenant | integration |
 > | RFC0009.9 | `rfc0009_9_listing_plan_selects_what_per_partition_reads_select` — proptest over partitions × files × sizes × manifest subsets × orphans/tmp; the oracle is the pre-amendment per-partition predicate, kept in the test module | property |
 > | RFC0009.9 | `rfc0009_9_a_manifest_decides_when_two_files_are_listed` — two listed files, a manifest naming one: not selected, one `GET` | unit |
-> | RFC0009.10 | `rfc0009_10_a_late_write_into_a_settled_partition_is_replanned` — one large file, planned (skipped), a second file lands, planned again (selected) | integration |
+> | RFC0009.10 | `rfc0009_10_a_late_write_into_a_settled_partition_is_replanned` — one file above the small-file size, planned (skipped, no `GET`); a late file below the small-file size lands; planned again (selected) | integration |
 > | RFC0009.10 | `rfc0009_10_a_late_write_into_a_compacted_partition_is_read` — compacted partition plus a late file: one `GET` of its manifest, not selected (pins today's #1026 behaviour; that fix updates this assertion) | integration |
 > | RFC0009.11 | `rfc0009_11_planning_writes_nothing_and_two_planners_agree` — store listing unchanged after planning; two `Store` handles plan the same list | integration |
 >

@@ -55,11 +55,14 @@ pub struct OrphanGc {
 /// the atomic manifest swap (§3.4), so a crash always freezes a partition at a
 /// clean generation; what it can leave behind is dead files the manifest does
 /// not name. When a `manifest.json` is present it is authoritative (RFC0009.3):
-/// every `*.parquet` object **not** named by it is provably dead — a pre-commit
-/// consolidated file, or a superseded input the post-commit GC never reached —
+/// a `*.parquet` object **not** named by it is dead — a superseded input the
+/// post-commit GC never reached, or a compaction output (`<uuid>.g<N>.parquet`)
+/// whose generation *N* the manifest has already reached without naming it —
 /// and any `*.parquet.tmp` is an interrupted publish (absent on S3). Both are
-/// safe to unlink. With **no** manifest the glob is the live set, so no
-/// `*.parquet` is an orphan and only stray `*.parquet.tmp` are reclaimed.
+/// safe to unlink. An output for a generation past the manifest's is kept: its
+/// compaction may still commit it (RFC0009.17). With **no** manifest the glob
+/// is the live set, so no `*.parquet` is an orphan and only stray
+/// `*.parquet.tmp` are reclaimed.
 ///
 /// Idempotent, never touches a live file, and safe to run on any sealed
 /// partition at any time — so orphans left by a crash are *reclaimable*
@@ -73,26 +76,13 @@ pub struct OrphanGc {
 /// surfaced — an orphan that outlives one pass is reclaimed by the next.
 pub fn gc_orphans(store: &Store, partition: &PartitionKey) -> Result<OrphanGc, CompactionError> {
     let prefix = partition_data_prefix(partition);
-    let live: Option<HashSet<String>> =
-        read_manifest(store, partition)?.map(|m| m.files.into_iter().collect());
+    let manifest = read_manifest(store, partition)?;
     let keys = store
         .list_blocking(Some(&prefix))
         .map_err(|e| store_io("list", &prefix, e))?;
     let mut gc = OrphanGc::default();
     for object in keys {
-        let name = basename(&object);
-        // `.parquet.tmp` is always a dead interrupted publish. A `.parquet` is
-        // an orphan only when a manifest names a set that excludes it (no
-        // manifest ⇒ glob ⇒ every `.parquet` is live). Anything else
-        // (`manifest.json`, a future sidecar) is not ours.
-        let orphan = if name.ends_with(".parquet.tmp") {
-            true
-        } else if name.ends_with(".parquet") {
-            live.as_ref().is_some_and(|l| !l.contains(name))
-        } else {
-            false
-        };
-        if orphan {
+        if is_orphan(basename(&object), manifest.as_ref()) {
             match store.delete_blocking(&object) {
                 Ok(()) => gc.reclaimed += 1,
                 Err(e) if e.is_not_found() => {}
@@ -101,4 +91,24 @@ pub fn gc_orphans(store: &Store, partition: &PartitionKey) -> Result<OrphanGc, C
         }
     }
     Ok(gc)
+}
+
+/// Whether the object `name` in a partition is dead under `manifest`.
+///
+/// `.parquet.tmp` is always a dead interrupted publish. A `.parquet` is an
+/// orphan only when a manifest names a set that excludes it (no manifest ⇒
+/// glob ⇒ every `.parquet` is live), and a compaction output written for a
+/// generation the manifest has not reached yet is kept: its compaction may
+/// still be about to commit it (RFC0009.17). Anything else
+/// (`manifest.json`, a future sidecar) is not ours.
+fn is_orphan(name: &str, manifest: Option<&Manifest>) -> bool {
+    if name.ends_with(".parquet.tmp") {
+        return true;
+    }
+    let Some(manifest) = manifest else {
+        return false;
+    };
+    let in_flight =
+        compacted_generation(name).is_some_and(|generation| generation > manifest.generation);
+    name.ends_with(".parquet") && !in_flight && !manifest.files.iter().any(|f| f == name)
 }

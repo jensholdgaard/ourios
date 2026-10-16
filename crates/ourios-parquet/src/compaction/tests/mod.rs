@@ -466,10 +466,10 @@ proptest::proptest! {
     }
 }
 
-/// RFC0009.3 — atomic publish / no torn read. A compaction first
-/// bootstraps a manifest naming the *inputs*, then writes the
-/// consolidated file, then atomically swaps the manifest to name only
-/// that file. This models the two states a crash could freeze and
+/// RFC0009.3 — atomic publish / no torn read. Over an existing manifest
+/// that consumes nothing, a compaction writes the consolidated file, then
+/// atomically swaps the manifest to name only that file and consume the
+/// inputs. This models the two states a crash could freeze and
 /// asserts a reader is never torn: pre-commit it sees exactly the
 /// inputs (the stored consolidated file is invisible — no double
 /// count), post-commit exactly the consolidated rows (no loss).
@@ -486,8 +486,8 @@ fn atomic_publish_is_never_torn_across_the_swap() {
     let originals = read_partition_rows(&store);
     assert_eq!(originals.len(), 3, "three input rows");
 
-    // Mid-compaction, in compact_partition's order: bootstrap the
-    // manifest *first* (it consumes nothing, so the inputs stay live)...
+    // Mid-compaction: a manifest from an earlier generation that consumes
+    // nothing, so the inputs stay live...
     seed_manifest(&store, &part, &Manifest::new(1, Vec::new(), Vec::new()));
     // ...then write the consolidated file. It now exists in the store but
     // the manifest does not name it.

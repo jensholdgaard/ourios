@@ -168,9 +168,10 @@ measure" — minimal new code.
 
 > **Amendment 2026-10-16 (`drafted`) — the sweep span gets one phase child
 > (§3.8).** The sweep row now reads: one `INTERNAL` `sweep partitions`
-> span, plus one `INTERNAL` `plan partitions` child around the planning of
-> every tenant. The per-tenant and per-partition loops, planning and
-> consolidation alike, stay span-free.
+> span, plus one `INTERNAL` `plan partitions` child: a single aggregate
+> span over the planning of all tenants. Planning one tenant or one
+> partition gets no span of its own, and neither does consolidating a
+> partition.
 
 ### 3.2 The tracer, in the bootstrap
 
@@ -960,9 +961,12 @@ open question (§7).
 
 **What does not get a span.** Planning one tenant, examining one
 partition, and consolidating one partition are per-item loops, which §3.1
-keeps span-free. A tenant whose planning dominates shows up only as the
-phase's total; per-tenant attribution stays with the
-`ourios.storage.operation.duration` metric. The consolidation pass after
+keeps span-free. A tenant whose planning dominates shows up only in the
+phase's total. Nothing else attributes planning cost to a tenant either:
+`ourios.storage.operation.duration` carries only the operation, the
+caller (`compaction`) and `error.type`, never the tenant. So this
+amendment leaves per-tenant planning cost unattributed. Whether that
+matters is a §7 question. The consolidation pass after
 planning gets no phase span here: its work is already counted by the
 existing `ourios.compaction.*` metrics. The time under
 `sweep partitions` that `plan partitions` does not cover is the one
@@ -1040,8 +1044,9 @@ Collector expects, and Ourios's whole posture is OTel-native.
 >
 > **One planning span per tenant.** It would attribute the cost to a
 > tenant, but it is a per-item loop, and the span count would grow with
-> the tenant count. Rejected under §3.1. The storage metric already
-> carries per-tenant attribution where needed.
+> the tenant count. Rejected under §3.1. That leaves per-tenant planning
+> cost unattributed: no existing signal carries it, since the storage
+> metric has no tenant dimension (§3.8, §7).
 >
 > **New `ourios.compaction.plan.*` attribute names.** Names scoped to
 > compaction would avoid stretching "one file-set resolution" over many
@@ -1617,6 +1622,12 @@ Mapped to `CLAUDE.md` §6.2:
       unsealed ones cost only their share of the `hour=` roll-ups. A count
       of all partitions walked would need a new name. Add it only if a
       trace is found that needs it.
+- [ ] **Per-tenant planning cost.** With one aggregate span and no
+      tenant on `ourios.storage.operation.duration`, nothing says which
+      tenant's history dominates planning. Does that matter? If it does,
+      the candidates are a per-tenant count on a metric (a new name, or
+      `ourios.tenant` on an existing compaction metric), not a span per
+      tenant, which §3.1 rules out.
 
 **Future work (out of scope here).** A reusable **DataFusion → OTel
 instrumentation** — per-operator / per-`ExecutionPlan`-node sub-spans, bridging

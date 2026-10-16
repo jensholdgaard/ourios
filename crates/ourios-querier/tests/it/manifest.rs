@@ -79,14 +79,14 @@ fn write_file(bucket: &Path, recs: &[MinedRecord]) -> (PathBuf, String) {
     (dir, name)
 }
 
-/// A manifest is authoritative: with two files in one partition but a
-/// manifest naming only one, the query sees only the named file's
-/// rows — the unlisted file is ignored even though it is on disk.
+/// A manifest is authoritative: with two files in one partition and a
+/// manifest that consumed one, the query sees only the other file's rows —
+/// the consumed file is ignored even though it is on disk.
 #[tokio::test]
 async fn rfc0009_3_manifest_restricts_to_named_files() {
     let bucket = tempfile::TempDir::new().expect("temp");
-    let (dir_a, file_a) = write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
-    let (dir_b, _file_b) = write_file(
+    let (dir_a, _file_a) = write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
+    let (dir_b, file_b) = write_file(
         bucket.path(),
         &[rec(2, TS0 + 2_000_000), rec(2, TS0 + 3_000_000)],
     );
@@ -98,11 +98,8 @@ async fn rfc0009_3_manifest_restricts_to_named_files() {
     let all = q.run(req(None)).await.expect("glob-fallback query");
     assert_eq!(all.rows, 4, "without a manifest, both files are read");
 
-    // Manifest naming only file A ⇒ file B is no longer live.
-    let manifest = Manifest {
-        generation: 1,
-        files: vec![file_a],
-    };
+    // Manifest consuming file B ⇒ file B is no longer live.
+    let manifest = Manifest::new(1, Vec::new(), vec![file_b]);
     std::fs::write(dir_a.join(MANIFEST_FILENAME), manifest.to_json().unwrap())
         .expect("write manifest");
 
@@ -121,8 +118,8 @@ async fn rfc0009_3_manifest_restricts_to_named_files() {
 #[tokio::test]
 async fn rfc0009_3_manifest_naming_compacted_file_avoids_double_count() {
     let bucket = tempfile::TempDir::new().expect("temp");
-    write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
-    write_file(
+    let (_, input_a) = write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
+    let (_, input_b) = write_file(
         bucket.path(),
         &[rec(2, TS0 + 2_000_000), rec(2, TS0 + 3_000_000)],
     );
@@ -144,11 +141,11 @@ async fn rfc0009_3_manifest_naming_compacted_file_avoids_double_count() {
     let pre = q.run(req(None)).await.expect("pre-commit query");
     assert_eq!(pre.rows, 8, "glob without a manifest double-counts");
 
-    // Commit: manifest names only the compacted file.
-    let manifest = Manifest {
-        generation: 2,
-        files: vec![compacted],
-    };
+    // Commit: the output takes its generation-2 compacted name, and the
+    // manifest names only it and consumes the inputs.
+    let named = compacted.replace(".parquet", ".g2.parquet");
+    std::fs::rename(dir.join(&compacted), dir.join(&named)).expect("name the output");
+    let manifest = Manifest::new(2, vec![named], vec![input_a, input_b]);
     std::fs::write(dir.join(MANIFEST_FILENAME), manifest.to_json().unwrap())
         .expect("write manifest");
 

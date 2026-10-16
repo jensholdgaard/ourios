@@ -10,6 +10,7 @@ use super::*;
 use crate::writer::DEFAULT_ZSTD_LEVEL;
 
 mod bounded_sort;
+mod late_writes;
 mod plan_cost;
 
 /// 2026-04-02T10:58:00 UTC — offsets stay within hour 10, so
@@ -486,22 +487,12 @@ fn atomic_publish_is_never_torn_across_the_swap() {
     assert_eq!(originals.len(), 3, "three input rows");
 
     // Mid-compaction, in compact_partition's order: bootstrap the
-    // manifest naming the inputs *first* (so the reader is
-    // manifest-authoritative before any new file appears)...
-    seed_manifest(
-        &store,
-        &part,
-        &Manifest {
-            generation: 1,
-            files: input_names,
-        },
-    );
+    // manifest *first* (it consumes nothing, so the inputs stay live)...
+    seed_manifest(&store, &part, &Manifest::new(1, Vec::new(), Vec::new()));
     // ...then write the consolidated file. It now exists in the store but
-    // the manifest still names only the inputs.
-    let mut w = Writer::open_in(&store, part.clone()).expect("writer");
-    w.append_records(&originals).expect("append");
-    let consolidated = w.close().expect("close");
-    let consolidated_name = basename(&consolidated.key).to_owned();
+    // the manifest does not name it.
+    let consolidated = write_uncommitted_output(&store, &originals, 2);
+    let consolidated_name = basename(&consolidated).to_owned();
 
     // All three files are physically present...
     assert_eq!(
@@ -514,14 +505,12 @@ fn atomic_publish_is_never_torn_across_the_swap() {
     let pre = read_partition_rows(&store);
     assert_eq!(pre, originals, "pre-commit reader sees only the inputs");
 
-    // Commit: atomic swap to name only the consolidated file.
+    // Commit: atomic swap to name only the consolidated file and consume
+    // the inputs.
     seed_manifest(
         &store,
         &part,
-        &Manifest {
-            generation: 2,
-            files: vec![consolidated_name],
-        },
+        &Manifest::new(2, vec![consolidated_name], input_names),
     );
 
     // Post-commit: exactly the consolidated rows — no loss, no dup.
@@ -551,18 +540,14 @@ fn rfc0009_4_post_commit_orphan_inputs_are_reclaimable() {
     let part = partition();
     write_file(&store, &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
     write_file(&store, &[rec(2, TS0 + 2_000_000)]);
+    let input_names = basenames(&live_keys(&store, &part));
     let originals = read_partition_rows(&store);
-    let mut w = Writer::open_in(&store, part.clone()).expect("writer");
-    w.append_records(&originals).expect("append");
-    let consolidated = w.close().expect("close");
-    let consolidated_name = basename(&consolidated.key).to_owned();
+    let consolidated = write_uncommitted_output(&store, &originals, 2);
+    let consolidated_name = basename(&consolidated).to_owned();
     seed_manifest(
         &store,
         &part,
-        &Manifest {
-            generation: 2,
-            files: vec![consolidated_name],
-        },
+        &Manifest::new(2, vec![consolidated_name], input_names),
     );
     // Reader is already at the clean post generation despite orphans.
     assert_eq!(
@@ -616,15 +601,13 @@ fn write_uncommitted_output(store: &Store, rows: &[MinedRecord], generation: u64
     w.close().expect("close").key
 }
 
-/// Seed [`partition`]'s manifest at `generation`, naming `keys`.
-fn seed_generation(store: &Store, generation: u64, keys: &[String]) {
+/// Seed [`partition`]'s manifest at `generation`, consuming nothing, so its
+/// flush files stay live.
+fn seed_generation(store: &Store, generation: u64) {
     seed_manifest(
         store,
         &partition(),
-        &Manifest {
-            generation,
-            files: basenames(keys),
-        },
+        &Manifest::new(generation, Vec::new(), Vec::new()),
     );
 }
 
@@ -672,7 +655,7 @@ fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimed_once_generation_passes(
     write_file(&store, &[rec(8, TS0 + 2_000_000)]);
     let inputs = live_keys(&store, &part);
     let originals = read_partition_rows(&store);
-    seed_generation(&store, 1, &inputs);
+    seed_generation(&store, 1);
     let crashed = write_uncommitted_output(&store, &originals, 2);
     assert!(crashed.ends_with(".g2.parquet"), "{crashed}");
     assert_eq!(
@@ -712,9 +695,8 @@ fn rfc0009_17_gc_keeps_an_output_for_a_future_generation() {
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
     write_file(&store, &[rec(1, TS0)]);
-    let inputs = live_keys(&store, &partition());
     let rows = read_partition_rows(&store);
-    seed_generation(&store, 3, &inputs);
+    seed_generation(&store, 3);
     let in_flight = write_uncommitted_output(&store, &rows, 4);
 
     assert_gc_reclaims(
@@ -724,7 +706,7 @@ fn rfc0009_17_gc_keeps_an_output_for_a_future_generation() {
     );
     assert_object_and_rows(&store, &in_flight, true, &rows);
 
-    seed_generation(&store, 4, &inputs);
+    seed_generation(&store, 4);
     assert_gc_reclaims(&store, 1, "generation 4 committed without it: dead");
     assert_object_and_rows(&store, &in_flight, false, &rows);
 }
@@ -1074,15 +1056,7 @@ fn bumps_generation_from_an_existing_manifest() {
     let part = partition();
     write_file(&store, &[rec(1, TS0)]);
     write_file(&store, &[rec(2, TS0 + 1_000_000)]);
-    let names = basenames(&live_keys(&store, &part));
-    seed_manifest(
-        &store,
-        &part,
-        &Manifest {
-            generation: 5,
-            files: names,
-        },
-    );
+    seed_manifest(&store, &part, &Manifest::new(5, Vec::new(), Vec::new()));
 
     // Act
     let outcome = compact_partition(&store, &part).expect("compact");

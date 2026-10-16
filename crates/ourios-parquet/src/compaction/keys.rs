@@ -8,26 +8,52 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// The partition's live data-file keys under the RFC 0009 §3.4 live-set
+/// rule: the compacted files `manifest` names, by name (a named file missing
+/// from the store fails loudly when read, never silently drops rows), plus
+/// every listed flush file it does not consume. With no manifest that is
+/// every listed flush file. Mirrors the querier's resolution.
 pub(super) fn live_file_keys(
     store: &Store,
     partition: &PartitionKey,
     manifest: Option<&Manifest>,
 ) -> Result<Vec<String>, CompactionError> {
+    let keys = list_partition(store, partition)?;
+    Ok(live_keys_of(partition, manifest, keys))
+}
+
+/// Every object key under the partition's prefix.
+pub(super) fn list_partition(
+    store: &Store,
+    partition: &PartitionKey,
+) -> Result<Vec<String>, CompactionError> {
     let prefix = partition_data_prefix(partition);
-    if let Some(manifest) = manifest {
-        return Ok(manifest
-            .files
-            .iter()
-            .map(|name| format!("{prefix}/{name}"))
-            .collect());
-    }
-    let keys = store
+    store
         .list_blocking(Some(&prefix))
-        .map_err(|e| store_io("list", &prefix, e))?;
-    Ok(keys
+        .map_err(|e| store_io("list", &prefix, e))
+}
+
+/// The live keys among a partition listing `keys` under `manifest`; see
+/// [`live_file_keys`].
+pub(super) fn live_keys_of(
+    partition: &PartitionKey,
+    manifest: Option<&Manifest>,
+    keys: Vec<String>,
+) -> Vec<String> {
+    let prefix = partition_data_prefix(partition);
+    let live = LiveSet::new(manifest);
+    let named = manifest
         .into_iter()
-        .filter(|k| is_committed_parquet(k) && is_immediate_child(k, &prefix))
-        .collect())
+        .flat_map(|m| &m.files)
+        .map(|name| format!("{prefix}/{name}"));
+    let flush = keys.into_iter().filter(|k| {
+        let name = basename(k);
+        is_committed_parquet(k)
+            && is_immediate_child(k, &prefix)
+            && compacted_generation(name).is_none()
+            && live.is_live(name)
+    });
+    named.chain(flush).collect()
 }
 
 /// Sum the on-disk byte sizes of the partition's live input files — the
@@ -67,17 +93,33 @@ pub(super) fn read_manifest(
         .map(|(manifest, _etag)| manifest))
 }
 
-/// Re-read `key`'s manifest `ETag` after a successful bootstrap publish — the
-/// compare-and-swap token the S3 commit needs. `None` if the backend exposes no
-/// `ETag` or the manifest vanished under us (the latter only under concurrency;
-/// the commit then falls back to a create-if-absent that a winning peer loses).
-pub(super) fn read_manifest_etag(
+/// Re-read `key`'s manifest after a successful bootstrap publish, taking the
+/// `ETag` from the same read as the content: the compare-and-swap token the S3
+/// commit needs. [`Claim::Held`] only while the manifest is still exactly
+/// `bootstrap`; [`Claim::Overtaken`] when a peer has already committed over
+/// it, or it vanished.
+pub(super) fn bootstrap_etag(
     store: &Store,
     key: &str,
-) -> Result<Option<String>, CompactionError> {
-    Ok(Manifest::read_with_etag(store, key)
-        .map_err(CompactionError::Manifest)?
-        .and_then(|(_manifest, etag)| etag))
+    bootstrap: &Manifest,
+) -> Result<Claim, CompactionError> {
+    Ok(
+        match Manifest::read_with_etag(store, key).map_err(CompactionError::Manifest)? {
+            Some((read, etag)) if read == *bootstrap => Claim::Held { etag },
+            _ => Claim::Overtaken,
+        },
+    )
+}
+
+/// Whether this compaction still owns the bootstrap it published.
+pub(super) enum Claim {
+    /// The manifest is still the bootstrap; `etag` is the compare-and-swap
+    /// token for the commit (`None` if the backend exposes none).
+    Held { etag: Option<String> },
+    /// A peer committed over the bootstrap. Back off: a commit based on the
+    /// bootstrap would overwrite the peer's output and consumed list with
+    /// this compaction's stale view of the inputs.
+    Overtaken,
 }
 
 /// An outcome that **committed nothing** (`committed: None`, zero rows/bytes):

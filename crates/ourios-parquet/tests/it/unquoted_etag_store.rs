@@ -470,10 +470,11 @@ fn put_if_match_still_loses_with_a_stale_etag() {
 }
 
 /// #807: a sealed two-file partition on such a store consolidates — the
-/// commit wins instead of being discarded as a lost race.
+/// commit wins instead of being discarded as a lost race. An existing
+/// manifest makes the commit an `If-Match` swap, the request #807 was about.
 #[test]
 fn compaction_commits_on_an_unquoted_etag_store() {
-    let store = unquoted_etag_store();
+    let (store, state) = fake_store(IfMatch::Unquoted);
     let partition = PartitionKey::derive(&rec_for("tenant-a", 0)).expect("derive");
     for i in 0..2 {
         let mut writer = Writer::open_in(&store, partition.clone()).expect("open writer");
@@ -482,6 +483,7 @@ fn compaction_commits_on_an_unquoted_etag_store() {
             .expect("append");
         writer.close().expect("close");
     }
+    seed_empty_manifest(&store, &partition);
 
     let outcome = compact_partition(&store, &partition).expect("compact");
 
@@ -490,6 +492,20 @@ fn compaction_commits_on_an_unquoted_etag_store() {
         .expect("the manifest swap commits instead of losing its CAS");
     assert_eq!(committed.input_files.len(), 2);
     assert_eq!(outcome.rows, 2);
+    assert!(
+        state.if_match_puts.load(Ordering::SeqCst) > 0,
+        "the commit was an If-Match swap"
+    );
+}
+
+/// An existing format-2 manifest in `partition` that consumes nothing, so
+/// the next commit there is an `If-Match` swap and the inputs stay live.
+fn seed_empty_manifest(store: &Store, partition: &PartitionKey) {
+    let manifest_key = format!("{}/manifest.json", name_prefix(partition));
+    let existing = Manifest::new(1, Vec::new(), Vec::new());
+    store
+        .put_blocking(&manifest_key, existing.to_json().expect("json"))
+        .expect("seed manifest");
 }
 
 /// A store that honours the quoted `ETag` is unaffected: the first swap wins
@@ -557,11 +573,7 @@ fn a_lost_final_swap_removes_its_rewrite() {
     }
     // An existing manifest makes the commit an `If-Match` swap, which this
     // store never honours.
-    let manifest_key = format!("{}/manifest.json", name_prefix(&partition));
-    let existing = Manifest::new(1, Vec::new(), Vec::new());
-    store
-        .put_blocking(&manifest_key, existing.to_json().expect("json"))
-        .expect("seed manifest");
+    seed_empty_manifest(&store, &partition);
     let parquet_keys = || -> Vec<String> {
         let mut keys: Vec<_> = store
             .list_blocking(Some("data/"))

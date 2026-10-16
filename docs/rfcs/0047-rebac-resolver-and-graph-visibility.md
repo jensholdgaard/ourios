@@ -490,6 +490,21 @@ server-side deadline behaviour on `streamed-list-objects` remains
 undocumented (a source-level question); the client-side `list_timeout_ms`
 below the server deadline stays the fail-closed pattern.
 
+> **Note 2026-10-16 (`drafted`, RFC 0009 late-write amendment, #1026).**
+> The rewrite above covers only the files a partition's manifest names,
+> so a late write into a compacted partition is skipped by it. Today that
+> file is also hidden from every reader, so nothing leaks. The RFC 0009
+> amendment makes late files live and extends this erasure to them. The
+> rewrite's inputs are the live set, which now includes late files. A
+> confirming pass before the marker advances to `tuples` rewrites any
+> partition that took a flush during the rows phase. The rows phase
+> waits until the marker is older than `erasure_settle`, so rows
+> acknowledged before the request have been published. It also records
+> the residual this section's "rows durable at the rewrite" leaves: a WAL
+> replay after a long outage can publish a pre-request row, and its
+> tuples, after the erasure. The OpenFGA model and the tuple shapes do
+> not change. See RFC 0009 §3.4 (erasure note) and RFC0009.20–.23.
+
 ### 3.7 Operational posture
 
 Fail-closed everywhere OpenFGA is consulted (resolution, planner, tool

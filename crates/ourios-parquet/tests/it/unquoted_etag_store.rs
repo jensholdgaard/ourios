@@ -213,46 +213,29 @@ struct State {
     objects: Objects,
     next_etag: Mutex<u64>,
     if_match_puts: AtomicUsize,
-    interleave: Mutex<Option<(After, Interleave)>>,
+    interleave: Mutex<Option<Interleave>>,
 }
 
-/// A change another process makes to the bucket, applied once at a chosen
-/// point in the client's request sequence.
+/// A change another process makes to the bucket, applied once, on the first
+/// `GET` (a listing or an object read): after that request's answer is
+/// computed and before it is sent, so the client sees the old state in that
+/// answer and the new state in every later one.
 type Interleave = Box<dyn FnOnce(&mut BTreeMap<String, (Vec<u8>, String)>) + Send>;
 
-/// When an [`Interleave`] runs: after the request's answer is computed and
-/// before it is sent, so the client sees the old state in that answer and
-/// the new state in every later one.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum After {
-    /// The first `GET` (a listing or an object read).
-    Read,
-    /// A won create-if-absent `PUT` of a `manifest.json`.
-    ManifestCreate,
-}
-
 impl State {
-    fn interleave_at(&self, at: After, change: Interleave) {
+    fn interleave_on_first_read(&self, change: Interleave) {
         *self
             .interleave
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((at, change));
+            .unwrap_or_else(PoisonError::into_inner) = Some(change);
     }
 
-    fn run_interleave(&self, at: After) {
-        let change = {
-            let mut slot = self
-                .interleave
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match slot.take() {
-                Some((when, change)) if when == at => Some(change),
-                other => {
-                    *slot = other;
-                    None
-                }
-            }
-        };
+    fn run_interleave(&self) {
+        let change = self
+            .interleave
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some(change) = change {
             change(&mut self.objects.lock().unwrap_or_else(PoisonError::into_inner));
         }
@@ -266,7 +249,7 @@ fn get(state: &State, key: &str, stream: &TcpStream) {
         .unwrap_or_else(PoisonError::into_inner)
         .get(key)
         .cloned();
-    state.run_interleave(After::Read);
+    state.run_interleave();
     match found {
         Some((bytes, etag)) => respond(
             stream,
@@ -309,7 +292,7 @@ fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
 /// `ListObjectsV2`, answered from the state before any interleaved change.
 fn list_objects(state: &State, req: &Request, stream: &TcpStream) {
     let xml = list(&state.objects, req);
-    state.run_interleave(After::Read);
+    state.run_interleave();
     respond(stream, "200 OK", &[], xml.as_bytes());
 }
 
@@ -318,8 +301,6 @@ fn put(mode: IfMatch, state: &State, req: Request, key: String, stream: &TcpStre
     if req.header("if-match").is_some() {
         state.if_match_puts.fetch_add(1, Ordering::SeqCst);
     }
-    let created_manifest =
-        req.header("if-none-match") == Some("*") && key.ends_with("manifest.json");
     let Some(etag) = store_if_precondition_holds(mode, state, req, key) else {
         respond(
             stream,
@@ -329,9 +310,6 @@ fn put(mode: IfMatch, state: &State, req: Request, key: String, stream: &TcpStre
         );
         return;
     };
-    if created_manifest {
-        state.run_interleave(After::ManifestCreate);
-    }
     respond(stream, "200 OK", &[("ETag", format!("\"{etag}\""))], b"");
 }
 
@@ -567,6 +545,13 @@ fn a_lost_final_swap_removes_its_rewrite() {
             .expect("append");
         writer.close().expect("close");
     }
+    // An existing manifest makes the commit an `If-Match` swap, which this
+    // store never honours.
+    let manifest_key = format!("{}/manifest.json", name_prefix(&partition));
+    let existing = Manifest::new(1, Vec::new(), Vec::new());
+    store
+        .put_blocking(&manifest_key, existing.to_json().expect("json"))
+        .expect("seed manifest");
     let parquet_keys = || -> Vec<String> {
         let mut keys: Vec<_> = store
             .list_blocking(Some("data/"))
@@ -747,61 +732,14 @@ fn visit_reads_every_row_across_a_first_commit_between_its_reads() {
     let out = "00000000-0000-7000-8000-000000000001.g2.parquet";
     let consumed = inputs.iter().map(|k| name_of(k)).collect();
     let commit = peer_commit(&partition, out, &rows, consumed);
-    state.interleave_at(
-        After::Read,
-        Box::new(move |objects| {
-            objects.extend(commit);
-            for input in &inputs {
-                objects.remove(input);
-            }
-        }),
-    );
+    state.interleave_on_first_read(Box::new(move |objects| {
+        objects.extend(commit);
+        for input in &inputs {
+            objects.remove(input);
+        }
+    }));
 
     let times = visited_times(&store, &partition);
 
     assert_eq!(times, rows.map(|r| r.time_unix_nano), "every row, once");
-}
-
-/// A peer compactor commits after this compaction's bootstrap is published and
-/// before it reads the bootstrap back, having also consumed a late file this
-/// compaction never listed. This compaction backs off instead of overwriting
-/// the peer's commit, so once the peer deletes its inputs every row, the late
-/// one included, is still read.
-#[test]
-fn a_compaction_backs_off_when_a_peer_commits_over_its_bootstrap() {
-    let (store, state) = fake_store(IfMatch::Either);
-    let partition = PartitionKey::derive(&rec_for("tenant-a", 0)).expect("derive");
-    let rows = [rec_for("tenant-a", 0), rec_for("tenant-a", 1)];
-    let late_row = rec_for("tenant-a", 2);
-    let inputs = write_flush_files(&store, &partition, &rows);
-    let prefix = name_prefix(&partition);
-    let late = format!("{prefix}/00000000-0000-7000-8000-00000000000a.parquet");
-    let out = "00000000-0000-7000-8000-00000000000b.g2.parquet";
-    let mut consumed: Vec<String> = inputs.iter().map(|k| name_of(k)).collect();
-    consumed.push(name_of(&late));
-    let all = [rows[0].clone(), rows[1].clone(), late_row.clone()];
-    let mut commit = peer_commit(&partition, out, &all, consumed);
-    commit.insert(
-        late.clone(),
-        (parquet_bytes(&partition, &[late_row]), "late".to_owned()),
-    );
-    state.interleave_at(
-        After::ManifestCreate,
-        Box::new(move |objects| objects.extend(commit)),
-    );
-
-    let outcome = compact_partition(&store, &partition).expect("compact");
-    for key in inputs.iter().chain([&late]) {
-        store
-            .delete_blocking(key)
-            .expect("the peer deletes its inputs");
-    }
-
-    assert!(outcome.committed.is_none(), "backed off: {outcome:?}");
-    assert!(!outcome.commit_lost, "nothing was written to lose");
-    assert_eq!(
-        visited_times(&store, &partition),
-        all.map(|r| r.time_unix_nano),
-        "the peer's commit stands, late row included"
-    );
 }

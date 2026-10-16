@@ -535,13 +535,17 @@ async fn compact_partition_consolidates_on_s3_via_cas() {
         "every row carried across the consolidation"
     );
 
-    // The manifest is at generation 2 (bootstrap gen 1, CAS commit gen 2),
-    // naming the single consolidated file — swapped via the conditional PUT.
+    // The manifest is at generation 1, created by the first commit's
+    // conditional (create-if-absent) PUT and naming the single consolidated
+    // file.
     let key = "data/tenant_id=tenant-c/year=2026/month=04/day=02/hour=10/manifest.json";
     let (manifest, _) = Manifest::read_with_etag(&s3, key)
         .expect("read manifest")
         .expect("manifest present after commit");
-    assert_eq!(manifest.generation, 2, "bootstrap gen 1 → CAS commit gen 2");
+    assert_eq!(
+        manifest.generation, 1,
+        "the first commit creates the manifest at gen 1"
+    );
     assert_eq!(
         manifest.files.len(),
         1,

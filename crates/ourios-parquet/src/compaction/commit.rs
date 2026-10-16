@@ -80,10 +80,11 @@ pub fn gc_orphans(store: &Store, partition: &PartitionKey) -> Result<OrphanGc, C
     let keys = store
         .list_blocking(Some(&prefix))
         .map_err(|e| store_io("list", &prefix, e))?;
+    let named = manifest.as_ref().map(Named::of);
     let mut gc = OrphanGc::default();
     let orphans = keys
         .iter()
-        .filter(|object| is_orphan(basename(object), manifest.as_ref()));
+        .filter(|object| is_orphan(basename(object), named.as_ref()));
     for object in orphans {
         match unlink(store, object) {
             Unlink::Removed => gc.reclaimed += 1,
@@ -112,7 +113,24 @@ fn unlink(store: &Store, object: &str) -> Unlink {
     }
 }
 
-/// Whether the object `name` in a partition is dead under `manifest`.
+/// A manifest's generation and the file names it lists, indexed once per
+/// GC pass.
+struct Named<'m> {
+    generation: u64,
+    files: HashSet<&'m str>,
+}
+
+impl<'m> Named<'m> {
+    fn of(manifest: &'m Manifest) -> Self {
+        Self {
+            generation: manifest.generation,
+            files: manifest.files.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// Whether the object `name` in a partition is dead under the manifest
+/// `named` indexes.
 ///
 /// `.parquet.tmp` is always a dead interrupted publish. A `.parquet` is an
 /// orphan only when a manifest names a set that excludes it (no manifest ⇒
@@ -120,14 +138,14 @@ fn unlink(store: &Store, object: &str) -> Unlink {
 /// generation the manifest has not reached yet is kept: its compaction may
 /// still be about to commit it (RFC0009.17). Anything else
 /// (`manifest.json`, a future sidecar) is not ours.
-fn is_orphan(name: &str, manifest: Option<&Manifest>) -> bool {
+fn is_orphan(name: &str, named: Option<&Named<'_>>) -> bool {
     if name.ends_with(".parquet.tmp") {
         return true;
     }
-    let Some(manifest) = manifest else {
+    let Some(named) = named else {
         return false;
     };
     let in_flight =
-        compacted_generation(name).is_some_and(|generation| generation > manifest.generation);
-    name.ends_with(".parquet") && !in_flight && !manifest.files.iter().any(|f| f == name)
+        compacted_generation(name).is_some_and(|generation| generation > named.generation);
+    name.ends_with(".parquet") && !in_flight && !named.files.contains(name)
 }

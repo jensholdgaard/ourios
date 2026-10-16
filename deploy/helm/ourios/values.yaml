@@ -241,8 +241,9 @@ querier:
 
 # Background compactor (RFC 0009). The single sweeper: the receiver and querier
 # workloads set OURIOS_COMPACTION_ENABLED=0, so only this Deployment compacts.
-# Pinned to one replica on purpose (>1 is safe via the publish-CAS commit but
-# redundant; no leader election) — see the README "Compactor topology" section.
+# Pinned to one replica, rolled with the Recreate strategy so two compactors
+# never run at once (RFC0009.24; no leader election) — see the README
+# "Compactor topology" section.
 compactor:
   enabled: true
   # Sweep cadence (OURIOS_COMPACTION_INTERVAL_SECS), used only by this compactor.

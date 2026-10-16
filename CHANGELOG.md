@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.13.5] - 2026-10-16
+
+### Added
+
+- Skip the artifact read a refresh pass's listing proves unchanged (#1031) (4dd80d7)
+- Span the sweep's planning phase as plan partitions (#1029) (a34132a)
+
+### Documentation
+
+- Draft the late-write amendment so a late file stays live (#1033) (89db4cf)
+- Correct the plan partitions counts for the one-listing planner (#1035) (3737f9f)
+- Skip the artifact read a pass's listing proves unchanged (#1028) (bce1571)
+- Plan each tenant from one listing, not a read per partition (#1027) (04c1b74)
+- Draft a plan partitions span under the compaction sweep (#1025) (3a919ec)
+
+### Performance
+
+- Plan each tenant from one listing, skip settled partitions (#1030) (8e682da)
+
 ## [0.13.4] - 2026-10-16
 
 ### Added

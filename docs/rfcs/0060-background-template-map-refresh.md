@@ -28,8 +28,8 @@ superseded-by: —
 > evidence (§2.1). If this RFC is accepted, RFC 0033 §4 gets a dated
 > pointer here.
 
-> **Amendment 2026-10-16 — a pass skips the artifact read its listing
-> proves unnecessary (#1008, `drafted`, pending maintainer approval).**
+> **Amendment (2026-10-16, #1008, maintainer-approved) — a pass skips the
+> artifact read its listing proves unnecessary.**
 > Adds §3.7: a pass remembers, per tenant, the frontier and artifact
 > `ETag` of its last verified hit. When its next listing shows the same
 > frontier and the same `ETag`, it stops there instead of reading the
@@ -38,8 +38,8 @@ superseded-by: —
 > the listing. A change that lands between the listing and the skipped
 > read is repaired one pass late (§3.7). Queries are untouched. It
 > does not shrink the per-tenant listing itself, which is most of a
-> pass's requests on a tenant with a long audit history; §7 lists the
-> options for that as open questions for the maintainer. In-place notes
+> pass's requests on a tenant with a long audit history. §7 records the
+> maintainer's decisions on that and on telemetry. In-place notes
 > in §3.3, §3.5 and §6, and an amended RFC0060.10 (a hit or publish no
 > longer forces an acquisition on the next pass, only a listing). New
 > scenarios RFC0060.12–.16 (`drafted`); §9 records the history. The
@@ -171,7 +171,7 @@ ask. §7 lists pre-emptive full folds as an open question.
   requests. It is still paid per tenant, hence §7's question about
   large tenant counts.
 
-  > *Amendment 2026-10-16 (#1008, `drafted`).* Measured on the
+  > *Amendment (2026-10-16, #1008, maintainer-approved).* Measured on the
   > production node (one pass, 2026-10-16, five idle tenants): one
   > delimited `LIST` of `audit/`, then per tenant one `LIST` **per
   > 1,000 audit objects** (8 and 6 pages for the two oldest tenants, 1
@@ -255,7 +255,7 @@ doubles the existing series.
 ourios-semconv `v0.3.17` under the purpose-check and
 maintainer-approval rule, after an OTel naming-guidance check.
 
-> *Amendment 2026-10-16 (#1008, `drafted`).* A tenant that §3.7 skips
+> *Amendment (2026-10-16, #1008, maintainer-approved).* A tenant that §3.7 skips
 > still gets its `load template_map` span, with the listing's `CLIENT`
 > spans beneath it and no `S3.GetObject`. It carries no
 > `ourios.template_map.lookup.outcome` and records no `lookups` sample:
@@ -284,7 +284,7 @@ sequenceDiagram
     T->>T: next tenant
 ```
 
-### 3.7 Skipping a read the listing proves unnecessary (amendment 2026-10-16, #1008, `drafted`)
+### 3.7 Skipping a read the listing proves unnecessary (amendment 2026-10-16, #1008, maintainer-approved)
 
 Every acquisition starts with one recursive listing of the tenant's
 audit prefix (RFC 0033 §3.3). The artifact lives under that prefix, so
@@ -490,7 +490,7 @@ path, and a second publisher contends for the CAS.
 > - **And** once a successful listing no longer names the tenant, its
 >   counter is dropped; a failed listing drops nothing.
 >
-> *Amendment 2026-10-16 (#1008, `drafted`).* The third **And** becomes:
+> *Amendment (2026-10-16, #1008, maintainer-approved).* The third **And** becomes:
 > after a hit or a publish, back-off no longer skips the tenant. The next
 > pass lists it, and acquires it unless §3.7's skip applies; RFC0060.12
 > says when it does. After a publish the skip never applies on the next
@@ -587,7 +587,7 @@ No `proptest` or corpus test applies: the task adds scheduling, not
 fold semantics, and the fold's own property tests (RFC0033.10–.13)
 already cover what it calls.
 
-> *Amendment 2026-10-16 (#1008, `drafted`).* Test map for §3.7:
+> *Amendment (2026-10-16, #1008, maintainer-approved).* Test map for §3.7:
 >
 > | Scenario | Test | Where |
 > |:--|:--|:--|
@@ -622,12 +622,13 @@ the Dash0 evidence named:
 - [x] **Default `interval`: `5m`.** Revisit with publish and fold rates
       after release.
 
-Open for the 2026-10-16 amendment (#1008); each needs a maintainer
-decision:
+Decided for the 2026-10-16 amendment (#1008, maintainer, 2026-10-16):
 
-- [ ] **The listing pages (most of a pass's cost).** §3.7 is the only
-      skip a listing can prove. Fewer `LIST` pages need one of these:
-      1. **Shrink the listing: compact the audit stream** (recommended).
+- [x] **The listing pages (most of a pass's cost): compact the audit
+      stream, in a follow-up RFC.** Option 1 below, not part of this
+      amendment. Options 2–5 are not taken. §3.7 is the only skip a
+      listing can prove. The options considered for fewer `LIST` pages:
+      1. **Shrink the listing: compact the audit stream** (chosen).
          Pages grow with audit objects, and the stream writes many small
          objects (one per audit flush and one per compaction event,
          RFC 0005 §3.7). Merging a tenant's closed audit days into a few
@@ -661,7 +662,7 @@ decision:
          role). It sees only this process's writes: not another
          ingester, a lifecycle rule, or a separate-process deployment.
          Not a proof, so it is rejected as the basis of a skip.
-- [ ] **An `unchanged` lookup outcome.** §3.5's note records a skip
+- [x] **An `unchanged` lookup outcome: not now.** §3.5's note records a skip
       only through the storage counters and the span shape. Registering
       `unchanged` as a value of `ourios.template_map.lookup.outcome`
       would let a dashboard count skips directly. That is a new registry
@@ -682,7 +683,7 @@ decision:
 ## 9. Amendment history
 
 - **2026-10-16 — a pass skips the artifact read its listing proves
-  unnecessary (#1008, `drafted`, pending maintainer approval).** Adds
+  unnecessary (#1008, maintainer-approved 2026-10-16).** Adds
   §3.7: a per-tenant verified listing (frontier and artifact tag),
   recorded only on a hit whose read tag equals the listed one; a pass
   whose listing matches it reads nothing. In-place notes in §3.3 (the
@@ -691,9 +692,10 @@ decision:
   publish the next pass lists the tenant and acquires it unless §3.7's
   skip applies. States the one interleaving §3.7 does not cover, a
   change between the listing and the skipped read, and accepts its
-  one-pass repair delay. New scenarios RFC0060.12–.16. New open
-  questions in §7 on the listing pages and on an `unchanged` lookup
-  outcome. RFC0060.1–.9, .11 and the frontmatter status are unchanged.
+  one-pass repair delay. New scenarios RFC0060.12–.16. Two §7
+  decisions: the listing pages are cut by compacting the audit stream
+  (a follow-up RFC), and there is no `unchanged` lookup outcome for now.
+  RFC0060.1–.9, .11 and the frontmatter status are unchanged.
   Review (Copilot, #1028): the race qualification and RFC0060.16, the
   RFC0060.10 amendment, a different tag in RFC0060.13 (c), and the
   back-off-eligible pass in RFC0060.14.

@@ -270,6 +270,17 @@ pub(super) async fn resolve_data_urls(
         })
 }
 
+/// Resolve `scope` again only to compare it with an earlier resolution, after
+/// a scan over that one failed (RFC0009.18). Not a `resolve files` phase of
+/// its own: the query's phase count stays one per scan attempt.
+pub(super) async fn recheck_data_urls(
+    backend: &Backend,
+    ctx: &SessionContext,
+    scope: DataScope<'_>,
+) -> Result<Vec<ListingTableUrl>, QueryError> {
+    resolve_in_phase(backend, ctx, scope, &tracing::Span::none()).await
+}
+
 async fn resolve_in_phase(
     backend: &Backend,
     ctx: &SessionContext,

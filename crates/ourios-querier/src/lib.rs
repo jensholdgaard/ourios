@@ -105,6 +105,8 @@ mod file_set;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
+#[cfg(test)]
+mod stale_resolution_tests;
 mod stats;
 #[cfg(test)]
 mod test_support;
@@ -357,10 +359,23 @@ struct CollectedRecords {
     map_fetched: u64,
 }
 
+/// How many times [`Querier::execute`] resolves and scans before a read error
+/// over a file set that keeps changing is returned (RFC0009.18).
+const SCAN_ATTEMPTS: u32 = 3;
+
+/// One scan of a resolved file set by [`Querier::execute`].
+struct ScanAttempt<'a, F> {
+    tenant: &'a TenantId,
+    terminal: Terminal,
+    acquired: Option<map_flight::MapAcquisition>,
+    build_filter: &'a F,
+}
+
 /// How [`Querier::execute`] terminates the filtered scan (RFC 0002 §6.5):
 /// count + optional row materialization, or one grouped-count aggregation
 /// returning the map. An enum so an aggregation carrying a row limit /
 /// elision option is unrepresentable — the map is the whole result.
+#[derive(Clone)]
 enum Terminal {
     /// Count + up-to-`limit` rendered rows (RFC 0017 §3.4).
     Rows {
@@ -622,7 +637,7 @@ impl Querier {
             },
         };
         self.execute(tenant, Some(plan.window), terminal, acquired, move |df| {
-            plan::apply(df, plan)
+            plan::apply(df, plan.clone())
         })
         .await
     }
@@ -706,57 +721,103 @@ impl Querier {
         // `Ok(None)` ⇒ the filter is provably empty (an absent OPTIONAL
         // column, RFC 0005 §3.9), so the query short-circuits to an empty
         // result rather than planning a scan that matches nothing.
-        F: FnOnce(
+        F: Fn(
             datafusion::dataframe::DataFrame,
         ) -> Result<Option<datafusion::dataframe::DataFrame>, QueryError>,
     {
         let enc = percent_encode_tenant(tenant.as_str());
         let data_prefix = format!("data/tenant_id={enc}");
-
-        let ctx = crate::exec::session();
-        let compile_fetched = acquired.as_ref().map_or(0, |a| a.fetched);
-        // Resolve the live file set under the tenant's `data/` prefix,
-        // honouring the RFC 0009 §3.4 manifest (glob-fallback when absent),
-        // and produce the per-file table URLs (local absolute path, or
-        // object-store URL on S3). An empty set ⇒ the tenant has nothing
-        // queryable ⇒ empty result (not an error). Covers the missing-dir
-        // case and a partition holding only `*.parquet.tmp` (a poisoned /
-        // crashed writer) — where building a table over zero files would
-        // otherwise error and wrongly fail the query.
         let scope = file_set::DataScope {
             tenant,
             prefix: &data_prefix,
             window: partition_window,
         };
-        let urls = file_set::resolve_data_urls(&self.backend, &ctx, scope).await?;
+        // A compaction that commits while this query runs can delete files
+        // the resolution named; their rows are already in a file the new
+        // manifest names, so a read error over a file set that has since
+        // changed is a stale resolution, not a loss. Resolve and scan again,
+        // a bounded number of times (RFC 0009 §3.4, RFC0009.18). A result
+        // is only ever returned whole, so no rows have been sent on a retry.
+        let mut fetched = acquired.as_ref().map_or(0, |a| a.fetched);
+        let mut acquired = acquired;
+        let mut attempt = 1;
+        loop {
+            let ctx = crate::exec::session();
+            let urls = file_set::resolve_data_urls(&self.backend, &ctx, scope).await?;
+            let scan = ScanAttempt {
+                tenant,
+                terminal: terminal.clone(),
+                acquired: acquired.take(),
+                build_filter: &build_filter,
+            };
+            match self.scan_resolved(&ctx, urls.clone(), scan).await {
+                Err(QueryError::Storage { .. })
+                    if attempt < SCAN_ATTEMPTS && self.file_set_moved(scope, &urls).await? =>
+                {
+                    fetched += crate::fetch_count::fetched(&ctx);
+                    attempt += 1;
+                }
+                outcome => {
+                    return outcome
+                        .map(|result| crate::fetch_count::with_fetched(result, &ctx, fetched));
+                }
+            }
+        }
+    }
+
+    /// Whether `scope` now resolves to a different file set than `used`: a
+    /// commit has replaced files since `used` was resolved.
+    async fn file_set_moved(
+        &self,
+        scope: file_set::DataScope<'_>,
+        used: &[ListingTableUrl],
+    ) -> Result<bool, QueryError> {
+        let ctx = crate::exec::session();
+        let now = file_set::recheck_data_urls(&self.backend, &ctx, scope).await?;
+        Ok(now != used)
+    }
+
+    /// Scan the resolved file set `urls` once. An empty set ⇒ the tenant has
+    /// nothing queryable ⇒ empty result (not an error). Covers the
+    /// missing-dir case and a partition holding only `*.parquet.tmp` (a
+    /// poisoned / crashed writer) — where building a table over zero files
+    /// would otherwise error and wrongly fail the query.
+    async fn scan_resolved<F>(
+        &self,
+        ctx: &SessionContext,
+        urls: Vec<ListingTableUrl>,
+        scan: ScanAttempt<'_, F>,
+    ) -> Result<QueryResult, QueryError>
+    where
+        F: Fn(
+            datafusion::dataframe::DataFrame,
+        ) -> Result<Option<datafusion::dataframe::DataFrame>, QueryError>,
+    {
+        let ScanAttempt {
+            tenant,
+            terminal,
+            acquired,
+            build_filter,
+        } = scan;
         if urls.is_empty() {
-            let result = empty_result(terminal.aggregate());
-            return Ok(crate::fetch_count::with_fetched(
-                result,
-                &ctx,
-                compile_fetched,
-            ));
+            return Ok(empty_result(terminal.aggregate()));
         }
         let files_opened = urls.len() as u64;
 
         // Union schema + promoted no-coercion adapter — the rationale
         // lives on `SchemaMode::Union` (epic #745 wave 2).
-        let base = register_logs_table(&ctx, urls, &self.promoted, tenant).await?;
+        let base = register_logs_table(ctx, urls, &self.promoted, tenant).await?;
         let mut result = match build_filter(base)? {
             // A provably-empty filter (absent OPTIONAL column) ⇒ no scan. The
             // files were still opened: schema inference read every footer.
             None => empty_result(terminal.aggregate()),
             Some(df) => {
-                self.run_terminal(&ctx, df, tenant, terminal, acquired)
+                self.run_terminal(ctx, df, tenant, terminal, acquired)
                     .await?
             }
         };
         result.stats.files_opened = files_opened;
-        Ok(crate::fetch_count::with_fetched(
-            result,
-            &ctx,
-            compile_fetched,
-        ))
+        Ok(result)
     }
 
     /// Run `terminal` over the filtered frame `df` (see [`Self::execute`],

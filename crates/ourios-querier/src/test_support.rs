@@ -249,3 +249,80 @@ impl ObjectStore for SlowStore {
         self.inner.copy_opts(from, to, options).await
     }
 }
+
+/// A change made to the store by another process, keyed on the object a
+/// read is about to fetch.
+pub(crate) type GetHook = Box<dyn FnMut(&str) + Send>;
+
+/// Runs a [`GetHook`] before every GET (and HEAD) is forwarded, so a test can
+/// change the store between a query's file-set resolution and its scan.
+#[derive(Clone)]
+pub(crate) struct HookStore {
+    inner: Arc<dyn ObjectStore>,
+    hook: Arc<Mutex<GetHook>>,
+}
+
+impl HookStore {
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>, hook: GetHook) -> Self {
+        Self {
+            inner,
+            hook: Arc::new(Mutex::new(hook)),
+        }
+    }
+}
+
+impl fmt::Debug for HookStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HookStore({})", self.inner)
+    }
+}
+
+impl fmt::Display for HookStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HookStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for HookStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        (self.hook.lock().unwrap_or_else(PoisonError::into_inner))(location.as_ref());
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}

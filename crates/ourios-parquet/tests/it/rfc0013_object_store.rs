@@ -282,7 +282,7 @@ async fn rfc0013_4_manifest_swap_via_conditional_put() {
         .expect("read")
         .expect("present");
     assert_eq!(final_m.generation, 2);
-    assert_eq!(final_m.files, vec!["b.parquet".to_string()]);
+    assert_eq!(final_m.files, vec![compacted_name(2, 2)]);
 }
 
 /// Scenario RFC0013.5 — operations in tenant X's context address only X's key

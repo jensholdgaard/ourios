@@ -270,18 +270,23 @@ fn erase_rows(sweep: &mut Sweep<'_, '_>, matches: &ErasureMatch<'_>, outcome: &m
         return;
     };
     let mut checked = Checked::new();
-    if !erase_each(sweep, &partitions, &drop, outcome, &mut checked) {
+    let mut erasing = Erasing {
+        drop: &drop,
+        outcome,
+        checked: &mut checked,
+    };
+    if !erase_each(sweep, &partitions, &mut erasing) {
         return;
     }
     for _ in 0..CONFIRMING_ROUNDS {
-        let Some(changed) = changed_partitions(sweep, &request, &checked) else {
+        let Some(changed) = changed_partitions(sweep, &request, erasing.checked) else {
             return;
         };
         if changed.is_empty() {
-            advance_marker(sweep, outcome);
+            advance_marker(sweep, erasing.outcome);
             return;
         }
-        if !erase_each(sweep, &changed, &drop, outcome, &mut checked) {
+        if !erase_each(sweep, &changed, &mut erasing) {
             return;
         }
     }
@@ -314,20 +319,26 @@ fn tenant_partitions(
 fn erase_each(
     sweep: &mut Sweep<'_, '_>,
     partitions: &[PartitionKey],
-    drop: &RowFilter<'_>,
-    outcome: &mut ErasureOutcome,
-    checked: &mut Checked,
+    erasing: &mut Erasing<'_, '_>,
 ) -> bool {
     let mut clean = true;
     for partition in partitions {
-        match erase_partition(sweep, partition, drop, outcome) {
+        match erase_partition(sweep, partition, erasing.drop, erasing.outcome) {
             Some(generation) => {
-                checked.insert(partition.clone(), generation);
+                erasing.checked.insert(partition.clone(), generation);
             }
             None => clean = false,
         }
     }
     clean
+}
+
+/// One request's rows phase in progress: its filter, its outcome, and the
+/// generation each partition was checked at.
+struct Erasing<'e, 'f> {
+    drop: &'e RowFilter<'f>,
+    outcome: &'e mut ErasureOutcome,
+    checked: &'e mut Checked,
 }
 
 /// The partitions of the request's tenant a confirming pass must rewrite
@@ -369,7 +380,10 @@ fn changed_partitions(
 /// sweep's IO accounting and audit trail (RFC 0009 §3.6): it reads and
 /// writes the partition and commits a generation, so `rewrite` records
 /// its commit as the consolidation pass does. A partition with nothing to
-/// rewrite is checked at the generation it is observed at.
+/// rewrite is checked at the generation read **before** the rewrite: one
+/// read after it could already name a peer's commit of rows this rewrite
+/// never filtered, which the confirming pass would then wrongly take as
+/// checked.
 fn erase_partition(
     sweep: &mut Sweep<'_, '_>,
     partition: &PartitionKey,
@@ -388,6 +402,13 @@ fn erase_partition(
             request.tenant, request.conversation_id
         )
     };
+    let before = match partition_snapshot(sweep.store, partition) {
+        Ok(before) => before,
+        Err(e) => {
+            sweep.report.errors.push(format!("{}: {e}", context()));
+            return None;
+        }
+    };
     match sweep.rewrite(target, None, Some(drop)) {
         Ok(o) => match o.committed {
             Some(committed) => {
@@ -396,13 +417,7 @@ fn erase_partition(
                 sweep.report.gc_failures += o.gc_failures;
                 Some(committed.generation)
             }
-            None => match partition_snapshot(sweep.store, partition) {
-                Ok(now) => Some(now.generation),
-                Err(e) => {
-                    sweep.report.errors.push(format!("{}: {e}", context()));
-                    None
-                }
-            },
+            None => Some(before.generation),
         },
         Err(e) => {
             e.record(&mut sweep.report, &context());

@@ -422,3 +422,147 @@ fn rfc0009_23_rows_phase_waits_for_erasure_settle() {
     assert_eq!(phases(&old), [ErasurePhase::Tuples], "{old:?}");
     assert_eq!(templates(&store, &partition), [2]);
 }
+
+/// A file another process writes: its path and its bytes.
+type PeerWrite = (PathBuf, Vec<u8>);
+
+/// A store backend that runs `change` once, just before the `nth` listing of
+/// a prefix containing `scope` is answered.
+#[derive(Debug)]
+struct OnListing {
+    inner: Arc<dyn object_store::ObjectStore>,
+    scope: String,
+    nth: u64,
+    seen: AtomicU64,
+    change: Mutex<Option<Vec<PeerWrite>>>,
+}
+
+impl std::fmt::Display for OnListing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OnListing({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for OnListing {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        let in_scope = prefix.is_some_and(|p| p.as_ref().contains(&self.scope));
+        if in_scope && self.seen.fetch_add(1, Ordering::SeqCst) + 1 == self.nth {
+            let writes = self
+                .change
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            for (path, bytes) in writes.into_iter().flatten() {
+                std::fs::write(path, bytes).expect("the peer's write");
+            }
+        }
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// RFC0009.22 — a partition with nothing to rewrite (only a `*.parquet.tmp`)
+/// is checked at the generation seen before its rewrite. A peer that then
+/// publishes the conversation's rows there and consolidates them, before the
+/// rows phase reads the partition's generation, moves the partition past
+/// that generation, so the confirming pass rewrites it and the rows go.
+#[test]
+fn rfc0009_22_a_peer_commit_after_a_no_op_rewrite_is_still_erased() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let plain = store_at(bucket.path());
+    flush(&plain, &[rec("a", 2, TS0)]);
+    let other_ts = TS0 + 3 * HOUR;
+    let other = partition_of(other_ts);
+    let prefix = format!("{}", other.data_path(Path::new("")).display());
+    plain
+        .put_blocking(&format!("{prefix}/stray.parquet.tmp"), b"x".to_vec())
+        .expect("tmp");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let staged = flush(&store_at(scratch.path()), &[rec("a", 1, other_ts)]);
+    let output = staged.replace(".parquet", ".g1.parquet");
+    let bytes = std::fs::read(scratch.path().join(&staged)).expect("peer output");
+    let manifest = ourios_parquet::Manifest::new(
+        1,
+        vec![output.rsplit_once('/').expect("key").1.to_owned()],
+        Vec::new(),
+    );
+    let change = vec![
+        (bucket.path().join(&output), bytes),
+        (
+            bucket.path().join(&prefix).join("manifest.json"),
+            manifest.to_json().expect("json"),
+        ),
+    ];
+    request_erasure(&plain, "a", "c-1").expect("request");
+    let store = plain.wrap_backend(|inner| {
+        Arc::new(OnListing {
+            inner,
+            scope: prefix.clone(),
+            nth: 2,
+            seen: AtomicU64::new(0),
+            change: Mutex::new(Some(change)),
+        })
+    });
+
+    let report = sweep(&store, &erase_template_1);
+
+    assert_eq!(phases(&report), [ErasurePhase::Tuples], "{report:?}");
+    assert!(
+        !templates(&store, &other).contains(&1),
+        "the peer's row of the conversation is erased"
+    );
+}

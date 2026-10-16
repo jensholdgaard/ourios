@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::audit_fetch::{FetchPool, fetch_in_order};
 use crate::fetch_count::FetchCounter;
-use ourios_parquet::ManifestError;
+use ourios_parquet::{ManifestError, compacted_generation};
 use tracing::Instrument as _;
 
 /// Resolve the live data files a query must read under `dir` (a
@@ -67,16 +67,13 @@ pub(super) fn resolve_live_files(
         // path it can't prove out of range, so no in-window data is lost.
         let keep = window.is_none_or(|(start, end)| hour_partition_in_window(&d, start, end));
         if keep {
-            match read_local_manifest(&d, tally).map_err(|e| QueryError::Storage {
+            let manifest = read_local_manifest(&d, tally).map_err(|e| QueryError::Storage {
                 detail: format!("manifest in {}: {e}", d.display()),
-            })? {
-                // Manifest is authoritative: only its named files are live.
-                Some(manifest) => {
-                    files.extend(manifest.files.into_iter().map(|name| d.join(name)));
-                }
-                // No manifest → glob fallback for this partition.
-                None => files.append(&mut parquets),
-            }
+            })?;
+            let listed = std::mem::take(&mut parquets);
+            files.extend(live_in_partition(manifest.as_ref(), listed, |name| {
+                d.join(name)
+            }));
         }
         for subdir in subdirs {
             let (Some(level), Some(window)) = (level, window) else {
@@ -626,27 +623,40 @@ fn live_keys_from_listing(
 
     let mut live = Vec::new();
     for (dir, partition_keys) in by_partition {
-        match manifests.remove(dir) {
-            // Manifest is authoritative: only its named files are live (joined
-            // onto the partition key as `<dir>/<name>`).
-            Some(manifest) => {
-                live.extend(
-                    manifest
-                        .files
-                        .into_iter()
-                        .map(|name| format!("{dir}/{name}")),
-                );
-            }
-            // No manifest → glob fallback for this partition's committed files.
-            None => live.extend(
-                partition_keys
-                    .into_iter()
-                    .filter(|(key, _)| key.ends_with(".parquet"))
-                    .map(|(key, _)| key.to_owned()),
-            ),
-        }
+        let manifest = manifests.remove(dir);
+        let listed = partition_keys
+            .into_iter()
+            .filter(|(key, _)| key.ends_with(".parquet"))
+            .map(|(key, _)| key.to_owned());
+        live.extend(live_in_partition(manifest.as_ref(), listed, |name| {
+            format!("{dir}/{name}")
+        }));
     }
     Ok(live)
+}
+
+/// One partition's live files under the RFC 0009 §3.4 live-set rule, as the
+/// compactor computes them: the compacted files `manifest` names, by name
+/// (`locate` joins a name onto the partition), plus every `listed` flush
+/// file it does not consume. With no manifest that is every listed flush
+/// file; a compacted file is never live unless named.
+fn live_in_partition<T: AsRef<std::path::Path>>(
+    manifest: Option<&Manifest>,
+    listed: impl IntoIterator<Item = T>,
+    locate: impl Fn(&str) -> T,
+) -> Vec<T> {
+    let live = ourios_parquet::LiveSet::new(manifest);
+    let named = manifest
+        .into_iter()
+        .flat_map(|m| &m.files)
+        .map(|name| locate(name));
+    let flush = listed.into_iter().filter(|item| {
+        item.as_ref()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| compacted_generation(name).is_none() && live.is_live(name))
+    });
+    named.chain(flush).collect()
 }
 
 /// Build the `DataFusion` table URLs for the **local** backend: every resolved
@@ -891,11 +901,14 @@ mod tests {
         store.put_blocking(key, b"x".to_vec()).expect("put");
     }
 
-    fn put_manifest(store: &Store, dir: &str, files: &[&str]) {
-        let manifest = ourios_parquet::Manifest {
-            generation: 1,
-            files: files.iter().map(ToString::to_string).collect(),
-        };
+    /// A manifest in `dir` that consumes the flush files `retired`, so every
+    /// other flush file there stays live (RFC 0009 §3.4).
+    fn put_manifest(store: &Store, dir: &str, retired: &[&str]) {
+        let manifest = ourios_parquet::Manifest::new(
+            1,
+            Vec::new(),
+            retired.iter().map(ToString::to_string).collect(),
+        );
         store
             .put_blocking(
                 &format!("{dir}/{}", ourios_parquet::MANIFEST_FILENAME),
@@ -969,7 +982,7 @@ mod tests {
             store,
             &format!("{}/c.parquet.tmp", hour_prefix(2026, 4, 2, 10)),
         );
-        put_manifest(store, &hour_prefix(2026, 4, 2, 11), &["a.parquet"]);
+        put_manifest(store, &hour_prefix(2026, 4, 2, 11), &["orphan.parquet"]);
         put(
             store,
             &format!("{}/orphan.parquet", hour_prefix(2026, 4, 2, 11)),
@@ -979,7 +992,7 @@ mod tests {
             &format!("{}/f.parquet", hour_prefix(2025, 12, 31, 23)),
         );
         put(store, &format!("{}/f.parquet", hour_prefix(2026, 1, 1, 0)));
-        put_manifest(store, &hour_prefix(2025, 12, 31, 23), &["f.parquet"]);
+        put_manifest(store, &hour_prefix(2025, 12, 31, 23), &[]);
     }
 
     /// Stray keys below parsed Hive ancestors (`year=2026`, then the
@@ -1336,15 +1349,12 @@ mod tests {
 
     #[test]
     fn resolve_manifest_is_authoritative() {
-        // Arrange — two files on disk, a manifest naming only one.
+        // Arrange — two files on disk, a manifest that consumed one.
         let tmp = tempfile::tempdir().expect("temp");
         let (tenant, partition) = tenant_and_partition(tmp.path());
         std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
         std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
-        let manifest = ourios_parquet::Manifest {
-            generation: 1,
-            files: vec!["a.parquet".to_string()],
-        };
+        let manifest = ourios_parquet::Manifest::new(1, Vec::new(), vec!["b.parquet".to_string()]);
         std::fs::write(
             partition.join(ourios_parquet::MANIFEST_FILENAME),
             manifest.to_json().unwrap(),
@@ -1365,7 +1375,7 @@ mod tests {
     }
 
     /// A store of `partitions` hour partitions on 2026-04-02, each with a
-    /// manifest naming `a.parquet` plus a retired `b.parquet` it excludes,
+    /// manifest that consumed `b.parquet`, so only `a.parquet` is live,
     /// seen through a [`SlowStore`] whose GETs answer later partitions first.
     fn manifested_partitions(
         root: &std::path::Path,
@@ -1386,7 +1396,7 @@ mod tests {
             let dir = hour_prefix(2026, 4, 2, hour);
             put(&plain, &format!("{dir}/a.parquet"));
             put(&plain, &format!("{dir}/b.parquet"));
-            put_manifest(&plain, &dir, &["a.parquet"]);
+            put_manifest(&plain, &dir, &["b.parquet"]);
         }
         let mut slow = None;
         let wrapped = plain.wrap_backend(|inner| {

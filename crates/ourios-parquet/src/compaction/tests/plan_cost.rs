@@ -170,12 +170,19 @@ fn put_object(store: &Store, part: &PartitionKey, name: &str, len: usize) {
         .expect("put object");
 }
 
-fn manifest_naming(names: &[&str]) -> Manifest {
-    Manifest {
-        generation: 1,
-        files: names.iter().map(ToString::to_string).collect(),
-    }
+/// A generation-1 manifest naming the compacted `files` and consuming the
+/// flush files `consumed`.
+fn manifest_of(files: &[&str], consumed: &[&str]) -> Manifest {
+    let owned = |names: &[&str]| names.iter().map(ToString::to_string).collect();
+    Manifest::new(1, owned(files), owned(consumed))
 }
+
+/// Compacted-file names for generation 1 (`<uuid>.g1.parquet`).
+const COMPACTED: [&str; 3] = [
+    "00000000-0000-7000-8000-000000000000.g1.parquet",
+    "00000000-0000-7000-8000-000000000001.g1.parquet",
+    "00000000-0000-7000-8000-000000000002.g1.parquet",
+];
 
 /// No file counts as small: a 1-byte threshold.
 fn large_files_policy() -> CompactionPolicy {
@@ -187,7 +194,8 @@ fn large_files_policy() -> CompactionPolicy {
 
 /// The pre-amendment planner, kept as the RFC0009.9 oracle: enumerate the
 /// partitions by delimiter walk, then read each sealed one's manifest and list
-/// it.
+/// it. Its live set follows the format-2 rule (RFC 0009 §3.4 late-write
+/// note), written out here rather than shared with the production code.
 fn per_partition_plan(store: &Store, now: u64, policy: &CompactionPolicy) -> Vec<PartitionKey> {
     hour_partitions(store, "a")
         .expect("partitions")
@@ -203,15 +211,24 @@ fn per_partition_is_candidate(
 ) -> bool {
     let prefix = partition_data_prefix(partition);
     let manifest = read_manifest(store, partition).expect("manifest");
-    let live: Option<HashSet<&str>> = manifest
-        .as_ref()
-        .map(|m| m.files.iter().map(String::as_str).collect());
+    let listed_in = |list: fn(&Manifest) -> &Vec<String>, name: &str| {
+        manifest
+            .as_ref()
+            .is_some_and(|m| list(m).iter().any(|n| n == name))
+    };
+    let is_live = |name: &str| {
+        if compacted_generation(name).is_some() {
+            listed_in(|m| &m.files, name)
+        } else {
+            !listed_in(|m| &m.consumed, name)
+        }
+    };
     let sizes: Vec<u64> = store
         .list_with_sizes_blocking(Some(&prefix))
         .expect("list")
         .iter()
         .filter(|(key, _)| is_committed_parquet(key) && is_immediate_child(key, &prefix))
-        .filter(|(key, _)| live.as_ref().is_none_or(|l| l.contains(basename(key))))
+        .filter(|(key, _)| is_live(basename(key)))
         .map(|(_, size)| *size)
         .collect();
     // The pre-amendment predicate, frozen here rather than shared with the
@@ -227,8 +244,8 @@ fn per_partition_is_candidate(
 
 #[test]
 fn rfc0009_8_settled_partitions_cost_no_request_of_their_own() {
-    // Arrange — 48 sealed hours of one file each; every other one also has
-    // a manifest naming its file (the shape a compaction leaves).
+    // Arrange — 48 sealed hours of one file each; every other one is the
+    // shape a compaction leaves: one compacted file its manifest names.
     let bucket = tempfile::tempdir().expect("temp");
     let (store, counts) = counted(bucket.path());
     let start = partition();
@@ -238,9 +255,11 @@ fn rfc0009_8_settled_partitions_cost_no_request_of_their_own() {
             hour: offset % 24,
             ..start.clone()
         };
-        put_object(&store, &part, "only.parquet", 64);
         if offset % 2 == 0 {
-            seed_manifest(&store, &part, &manifest_naming(&["only.parquet"]));
+            put_object(&store, &part, COMPACTED[0], 64);
+            seed_manifest(&store, &part, &manifest_of(&[COMPACTED[0]], &[]));
+        } else {
+            put_object(&store, &part, "only.parquet", 64);
         }
     }
     let one = tempfile::tempdir().expect("temp");
@@ -274,13 +293,14 @@ fn rfc0009_8_settled_partitions_cost_no_request_of_their_own() {
 
 #[test]
 fn rfc0009_9_a_manifest_decides_when_two_files_are_listed() {
-    // Arrange — two small files listed, but the manifest names only one
-    // (the other is an orphan): one live file, not a candidate.
+    // Arrange — two small compacted files listed, but the manifest names
+    // only one (the other is an orphan from its own generation): one live
+    // file, not a candidate.
     let bucket = tempfile::tempdir().expect("temp");
     let (store, counts) = counted(bucket.path());
-    put_object(&store, &partition(), "live.parquet", 8);
-    put_object(&store, &partition(), "orphan.parquet", 8);
-    seed_manifest(&store, &partition(), &manifest_naming(&["live.parquet"]));
+    put_object(&store, &partition(), COMPACTED[0], 8);
+    put_object(&store, &partition(), COMPACTED[1], 8);
+    seed_manifest(&store, &partition(), &manifest_of(&[COMPACTED[0]], &[]));
     counts.reset();
 
     // Act
@@ -342,17 +362,18 @@ fn rfc0009_10_a_late_write_into_a_compacted_partition_is_read() {
     let selected =
         plan_candidates(&store, "a", NOW_SEALED, &CompactionPolicy::default()).expect("replan");
 
-    // Assert — the partition is no longer skipped unread. The manifest does
-    // not name the late file, so it is still not selected: #1026 decides
-    // whether it should be, and updates this assertion with the fix.
+    // Assert — the partition is no longer skipped unread, and the late
+    // file is live beside the compacted one, so the partition is selected
+    // (RFC0009.13, #1026).
     assert_eq!(
         counts.gets(),
         1,
         "the late file makes the planner read the manifest"
     );
-    assert!(
-        selected.is_empty(),
-        "today's manifest-authoritative live set (#1026)"
+    assert_eq!(
+        selected,
+        vec![partition()],
+        "the late file is live and re-flags the partition (#1026)"
     );
 }
 
@@ -409,8 +430,8 @@ fn listed_partitions_skip_nested_and_non_canonical_objects() {
 }
 
 /// One partition's generated contents: committed file sizes, which of a
-/// pool of names a manifest lists (if any), and whether a `*.parquet.tmp`
-/// is present.
+/// pool of names a manifest lists (if any) — a compacted name in `files`, a
+/// flush name in `consumed` — and whether a `*.parquet.tmp` is present.
 #[derive(Debug, Clone)]
 struct GenPartition {
     sizes: Vec<usize>,
@@ -418,14 +439,15 @@ struct GenPartition {
     tmp: bool,
 }
 
-/// File-name pool: the first `sizes.len()` are written, the rest only named.
+/// File-name pool, flush and compacted names interleaved: the first
+/// `sizes.len()` are written, the rest only named.
 const NAMES: [&str; 6] = [
     "f0.parquet",
+    COMPACTED[0],
     "f1.parquet",
+    COMPACTED[1],
     "f2.parquet",
-    "f3.parquet",
-    "f4.parquet",
-    "f5.parquet",
+    COMPACTED[2],
 ];
 
 fn gen_partition() -> impl Strategy<Value = GenPartition> {
@@ -449,12 +471,12 @@ fn seed(store: &Store, part: &PartitionKey, contents: &GenPartition) {
         put_object(store, part, "t.parquet.tmp", 1);
     }
     if let Some(mask) = &contents.manifest {
-        let named: Vec<&str> = NAMES
+        let (files, consumed): (Vec<&str>, Vec<&str>) = NAMES
             .iter()
             .zip(mask)
             .filter_map(|(name, keep)| keep.then_some(*name))
-            .collect();
-        seed_manifest(store, part, &manifest_naming(&named));
+            .partition(|name| compacted_generation(name).is_some());
+        seed_manifest(store, part, &manifest_of(&files, &consumed));
     }
 }
 

@@ -8,26 +8,33 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// The partition's live data-file keys under the RFC 0009 §3.4 live-set
+/// rule: the compacted files `manifest` names, by name (a named file missing
+/// from the store fails loudly when read, never silently drops rows), plus
+/// every listed flush file it does not consume. With no manifest that is
+/// every listed flush file. Mirrors the querier's resolution.
 pub(super) fn live_file_keys(
     store: &Store,
     partition: &PartitionKey,
     manifest: Option<&Manifest>,
 ) -> Result<Vec<String>, CompactionError> {
     let prefix = partition_data_prefix(partition);
-    if let Some(manifest) = manifest {
-        return Ok(manifest
-            .files
-            .iter()
-            .map(|name| format!("{prefix}/{name}"))
-            .collect());
-    }
+    let live = LiveSet::new(manifest);
     let keys = store
         .list_blocking(Some(&prefix))
         .map_err(|e| store_io("list", &prefix, e))?;
-    Ok(keys
+    let named = manifest
         .into_iter()
-        .filter(|k| is_committed_parquet(k) && is_immediate_child(k, &prefix))
-        .collect())
+        .flat_map(|m| &m.files)
+        .map(|name| format!("{prefix}/{name}"));
+    let flush = keys.into_iter().filter(|k| {
+        let name = basename(k);
+        is_committed_parquet(k)
+            && is_immediate_child(k, &prefix)
+            && compacted_generation(name).is_none()
+            && live.is_live(name)
+    });
+    Ok(named.chain(flush).collect())
 }
 
 /// Sum the on-disk byte sizes of the partition's live input files — the

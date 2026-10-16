@@ -13,6 +13,7 @@
 //! back-compatible (RFC 0009 §3.4 reader-first sequencing: the reader
 //! learns the manifest before any compactor writes one).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -28,18 +29,33 @@ fn store_io(err: StoreError) -> ManifestError {
 /// Canonical manifest filename inside a partition directory.
 pub const MANIFEST_FILENAME: &str = "manifest.json";
 
-/// The live data-file set of one partition (RFC 0009 §3.4).
+/// The manifest format this build reads and writes (RFC 0009 §3.4
+/// late-write note). Any other format is rejected.
+pub const MANIFEST_FORMAT: u32 = 2;
+
+/// What compaction committed in one partition (RFC 0009 §3.4, late-write
+/// note): the live compacted files and the flush files a won commit
+/// consumed. Every other flush file in the partition is live, so a late
+/// write is read without the writer touching the manifest; see
+/// [`LiveSet`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
+    /// [`MANIFEST_FORMAT`]. Absent in a manifest written before it, which
+    /// is then rejected.
+    #[serde(default)]
+    pub format: u32,
     /// Monotonic generation, bumped on each atomic swap. Lets a reader
     /// confirm it read one consistent generation and a compactor
     /// detect a lost update.
     pub generation: u64,
-    /// Live data files, as bare file names (no path) relative to the
-    /// partition directory. A reader joins each onto the partition
-    /// dir; files present on disk but *not* listed here are orphans
-    /// awaiting GC and MUST be ignored.
+    /// Live compacted files (`<uuid>.g<N>.parquet`), as bare file names
+    /// relative to the partition directory. A compacted file present on
+    /// disk but not listed here is never live.
     pub files: Vec<String>,
+    /// Flush files a won commit copied into a compacted file. They are
+    /// dead and awaiting GC. Append-only: a commit never drops a name.
+    #[serde(default)]
+    pub consumed: Vec<String>,
 }
 
 /// Failure reading, parsing, or validating a [`Manifest`].
@@ -63,6 +79,10 @@ pub enum ManifestError {
     /// read the same file twice and double-count its rows — the live
     /// set must be unique.
     DuplicateFilename(String),
+    /// The manifest is not [`MANIFEST_FORMAT`]: written before the RFC 0009
+    /// late-write amendment, whose unnamed files cannot be told apart. No
+    /// fallback reads it.
+    UnsupportedFormat(u32),
 }
 
 impl std::fmt::Display for ManifestError {
@@ -79,6 +99,10 @@ impl std::fmt::Display for ManifestError {
             Self::DuplicateFilename(name) => {
                 write!(f, "manifest lists a duplicate file name: {name:?}")
             }
+            Self::UnsupportedFormat(found) => write!(
+                f,
+                "manifest format {found} is not supported (expected {MANIFEST_FORMAT})"
+            ),
         }
     }
 }
@@ -88,7 +112,9 @@ impl std::error::Error for ManifestError {
         match self {
             Self::Io(e) => Some(e),
             Self::Parse(e) => Some(e),
-            Self::InvalidFilename(_) | Self::DuplicateFilename(_) => None,
+            Self::InvalidFilename(_) | Self::DuplicateFilename(_) | Self::UnsupportedFormat(_) => {
+                None
+            }
         }
     }
 }
@@ -111,6 +137,17 @@ fn is_partition_local_parquet(name: &str) -> bool {
 }
 
 impl Manifest {
+    /// A [`MANIFEST_FORMAT`] manifest at `generation`.
+    #[must_use]
+    pub fn new(generation: u64, files: Vec<String>, consumed: Vec<String>) -> Self {
+        Self {
+            format: MANIFEST_FORMAT,
+            generation,
+            files,
+            consumed,
+        }
+    }
+
     /// Read `<partition_dir>/manifest.json` through the object-storage
     /// [`Store`] seam (RFC 0013).
     ///
@@ -152,17 +189,29 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// Validate the live set: every entry is a partition-local
-    /// `*.parquet` name and no name is repeated.
+    /// Validate the manifest: it is [`MANIFEST_FORMAT`], every `files`
+    /// entry is a partition-local compacted file name, every `consumed`
+    /// entry a partition-local flush file name, and no name is repeated.
     ///
     /// # Errors
     ///
-    /// [`ManifestError::InvalidFilename`] for the first non-local name,
-    /// or [`ManifestError::DuplicateFilename`] for the first repeat.
+    /// [`ManifestError::UnsupportedFormat`] for any other format,
+    /// [`ManifestError::InvalidFilename`] for the first name of the wrong
+    /// form, or [`ManifestError::DuplicateFilename`] for the first repeat.
     pub fn validate(&self) -> Result<(), ManifestError> {
-        let mut seen = std::collections::HashSet::with_capacity(self.files.len());
-        for name in &self.files {
-            if !is_partition_local_parquet(name) {
+        if self.format != MANIFEST_FORMAT {
+            return Err(ManifestError::UnsupportedFormat(self.format));
+        }
+        let mut seen = HashSet::with_capacity(self.files.len() + self.consumed.len());
+        let entries = self
+            .files
+            .iter()
+            .map(|name| (name, true))
+            .chain(self.consumed.iter().map(|name| (name, false)));
+        for (name, compacted) in entries {
+            let right_form = is_partition_local_parquet(name)
+                && compacted_generation(name).is_some() == compacted;
+            if !right_form {
                 return Err(ManifestError::InvalidFilename(name.clone()));
             }
             if !seen.insert(name.as_str()) {
@@ -296,6 +345,62 @@ pub fn compacted_generation(name: &str) -> Option<u64> {
     (canonical_uuid && digits == generation.to_string()).then_some(generation)
 }
 
+/// The RFC 0009 §3.4 live-set rule for one partition, indexed once from its
+/// manifest (or its absence). A compacted file (`<uuid>.g<N>.parquet`) is
+/// live only when the manifest names it; any other `*.parquet` is a flush
+/// file and is live unless the manifest lists it as consumed. With no
+/// manifest, every flush file is live and no compacted file is.
+#[derive(Debug)]
+pub struct LiveSet<'m> {
+    generation: u64,
+    files: HashSet<&'m str>,
+    consumed: HashSet<&'m str>,
+}
+
+impl<'m> LiveSet<'m> {
+    /// Index `manifest`; `None` is a partition with no manifest.
+    #[must_use]
+    pub fn new(manifest: Option<&'m Manifest>) -> Self {
+        let names = |list: Option<&'m Vec<String>>| {
+            list.into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+        };
+        Self {
+            generation: manifest.map_or(0, |m| m.generation),
+            files: names(manifest.map(|m| &m.files)),
+            consumed: names(manifest.map(|m| &m.consumed)),
+        }
+    }
+
+    /// Whether the listed object named `name` holds live rows.
+    #[must_use]
+    pub fn is_live(&self, name: &str) -> bool {
+        match compacted_generation(name) {
+            Some(_) => self.files.contains(name),
+            None => name.ends_with(".parquet") && !self.consumed.contains(name),
+        }
+    }
+
+    /// Whether the listed object named `name` is dead and safe to delete:
+    /// an interrupted `*.parquet.tmp`, a consumed flush file, or a compacted
+    /// file the manifest does not name whose generation the manifest has
+    /// reached. An unnamed compacted file for a later generation is kept,
+    /// since its compaction may still commit it (RFC0009.17); a flush file
+    /// is never an orphan unless consumed.
+    #[must_use]
+    pub fn is_orphan(&self, name: &str) -> bool {
+        if name.ends_with(".parquet.tmp") {
+            return true;
+        }
+        match compacted_generation(name) {
+            Some(generation) => generation <= self.generation && !self.files.contains(name),
+            None => self.consumed.contains(name),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,13 +428,20 @@ mod tests {
         }
     }
 
+    /// A compacted-file name for generation `n`.
+    fn compacted(n: u64) -> String {
+        format!("{}.g{n}.parquet", uuid::Uuid::now_v7())
+    }
+
+    /// A flush-file name.
+    fn flush() -> String {
+        format!("{}.parquet", uuid::Uuid::now_v7())
+    }
+
     #[test]
     fn round_trips_through_json() {
         // Arrange
-        let manifest = Manifest {
-            generation: 7,
-            files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
-        };
+        let manifest = Manifest::new(7, vec![compacted(7), compacted(6)], vec![flush(), flush()]);
 
         // Act
         let restored: Manifest =
@@ -355,10 +467,7 @@ mod tests {
     fn reads_a_written_manifest() {
         // Arrange
         let dir = tempfile::tempdir().expect("temp");
-        let manifest = Manifest {
-            generation: 3,
-            files: vec!["compacted.parquet".to_string()],
-        };
+        let manifest = Manifest::new(3, vec![compacted(3)], Vec::new());
         std::fs::write(
             dir.path().join(MANIFEST_FILENAME),
             manifest.to_json().unwrap(),
@@ -427,10 +536,11 @@ mod tests {
         // Arrange — a hostile manifest on disk (serialized directly,
         // bypassing `validate`) whose entry escapes the partition.
         let dir = tempfile::tempdir().expect("temp");
-        let evil = Manifest {
-            generation: 1,
-            files: vec!["../../../etc/secrets.parquet".to_string()],
-        };
+        let evil = Manifest::new(
+            1,
+            vec!["../../../etc/secrets.parquet".to_string()],
+            Vec::new(),
+        );
         std::fs::write(
             dir.path().join(MANIFEST_FILENAME),
             serde_json::to_vec(&evil).unwrap(),
@@ -448,14 +558,9 @@ mod tests {
     fn write_atomic_round_trips_and_overwrites() {
         // Arrange
         let dir = tempfile::tempdir().expect("temp");
-        let first = Manifest {
-            generation: 1,
-            files: vec!["a.parquet".to_string()],
-        };
-        let second = Manifest {
-            generation: 2,
-            files: vec!["compacted.parquet".to_string()],
-        };
+        let consumed = vec![flush()];
+        let first = Manifest::new(1, Vec::new(), Vec::new());
+        let second = Manifest::new(2, vec![compacted(2)], consumed);
         first.write_atomic(dir.path()).expect("write first");
 
         // Act — the second write swaps the manifest in place.
@@ -470,10 +575,7 @@ mod tests {
     fn write_atomic_rejects_an_invalid_entry_before_writing() {
         // Arrange
         let dir = tempfile::tempdir().expect("temp");
-        let bad = Manifest {
-            generation: 1,
-            files: vec!["../escape.parquet".to_string()],
-        };
+        let bad = Manifest::new(1, vec!["../escape.parquet".to_string()], Vec::new());
 
         // Act
         let result = bad.write_atomic(dir.path());
@@ -486,15 +588,91 @@ mod tests {
     #[test]
     fn validate_rejects_a_duplicate_file_name() {
         // Arrange — the same file named twice would double-count.
-        let manifest = Manifest {
-            generation: 1,
-            files: vec!["a.parquet".to_string(), "a.parquet".to_string()],
-        };
+        let name = compacted(1);
+        let manifest = Manifest::new(1, vec![name.clone(), name], Vec::new());
 
         // Act
         let result = manifest.validate();
 
         // Assert
         assert!(matches!(result, Err(ManifestError::DuplicateFilename(_))));
+    }
+
+    /// RFC0009.19 — a manifest written before the late-write amendment (no
+    /// `format`) is rejected, and so is any other format.
+    #[test]
+    fn rfc0009_19_an_old_format_manifest_is_rejected() {
+        let old = format!(r#"{{"generation":2,"files":["{}"]}}"#, flush());
+        assert!(matches!(
+            Manifest::from_json(old.as_bytes()),
+            Err(ManifestError::UnsupportedFormat(0))
+        ));
+        let future = Manifest {
+            format: MANIFEST_FORMAT + 1,
+            ..Manifest::new(1, Vec::new(), Vec::new())
+        };
+        assert!(matches!(
+            future.validate(),
+            Err(ManifestError::UnsupportedFormat(3))
+        ));
+    }
+
+    #[test]
+    fn validate_keeps_each_list_to_its_file_class() {
+        let flush_in_files = Manifest::new(1, vec![flush()], Vec::new());
+        let compacted_in_consumed = Manifest::new(1, Vec::new(), vec![compacted(1)]);
+        let name = flush();
+        let twice = Manifest::new(1, Vec::new(), vec![name.clone(), name]);
+        assert!(matches!(
+            flush_in_files.validate(),
+            Err(ManifestError::InvalidFilename(_))
+        ));
+        assert!(matches!(
+            compacted_in_consumed.validate(),
+            Err(ManifestError::InvalidFilename(_))
+        ));
+        assert!(matches!(
+            twice.validate(),
+            Err(ManifestError::DuplicateFilename(_))
+        ));
+    }
+
+    #[test]
+    fn live_set_reads_named_compacted_and_unconsumed_flush_files() {
+        let (named, unnamed, consumed, late) = (compacted(2), compacted(1), flush(), flush());
+        let manifest = Manifest::new(2, vec![named.clone()], vec![consumed.clone()]);
+        let live = LiveSet::new(Some(&manifest));
+        let verdicts: Vec<_> = [&named, &unnamed, &consumed, &late]
+            .iter()
+            .map(|name| live.is_live(name))
+            .collect();
+        assert_eq!(verdicts, [true, false, false, true]);
+
+        let none = LiveSet::new(None);
+        assert_eq!((none.is_live(&late), none.is_live(&named)), (true, false));
+    }
+
+    #[test]
+    fn live_set_orphans_only_dead_files() {
+        let (named, past, future, consumed, late) =
+            (compacted(2), compacted(2), compacted(3), flush(), flush());
+        let manifest = Manifest::new(2, vec![named.clone()], vec![consumed.clone()]);
+        let live = LiveSet::new(Some(&manifest));
+        let tmp = format!("{late}.tmp");
+        let verdicts: Vec<_> = [&named, &past, &future, &consumed, &late, &tmp]
+            .iter()
+            .map(|name| live.is_orphan(name))
+            .collect();
+        assert_eq!(verdicts, [false, true, false, true, false, true]);
+
+        let none = LiveSet::new(None);
+        assert_eq!(
+            (
+                none.is_orphan(&late),
+                none.is_orphan(&future),
+                none.is_orphan(&tmp)
+            ),
+            (false, false, true)
+        );
     }
 }

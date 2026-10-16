@@ -58,7 +58,10 @@ pub use compaction::{
     hour_partitions, plan_candidates, plan_candidates_counted,
 };
 pub use id_max::{FooterMax, IdColumns, IdMaxError, decoded_max, footer_max, object_max_id};
-pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
+pub use manifest::{
+    LiveSet, MANIFEST_FILENAME, MANIFEST_FORMAT, Manifest, ManifestError, Published,
+    compacted_generation,
+};
 pub use partition::{
     PartitionKey, TimestampOverflowError, effective_time_unix_nano, hour_partition_in_window,
     percent_decode_tenant, percent_encode_tenant,

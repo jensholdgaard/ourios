@@ -182,6 +182,12 @@ fn rfc0013_2_local_backend_regresses_nothing() {
     );
 }
 
+/// A distinct, stable compacted-file name (`<uuid>.g<generation>.parquet`)
+/// per publisher `n`, so the RFC0013 CAS tests can tell them apart.
+fn compacted_name(n: u64, generation: u64) -> String {
+    format!("00000000-0000-7000-8000-{n:012}.g{generation}.parquet")
+}
+
 /// Scenario RFC0013.3 — two `compact_partition` runs racing on one partition: exactly
 /// one manifest generation wins; no torn / doubled / missing rows.
 /// See `docs/rfcs/0013-object-storage.md` §5.
@@ -192,10 +198,7 @@ async fn rfc0013_3_atomic_publish_under_contention() {
     let (_node, s3) = localstack_s3("ourios-it-cas3").await;
 
     // Seed generation 1, then capture its ETag.
-    let seed = Manifest {
-        generation: 1,
-        files: vec!["seed.parquet".to_string()],
-    };
+    let seed = Manifest::new(1, vec![compacted_name(0, 1)], Vec::new());
     assert_eq!(
         seed.publish_cas(&s3, KEY, None).expect("seed"),
         Published::Won
@@ -209,18 +212,10 @@ async fn rfc0013_3_atomic_publish_under_contention() {
     let (sa, sb) = (s3.clone(), s3.clone());
     let (ea, eb) = (etag.clone(), etag.clone());
     let a = tokio::task::spawn_blocking(move || {
-        Manifest {
-            generation: 2,
-            files: vec!["a.parquet".to_string()],
-        }
-        .publish_cas(&sa, KEY, Some(&ea))
+        Manifest::new(2, vec![compacted_name(1, 2)], Vec::new()).publish_cas(&sa, KEY, Some(&ea))
     });
     let b = tokio::task::spawn_blocking(move || {
-        Manifest {
-            generation: 2,
-            files: vec!["b.parquet".to_string()],
-        }
-        .publish_cas(&sb, KEY, Some(&eb))
+        Manifest::new(2, vec![compacted_name(2, 2)], Vec::new()).publish_cas(&sb, KEY, Some(&eb))
     });
     let ra = a.await.expect("join a").expect("publish a");
     let rb = b.await.expect("join b").expect("publish b");
@@ -235,8 +230,7 @@ async fn rfc0013_3_atomic_publish_under_contention() {
         .expect("present");
     assert_eq!(final_m.generation, 2);
     assert!(
-        final_m.files == vec!["a.parquet".to_string()]
-            || final_m.files == vec!["b.parquet".to_string()],
+        final_m.files == vec![compacted_name(1, 2)] || final_m.files == vec![compacted_name(2, 2)],
         "no torn / doubled state, got {:?}",
         final_m.files,
     );
@@ -252,10 +246,7 @@ async fn rfc0013_4_manifest_swap_via_conditional_put() {
     let (_node, s3) = localstack_s3("ourios-it-cas4").await;
 
     // First publish: create-if-absent (`If-None-Match`).
-    let gen1 = Manifest {
-        generation: 1,
-        files: vec!["a.parquet".to_string()],
-    };
+    let gen1 = Manifest::new(1, vec![compacted_name(1, 1)], Vec::new());
     assert_eq!(
         gen1.publish_cas(&s3, KEY, None).expect("create"),
         Published::Won
@@ -272,20 +263,14 @@ async fn rfc0013_4_manifest_swap_via_conditional_put() {
         .expect("present");
     assert_eq!(read.generation, 1);
     let etag = etag.expect("S3 exposes an ETag");
-    let gen2 = Manifest {
-        generation: 2,
-        files: vec!["b.parquet".to_string()],
-    };
+    let gen2 = Manifest::new(2, vec![compacted_name(2, 2)], Vec::new());
     assert_eq!(
         gen2.publish_cas(&s3, KEY, Some(&etag)).expect("swap"),
         Published::Won,
     );
 
     // A swap against the now-stale ETag loses (no blind overwrite, no rename).
-    let stale = Manifest {
-        generation: 3,
-        files: vec!["c.parquet".to_string()],
-    };
+    let stale = Manifest::new(3, vec![compacted_name(3, 3)], Vec::new());
     assert_eq!(
         stale
             .publish_cas(&s3, KEY, Some(&etag))

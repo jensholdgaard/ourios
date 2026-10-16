@@ -113,10 +113,11 @@ impl<'s> Lister<'s> {
     }
 
     /// Whether a partition is worth compacting per `policy` (see
-    /// [`meets_policy`]). The live set is the listed files, restricted to
-    /// the manifest's names when a manifest is listed; that manifest is read
-    /// only when two or more files are listed, since fewer can't be two live
-    /// files.
+    /// [`meets_policy`]). The live set is the listed files that are live
+    /// under the RFC 0009 §3.4 rule ([`LiveSet`]): with no manifest listed,
+    /// the flush files; otherwise also the named compacted files, less the
+    /// consumed flush files. The manifest is read only when two or more files
+    /// are listed, since fewer can't be two live files.
     fn is_candidate(
         &mut self,
         partition: &PartitionKey,
@@ -132,13 +133,11 @@ impl<'s> Lister<'s> {
         } else {
             None
         };
-        let live: Option<HashSet<&str>> = manifest
-            .as_ref()
-            .map(|m| m.files.iter().map(String::as_str).collect());
+        let live = LiveSet::new(manifest.as_ref());
         let sizes: Vec<u64> = listed
             .files
             .iter()
-            .filter(|(name, _)| live.as_ref().is_none_or(|l| l.contains(name.as_str())))
+            .filter(|(name, _)| live.is_live(name))
             .map(|(_, size)| *size)
             .collect();
         Ok(meets_policy(&sizes, policy))

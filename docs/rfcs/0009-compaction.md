@@ -401,13 +401,19 @@ back-compatible). Both are recorded as resolved decisions in §7.
 >    no reader sees it. The bootstrap manifest of today's step is no
 >    longer needed: an unnamed compacted file is invisible with or
 >    without a manifest.
-> 3. Commit `{format: 2, generation: N+1, files: [output], consumed:
+> 3. Commit `{format: 2, generation: N+1, files: outputs, consumed:
 >    consumed ∪ flush inputs}` with the existing conditional PUT
 >    (`If-Match` on the `ETag`, or create-if-absent at generation 0) on
 >    S3, or the local atomic overwrite (RFC0019.7). This is the commit
->    point. Compacted inputs drop out of `files`.
-> 4. On a won commit, delete the inputs, best effort (unchanged). On a
->    lost one, delete the output, best effort (unchanged).
+>    point. `outputs` is **every** file the compaction wrote, each named
+>    `….g<N+1>.parquet`. Today `compact_sorted` writes exactly one (`files:
+>    vec![consolidated]`), so `outputs` has one entry. A compaction that
+>    splits its output into the "one or few" files §3.1 allows names all of
+>    them in this one commit. Compacted inputs drop out of `files`.
+> 4. On a won commit, delete the inputs, best effort (unchanged). An
+>    input is never deleted before the commit that names every output has
+>    won. On a lost commit, delete every output, best effort; any that
+>    survive are orphans by the generation rule below.
 >
 > **Why a late file is never lost.** A flush file becomes invisible only
 > by entering `consumed`, and it enters `consumed` only in a won commit
@@ -523,9 +529,18 @@ back-compatible). Both are recorded as resolved decisions in §7.
 >    visible without this rule, so the rule and the erasure change land
 >    together.)
 > 2. **A file that lands, or is committed, while the rows phase runs.**
->    The rows phase records, for each partition it rewrites, the generation
->    its erasure commit won. After that commit the partition's live set is
->    exactly that commit's compacted file. Before the marker advances to
+>    The rows phase records, for each partition it visits, a **checked
+>    generation**:
+>
+>    - after a won erasure commit, the generation that commit won; the
+>      partition's live set is then exactly that commit's compacted files;
+>    - when the rewrite finds no live input and commits nothing, the
+>      generation it observed. That is 0 when there is no manifest, as in a
+>      partition holding only `*.parquet.tmp` objects or nothing live at
+>      all.
+>
+>    An empty partition that stays empty is therefore settled, not
+>    "changed" forever. Before the marker advances to
 >    `tuples`, the rows phase runs a **confirming pass**: it re-lists the
 >    tenant and reads the manifest of every partition. A partition must be
 >    rewritten again, with the same drop filter, if it holds a live flush
@@ -534,8 +549,9 @@ back-compatible). Both are recorded as resolved decisions in §7.
 >    ordinary consolidation by a second compactor (S3 allows more than
 >    one) may have folded a late file holding the conversation's rows into
 >    a new compacted file, which then shows no live flush file. Each
->    rewrite records its new generation. A partition that no erasure commit
->    has touched yet (it was created during the phase) counts as changed.
+>    rewrite or empty check records its checked generation. A partition the
+>    phase has not visited yet (it was created during the phase) has no
+>    checked generation, so it is visited.
 >    The pass repeats until a pass finds nothing to rewrite, for at most 8
 >    rounds, the bound the tuple phase already uses. If partitions are
 >    still changing after that, the marker stays in `rows` and the next
@@ -588,8 +604,12 @@ back-compatible). Both are recorded as resolved decisions in §7.
 > is hidden), the compaction pass's `observe` hook, and the backfill
 > through `visit_partition_rows`. Under this amendment the last two also
 > see late rows, because those rows are live. All three write with
-> `on_duplicate = ignore`, so this adds no tuple that would not otherwise
-> exist and needs no coordination. The OpenFGA model and the tuple shapes
+> `on_duplicate = ignore`, so this amendment adds no tuple that would not
+> otherwise exist. That does not make the feeds free of races with
+> erasure. A separate known residual exists today, independent of late
+> data: with more than one compactor, a sweep's buffered `observe`
+> tuples can be written after another sweep erased the conversation
+> (#1034, §7 next to D3). The OpenFGA model and the tuple shapes
 > do not change. The OpenFGA documentation assistant (2026-10-16)
 > confirmed the one point that matters for erasure: `on_duplicate =
 > ignore` skips only a tuple that **currently exists**, so a tuple that an
@@ -769,8 +789,12 @@ bytes, not a base metric.
 > **Amendment 2026-10-16 (`drafted`) — late writes (#1026).** Three fix
 > directions were filed with the issue. The recommended design (§3.4
 > late-write note) is a fourth. Each was weighed against the same
-> requirements: a late file is visible and eventually compacted, it is
-> never deleted as an orphan under any crash or lost CAS, the flush path
+> requirements: a late file is visible to queries from the moment its put
+> completes, it counts toward the candidate predicate like any other live
+> file (so it is compacted once §3.3 selects its partition; two large live
+> files below `compaction_min_files` stay unselected, as RFC0009.10
+> states), it is never deleted as an orphan under any crash or lost CAS,
+> the flush path
 > stays as it is, and the design works with a writer and a compactor in
 > separate processes (the chart's separate compactor Deployment) on S3
 > and on the local backend.
@@ -1058,6 +1082,10 @@ bytes, not a base metric.
     consolidation commits it into a new compacted file at *E* + 1 before
     the confirming pass, the pass sees the generation change, rewrites the
     partition, and no row of *c* is read.
+  - **And** given a partition holding only `*.parquet.tmp` objects (no
+    live input, no manifest), the erasure records checked generation 0.
+    The confirming pass, finding it still at 0 with no live flush file,
+    treats it as settled, and the marker advances to `tuples`.
   - **And** if partitions keep changing for 8 rounds, the marker stays
     in `rows` and the sweep reports it.
   - **And (residual, for maintainer approval, D3)** a pre-request row
@@ -1144,6 +1172,7 @@ Mapped to `CLAUDE.md` §6.2:
 > | RFC0009.21 | `rfc0009_21_a_flush_after_an_erasure_rewrite_is_read`: the current-hour case | integration |
 > | RFC0009.22 | `rfc0009_22_confirming_pass_rewrites_a_flush_during_the_rows_phase` and `rfc0009_22_rows_phase_stays_open_while_flushes_keep_arriving` | integration |
 > | RFC0009.22 | `rfc0009_22_confirming_pass_catches_a_consolidation_since_the_erasure`: a second `Sweep` handle consolidates the late file between the erasure rewrite and the confirming pass | integration |
+> | RFC0009.22 | `rfc0009_22_a_tmp_only_partition_does_not_block_the_marker`: a partition with only a `*.parquet.tmp` object; the erasure finishes its rows phase and advances | integration |
 > | RFC0009.22 | `rfc0009_22_residual_a_publish_after_the_last_pass_is_not_erased`: a flush is injected after the final confirming listing and before the marker advances; the row stays readable (pins D3's residual) | integration |
 > | RFC0009.23 | `rfc0009_23_rows_phase_waits_for_erasure_settle`: an injected clock against the marker's `LastModified` | unit |
 >
@@ -1209,8 +1238,11 @@ history is legible):
 **Alternatives considered for the planning cost.** The recommended
 design is the one-listing planner in the §3.3 note. Each alternative
 below was weighed against the same constraint: never skip a partition
-that holds more than one live file, or a live file below the small-file
-size.
+that the §3.3 candidate predicate selects, meaning at least two live
+files and either more than `compaction_min_files` of them or one below
+the small-file size. (Wording narrowed by the late-write amendment: a
+partition with two large live files is not selected, as RFC0009.10
+states.)
 
 - **A per-tenant "settled-through" watermark in object storage.** The
   compactor records "every partition up to hour *H* was settled when I
@@ -1303,6 +1335,16 @@ size.
     the tenant during it. This catches late publishes at the next
     compaction, but the rows are readable until then and new rows of
     the same id are erased too.
+- [ ] **Known residual, separate from D3 and pre-existing (#1034).**
+  Sweep A buffers the tuples its `observe` hook derives during the
+  blocking pass and writes them in its graph phase afterwards
+  (`compactor/daemon.rs` `sweep_deriving`, `compactor/graph_phase.rs`).
+  With more than one compactor, sweep B can erase a conversation in
+  between, and A then creates the deleted tuples again. Only the grant
+  comes back, not the rows. Neither the generation-keyed confirming pass
+  nor the erasure rewrite's missing `observe` hook prevents it. This
+  amendment neither causes nor fixes it; #1034 tracks it as an RFC 0047
+  question.
 - [ ] **D4. Compacted-file name.** `<uuidv7>.g<N>.parquet` is proposed.
   Any form works that a flush name can never take and that carries *N*.
 

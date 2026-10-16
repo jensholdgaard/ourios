@@ -498,7 +498,9 @@ below the server deadline stays the fail-closed pattern.
 > rewrite's inputs are the live set, which now includes late files. A
 > confirming pass runs before the marker advances to `tuples`. It
 > rewrites any partition that holds a live flush file, or whose manifest
-> generation has moved past the one the erasure committed, which catches
+> generation has moved past the one the erasure checked (the generation
+> it committed, or the one it observed when there was nothing to
+> rewrite), which catches
 > a late file that another compactor's consolidation folded in. The rows
 > phase does not start until the marker is older than `erasure_settle`.
 > The amendment also restates this section's scope, "rows durable at the
@@ -508,9 +510,12 @@ below the server deadline stays the fail-closed pattern.
 > `tuples`. So a pre-request row whose flush publishes after that pass,
 > whether still pending, backlogged, or replayed from the WAL after an
 > outage, is not erased and writes its tuples again. The fences that
-> would close it are listed in RFC 0009 §7 D3. The OpenFGA model and the
-> tuple shapes do not change. See RFC 0009 §3.4 (erasure note) and
-> RFC0009.20–.23.
+> would close it are listed in RFC 0009 §7 D3. A separate,
+> pre-existing race is tracked in #1034 and is not caused by late data.
+> With more than one compactor, a sweep writes its buffered `observe`
+> tuples after another sweep erased the conversation, so the deleted
+> tuples are created again. The OpenFGA model and the tuple shapes do
+> not change. See RFC 0009 §3.4 (erasure note) and RFC0009.20–.23.
 
 ### 3.7 Operational posture
 

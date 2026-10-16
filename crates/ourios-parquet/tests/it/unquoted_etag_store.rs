@@ -299,7 +299,7 @@ fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
     match req.method.as_str() {
         "GET" if key.is_empty() => list_objects(state, &req, stream),
         "GET" | "HEAD" => get(state, &key, stream),
-        "PUT" => put(mode, state, req, key, stream),
+        "PUT" => put(Fake { mode, state }, PutRequest { req, key }, stream),
         "DELETE" => delete(state, &key, stream),
         "POST" if req.query("delete").is_some() => bulk_delete(&state.objects, &req, stream),
         _ => respond(stream, "405 Method Not Allowed", &[], b""),
@@ -313,14 +313,29 @@ fn list_objects(state: &State, req: &Request, stream: &TcpStream) {
     respond(stream, "200 OK", &[], xml.as_bytes());
 }
 
-/// `PUT`, plain or conditional as `mode` compares tags.
-fn put(mode: IfMatch, state: &State, req: Request, key: String, stream: &TcpStream) {
+/// The fake as one request sees it: how it compares tags, and its state.
+#[derive(Clone, Copy)]
+struct Fake<'s> {
+    mode: IfMatch,
+    state: &'s State,
+}
+
+/// A `PUT` and the object key it targets.
+struct PutRequest {
+    req: Request,
+    key: String,
+}
+
+/// `PUT`, plain or conditional as the fake's mode compares tags.
+fn put(fake: Fake<'_>, put: PutRequest, stream: &TcpStream) {
+    let Fake { state, .. } = fake;
+    let PutRequest { req, key } = &put;
     if req.header("if-match").is_some() {
         state.if_match_puts.fetch_add(1, Ordering::SeqCst);
     }
     let created_manifest =
         req.header("if-none-match") == Some("*") && key.ends_with("manifest.json");
-    let Some(etag) = store_if_precondition_holds(mode, state, req, key) else {
+    let Some(etag) = store_if_precondition_holds(fake, put) else {
         respond(
             stream,
             "412 Precondition Failed",
@@ -337,12 +352,9 @@ fn put(mode: IfMatch, state: &State, req: Request, key: String, stream: &TcpStre
 
 /// Store `req`'s body at `key` under a fresh `ETag` when its conditional
 /// headers hold; that `ETag`, or `None` for a failed precondition.
-fn store_if_precondition_holds(
-    mode: IfMatch,
-    state: &State,
-    req: Request,
-    key: String,
-) -> Option<String> {
+fn store_if_precondition_holds(fake: Fake<'_>, put: PutRequest) -> Option<String> {
+    let Fake { mode, state } = fake;
+    let PutRequest { req, key } = put;
     let mut objects = state.objects.lock().unwrap_or_else(PoisonError::into_inner);
     let current = objects.get(&key).map(|(_, etag)| etag);
     if !precondition_holds(mode, &req, current) {

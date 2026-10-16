@@ -48,6 +48,7 @@ use ourios_semconv as semconv;
 use serde::{Deserialize, Serialize};
 
 use crate::alias_store::AliasFold;
+use crate::audit_scan::ObjectTag;
 use crate::fold_state::{FoldState, FoldStateJson, HighWater};
 use crate::template_registry::{BindingConflicts, RegistryFold, TemplateRegistry};
 use crate::{QueryError, StoreRef, audit_scan, local_publish};
@@ -496,6 +497,9 @@ pub(crate) struct Loaded {
     pub(crate) bytes: u64,
     pub(crate) outcome: CacheOutcome,
     pub(crate) persisted: Persisted,
+    /// On a hit, the tag of the artifact bytes it read (RFC 0060 §3.7);
+    /// `None` on every other outcome.
+    pub(crate) hit_tag: Option<ObjectTag>,
 }
 
 /// The per-tenant cached fold of the audit stream (RFC 0033 §3.2):
@@ -676,7 +680,7 @@ pub(crate) fn load_or_derive_resolved(
     let (fetched_bytes, expected, outcome, stale) = match fetch_artifact(backend, tenant) {
         FetchedArtifact::Absent => (0, None, miss(MissReason::Absent), None),
         FetchedArtifact::Unreadable => (0, None, miss(MissReason::Torn), None),
-        FetchedArtifact::Present { bytes, e_tag } => {
+        FetchedArtifact::Present { bytes, e_tag, tag } => {
             let len = bytes.len() as u64;
             match TemplateMap::from_artifact_bytes(&bytes, tenant)? {
                 ArtifactRead::Valid(map) if map.folded_files() == resolved.frontier() => {
@@ -686,6 +690,7 @@ pub(crate) fn load_or_derive_resolved(
                         bytes: len,
                         outcome: CacheOutcome::Hit,
                         persisted: Persisted::Current,
+                        hit_tag: tag,
                     });
                 }
                 ArtifactRead::Valid(map) => (len, e_tag, CacheOutcome::StaleRefreshed, Some(map)),
@@ -718,6 +723,7 @@ pub(crate) fn load_or_derive_resolved(
         bytes: acquisition_bytes,
         outcome,
         persisted,
+        hit_tag: None,
     })
 }
 
@@ -891,6 +897,9 @@ enum FetchedArtifact {
         /// write-through publish carries. `None` on the local backend
         /// (its publish is last-writer-wins, §3.4).
         e_tag: Option<String>,
+        /// What identifies the bytes read (RFC 0060 §3.7): the `ETag`, or
+        /// locally the open file's metadata.
+        tag: Option<ObjectTag>,
     },
 }
 
@@ -902,8 +911,12 @@ fn fetch_artifact(backend: StoreRef<'_>, tenant: &TenantId) -> FetchedArtifact {
                 .join("audit")
                 .join(format!("tenant_id={enc}"))
                 .join(TEMPLATE_MAP_FILENAME);
-            match std::fs::read(&path) {
-                Ok(bytes) => FetchedArtifact::Present { bytes, e_tag: None },
+            match read_local_artifact(&path) {
+                Ok((bytes, tag)) => FetchedArtifact::Present {
+                    bytes,
+                    e_tag: None,
+                    tag,
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => FetchedArtifact::Absent,
                 Err(_) => FetchedArtifact::Unreadable,
             }
@@ -911,12 +924,27 @@ fn fetch_artifact(backend: StoreRef<'_>, tenant: &TenantId) -> FetchedArtifact {
         StoreRef::Remote(store) => {
             let key = format!("audit/tenant_id={enc}/{TEMPLATE_MAP_FILENAME}");
             match store.get_with_etag_blocking_opt(&key) {
-                Ok(Some((bytes, e_tag))) => FetchedArtifact::Present { bytes, e_tag },
+                Ok(Some((bytes, e_tag))) => FetchedArtifact::Present {
+                    bytes,
+                    tag: e_tag.as_deref().map(ObjectTag::from_e_tag),
+                    e_tag,
+                },
                 Ok(None) => FetchedArtifact::Absent,
                 Err(_) => FetchedArtifact::Unreadable,
             }
         }
     }
+}
+
+/// The local artifact's bytes, tagged from the handle they were read
+/// through: a publish renames a new file into place, so the tag names
+/// exactly these bytes even when a publish lands meanwhile.
+fn read_local_artifact(path: &Path) -> std::io::Result<(Vec<u8>, Option<ObjectTag>)> {
+    let mut file = std::fs::File::open(path)?;
+    let tag = ObjectTag::from_metadata(&file.metadata()?);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok((bytes, tag))
 }
 
 /// Fold `tenant`'s [`TemplateMap`] from its audit stream — **one**

@@ -348,7 +348,7 @@ async fn a_narrow_window_counts_only_the_partitions_it_reaches() {
 async fn s3_resolution_requests_nest_under_the_phase() {
     let (exporter, provider, dispatch) = traced();
     // The store's `CLIENT` spans go to the global tracer provider.
-    opentelemetry::global::set_tracer_provider(provider.clone());
+    let _global = crate::common::global_tracer_provider(&provider).await;
     let (_container, config) = localstack_s3_config("ourios-it-file-set").await;
     let store = Store::s3(config.clone()).expect("s3 store");
     tokio::task::spawn_blocking(move || seed_narrow(&store))

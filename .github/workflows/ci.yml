@@ -210,13 +210,27 @@ jobs:
       # conditional-put ladder (create / lost create / If-Match swap /
       # lost swap), and the RFC0033.12 incremental publish under CAS,
       # against the same LocalStack. Plus the RFC 0038 §3.7.3 check that the
-      # file-set resolution's S3 requests are CLIENT spans under its phase.
-      - run: >
-          cargo test -p ourios-querier --test it --
-          --ignored --exact
-          rfc0033_cached_template_map::template_map_publish_cas_on_s3
-          rfc0033_incremental_fold::rfc0033_12_incremental_publish_resolves_by_cas_on_s3
-          rfc0038_file_set_span::s3_resolution_requests_nest_under_the_phase
+      # file-set resolution's S3 requests are CLIENT spans under its phase,
+      # and the RFC0060.15 refresh pass that reads no artifact its listing
+      # proves unchanged. `testing` compiles the RFC 0060 module. libtest
+      # passes a filter that matches nothing, so the step first lists the
+      # tests and fails unless every name exists.
+      - env:
+          S3_TESTS: >-
+            rfc0033_cached_template_map::template_map_publish_cas_on_s3
+            rfc0033_incremental_fold::rfc0033_12_incremental_publish_resolves_by_cas_on_s3
+            rfc0038_file_set_span::s3_resolution_requests_nest_under_the_phase
+            rfc0060_refresh::rfc0060_15_the_skip_on_s3_reads_no_artifact
+        run: |
+          read -ra tests <<< "$S3_TESTS"
+          listed=$(cargo test -p ourios-querier --features testing --test it -- \
+            --ignored --exact --list "${tests[@]}" | grep -c ': test$' || true)
+          if [ "$listed" -ne "${#tests[@]}" ]; then
+            echo "::error::$listed of ${#tests[@]} S3 tests exist"
+            exit 1
+          fi
+          cargo test -p ourios-querier --features testing --test it -- \
+            --ignored --exact "${tests[@]}"
       # RFC 0019 server-level §5 scenarios (.2/.3/.4/.5): spawn the
       # `ourios-server` binary configured for the S3 backend against the same
       # LocalStack, driven over HTTP. `--exact` (RFC0019.1/.6/.7 are non-ignored

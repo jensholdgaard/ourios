@@ -214,7 +214,15 @@ fn per_partition_is_candidate(
         .filter(|(key, _)| live.as_ref().is_none_or(|l| l.contains(basename(key))))
         .map(|(_, size)| *size)
         .collect();
-    meets_policy(&sizes, policy)
+    // The pre-amendment predicate, frozen here rather than shared with the
+    // planner, so a change to the production predicate fails the property.
+    if sizes.len() < 2 {
+        return false;
+    }
+    if sizes.len() > policy.min_files {
+        return true;
+    }
+    sizes.iter().any(|&len| len < policy.small_file_bytes)
 }
 
 #[test]

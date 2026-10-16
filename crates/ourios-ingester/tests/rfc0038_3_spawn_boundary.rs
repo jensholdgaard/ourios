@@ -124,4 +124,12 @@ async fn rfc0038_3_span_context_survives_spawn_boundaries() {
         "one `sweep partitions` span survived spawn_blocking, got {:?}",
         spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
     );
+    // Its RFC 0038 §3.8 planning phase nests under it on the same thread.
+    let plan = spans_named(&spans, "plan partitions");
+    assert_eq!(plan.len(), 1, "one `plan partitions` span, got {spans:?}");
+    assert_eq!(
+        plan[0].parent_span_id,
+        sweep[0].span_context.span_id(),
+        "`plan partitions` nests under `sweep partitions` across spawn_blocking",
+    );
 }

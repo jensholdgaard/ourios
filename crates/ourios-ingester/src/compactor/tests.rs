@@ -12,7 +12,7 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{PartitionKey, Store, Writer};
+use ourios_parquet::{PartitionKey, Store, Writer, plan_candidates};
 
 use super::*;
 
@@ -76,19 +76,11 @@ pub(super) fn write_sealed_candidate(store: &Store, tenant: &str) {
     write_file(store, tenant, 2, TS0 + 1_000_000);
 }
 
-/// RFC0038.1 — one `sweep partitions` INTERNAL span per sweep.
-/// `run_sweep` is the sync body `spawn_blocking`ed in production; a scoped
-/// `with_default` subscriber captures the span it opens internally (the
-/// per-tenant / per-file loops below it stay span-free — RFC0038.2).
-#[test]
-fn rfc0038_1_sweep_emits_one_internal_span() {
-    use opentelemetry::trace::SpanKind;
+/// The spans `run` emits under a scoped subscriber over an in-memory
+/// exporter, with what `run` returned.
+fn traced<T>(run: impl FnOnce() -> T) -> (T, Vec<opentelemetry_sdk::trace::SpanData>) {
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use tracing_subscriber::prelude::*;
-
-    let bucket = tempfile::tempdir().expect("temp");
-    let store = store_at(bucket.path());
-    write_sealed_candidate(&store, "a");
 
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
@@ -96,23 +88,173 @@ fn rfc0038_1_sweep_emits_one_internal_span() {
         .build();
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
-
-    tracing::subscriber::with_default(subscriber, || {
-        run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
-    });
+    let out = tracing::subscriber::with_default(subscriber, run);
     provider.force_flush().expect("spans flush");
+    (out, exporter.get_finished_spans().expect("spans exported"))
+}
 
-    let spans = exporter.get_finished_spans().expect("spans exported");
+/// The one span named `name`.
+fn only_span<'s>(
+    spans: &'s [opentelemetry_sdk::trace::SpanData],
+    name: &str,
+) -> &'s opentelemetry_sdk::trace::SpanData {
+    let [span] = spans
+        .iter()
+        .filter(|s| s.name.as_ref() == name)
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("one `{name}` span, got {spans:?}");
+    };
+    span
+}
+
+fn attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<opentelemetry::Value> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.clone())
+}
+
+/// The `ourios.file_set.*` counts `plan partitions` carries, in order:
+/// list requests, listed objects, manifest reads.
+fn plan_counts(span: &opentelemetry_sdk::trace::SpanData) -> [Option<opentelemetry::Value>; 3] {
+    [
+        ourios_semconv::OURIOS_FILE_SET_LIST_REQUEST_COUNT,
+        ourios_semconv::OURIOS_FILE_SET_LISTED_OBJECTS,
+        ourios_semconv::OURIOS_FILE_SET_MANIFEST_READ_COUNT,
+    ]
+    .map(|key| attr(span, key))
+}
+
+fn counts(
+    list_requests: i64,
+    listed_objects: i64,
+    manifest_reads: i64,
+) -> [Option<opentelemetry::Value>; 3] {
+    [list_requests, listed_objects, manifest_reads].map(|n| Some(opentelemetry::Value::I64(n)))
+}
+
+/// RFC0038.1 (sweep arm, as amended for RFC 0038 §3.8) — one `sweep
+/// partitions` INTERNAL root per sweep, with exactly one `plan partitions`
+/// INTERNAL child. `run_sweep` is the sync body `spawn_blocking`ed in
+/// production; a scoped `with_default` subscriber captures the spans it
+/// opens (the per-tenant / per-file loops below them stay span-free —
+/// RFC0038.2). Replaces the one-span test the amendment supersedes.
+#[test]
+fn rfc0038_1_sweep_emits_its_span_and_one_plan_phase() {
+    use opentelemetry::trace::{SpanId, SpanKind};
+
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+
+    let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
+    result.expect("sweep");
+
     // The sweep path is our code only (filesystem + Parquet, no async
-    // runtime / DataFusion), so the whole sweep emits exactly this one
-    // span — asserting the total count catches any accidental extra
-    // instrumentation (the "one span per sweep" contract, RFC0038.2).
-    assert_eq!(spans.len(), 1, "exactly one span total, got {spans:?}");
-    assert_eq!(spans[0].name.as_ref(), "sweep partitions");
+    // runtime / DataFusion), so asserting the total count catches any
+    // accidental extra instrumentation.
+    assert_eq!(spans.len(), 2, "exactly two spans total, got {spans:?}");
+    let sweep = only_span(&spans, "sweep partitions");
+    let plan = only_span(&spans, "plan partitions");
+    assert_eq!(sweep.span_kind, SpanKind::Internal);
+    assert_eq!(plan.span_kind, SpanKind::Internal);
+    assert_eq!(sweep.parent_span_id, SpanId::INVALID, "the sweep is a root");
+    assert_eq!(plan.parent_span_id, sweep.span_context.span_id());
+    assert_eq!(plan.span_context.trace_id(), sweep.span_context.trace_id());
+}
+
+/// RFC0038.17 — `plan partitions` counts the planning's listings and
+/// manifest reads over every tenant, lies within the sweep, and ends
+/// before the first partition commits.
+#[test]
+fn the_plan_phase_counts_its_listings_and_manifest_reads() {
+    use opentelemetry::trace::Status;
+
+    // Arrange — `a`: a sealed hour-10 partition with two files and no
+    // manifest. `b`: one file in hour 12, still open at `NOW_SEALED`.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    write_file(&store, "b", 1, NOW_SEALED);
+    let mut first_commit = None;
+
+    // Act
+    let (result, spans) = traced(|| {
+        run_sweep_committing(
+            &store,
+            SweepClock::sealed_at(NOW_SEALED),
+            &CompactionPolicy::default(),
+            &PromotedAttributes::default(),
+            &mut SweepHooks::default(),
+            &mut |_| {
+                first_commit.get_or_insert_with(SystemTime::now);
+            },
+        )
+    });
+
+    // Assert — per tenant four roll-ups (year, month, day, hour); `a`'s
+    // sealed partition adds one manifest read and one listing of its two
+    // files; `b`'s open partition adds nothing.
+    assert_eq!(result.expect("sweep").partitions_compacted, 1);
+    let sweep = only_span(&spans, "sweep partitions");
+    let plan = only_span(&spans, "plan partitions");
+    assert_eq!(plan_counts(plan), counts(9, 2, 1));
+    assert_eq!(plan.status, Status::Unset);
+    assert!(sweep.start_time <= plan.start_time && plan.end_time <= sweep.end_time);
+    let first_commit = first_commit.expect("a partition committed");
+    assert!(
+        plan.end_time <= first_commit,
+        "planning ends before the first commit"
+    );
+}
+
+/// RFC0038.17 — a tenant whose planning fails marks `plan partitions`
+/// `Error`, keeps the counts up to the failure, and the sweep goes on.
+#[cfg(unix)]
+#[test]
+fn a_failed_tenant_plan_marks_the_plan_phase_error() {
+    use opentelemetry::trace::Status;
+
+    // Arrange — `a` plans and compacts; `b`'s directory can't be listed.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    write_file(&store, "b", 1, TS0);
+    let unlistable = Unreadable::new(bucket.path().join("data/tenant_id=b"));
+
+    // Act
+    let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
+    drop(unlistable);
+
+    // Assert — `a`'s five listings, two objects and one manifest read,
+    // plus `b`'s one failed roll-up.
+    let report = result.expect("a failed tenant does not fail the sweep");
+    assert_eq!(report.partitions_compacted, 1, "{report:?}");
+    let plan = only_span(&spans, "plan partitions");
+    assert!(
+        matches!(plan.status, Status::Error { .. }),
+        "{:?}",
+        plan.status
+    );
+    assert_eq!(attr(plan, "error.type"), Some("io".into()));
+    assert_eq!(plan_counts(plan), counts(6, 2, 1));
+    assert_eq!(only_span(&spans, "sweep partitions").status, Status::Unset);
+}
+
+/// RFC0038.17 — a store with no tenant still has its (empty) planning
+/// phase.
+#[test]
+fn an_empty_store_still_spans_its_planning() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+
+    let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
+
+    result.expect("sweep");
     assert_eq!(
-        spans[0].span_kind,
-        SpanKind::Internal,
-        "sweep partitions is an INTERNAL span",
+        plan_counts(only_span(&spans, "plan partitions")),
+        counts(0, 0, 0)
     );
 }
 

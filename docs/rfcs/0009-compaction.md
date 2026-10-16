@@ -62,11 +62,14 @@ superseded-by: —
 > counts the superseded inputs the committing rewrite could not delete.
 > This amendment adds one counter, `ourios.compaction.orphan.reclaimed`,
 > per tenant, with `error.type` on a file whose delete failed (§3.6), and
-> runs the GC of every candidate as one pass after the consolidation pass,
-> so the pass can carry one RFC 0038 phase span (`reclaim orphans`, RFC
-> 0038 §3.9). The GC rule, RFC0009.17 and the files GC may delete are
-> unchanged. Adds the in-place note in §3.6, scenario RFC0009.25 (§5), its
-> test map (§6) and the history (§9). The new names go to the ourios-semconv
+> runs the GC as one pass after the consolidation pass, so the pass can
+> carry one RFC 0038 phase span (`reclaim orphans`, RFC 0038 §3.9). The
+> pass visits the candidates and, so that a sweep stopped before it loses
+> nothing, every sealed partition whose listing shows an orphan, picked
+> from the planner's one listing with no persisted state. The GC rule,
+> RFC0009.17 and the files GC may delete are unchanged. Adds the in-place
+> note in §3.6, scenarios RFC0009.25–.26 (§5), their test map (§6) and the
+> history (§9). The new names go to the ourios-semconv
 > registry. `ourios.compaction.orphan.files` keeps its meaning and its
 > attributes.
 
@@ -762,14 +765,18 @@ bytes, not a base metric.
 >
 > | Metric | Instrument | Unit | Attributes | Source |
 > |---|---|---|---|---|
-> | `ourios.compaction.orphan.reclaimed` | Counter | `{file}` | `ourios.tenant` (required); `error.type` (iff the delete failed) | orphan files the GC pass deleted, or tried to (RFC0009.4) |
+> | `ourios.compaction.orphan.reclaimed` | Counter | `{file}` | `ourios.tenant` (required); `error.type` (iff the delete failed) | the GC pass's orphan delete attempts (RFC0009.4) |
 >
-> **What it counts.** Each orphan file `gc_orphans` tries to delete, once,
-> under the tenant whose partition holds it. A delete that succeeds adds
-> one with no `error.type`. A delete that fails adds one with
+> **What it counts.** Each delete `gc_orphans` issues for an orphan file,
+> once, under the tenant whose partition holds it. A successful delete
+> response adds one with no `error.type`. A failed delete adds one with
 > `error.type = io`, and the file is left for a later pass, which counts it
-> again when it tries again. A file already gone when the delete runs is
-> not counted. A partition whose GC scan fails (an unreadable manifest, a
+> again when it tries again. Only an explicit not-found result adds
+> nothing. The count is of successful delete responses, not of files known
+> to have existed: S3 answers a `DELETE` of an absent key with success
+> (`Store::delete_blocking`), so a file another actor removed between the
+> listing and the delete is still counted there. On the local backend an
+> absent file is a not-found and is not counted. A partition whose GC scan fails (an unreadable manifest, a
 > failed listing) deletes nothing and adds nothing here; the scan failure
 > is a sweep error and marks the phase span (RFC 0038 §3.9). This follows
 > OpenTelemetry's guidance to report successes and failures on one metric
@@ -784,15 +791,43 @@ bytes, not a base metric.
 > events: an input left by a rewrite becomes an orphan, and a later GC
 > pass reclaims it, so one file can appear on both counters.
 >
-> **When the GC runs.** The sweep reclaims orphans in one pass over every
-> planned candidate of every tenant, after the consolidation pass and
-> before the RFC 0047 erasure pass. Each partition's GC still runs after
-> its own rewrite, which is what RFC0009.17 needs: an output a crashed
-> compaction wrote for the generation this sweep commits is dead only once
-> that commit is in. A partition whose rewrite failed is still GC'd, as
-> before. Moving the GC out of the per-partition loop changes when, not
-> what, it deletes: no file becomes deletable earlier. Erasure rewrites
-> still run no GC.
+> **When the GC runs.** The sweep reclaims orphans in one pass, after the
+> consolidation pass and before the RFC 0047 erasure pass. Each
+> candidate's GC still runs after its own rewrite, which is what
+> RFC0009.17 needs: an output a crashed compaction wrote for the
+> generation this sweep commits is dead only once that commit is in. A
+> partition whose rewrite failed is still GC'd, as before. Moving the GC
+> out of the per-partition loop changes when, not what, it deletes: no
+> file becomes deletable earlier. Erasure rewrites still run no GC.
+>
+> **Which partitions: eligibility from the listing.** Running the GC only
+> on candidates is not restart-safe. If a sweep commits partition A and the
+> process stops before A's GC (while rewriting B, or between A's commit and
+> its cleanup, a window that already existed), A is left with one live file
+> beside a dead one. A is then no longer a candidate, and nothing would
+> visit it again. So the planner (§3.3) also returns, from the same one
+> listing per tenant, the sealed partitions that are not candidates but
+> whose listing shows an object outside the live set:
+>
+> - a `*.parquet.tmp` (an interrupted publish), with no manifest read; or
+> - beside a `manifest.json`, two or more committed `*.parquet` objects of
+>   which at least one is not named by the manifest. The planner already
+>   reads that manifest for the candidate test (it reads one exactly when
+>   two or more committed files are listed beside it), so this costs no
+>   extra request.
+>
+> A partition with one committed file, or with no manifest and no
+> `*.parquet.tmp`, cannot hold an orphan under the GC rule, so it is not
+> visited and still costs nothing beyond its share of the listing. The
+> selection is a superset: an unnamed file the GC keeps (an in-flight
+> output past the manifest's generation, RFC0009.17, or a live late write
+> under the late-write amendment) still gets the partition visited, and
+> `gc_orphans` decides each object as before. The selection is derived from
+> the listing alone, so it needs no persisted state and survives a restart:
+> the next sweep that lists the partition finds the orphan. Only sealed
+> partitions are visited, as before, so a writer's in-progress publish in
+> an open hour is never touched. The RFC 0038 §3.8 planning counts are
+> unchanged, since no request is added.
 
 > **Validation gate.** This set is the OpenTelemetry semantic-
 > conventions **registry** at `semconv/registry/`, validated by
@@ -1194,6 +1229,19 @@ The following scenario is added by the 2026-10-16 orphan-GC amendment
     consolidation commit, and RFC0009.17's sweep test still reclaims the
     crashed output once.
 
+- **RFC0009.26 — an orphan a stopped sweep left is reclaimed by the next
+  `[RFC0009.4]`**
+  - **Given** a partition whose compaction committed and whose process
+    stopped before the GC pass, leaving one live compacted file beside a
+    dead output (or a stray `*.parquet.tmp` in a sealed hour)
+  - **When** a later sweep runs
+  - **Then** the partition is not a candidate and is not rewritten, its
+    GC runs and deletes the dead object, and every row is read once.
+  - **And** planning it costs no request beyond the listing and the one
+    manifest read the candidate test already makes, and once reclaimed the
+    partition is settled and costs no manifest read.
+  - **And** a `*.parquet.tmp` in an unsealed hour is never planned for GC.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -1307,7 +1355,7 @@ Mapped to `CLAUDE.md` §6.2:
 > test only after the maintainer has approved this wording.
 
 > **Amendment (2026-10-16, #1039, maintainer-approved) — test map for
-> RFC0009.25.** In `ourios-ingester`, beside the existing compaction metric
+> RFC0009.25–.26.** In `ourios-ingester`, beside the existing compaction metric
 > tests, over an in-memory metric reader.
 >
 > | Scenario | Test | Kind |
@@ -1315,6 +1363,9 @@ Mapped to `CLAUDE.md` §6.2:
 > | RFC0009.25 | `rfc0009_25_reclaimed_orphans_are_counted_per_tenant`: two tenants, one with two orphans; the counter's points per tenant, and `orphan.files` unchanged | integration |
 > | RFC0009.25 | `rfc0009_25_a_failed_orphan_delete_carries_error_type`: an orphan in a partition directory made read-only; `error.type = io`, the file still listed; after the directory is restored, the next sweep counts it without `error.type` | integration |
 > | RFC0009.25 | `rfc0009_17_sweeps_reclaim_an_output_a_crashed_compaction_left` (existing, unchanged): the crashed output is reclaimed once under the moved pass | integration |
+> | RFC0009.26 | `rfc0009_26_a_later_sweep_reclaims_what_an_interrupted_one_left` (`ourios-ingester`): `compact_partition` commits over a crashed output and stops; a sweep compacts nothing and reclaims the output; rows read once | integration |
+> | RFC0009.26 | `rfc0009_26_a_settled_partition_with_a_dead_output_is_reclaimable` (`ourios-parquet` planner): planned for GC with one manifest read; after the GC, settled with none | unit |
+> | RFC0009.26 | `rfc0009_26_a_stray_tmp_makes_only_a_sealed_partition_reclaimable` (`ourios-parquet` planner): no manifest read; unsealed never planned | unit |
 
 ## 7. Open questions
 
@@ -1560,8 +1611,10 @@ change (§6 late-write test map).
 - **2026-10-16 — orphan GC is observable (#1039, maintainer-approved).**
   Adds `ourios.compaction.orphan.reclaimed`, a per-tenant counter of the
   files the orphan GC deleted or failed to delete (`error.type` on a
-  failure), and moves the GC of every candidate into one pass after the
-  consolidation pass so it can carry RFC 0038's `reclaim orphans` phase
-  span. The GC rule and RFC0009.17 are unchanged, and
-  `ourios.compaction.orphan.files` keeps its meaning. §3.6 note,
-  RFC0009.25, test map. The new names go to the ourios-semconv registry.
+  failure; the count is of successful delete responses), and moves the GC
+  into one pass after the consolidation pass so it can carry RFC 0038's
+  `reclaim orphans` phase span. The pass visits the candidates and every
+  sealed partition whose listing shows an orphan, so a sweep stopped
+  before the pass loses nothing. The GC rule and RFC0009.17 are unchanged,
+  and `ourios.compaction.orphan.files` keeps its meaning. §3.6 note,
+  RFC0009.25–.26, test map. The new names go to the ourios-semconv registry.

@@ -357,7 +357,7 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 >
 > | Operation | Span name | Kind |
 > |---|---|---|
-> | Reclaiming orphan files from every planned candidate, once per sweep after consolidation | `reclaim orphans` | `INTERNAL` (child of `sweep partitions`) |
+> | Reclaiming orphan files from every partition the plan marks for GC, once per sweep after consolidation | `reclaim orphans` | `INTERNAL` (child of `sweep partitions`) |
 
 ### 3.6 GenAI/MCP semantic-convention attributes on the tool spans
 
@@ -1059,7 +1059,7 @@ inside the per-partition consolidation loop, which §3.1 keeps span-free,
 so it could not get a span there. RFC 0009's orphan-GC amendment moves it
 into one pass after the consolidation pass. That pass has duration and,
 on the S3 backend, makes one listing, one manifest read and one `DELETE`
-per orphan for each candidate, which is the §3.7 rule for a phase span.
+per orphan for each partition it visits, which is the §3.7 rule for a phase span.
 
 **The span.**
 
@@ -1067,7 +1067,7 @@ per orphan for each candidate, which is the §3.7 rule for a phase span.
 |---|---|
 | Kind | `INTERNAL` |
 | Parent | `sweep partitions` |
-| Opens / ends | around the GC of every planned candidate of every tenant whose planning succeeded: after the consolidation pass's last rewrite, before the RFC 0047 erasure pass. It starts after `plan partitions` ends. |
+| Opens / ends | around the GC of every partition the plan marks for GC, for every tenant whose planning succeeded: the candidates, then the sealed non-candidates whose listing shows an orphan (RFC 0009 §3.6, "Which partitions"). It opens after the consolidation pass's last rewrite and before the RFC 0047 erasure pass, and starts after `plan partitions` ends. |
 | Cardinality | **exactly one** per sweep whose tenant enumeration succeeds, also when there is no candidate (the counts are then zero); **none** when the enumeration fails, since the sweep then ends before planning |
 | Status | `Error` iff the GC of at least one partition failed, either its scan (an unreadable manifest or a failed listing) or the delete of at least one orphan. `error.type` is the first such failure's class, in pass order: a scan failure takes the class `sweep partitions` already uses (`read`, `write`, `manifest`, `io`, `_OTHER`), and a failed delete is `io`. `Unset` otherwise. The sweep goes on either way, so `sweep partitions` stays `Unset` (its existing rule). |
 | Required attributes | `ourios.compaction.orphan.reclaimed_count`, `ourios.compaction.orphan.failed_count`, summed over every partition GC'd |
@@ -1078,8 +1078,10 @@ split is `ourios.compaction.orphan.reclaimed` (RFC 0009 §3.6).
 **The counts.** Set when the phase ends, including when some partition's
 GC failed (the counts up to and after it, since the pass goes on).
 
-- `reclaimed_count` counts the orphan files whose delete succeeded. A file
-  already gone when its delete runs is not counted.
+- `reclaimed_count` counts the successful delete responses for orphan
+  files. Only an explicit not-found result is excluded. S3 answers a
+  `DELETE` of an absent key with success, so a file another actor removed
+  after the listing is still counted there (RFC 0009 §3.6).
 - `failed_count` counts the orphan files whose delete failed. A partition
   whose scan failed deletes nothing and adds to neither count; it shows as
   the span's `Error`.

@@ -26,7 +26,7 @@ pub(super) fn store_at(bucket: &Path) -> Store {
 pub(super) const TS0: u64 = 1_775_127_480_000_000_000;
 pub(super) const HOUR: u64 = 3_600_000_000_000;
 /// Well past hour 10's end + grace.
-const NOW_SEALED: u64 = TS0 + 2 * HOUR;
+pub(super) const NOW_SEALED: u64 = TS0 + 2 * HOUR;
 
 pub(super) fn rec(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
     MinedRecord {
@@ -78,7 +78,7 @@ pub(super) fn write_sealed_candidate(store: &Store, tenant: &str) {
 
 /// The spans `run` emits under a scoped subscriber over an in-memory
 /// exporter, with what `run` returned.
-fn traced<T>(run: impl FnOnce() -> T) -> (T, Vec<opentelemetry_sdk::trace::SpanData>) {
+pub(super) fn traced<T>(run: impl FnOnce() -> T) -> (T, Vec<opentelemetry_sdk::trace::SpanData>) {
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use tracing_subscriber::prelude::*;
 
@@ -94,7 +94,7 @@ fn traced<T>(run: impl FnOnce() -> T) -> (T, Vec<opentelemetry_sdk::trace::SpanD
 }
 
 /// The one span named `name`.
-fn only_span<'s>(
+pub(super) fn only_span<'s>(
     spans: &'s [opentelemetry_sdk::trace::SpanData],
     name: &str,
 ) -> &'s opentelemetry_sdk::trace::SpanData {
@@ -108,7 +108,10 @@ fn only_span<'s>(
     span
 }
 
-fn attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<opentelemetry::Value> {
+pub(super) fn attr(
+    span: &opentelemetry_sdk::trace::SpanData,
+    key: &str,
+) -> Option<opentelemetry::Value> {
     span.attributes
         .iter()
         .find(|kv| kv.key.as_str() == key)
@@ -134,14 +137,15 @@ fn counts(
     [list_requests, listed_objects, manifest_reads].map(|n| Some(opentelemetry::Value::I64(n)))
 }
 
-/// RFC0038.1 (sweep arm, as amended for RFC 0038 §3.8) — one `sweep
-/// partitions` INTERNAL root per sweep, with exactly one `plan partitions`
-/// INTERNAL child. `run_sweep` is the sync body `spawn_blocking`ed in
-/// production; a scoped `with_default` subscriber captures the spans it
-/// opens (the per-tenant / per-file loops below them stay span-free —
-/// RFC0038.2). Replaces the one-span test the amendment supersedes.
+/// RFC0038.1 (sweep arm, as amended for RFC 0038 §3.8 and §3.9) — one
+/// `sweep partitions` INTERNAL root per sweep, with exactly two INTERNAL
+/// children, `plan partitions` and then `reclaim orphans`. `run_sweep` is
+/// the sync body `spawn_blocking`ed in production; a scoped `with_default`
+/// subscriber captures the spans it opens (the per-tenant / per-file loops
+/// below them stay span-free — RFC0038.2). Replaces the one-span and then
+/// the two-span test the amendments supersede.
 #[test]
-fn rfc0038_1_sweep_emits_its_span_and_one_plan_phase() {
+fn rfc0038_1_sweep_emits_its_span_and_two_phases() {
     use opentelemetry::trace::{SpanId, SpanKind};
 
     let bucket = tempfile::tempdir().expect("temp");
@@ -154,9 +158,10 @@ fn rfc0038_1_sweep_emits_its_span_and_one_plan_phase() {
     // The sweep path is our code only (filesystem + Parquet, no async
     // runtime / DataFusion), so asserting the total count catches any
     // accidental extra instrumentation.
-    assert_eq!(spans.len(), 2, "exactly two spans total, got {spans:?}");
+    assert_eq!(spans.len(), 3, "exactly three spans total, got {spans:?}");
     let sweep = only_span(&spans, "sweep partitions");
     let plan = only_span(&spans, "plan partitions");
+    let reclaim = only_span(&spans, "reclaim orphans");
     assert_eq!(
         (&sweep.span_kind, &plan.span_kind),
         (&SpanKind::Internal, &SpanKind::Internal),
@@ -174,6 +179,23 @@ fn rfc0038_1_sweep_emits_its_span_and_one_plan_phase() {
             sweep.span_context.trace_id(),
         ),
         "the sweep is a root, and the plan phase its child in the same trace",
+    );
+    assert_eq!(
+        (
+            &reclaim.span_kind,
+            reclaim.parent_span_id,
+            reclaim.span_context.trace_id(),
+        ),
+        (
+            &SpanKind::Internal,
+            sweep.span_context.span_id(),
+            sweep.span_context.trace_id(),
+        ),
+        "the reclaim phase is an INTERNAL child of the sweep in the same trace",
+    );
+    assert!(
+        plan.end_time <= reclaim.start_time,
+        "reclaiming starts after planning ends"
     );
 }
 

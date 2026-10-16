@@ -120,7 +120,7 @@ fn assert_ingest_spans(spans: &[SpanData]) {
 
 /// Boundary 2 — exactly one `sweep partitions` span crossed `spawn_blocking`
 /// (the long interval means a single tick before abort), with its RFC 0038
-/// §3.8 planning phase nested under it on the same thread.
+/// §3.8 planning and §3.9 reclaim phases nested under it on the same thread.
 fn assert_sweep_spans(spans: &[SpanData]) {
     let sweep = spans_named(spans, "sweep partitions");
     assert_eq!(
@@ -135,5 +135,16 @@ fn assert_sweep_spans(spans: &[SpanData]) {
         plan[0].parent_span_id,
         sweep[0].span_context.span_id(),
         "`plan partitions` nests under `sweep partitions` across spawn_blocking",
+    );
+    let reclaim = spans_named(spans, "reclaim orphans");
+    assert_eq!(
+        reclaim.len(),
+        1,
+        "one `reclaim orphans` span, got {spans:?}"
+    );
+    assert_eq!(
+        reclaim[0].parent_span_id,
+        sweep[0].span_context.span_id(),
+        "`reclaim orphans` nests under `sweep partitions` across spawn_blocking",
     );
 }

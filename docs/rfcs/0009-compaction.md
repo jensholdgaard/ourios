@@ -807,27 +807,32 @@ bytes, not a base metric.
 > beside a dead one. A is then no longer a candidate, and nothing would
 > visit it again. So the planner (§3.3) also returns, from the same one
 > listing per tenant, the sealed partitions that are not candidates but
-> whose listing shows an object outside the live set:
+> whose listing shows an object `gc_orphans` would delete, judged by the
+> GC's own rule (the §3.4 late-write live set, `LiveSet::is_orphan`):
 >
 > - a `*.parquet.tmp` (an interrupted publish), with no manifest read; or
-> - beside a `manifest.json`, two or more committed `*.parquet` objects of
->   which at least one is not named by the manifest. The planner already
->   reads that manifest for the candidate test (it reads one exactly when
->   two or more committed files are listed beside it), so this costs no
->   extra request.
+> - a listed committed file that is an orphan under that rule: a consumed
+>   flush file, or a compacted file the manifest does not name whose
+>   generation the manifest has reached. The rule is applied with the
+>   manifest the planner already reads for the candidate test (it reads
+>   one exactly when two or more committed files are listed beside it), or
+>   with no manifest when none is listed, which is what `gc_orphans` itself
+>   sees, so this costs no extra request.
 >
-> A partition with one committed file, or with no manifest and no
-> `*.parquet.tmp`, cannot hold an orphan under the GC rule, so it is not
-> visited and still costs nothing beyond its share of the listing. The
-> selection is a superset: an unnamed file the GC keeps (an in-flight
-> output past the manifest's generation, RFC0009.17, or a live late write
-> under the late-write amendment) still gets the partition visited, and
-> `gc_orphans` decides each object as before. The selection is derived from
-> the listing alone, so it needs no persisted state and survives a restart:
-> the next sweep that lists the partition finds the orphan. Only sealed
-> partitions are visited, as before, so a writer's in-progress publish in
-> an open hour is never touched. The RFC 0038 §3.8 planning counts are
-> unchanged, since no request is added.
+> Where a manifest is listed but not read (one committed file beside it),
+> a lone file cannot be an orphan beside a live one, so only a
+> `*.parquet.tmp` makes the partition eligible. The selection matches the
+> GC's verdict, including the RFC0009.17 generation guard: an unnamed
+> compacted file for a generation past the manifest's (an in-flight
+> output) and an unconsumed flush file (a live late write) are kept by the
+> GC and do not get a partition visited. A settled partition, one with no
+> orphan, still costs nothing beyond its share of the listing.
+> `gc_orphans` still decides each object when it runs. The selection is
+> derived from the listing alone, so it needs no persisted state and
+> survives a restart: the next sweep that lists the partition finds the
+> orphan. Only sealed partitions are visited, as before, so a writer's
+> in-progress publish in an open hour is never touched. The RFC 0038 §3.8
+> planning counts are unchanged, since no request is added.
 
 > **Validation gate.** This set is the OpenTelemetry semantic-
 > conventions **registry** at `semconv/registry/`, validated by

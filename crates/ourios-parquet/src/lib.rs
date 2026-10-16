@@ -51,11 +51,11 @@ pub use audit_record_batch::{AuditBatchError, audit_events_to_batch};
 pub use audit_sink::ParquetAuditSink;
 pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile, derive_audit_partition};
 pub use compaction::{
-    CommitHook, Committed, CompactionError, CompactionOutcome, CompactionPolicy, CompactionStats,
-    MemoryPhase, OrphanGc, PlanCounts, RowFilter, RowHooks, RowObserver, compact_partition,
-    compact_partition_hooked, compact_partition_with_flush_threshold,
+    CommitHook, Committed, CompactionError, CompactionOutcome, CompactionPlan, CompactionPolicy,
+    CompactionStats, MemoryPhase, OrphanGc, PlanCounts, RowFilter, RowHooks, RowObserver,
+    compact_partition, compact_partition_hooked, compact_partition_with_flush_threshold,
     compact_partition_with_promoted, compact_partition_with_sort_budget, gc_orphans,
-    hour_partitions, plan_candidates, plan_candidates_counted,
+    hour_partitions, plan_candidates, plan_candidates_counted, plan_compaction_counted,
 };
 pub use id_max::{FooterMax, IdColumns, IdMaxError, decoded_max, footer_max, object_max_id};
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};

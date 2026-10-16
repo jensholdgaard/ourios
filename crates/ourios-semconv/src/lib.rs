@@ -158,7 +158,7 @@ pub const OURIOS_COMPACTION_ORPHAN_FILES_UNIT: &str = "{file}";
 pub const OURIOS_COMPACTION_ORPHAN_RECLAIMED: &str = "ourios.compaction.orphan.reclaimed";
 
 /// `ourios.compaction.orphan.reclaimed` description (the registry `brief`).
-pub const OURIOS_COMPACTION_ORPHAN_RECLAIMED_DESCRIPTION: &str = "Orphan files the compaction sweep's orphan GC pass deleted or tried to delete (RFC 0009 RFC0009.4). A deleted file carries no `error.type`; a file whose delete failed carries `error.type` (`io`) and is left for a later pass, which counts it again. A file already gone is not counted.";
+pub const OURIOS_COMPACTION_ORPHAN_RECLAIMED_DESCRIPTION: &str = "Delete attempts of the compaction sweep's orphan GC pass, one per orphan file (RFC 0009 RFC0009.4). A successful delete response carries no `error.type`; a failed delete carries `error.type` (`io`), and the file is left for a later pass, which counts it again. Only an explicit not-found result is not counted, so an idempotent success (S3 answers a delete of an absent key with success) can count a file another actor already removed.";
 
 /// `ourios.compaction.orphan.reclaimed` unit (UCUM).
 pub const OURIOS_COMPACTION_ORPHAN_RECLAIMED_UNIT: &str = "{file}";

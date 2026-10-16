@@ -15,7 +15,10 @@ use ourios_core::audit::NoOpAuditSink;
 use ourios_semconv as semconv;
 
 use super::tenant_metrics_tests::{by_tenant, tenants};
-use super::tests::{NOW_SEALED, attr, only_span, store_at, target, traced, write_sealed_candidate};
+use super::tests::{
+    NOW_SEALED, TS0, attr, crash_before_commit, only_span, rec, store_at, target, traced,
+    write_sealed_candidate,
+};
 use super::*;
 
 /// A sealed candidate for `tenant` plus `orphans` interrupted publishes
@@ -149,6 +152,41 @@ fn a_failed_orphan_delete_marks_the_reclaim_phase_error() {
         ),
         (Some("io".into()), counts(0, 1), &Status::Unset),
     );
+}
+
+/// RFC0009.26 — a sweep that stopped between a commit and its GC pass
+/// left the partition settled (one live file) beside a dead output; the next
+/// sweep, which has nothing to consolidate, reclaims it.
+#[test]
+fn rfc0009_26_a_later_sweep_reclaims_what_an_interrupted_one_left() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    let records = [rec("a", 1, TS0), rec("a", 2, TS0 + 1_000_000)];
+    let partition = PartitionKey::derive(&records[0]).expect("derive");
+    let crashed = crash_before_commit(&store, &records);
+    ourios_parquet::compact_partition(&store, &partition).expect("the commit before the stop");
+
+    let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
+
+    let report = result.expect("sweep");
+    assert_eq!(
+        (report.partitions_compacted, report.orphans_reclaimed),
+        (0, 1),
+        "settled, so no rewrite, and the dead output reclaimed"
+    );
+    assert_eq!(
+        reclaim_counts(only_span(&spans, "reclaim orphans")),
+        counts(1, 0)
+    );
+    let listed = store.list_blocking(Some("data/")).expect("list");
+    assert!(!listed.contains(&crashed), "{listed:?}");
+    let mut rows = Vec::new();
+    ourios_parquet::compaction::visit_partition_rows(&store, &partition, |batch| {
+        rows.extend(batch.iter().map(|r| r.template_id));
+    })
+    .expect("read");
+    rows.sort_unstable();
+    assert_eq!(rows, [1, 2], "every row read exactly once");
 }
 
 /// A meter provider over an in-memory exporter, and the compaction

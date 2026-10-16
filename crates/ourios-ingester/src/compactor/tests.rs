@@ -567,7 +567,7 @@ fn write_records(store: &Store, records: &[MinedRecord]) -> String {
 /// Lay down what a compactor killed before its commit leaves: a manifest
 /// at generation 1 naming the two inputs, and their consolidated rows
 /// under an unnamed output for generation 2. Returns that output's key.
-fn crash_before_commit(store: &Store, records: &[MinedRecord; 2]) -> String {
+pub(super) fn crash_before_commit(store: &Store, records: &[MinedRecord; 2]) -> String {
     let inputs = [
         write_records(store, &records[..1]),
         write_records(store, &records[1..]),

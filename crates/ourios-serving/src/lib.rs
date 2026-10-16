@@ -9,6 +9,8 @@
 //!   resolver seam.
 //! - [`tls`] / [`tls_serve`] — listener TLS settings and the reloading
 //!   acceptors (RFC 0030).
+//! - [`client`] — the peer address and `User-Agent` of a request, for
+//!   the HTTP server spans.
 //! - [`propagation`] — inbound W3C trace-context extraction (RFC 0039).
 //! - [`serve`] — the HTTP serve loop and the listeners' connection deadlines.
 //! - [`metrics`] — the `ourios.auth.resolutions` instrument and the
@@ -21,6 +23,7 @@
 #![deny(unsafe_code)]
 
 pub mod auth;
+pub mod client;
 pub mod metrics;
 #[cfg(feature = "oidc")]
 pub mod oidc;
@@ -32,6 +35,7 @@ pub mod tls;
 pub mod tls_serve;
 
 pub use auth::{AuthBinding, AuthError, AuthResolver, GraphIdentity, authenticate_bearer};
+pub use client::HttpClient;
 pub use metrics::AuthMetrics;
 pub use propagation::{
     HeaderExtractor, MetadataExtractor, extract_context, extract_context_from_metadata,

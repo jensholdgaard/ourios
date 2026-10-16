@@ -34,10 +34,10 @@ use opentelemetry::KeyValue;
 use opentelemetry::context::FutureExt as _;
 use opentelemetry::metrics::{Counter, Histogram};
 use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
-use ourios_serving::extract_context;
 use ourios_serving::serve::{PlainListener, serve_http};
 use ourios_serving::tls::{ALPN_HTTP, TlsSettings};
 use ourios_serving::tls_serve::{LISTENER_QUERIER, TlsListener, reloading_acceptor};
+use ourios_serving::{HttpClient, extract_context};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -514,11 +514,12 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
 /// already-entered span fails with `AlreadyStarted` (§3.3).
 async fn handle_query(
     State(state): State<QuerierState>,
+    client: HttpClient,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let parent = extract_context(&headers);
-    handle_query_traced(state, headers, body)
+    handle_query_traced(state, &client, headers, body)
         .with_context(parent)
         .await
 }
@@ -532,6 +533,11 @@ async fn handle_query(
         otel.kind = "server",
         http.request.method = "POST",
         http.route = "/v1/query",
+        client.address = client.address().map(tracing::field::display),
+        client.port = client.port(),
+        network.peer.address = client.address().map(tracing::field::display),
+        network.peer.port = client.port(),
+        user_agent.original = client.user_agent(),
         ourios.tenant = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
         ourios.query.visibility.branch = tracing::field::Empty,
@@ -539,7 +545,12 @@ async fn handle_query(
         error.type = tracing::field::Empty,
     )
 )]
-async fn handle_query_traced(state: QuerierState, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle_query_traced(
+    state: QuerierState,
+    client: &HttpClient,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     // Record the outgoing status across every early-return path at the one
     // exit; the RFC 0016 flow lives in the inner fn, which runs inside this
     // span so its `ourios.tenant` record lands on it.

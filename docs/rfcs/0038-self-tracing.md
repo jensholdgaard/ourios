@@ -49,6 +49,13 @@ superseded-by: —
 > RFC0038.17 (§5). No new attribute names. The sweep still emits no
 > `CLIENT` spans, so the §7 question about them stays open. Refs #1019.
 
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — the planning counts.** RFC 0009's
+> amended planner (#1027, implemented in #1030) plans each tenant from one
+> recursive listing and reads a manifest only where it can change the
+> decision. §3.8's count definitions, its reuse paragraph, RFC0038.17's
+> expected counts and the §6 test map are corrected in place to match. The
+> span, its attributes and its names are unchanged.
+
 > **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
 > the completed-backlog batch flip. Where a thesis-gate applies it
 > stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
@@ -907,6 +914,14 @@ with the compaction work there is, and it is the part of the sweep most
 likely to regress again. It has duration and makes network calls on the
 S3 backend, which is the §3.7 rule for a phase span.
 
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner).** The
+> per-partition reads described above are what #1019 measured. Under the
+> RFC 0009 planner, a tenant's planning is one recursive listing plus one
+> manifest read per sealed partition whose listing shows two or more
+> committed files and a manifest. Its cost grows with the tenant's object
+> count rather than with its retained hours, and the phase span stays the
+> place a regression would show.
+
 **The span.**
 
 | | `plan partitions` |
@@ -943,6 +958,25 @@ failure). They follow §3.7.2's rules:
   this count is therefore also the number of sealed partitions examined,
   so no separate partition count is defined.
 
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — the counts
+> under the one-listing planner.** The three bullets above describe the
+> per-partition planner and no longer hold. Read instead:
+>
+> - `list_request_count` counts one logical recursive listing of each
+>   tenant's `data/` prefix, failed ones included. HTTP pages are still not
+>   counted. There are no delimited roll-ups and no per-partition listings.
+> - `listed_objects` counts every key that listing returns, before any
+>   filter: keys in unsealed hours, `manifest.json`, `*.tmp` files and
+>   anything outside a canonical hour partition included.
+> - `manifest_read_count` counts the manifest reads actually issued:
+>   one per sealed partition whose listing shows two or more committed
+>   `*.parquet` files **and** a `manifest.json`, whether that read
+>   succeeds or fails. Planning now lists before it reads, so it never
+>   issues a read for an absent manifest, which is the querier's S3
+>   resolution's rule too. The count is **not** the number of partitions
+>   examined: a settled or single-file partition, and a partition without
+>   a manifest, cost no read.
+
 **Reusing the `ourios.file_set.*` names.** Planning a tenant is a
 file-set resolution in the registry's sense: for each sealed partition it
 reads the manifest and lists the prefix to resolve the live files and
@@ -958,6 +992,16 @@ so this amendment reuses them, with the brief on `plan partitions` being
 over `ourios.file_set.manifest_read_count` show both the read path's and
 the sweep's manifest load. Whether the registry briefs should say so is an
 open question (§7).
+
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — the reuse
+> still holds, on a different footing.** Planning no longer reads each
+> sealed partition's manifest and lists its prefix. It lists the tenant's
+> data prefix once and reads only the manifests the listing shows where
+> they can change the decision. That is how the querier's S3 resolution
+> counts: one count per listing call, every object the listing returns
+> before filtering, and one read per manifest the listing showed and the
+> resolution fetched. So the three names still mean the same work on both
+> sides, and the names stay as approved.
 
 **What does not get a span.** Planning one tenant, examining one
 partition, and consolidating one partition are per-item loops, which §3.1
@@ -1364,6 +1408,15 @@ maintainer-approved).
 > goes on to plan and compact the other tenant with `sweep partitions`
 > `Unset`.
 
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — RFC0038.17's
+> counts.** "One manifest read per sealed partition, none for the unsealed
+> one" now reads: one listing per tenant; every key those listings return,
+> the unsealed partition's included; and one manifest read per sealed
+> partition listed with two or more committed files and a manifest, so
+> **none** for the scenario's fixture, whose files have no manifest. The
+> failure clause is unchanged: the failing tenant's one listing still
+> counts.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -1551,6 +1604,27 @@ Mapped to `CLAUDE.md` §6.2:
 >   partition (RFC0038.2's invariant), and the counting is integer
 >   increments beside store calls that each take milliseconds.
 
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — the
+> expected counts in the tests above.** #1030 changes the planner's I/O, not
+> the counting rules, so the tests keep their names and their assertions
+> other than these counts `(list_request_count, listed_objects,
+> manifest_read_count)`:
+>
+> | Test | Before | After |
+> |---|---|---|
+> | `planning_counts_its_listings_and_manifest_reads` (`ourios-parquet`) | 5, 2, 1 | 1, 3, 0 |
+> | `planning_keeps_its_counts_on_the_error_path` (`ourios-parquet`) | 4, 0, 1 | 1, 3, 1 |
+> | `the_plan_phase_counts_its_listings_and_manifest_reads` (`ourios-ingester`) | 9, 2, 1 | 2, 3, 0 |
+> | `a_failed_tenant_plan_marks_the_plan_phase_error` (`ourios-ingester`) | 6, 2, 1 | 2, 2, 0 |
+> | `planning_a_tenant_with_no_data_makes_one_listing`, `an_empty_store_still_spans_its_planning` | unchanged | unchanged |
+>
+> `list_request_count` and `manifest_read_count` only fall. `listed_objects`
+> rises where the tenant listing returns keys the per-partition listings
+> never fetched (an unsealed hour's file) or fetched only after the manifest
+> read (the error-path fixture's three keys). The error-path test still
+> counts its failing manifest read, because that partition lists two
+> files and a manifest.
+
 ## 7. Open questions
 
 - [ ] Should the per-Export-batch span live on `ingest_bound` (single choke
@@ -1628,6 +1702,10 @@ Mapped to `CLAUDE.md` §6.2:
       unsealed ones cost only their share of the `hour=` roll-ups. A count
       of all partitions walked would need a new name. Add it only if a
       trace is found that needs it.
+      *Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner):* the premise
+      no longer holds. `manifest_read_count` now counts only the manifests
+      read, not the sealed partitions examined, so the trace has no count of
+      partitions planned. The question stays open on that basis.
 - [ ] **Per-tenant planning cost.** With one aggregate span and no
       tenant on `ourios.storage.operation.duration`, nothing says which
       tenant's history dominates planning. Does that matter? If it does,
@@ -1732,3 +1810,9 @@ scope, not ingest) already covers it.
   change replaces. New scenario RFC0038.17 and two open questions in §7.
   No new attribute names; the sweep still emits no `CLIENT` spans.
   Motivated by #1019.
+- **2026-10-16 — the planning counts under RFC 0009's one-listing
+  planner (#1027, implemented in #1030).** In-place notes correct §3.8's
+  count definitions and its reuse argument, RFC0038.17's expected counts,
+  the §6 test map's counts and the §7 partition-count question. The span,
+  its attributes and the approved reuse of the `ourios.file_set.*` names
+  are unchanged.

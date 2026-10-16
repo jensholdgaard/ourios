@@ -187,6 +187,24 @@ pub(crate) enum ClusterKeys {
     TimeOnly,
 }
 
+/// How a compaction output is laid out and named (RFC 0036 §3.3–§3.4,
+/// RFC 0009 §3.4 late-write note).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompactedOutput {
+    /// The §3.1 clustering key the rows arrive sorted by.
+    pub(crate) keys: ClusterKeys,
+    /// Explicit row-group rotation threshold (the §7 sweep seam); `None`
+    /// takes the env override or the adaptive value.
+    pub(crate) flush_override: Option<usize>,
+    /// The partition's summed live input sizes, which the adaptive
+    /// threshold scales from.
+    pub(crate) estimated_output_bytes: u64,
+    /// The manifest generation the output will be committed at. The file
+    /// is named `<uuidv7>.g<generation>.parquet`, so GC can tell an
+    /// in-flight output from a dead one.
+    pub(crate) generation: u64,
+}
+
 impl ClusterKeys {
     pub(crate) fn for_promoted(promoted: &PromotedAttributes) -> Self {
         if promoted
@@ -344,21 +362,21 @@ impl Writer {
         zstd_level: i32,
         promoted: PromotedAttributes,
     ) -> Result<Self, WriterError> {
-        Self::open_in_inner(store, partition, zstd_level, promoted, None, None, 0)
+        Self::open_in_inner(store, partition, zstd_level, promoted, None)
     }
 
     /// Open a **compacted-output** writer for `partition` (RFC 0036):
     /// row groups rotate at the §3.3 threshold and the file declares the
-    /// §3.4 `sorting_columns` for `keys`. The rotation threshold resolves,
-    /// in precedence: explicit `flush_override` (positive) — the RFC 0036
-    /// §7 threshold sweep's deterministic seam — then the
-    /// [`COMPACTED_RG_BYTES_ENV`] operator override, then the **adaptive**
-    /// value [`adaptive_flush_bytes`] derives from `estimated_output_bytes`
-    /// (the partition's summed live input file sizes; §3.3). All read once
-    /// here. Compaction-only — ingest-side files keep the 128 MiB rotation
-    /// and declare no sort (their rows are genuinely unsorted, RFC0035.5).
-    /// The caller is responsible for appending rows in the declared §3.1
-    /// order.
+    /// §3.4 `sorting_columns` for `output.keys`. The rotation threshold
+    /// resolves, in precedence: explicit `output.flush_override`
+    /// (positive) — the RFC 0036 §7 threshold sweep's deterministic seam —
+    /// then the [`COMPACTED_RG_BYTES_ENV`] operator override, then the
+    /// **adaptive** value [`adaptive_flush_bytes`] derives from
+    /// `output.estimated_output_bytes` (§3.3). All read once here. The file
+    /// is named for `output.generation` (RFC 0009 §3.4). Compaction-only —
+    /// ingest-side files keep the 128 MiB rotation and declare no sort
+    /// (their rows are genuinely unsorted, RFC0035.5). The caller is
+    /// responsible for appending rows in the declared §3.1 order.
     ///
     /// # Errors
     ///
@@ -366,37 +384,21 @@ impl Writer {
     pub(crate) fn open_in_compacted(
         store: &Store,
         partition: PartitionKey,
-        zstd_level: i32,
         promoted: PromotedAttributes,
-        keys: ClusterKeys,
-        flush_override: Option<usize>,
-        estimated_output_bytes: u64,
+        output: CompactedOutput,
     ) -> Result<Self, WriterError> {
-        Self::open_in_inner(
-            store,
-            partition,
-            zstd_level,
-            promoted,
-            Some(keys),
-            flush_override,
-            estimated_output_bytes,
-        )
+        Self::open_in_inner(store, partition, DEFAULT_ZSTD_LEVEL, promoted, Some(output))
     }
 
     /// Shared body of [`Writer::open_in_with_promoted`] (ingest layout,
-    /// `compacted: None`) and [`Writer::open_in_compacted`]
-    /// (`Some(keys)` — RFC 0036 §3.3 threshold + §3.4 declaration).
-    /// `flush_override` and `estimated_output_bytes` apply to the compacted
-    /// branch only (the ingest branch always rotates at
-    /// [`ROW_GROUP_FLUSH_BYTES`]).
+    /// `compacted: None`) and [`Writer::open_in_compacted`] (RFC 0036 §3.3
+    /// threshold + §3.4 declaration, generation-named).
     fn open_in_inner(
         store: &Store,
         partition: PartitionKey,
         zstd_level: i32,
         promoted: PromotedAttributes,
-        compacted: Option<ClusterKeys>,
-        flush_override: Option<usize>,
-        estimated_output_bytes: u64,
+        compacted: Option<CompactedOutput>,
     ) -> Result<Self, WriterError> {
         // Validate the codec level up front so invalid input fails fast. The
         // validated level flows into `writer_properties` so it isn't re-checked.
@@ -406,21 +408,31 @@ impl Writer {
         // store root) plus the file name; the core renders it as the
         // default `final_path` (the local constructor overrides that
         // with the absolute landing path).
+        // A compaction output carries its generation in the name,
+        // `<uuid>.g<N>.parquet` (RFC 0009 §3.4 late-write note).
         let key = object_key(&partition.data_path(Path::new("")), flush_uuid);
+        let key = match compacted {
+            Some(output) => {
+                let stem = key.strip_suffix(".parquet").unwrap_or(&key);
+                format!("{stem}.g{}.parquet", output.generation)
+            }
+            None => key,
+        };
 
         let (sorting, flush_bytes) = match compacted {
-            Some(keys) => (
-                Some(sorting_columns(keys, &promoted)?),
+            Some(output) => (
+                Some(sorting_columns(output.keys, &promoted)?),
                 // Precedence (§3.3): explicit override > env override >
                 // adaptive. The positivity filter guards a 0 override, which
                 // would make `in_progress_size() >= flush_bytes` always true
                 // (a degenerate per-sub-batch rotation); `env_compacted_flush_bytes`
                 // guards the env path the same way. When neither is set the
                 // adaptive value scales with the partition's estimated output.
-                flush_override
+                output
+                    .flush_override
                     .filter(|&n| n > 0)
                     .or_else(env_compacted_flush_bytes)
-                    .unwrap_or_else(|| adaptive_flush_bytes(estimated_output_bytes)),
+                    .unwrap_or_else(|| adaptive_flush_bytes(output.estimated_output_bytes)),
             ),
             None => (None, ROW_GROUP_FLUSH_BYTES),
         };

@@ -38,14 +38,16 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::data_schema_with_promoted;
-use crate::manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
+use crate::manifest::{
+    MANIFEST_FILENAME, Manifest, ManifestError, Published, compacted_generation,
+};
 use crate::partition::{PartitionKey, percent_encode_tenant};
 use crate::promoted::{PromotedAttributes, SERVICE_NAME_KEY, project_string_value};
 use crate::reader::{Reader, ReaderError};
 use crate::record_batch::mined_records_to_batch_with_promoted;
 use crate::store::{Store, StoreError};
 use crate::writer::{
-    ClusterKeys, DEFAULT_ZSTD_LEVEL, MAX_COMPACTED_RG_BYTES, SUB_BATCH_ROWS, Writer, WriterError,
+    ClusterKeys, CompactedOutput, MAX_COMPACTED_RG_BYTES, SUB_BATCH_ROWS, Writer, WriterError,
 };
 
 /// One hour in nanoseconds — the span a `…/hour=HH/` partition covers.
@@ -515,16 +517,15 @@ fn compact_sorted_hooked(
     // so a mis-partitioned input aborts the compaction instead of being
     // silently merged. Row groups rotate at the §3.3 compacted
     // threshold and the file declares the §3.4 `sorting_columns`.
-    let writer = Writer::open_in_compacted(
-        store,
-        partition.clone(),
-        DEFAULT_ZSTD_LEVEL,
-        promoted.clone(),
+    let generation = base_generation.saturating_add(1);
+    let output = CompactedOutput {
         keys,
-        tuning.compacted_flush_bytes,
+        flush_override: tuning.compacted_flush_bytes,
         estimated_output_bytes,
-    )
-    .map_err(CompactionError::Write)?;
+        generation,
+    };
+    let writer = Writer::open_in_compacted(store, partition.clone(), promoted.clone(), output)
+        .map_err(CompactionError::Write)?;
     let plan = SortPlan {
         store,
         partition,
@@ -541,7 +542,6 @@ fn compact_sorted_hooked(
     // names (the merged-away set) for the §3.6 audit event are already sorted
     // (the §3.1 tie-break order), so the event is deterministic regardless of
     // listing order.
-    let generation = base_generation.saturating_add(1);
     let input_files = basenames(&inputs);
     let commit = Manifest {
         generation,

@@ -281,9 +281,47 @@ pub enum Published {
     Lost,
 }
 
+/// The manifest generation a compaction output was written for, parsed
+/// from its name `<uuid>.g<generation>.parquet` (RFC 0009 §3.4 late-write
+/// note). `None` for any other name, a flush file `<uuid>.parquet`
+/// included. Only the canonical forms the writer emits parse: a
+/// lowercase hyphenated UUID and a generation without sign or leading
+/// zeros.
+#[must_use]
+pub fn compacted_generation(name: &str) -> Option<u64> {
+    let (uuid, digits) = name.strip_suffix(".parquet")?.rsplit_once(".g")?;
+    let canonical_uuid =
+        uuid::Uuid::try_parse(uuid).is_ok_and(|parsed| parsed.hyphenated().to_string() == uuid);
+    let generation: u64 = digits.parse().ok()?;
+    (canonical_uuid && digits == generation.to_string()).then_some(generation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compacted_generation_parses_only_the_written_form() {
+        let uuid = uuid::Uuid::now_v7();
+        assert_eq!(compacted_generation(&format!("{uuid}.g7.parquet")), Some(7));
+        assert_eq!(compacted_generation(&format!("{uuid}.g0.parquet")), Some(0));
+        for name in [
+            format!("{uuid}.parquet"),
+            format!("{uuid}.g07.parquet"),
+            format!("{uuid}.g+7.parquet"),
+            format!("{uuid}.g.parquet"),
+            format!("{uuid}.g7.parquet.tmp"),
+            format!("{}.g7.parquet", uuid.simple()),
+            format!(
+                "{}.g7.parquet",
+                uuid.hyphenated().to_string().to_uppercase()
+            ),
+            "manifest.json".to_owned(),
+            "x.g7.parquet".to_owned(),
+        ] {
+            assert_eq!(compacted_generation(&name), None, "{name}");
+        }
+    }
 
     #[test]
     fn round_trips_through_json() {

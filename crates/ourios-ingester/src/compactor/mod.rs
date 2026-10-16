@@ -633,25 +633,15 @@ impl Sweep<'_, '_> {
         });
     }
 
-    /// Reclaim the partition's orphans, then consolidate it; whether it
+    /// Consolidate the partition, then reclaim its orphans; whether it
     /// committed.
     fn consolidate(&mut self, target: Target<'_>, observe: Option<&mut SweepObserver<'_>>) -> bool {
         let Target { tenant, partition } = target;
-        // Reclaim orphans a prior crashed compaction of this partition
-        // left (RFC0009.4). Manifest-authoritative, so it never touches
-        // a live file; a scan error is recorded, not fatal.
-        match gc_orphans(self.store, partition) {
-            Ok(gc) => self.report.orphans_reclaimed += gc.reclaimed,
-            Err(e) => self.report.errors.push(format!(
-                "gc-orphans {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
-                partition.year, partition.month, partition.day, partition.hour,
-            )),
-        }
         let mut observe = observe.map(|observe| move |rows: &[MinedRecord]| observe(tenant, rows));
         let observe = observe
             .as_mut()
             .map(|observe| observe as &mut dyn FnMut(&[MinedRecord]));
-        match self.rewrite(target, observe, None) {
+        let committed = match self.rewrite(target, observe, None) {
             Ok(outcome) => {
                 self.report.gc_failures += outcome.gc_failures;
                 outcome.committed.is_some()
@@ -661,6 +651,25 @@ impl Sweep<'_, '_> {
                 e.record(&mut self.report, &context);
                 false
             }
+        };
+        self.reclaim_orphans(target);
+        committed
+    }
+
+    /// Reclaim the orphans a prior crashed compaction of the partition left
+    /// (RFC0009.4). It runs after the rewrite: a crashed output written for
+    /// the generation this rewrite just committed is dead only now
+    /// (RFC0009.17), and the partition may not be a candidate again.
+    /// Manifest-authoritative, so it never touches a live file; a scan
+    /// error is recorded, not fatal.
+    fn reclaim_orphans(&mut self, target: Target<'_>) {
+        let Target { tenant, partition } = target;
+        match gc_orphans(self.store, partition) {
+            Ok(gc) => self.report.orphans_reclaimed += gc.reclaimed,
+            Err(e) => self.report.errors.push(format!(
+                "gc-orphans {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
+                partition.year, partition.month, partition.day, partition.hour,
+            )),
         }
     }
 

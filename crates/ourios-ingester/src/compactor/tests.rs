@@ -534,6 +534,79 @@ fn rfc0009_12_erasure_rewrites_a_settled_partition_the_planner_skips() {
     assert_eq!(kept, vec![2], "the erased row is gone, the other kept");
 }
 
+/// Write `records` as one committed file in their partition; its key.
+fn write_records(store: &Store, records: &[MinedRecord]) -> String {
+    let partition = PartitionKey::derive(&records[0]).expect("derive");
+    let mut w = Writer::open_in(store, partition).expect("open writer");
+    w.append_records(records).expect("append");
+    w.close().expect("close").key
+}
+
+/// Lay down what a compactor killed before its commit leaves: a manifest
+/// at generation 1 naming the two inputs, and their consolidated rows
+/// under an unnamed output for generation 2. Returns that output's key.
+fn crash_before_commit(store: &Store, records: &[MinedRecord; 2]) -> String {
+    let inputs = [
+        write_records(store, &records[..1]),
+        write_records(store, &records[1..]),
+    ];
+    let staged = write_records(store, records);
+    let (prefix, _) = staged.rsplit_once('/').expect("partition prefix");
+    let manifest = ourios_parquet::Manifest {
+        generation: 1,
+        files: inputs
+            .iter()
+            .map(|k| k.rsplit_once('/').expect("name").1.to_owned())
+            .collect(),
+    };
+    store
+        .put_blocking(
+            &format!("{prefix}/{}", ourios_parquet::MANIFEST_FILENAME),
+            manifest.to_json().expect("json"),
+        )
+        .expect("manifest");
+    let output = format!(
+        "{}.g2.parquet",
+        staged.strip_suffix(".parquet").expect("suffix")
+    );
+    let bytes = store.get_blocking(&staged).expect("staged bytes");
+    store.put_blocking(&output, bytes).expect("output");
+    store.delete_blocking(&staged).expect("unstage");
+    output
+}
+
+/// RFC0009.17 through production sweeps: an output a crashed compaction
+/// wrote for generation 2 survives GC while the manifest is at 1, and the
+/// sweep that commits generation 2 reclaims it. The partition then has one
+/// live file and is never a candidate again, so a GC that ran only before
+/// the rewrite would leave the output forever.
+#[test]
+fn rfc0009_17_sweeps_reclaim_an_output_a_crashed_compaction_left() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    let records = [rec("a", 1, TS0), rec("a", 2, TS0 + 1_000_000)];
+    let partition = PartitionKey::derive(&records[0]).expect("derive");
+    let crashed = crash_before_commit(&store, &records);
+
+    let reports: Vec<_> = (0..2)
+        .map(|_| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep"))
+        .collect();
+
+    let compacted: Vec<_> = reports.iter().map(|r| r.partitions_compacted).collect();
+    assert_eq!(compacted, [1, 0], "compacted once, then settled");
+    let reclaimed: u64 = reports.iter().map(|r| r.orphans_reclaimed).sum();
+    assert_eq!(reclaimed, 1, "the crashed output is reclaimed");
+    let listed = store.list_blocking(Some("data/")).expect("list");
+    assert!(!listed.contains(&crashed), "{listed:?}");
+    let mut rows = Vec::new();
+    ourios_parquet::compaction::visit_partition_rows(&store, &partition, |batch| {
+        rows.extend(batch.iter().map(|r| r.template_id));
+    })
+    .expect("read");
+    rows.sort_unstable();
+    assert_eq!(rows, [1, 2], "every row read exactly once");
+}
+
 #[test]
 fn sweep_compacts_a_sealed_candidate() {
     // Arrange

@@ -7,6 +7,7 @@ use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 
 use super::*;
+use crate::writer::DEFAULT_ZSTD_LEVEL;
 
 mod bounded_sort;
 mod plan_cost;
@@ -591,12 +592,79 @@ fn rfc0009_4_post_commit_orphan_inputs_are_reclaimable() {
     );
 }
 
+/// Whether `key` is an object in [`partition`]'s prefix.
+fn is_listed(store: &Store, key: &str) -> bool {
+    store
+        .list_blocking(Some(&partition_data_prefix(&partition())))
+        .expect("list")
+        .iter()
+        .any(|k| k == key)
+}
+
+/// Write `rows` as an unnamed compaction output for `generation`, as a
+/// compactor that died before its commit leaves it.
+fn write_uncommitted_output(store: &Store, rows: &[MinedRecord], generation: u64) -> String {
+    let promoted = PromotedAttributes::default();
+    let output = CompactedOutput {
+        keys: ClusterKeys::for_promoted(&promoted),
+        flush_override: None,
+        estimated_output_bytes: 0,
+        generation,
+    };
+    let mut w = Writer::open_in_compacted(store, partition(), promoted, output).expect("writer");
+    w.append_records(rows).expect("append");
+    w.close().expect("close").key
+}
+
+/// Seed [`partition`]'s manifest at `generation`, naming `keys`.
+fn seed_generation(store: &Store, generation: u64, keys: &[String]) {
+    seed_manifest(
+        store,
+        &partition(),
+        &Manifest {
+            generation,
+            files: basenames(keys),
+        },
+    );
+}
+
+/// Run `gc_orphans` on [`partition`] and assert it reclaimed exactly
+/// `reclaimed` objects with no failed unlink.
+fn assert_gc_reclaims(store: &Store, reclaimed: u64, why: &str) {
+    let gc = gc_orphans(store, &partition()).expect("gc");
+    assert_eq!(
+        gc,
+        OrphanGc {
+            reclaimed,
+            failures: 0
+        },
+        "{why}"
+    );
+}
+
+/// Assert whether `key` is still listed, and that the partition reads
+/// exactly `rows`, each once.
+fn assert_object_and_rows(store: &Store, key: &str, listed: bool, rows: &[MinedRecord]) {
+    assert_eq!(is_listed(store, key), listed, "{key} listed");
+    assert_eq!(read_partition_rows(store), rows, "live rows");
+}
+
+/// Compact [`partition`] and return its won commit.
+fn commit_compaction(store: &Store) -> Committed {
+    compact_partition(store, &partition())
+        .expect("compact")
+        .committed
+        .expect("committed")
+}
+
 /// RFC0009.4 — crash BEFORE the commit swap: the manifest still names
-/// the inputs; the freshly written consolidated file is a dead orphan
-/// (the pre-commit generation). See the post-commit test for the
-/// shared crash-safety note.
+/// the inputs, and the freshly written consolidated file, written for
+/// generation 2, is not named. GC at generation 1 keeps it, because its
+/// compaction may still be about to commit (RFC0009.17); once another
+/// commit reaches generation 2 without naming it, it is dead and GC
+/// reclaims it. See the post-commit test for the shared crash-safety note.
 #[test]
-fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable() {
+fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimed_once_generation_passes() {
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
     let part = partition();
@@ -604,37 +672,94 @@ fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable() {
     write_file(&store, &[rec(8, TS0 + 2_000_000)]);
     let inputs = live_keys(&store, &part);
     let originals = read_partition_rows(&store);
-    seed_manifest(
-        &store,
-        &part,
-        &Manifest {
-            generation: 1,
-            files: basenames(&inputs),
-        },
-    );
-    let mut w = Writer::open_in(&store, part.clone()).expect("writer");
-    w.append_records(&originals).expect("append");
-    w.close().expect("close"); // consolidated present, NOT in manifest
+    seed_generation(&store, 1, &inputs);
+    let crashed = write_uncommitted_output(&store, &originals, 2);
+    assert!(crashed.ends_with(".g2.parquet"), "{crashed}");
     assert_eq!(
         read_partition_rows(&store),
         originals,
         "pre-commit reader sees only the inputs (consolidated invisible)",
     );
-    let gc = gc_orphans(&store, &part).expect("gc");
-    assert_eq!(
-        gc,
-        OrphanGc {
-            reclaimed: 1,
-            failures: 0
-        },
-        "orphan consolidated reclaimed"
+
+    assert_gc_reclaims(
+        &store,
+        0,
+        "the generation-2 output is in flight at generation 1",
     );
+    assert_object_and_rows(&store, &crashed, true, &originals);
     assert_eq!(
         live_keys(&store, &part).len(),
         inputs.len(),
         "inputs stay live"
     );
-    assert_eq!(read_partition_rows(&store), originals, "inputs intact");
+
+    let committed = commit_compaction(&store);
+    assert_eq!(committed.generation, 2);
+    assert_ne!(committed.file, basename(&crashed));
+    assert_gc_reclaims(
+        &store,
+        1,
+        "the crashed output is dead once generation 2 is committed without it",
+    );
+    assert_object_and_rows(&store, &crashed, false, &originals);
+}
+
+/// RFC0009.17 — GC keeps a compaction output written for a generation the
+/// manifest has not reached, and reclaims it once a commit reaches that
+/// generation without naming it.
+#[test]
+fn rfc0009_17_gc_keeps_an_output_for_a_future_generation() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_file(&store, &[rec(1, TS0)]);
+    let inputs = live_keys(&store, &partition());
+    let rows = read_partition_rows(&store);
+    seed_generation(&store, 3, &inputs);
+    let in_flight = write_uncommitted_output(&store, &rows, 4);
+
+    assert_gc_reclaims(
+        &store,
+        0,
+        "an output for generation 4 survives GC at generation 3",
+    );
+    assert_object_and_rows(&store, &in_flight, true, &rows);
+
+    seed_generation(&store, 4, &inputs);
+    assert_gc_reclaims(&store, 1, "generation 4 committed without it: dead");
+    assert_object_and_rows(&store, &in_flight, false, &rows);
+}
+
+/// RFC0009.16 — a lost-CAS leftover (an unnamed output for a generation
+/// the winner already committed) is never read and GC reclaims it.
+#[test]
+fn rfc0009_16_a_lost_cas_leftover_is_never_live() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_file(&store, &[rec(1, TS0)]);
+    write_file(&store, &[rec(2, TS0 + 1_000_000)]);
+    let originals = read_partition_rows(&store);
+    let winner = commit_compaction(&store);
+    let leftover = write_uncommitted_output(&store, &originals, winner.generation);
+
+    assert_object_and_rows(&store, &leftover, true, &originals);
+    assert_gc_reclaims(&store, 1, "the leftover's generation is already committed");
+    assert_object_and_rows(&store, &leftover, false, &originals);
+}
+
+#[test]
+fn compaction_names_its_output_for_the_committed_generation() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_file(&store, &[rec(1, TS0)]);
+    write_file(&store, &[rec(2, TS0 + 1_000_000)]);
+    let committed = compact_partition(&store, &partition())
+        .expect("compact")
+        .committed
+        .expect("committed");
+    assert_eq!(
+        crate::manifest::compacted_generation(&committed.file),
+        Some(committed.generation)
+    );
 }
 
 /// RFC0009.4 — a stray `*.parquet.tmp` with NO manifest (glob live

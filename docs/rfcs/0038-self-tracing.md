@@ -30,6 +30,17 @@ superseded-by: —
 > other three `ourios.file_set.*` counts and the S3 variant land (#986).
 > RFC0038.8–.11 stay `drafted`.
 
+> **Status update (2026-10-16, maintainer-approved) — RFC0038.1's query arm
+> is `green`.** `resolve files` now carries all four `ourios.file_set.*`
+> counts, asserted by `resolution_spans_the_file_set_under_the_query` and
+> `a_narrow_window_counts_only_the_partitions_it_reaches`. The S3 variant,
+> `s3_resolution_requests_nest_under_the_phase`, passes in the
+> `s3-integration` CI job. `infer schema` is covered by
+> `schema_inference_spans_the_gap_between_resolution_and_the_scan` and
+> `a_failed_inference_marks_its_phase_as_an_error`. All are in
+> `crates/ourios-querier/tests/it/rfc0038_file_set_span.rs` (#986).
+> RFC0038.8–.11 stay `drafted`.
+
 > **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
 > the completed-backlog batch flip. Where a thesis-gate applies it
 > stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is

@@ -377,3 +377,41 @@ pub fn visit_partition_rows(
     }
     Ok(())
 }
+
+/// What an erasure's confirming pass (RFC 0009 §3.4 erasure note) reads of one
+/// partition: its manifest generation (`0` with no manifest) and how many live
+/// flush files it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionSnapshot {
+    /// The manifest generation, `0` when the partition has no manifest.
+    pub generation: u64,
+    /// Listed flush files the manifest does not consume.
+    pub live_flush_files: usize,
+}
+
+/// Read `partition`'s [`PartitionSnapshot`], listing before reading the
+/// manifest as every reader does (RFC 0009 §3.4, reader order): a commit
+/// between the two reads shows as a newer generation.
+///
+/// # Errors
+///
+/// [`CompactionError`] on a listing or manifest-read failure.
+pub fn partition_snapshot(
+    store: &Store,
+    partition: &PartitionKey,
+) -> Result<PartitionSnapshot, CompactionError> {
+    let listed = list_partition(store, partition)?;
+    let manifest = read_manifest(store, partition)?;
+    let prefix = partition_data_prefix(partition);
+    let live = LiveSet::new(manifest.as_ref());
+    let live_flush_files = listed
+        .iter()
+        .filter(|key| is_committed_parquet(key) && is_immediate_child(key, &prefix))
+        .map(|key| basename(key))
+        .filter(|name| compacted_generation(name).is_none() && live.is_live(name))
+        .count();
+    Ok(PartitionSnapshot {
+        generation: manifest.map_or(0, |m| m.generation),
+        live_flush_files,
+    })
+}

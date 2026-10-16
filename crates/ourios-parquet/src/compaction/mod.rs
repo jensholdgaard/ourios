@@ -77,7 +77,8 @@ use keys::*;
 #[allow(unused_imports, clippy::wildcard_imports)]
 use plan::*;
 pub use plan::{
-    PlanCounts, hour_partitions, plan_candidates, plan_candidates_counted, visit_partition_rows,
+    PartitionSnapshot, PlanCounts, hour_partitions, partition_snapshot, plan_candidates,
+    plan_candidates_counted, visit_partition_rows,
 };
 #[allow(unused_imports, clippy::wildcard_imports)]
 use sort::*;
@@ -159,6 +160,13 @@ pub struct CompactionPolicy {
     /// sealed, absorbing late-arriving records (RFC 0009 §3.3, default
     /// 15 min), in nanoseconds.
     pub grace_nanos: u64,
+    /// How old an erasure request's marker must be, by the store's clock,
+    /// before the sweep starts its rows phase (RFC 0009 §3.4 erasure note,
+    /// `erasure_settle`), in nanoseconds: long enough that the receivers
+    /// have published what they acknowledged before the request. `0` here,
+    /// so a library caller erases at once; the server sets the RFC default,
+    /// twice the receiver's maximum flush interval plus `grace_nanos`.
+    pub erasure_settle_nanos: u64,
 }
 
 impl Default for CompactionPolicy {
@@ -167,6 +175,7 @@ impl Default for CompactionPolicy {
             min_files: 4,
             small_file_bytes: 128 * 1024 * 1024,
             grace_nanos: 15 * 60 * 1_000_000_000,
+            erasure_settle_nanos: 0,
         }
     }
 }

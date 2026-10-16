@@ -63,13 +63,16 @@ fn is_plain_opaque_tag(tag: &str) -> bool {
 pub type EtaggedBytes = (Vec<u8>, Option<String>);
 
 /// One object of a recursive listing, as returned by
-/// [`Store::list_objects_blocking`]: its store-relative key, its size, and
-/// the `ETag` the backend listed for it (`None` when it lists none).
+/// [`Store::list_objects_blocking`]: its store-relative key, its size, the
+/// `ETag` the backend listed for it (`None` when it lists none), and when the
+/// store last modified it, by the store's own clock (Unix nanoseconds; `0` for
+/// an instant before the epoch or past the nanosecond range).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListedObject {
     pub key: String,
     pub size: u64,
     pub e_tag: Option<String>,
+    pub last_modified_unix_nanos: u64,
 }
 
 /// One `/`-delimited level of a listing, as returned by
@@ -746,10 +749,16 @@ impl Store {
                     .map(|p| p.as_ref().to_owned())
                     .collect::<Vec<_>>()
                     .join("/");
+                let last_modified_unix_nanos = m
+                    .last_modified
+                    .timestamp_nanos_opt()
+                    .and_then(|nanos| u64::try_from(nanos).ok())
+                    .unwrap_or(0);
                 Some(ListedObject {
                     key,
                     size: m.size,
                     e_tag: m.e_tag,
+                    last_modified_unix_nanos,
                 })
             })
             .collect();

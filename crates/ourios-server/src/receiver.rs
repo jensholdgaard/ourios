@@ -63,7 +63,7 @@ const SNAPSHOTS_DIR: &str = "snapshots";
 /// how long a low-volume partition's data stays unqueryable; `ceiling_bytes`
 /// is the hard cap on total buffered bytes (RFC0014.4).
 const SINK_TARGET_BYTES: usize = 256 * 1024 * 1024;
-const SINK_MAX_BUFFER_AGE: Duration = Duration::from_secs(300);
+pub(crate) const SINK_MAX_BUFFER_AGE: Duration = Duration::from_secs(300);
 const SINK_CEILING_BYTES: usize = 1024 * 1024 * 1024;
 /// How often the age sweep runs (≤ `SINK_MAX_BUFFER_AGE`): an aged partition
 /// flushes within `SINK_MAX_BUFFER_AGE + SINK_FLUSH_TICK`.

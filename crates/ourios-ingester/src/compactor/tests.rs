@@ -157,11 +157,24 @@ fn rfc0038_1_sweep_emits_its_span_and_one_plan_phase() {
     assert_eq!(spans.len(), 2, "exactly two spans total, got {spans:?}");
     let sweep = only_span(&spans, "sweep partitions");
     let plan = only_span(&spans, "plan partitions");
-    assert_eq!(sweep.span_kind, SpanKind::Internal);
-    assert_eq!(plan.span_kind, SpanKind::Internal);
-    assert_eq!(sweep.parent_span_id, SpanId::INVALID, "the sweep is a root");
-    assert_eq!(plan.parent_span_id, sweep.span_context.span_id());
-    assert_eq!(plan.span_context.trace_id(), sweep.span_context.trace_id());
+    assert_eq!(
+        (&sweep.span_kind, &plan.span_kind),
+        (&SpanKind::Internal, &SpanKind::Internal),
+        "both spans are INTERNAL",
+    );
+    assert_eq!(
+        (
+            sweep.parent_span_id,
+            plan.parent_span_id,
+            plan.span_context.trace_id(),
+        ),
+        (
+            SpanId::INVALID,
+            sweep.span_context.span_id(),
+            sweep.span_context.trace_id(),
+        ),
+        "the sweep is a root, and the plan phase its child in the same trace",
+    );
 }
 
 /// RFC0038.17 — `plan partitions` counts the planning's listings and
@@ -199,8 +212,10 @@ fn the_plan_phase_counts_its_listings_and_manifest_reads() {
     assert_eq!(result.expect("sweep").partitions_compacted, 1);
     let sweep = only_span(&spans, "sweep partitions");
     let plan = only_span(&spans, "plan partitions");
-    assert_eq!(plan_counts(plan), counts(9, 2, 1));
-    assert_eq!(plan.status, Status::Unset);
+    assert_eq!(
+        (plan_counts(plan), &plan.status),
+        (counts(9, 2, 1), &Status::Unset)
+    );
     assert!(sweep.start_time <= plan.start_time && plan.end_time <= sweep.end_time);
     let first_commit = first_commit.expect("a partition committed");
     assert!(
@@ -237,9 +252,14 @@ fn a_failed_tenant_plan_marks_the_plan_phase_error() {
         "{:?}",
         plan.status
     );
-    assert_eq!(attr(plan, "error.type"), Some("io".into()));
-    assert_eq!(plan_counts(plan), counts(6, 2, 1));
-    assert_eq!(only_span(&spans, "sweep partitions").status, Status::Unset);
+    assert_eq!(
+        (
+            attr(plan, "error.type"),
+            plan_counts(plan),
+            &only_span(&spans, "sweep partitions").status,
+        ),
+        (Some("io".into()), counts(6, 2, 1), &Status::Unset),
+    );
 }
 
 /// RFC0038.17 — a store with no tenant still has its (empty) planning

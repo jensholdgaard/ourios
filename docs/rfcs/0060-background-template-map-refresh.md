@@ -564,10 +564,15 @@ and are `drafted`.
 > - **When** another process deletes the artifact after a pass's tenant
 >   listing and before the pass decides
 > - **Then** that pass skips: it reads nothing and publishes nothing
-> - **And** the next pass's listing shows no artifact, and that pass
->   acquires a `miss`, folds and publishes
-> - **And** a query between the two passes answers correctly, paying the
->   fold itself.
+> - **And** a query between the two passes answers correctly. Its
+>   lookup is a `miss`, it pays the fold itself, and its usual
+>   write-through (RFC 0033 §3.5) may republish the artifact
+> - **And** if the artifact is still absent at the next pass's listing,
+>   that pass acquires a `miss`, folds and publishes
+> - **And** if a query republished it instead, the next pass reads the
+>   artifact the listing shows. Should that artifact restore the
+>   verified frontier and tag, the pass may skip under §3.7; a hit is not
+>   required.
 
 ## 6. Testing strategy
 

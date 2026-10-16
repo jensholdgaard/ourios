@@ -1068,7 +1068,7 @@ per orphan for each partition it visits, which is the §3.7 rule for a phase spa
 | Kind | `INTERNAL` |
 | Parent | `sweep partitions` |
 | Opens / ends | around the GC of every partition the plan marks for GC, for every tenant whose planning succeeded: the candidates, then the sealed non-candidates whose listing shows an orphan (RFC 0009 §3.6, "Which partitions"). It opens after the consolidation pass's last rewrite and before the RFC 0047 erasure pass, and starts after `plan partitions` ends. |
-| Cardinality | **exactly one** per sweep whose tenant enumeration succeeds, also when there is no candidate (the counts are then zero); **none** when the enumeration fails, since the sweep then ends before planning |
+| Cardinality | **exactly one** per sweep whose tenant enumeration succeeds, also when there is nothing to reclaim; **none** when the enumeration fails, since the sweep then ends before planning. A sweep with no candidate still reclaims from the sealed partitions whose listing shows an orphan (RFC 0009 §3.6, RFC0009.26) and reports them in `reclaimed_count`; the counts are zero only when no partition the plan marks for GC holds an orphan (for example an empty store) |
 | Status | `Error` iff the GC of at least one partition failed, either its scan (an unreadable manifest or a failed listing) or the delete of at least one orphan. `error.type` is the first such failure's class, in pass order: a scan failure takes the class `sweep partitions` already uses (`read`, `write`, `manifest`, `io`, `_OTHER`), and a failed delete is `io`. `Unset` otherwise. The sweep goes on either way, so `sweep partitions` stays `Unset` (its existing rule). |
 | Required attributes | `ourios.compaction.orphan.reclaimed_count`, `ourios.compaction.orphan.failed_count`, summed over every partition GC'd |
 
@@ -1526,8 +1526,10 @@ The following scenario is added by the 2026-10-16 orphan-GC amendment
 > sweep's last committed partition, and lies within its parent's interval,
 > **And** its `ourios.compaction.orphan.reclaimed_count` is 2, its
 > `ourios.compaction.orphan.failed_count` is 0, and its status is `Unset`,
-> **And** on a store with no orphan (or no candidate), the span is still
-> there with both counts 0,
+> **And** on a store with no orphan (a candidate without one, or an empty
+> store), the span is still there with both counts 0,
+> **And** a sweep with no candidate that finds an orphan beside a settled
+> partition reports it in `reclaimed_count` (RFC0009.26),
 > **And** when an orphan's delete fails (its partition directory is
 > read-only), `reclaim orphans` has status `Error` with
 > `error.type = io` and `failed_count` 1, and `sweep partitions` stays
@@ -1763,8 +1765,11 @@ Mapped to `CLAUDE.md` §6.2:
 >   - `the_reclaim_phase_counts_the_orphans_it_deleted`: two orphans, the
 >     two counts, `Unset`, the interval after `plan partitions` and after
 >     the last commit callback;
->   - `an_idle_reclaim_phase_still_spans_with_zero_counts`: a candidate with
->     no orphan, and an empty store;
+>   - `an_idle_reclaim_phase_still_spans_with_zero_counts`: no orphan
+>     anywhere, as a candidate without one and as an empty store;
+>   - `rfc0009_26_a_later_sweep_reclaims_what_an_interrupted_one_left`
+>     (RFC 0009's test, also asserting this span): no candidate,
+>     `reclaimed_count` 1;
 >   - `a_failed_orphan_delete_marks_the_reclaim_phase_error`: a read-only
 >     partition directory holding an orphan; `Error`, `error.type = io`,
 >     `failed_count` 1, and `sweep partitions` `Unset`.

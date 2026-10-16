@@ -490,8 +490,12 @@ fn compact_sorted_hooked(
             Published::Lost => return Ok(no_op_outcome(inputs.len())),
         }
         // Re-read to learn the bootstrap generation's ETag for the CAS commit
-        // (the S3 path; the local overwrite commit ignores it).
-        (1, read_manifest_etag(store, &key)?)
+        // (the S3 path; the local overwrite commit ignores it). A peer that
+        // committed in between owns the partition now: back off.
+        match bootstrap_etag(store, &key, &bootstrap)? {
+            Claim::Held { etag } => (1, etag),
+            Claim::Overtaken => return Ok(no_op_outcome(inputs.len())),
+        }
     };
 
     // RFC 0036 §3.3 adaptive row-group threshold: estimate the output size

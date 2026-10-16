@@ -18,11 +18,30 @@ pub(super) fn live_file_keys(
     partition: &PartitionKey,
     manifest: Option<&Manifest>,
 ) -> Result<Vec<String>, CompactionError> {
+    let keys = list_partition(store, partition)?;
+    Ok(live_keys_of(partition, manifest, keys))
+}
+
+/// Every object key under the partition's prefix.
+pub(super) fn list_partition(
+    store: &Store,
+    partition: &PartitionKey,
+) -> Result<Vec<String>, CompactionError> {
+    let prefix = partition_data_prefix(partition);
+    store
+        .list_blocking(Some(&prefix))
+        .map_err(|e| store_io("list", &prefix, e))
+}
+
+/// The live keys among a partition listing `keys` under `manifest`; see
+/// [`live_file_keys`].
+pub(super) fn live_keys_of(
+    partition: &PartitionKey,
+    manifest: Option<&Manifest>,
+    keys: Vec<String>,
+) -> Vec<String> {
     let prefix = partition_data_prefix(partition);
     let live = LiveSet::new(manifest);
-    let keys = store
-        .list_blocking(Some(&prefix))
-        .map_err(|e| store_io("list", &prefix, e))?;
     let named = manifest
         .into_iter()
         .flat_map(|m| &m.files)
@@ -34,7 +53,7 @@ pub(super) fn live_file_keys(
             && compacted_generation(name).is_none()
             && live.is_live(name)
     });
-    Ok(named.chain(flush).collect())
+    named.chain(flush).collect()
 }
 
 /// Sum the on-disk byte sizes of the partition's live input files — the
@@ -74,17 +93,33 @@ pub(super) fn read_manifest(
         .map(|(manifest, _etag)| manifest))
 }
 
-/// Re-read `key`'s manifest `ETag` after a successful bootstrap publish — the
-/// compare-and-swap token the S3 commit needs. `None` if the backend exposes no
-/// `ETag` or the manifest vanished under us (the latter only under concurrency;
-/// the commit then falls back to a create-if-absent that a winning peer loses).
-pub(super) fn read_manifest_etag(
+/// Re-read `key`'s manifest after a successful bootstrap publish, taking the
+/// `ETag` from the same read as the content: the compare-and-swap token the S3
+/// commit needs. [`Claim::Held`] only while the manifest is still exactly
+/// `bootstrap`; [`Claim::Overtaken`] when a peer has already committed over
+/// it, or it vanished.
+pub(super) fn bootstrap_etag(
     store: &Store,
     key: &str,
-) -> Result<Option<String>, CompactionError> {
-    Ok(Manifest::read_with_etag(store, key)
-        .map_err(CompactionError::Manifest)?
-        .and_then(|(_manifest, etag)| etag))
+    bootstrap: &Manifest,
+) -> Result<Claim, CompactionError> {
+    Ok(
+        match Manifest::read_with_etag(store, key).map_err(CompactionError::Manifest)? {
+            Some((read, etag)) if read == *bootstrap => Claim::Held { etag },
+            _ => Claim::Overtaken,
+        },
+    )
+}
+
+/// Whether this compaction still owns the bootstrap it published.
+pub(super) enum Claim {
+    /// The manifest is still the bootstrap; `etag` is the compare-and-swap
+    /// token for the commit (`None` if the backend exposes none).
+    Held { etag: Option<String> },
+    /// A peer committed over the bootstrap. Back off: a commit based on the
+    /// bootstrap would overwrite the peer's output and consumed list with
+    /// this compaction's stale view of the inputs.
+    Overtaken,
 }
 
 /// An outcome that **committed nothing** (`committed: None`, zero rows/bytes):

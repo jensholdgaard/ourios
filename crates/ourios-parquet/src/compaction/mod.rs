@@ -26,7 +26,7 @@
 //! of which needs local-path canonicalisation.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 

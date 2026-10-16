@@ -24,9 +24,16 @@ use super::*;
 /// `policy.small_file_bytes`. The list is ordered chronologically (oldest
 /// partition first), deterministic across runs.
 ///
+/// The decision is read from one recursive listing of the tenant's data
+/// prefix (RFC 0009 §3.3, 2026-10-16 amendment). A partition's manifest is
+/// read only when two or more committed files are listed there: fewer can't
+/// hold two live files whatever the manifest names, so a settled partition
+/// costs no request of its own and planning scales with the tenant's object
+/// count, not its retained hours.
+///
 /// # Errors
 ///
-/// [`CompactionError::Io`] if a [`Store`] listing fails, or
+/// [`CompactionError::Io`] if the [`Store`] listing fails, or
 /// [`CompactionError::Manifest`] if a partition's manifest can't be read while
 /// counting its live files.
 pub fn plan_candidates(
@@ -36,13 +43,125 @@ pub fn plan_candidates(
     policy: &CompactionPolicy,
 ) -> Result<Vec<PartitionKey>, CompactionError> {
     let mut selected = Vec::new();
-    for partition in hour_partitions(store, tenant)? {
-        if is_sealed(&partition, now_unix_nanos, policy) && is_candidate(store, &partition, policy)?
+    for (partition, listed) in listed_partitions(store, tenant)? {
+        if is_sealed(&partition, now_unix_nanos, policy)
+            && listed.is_candidate(store, &partition, policy)?
         {
             selected.push(partition);
         }
     }
     Ok(selected)
+}
+
+/// What a tenant listing shows directly inside one hour partition.
+#[derive(Debug, Default)]
+pub(super) struct ListedPartition {
+    /// Committed `*.parquet` objects as `(file name, size in bytes)`.
+    files: Vec<(String, u64)>,
+    has_manifest: bool,
+}
+
+impl ListedPartition {
+    /// Whether the partition is worth compacting per `policy` (see
+    /// [`meets_policy`]). The live set is the listed files, restricted to the
+    /// manifest's names when a manifest is listed; that manifest is read only
+    /// when two or more files are listed, since fewer can't be two live files.
+    fn is_candidate(
+        &self,
+        store: &Store,
+        partition: &PartitionKey,
+        policy: &CompactionPolicy,
+    ) -> Result<bool, CompactionError> {
+        if self.files.len() < 2 {
+            return Ok(false);
+        }
+        let manifest = if self.has_manifest {
+            read_manifest(store, partition)?
+        } else {
+            None
+        };
+        let live: Option<HashSet<&str>> = manifest
+            .as_ref()
+            .map(|m| m.files.iter().map(String::as_str).collect());
+        let sizes: Vec<u64> = self
+            .files
+            .iter()
+            .filter(|(name, _)| live.as_ref().is_none_or(|l| l.contains(name.as_str())))
+            .map(|(_, size)| *size)
+            .collect();
+        Ok(meets_policy(&sizes, policy))
+    }
+}
+
+/// The RFC 0009 §3.3 candidate test over a partition's live file sizes: at
+/// least two files, and either more than `min_files` of them or one smaller
+/// than `small_file_bytes`.
+pub(super) fn meets_policy(sizes: &[u64], policy: &CompactionPolicy) -> bool {
+    sizes.len() >= 2
+        && (sizes.len() > policy.min_files
+            || sizes.iter().any(|&len| len < policy.small_file_bytes))
+}
+
+/// Group one recursive listing of the tenant's data prefix by hour partition,
+/// oldest first. Only objects directly inside a canonical
+/// `year=YYYY/month=MM/day=DD/hour=HH/` prefix count, as in
+/// [`hour_partitions`]; anything nested deeper or under a non-canonical
+/// segment is not a partition input.
+pub(super) fn listed_partitions(
+    store: &Store,
+    tenant: &str,
+) -> Result<Vec<(PartitionKey, ListedPartition)>, CompactionError> {
+    let root = format!("data/tenant_id={}", percent_encode_tenant(tenant));
+    let entries = store
+        .list_with_sizes_blocking(Some(&root))
+        .map_err(|e| store_io("list", &root, e))?;
+    let mut partitions: BTreeMap<Hour, ListedPartition> = BTreeMap::new();
+    for (key, size) in &entries {
+        let Some((hour, name)) = key
+            .strip_prefix(root.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(parse_partition_object)
+        else {
+            continue;
+        };
+        let listed = partitions.entry(hour).or_default();
+        if name == MANIFEST_FILENAME {
+            listed.has_manifest = true;
+        } else if is_committed_parquet(name) {
+            listed.files.push((name.to_owned(), *size));
+        }
+    }
+    Ok(partitions
+        .into_iter()
+        .map(|((year, month, day, hour), listed)| {
+            let partition = PartitionKey {
+                tenant_id: tenant.to_owned(),
+                year,
+                month,
+                day,
+                hour,
+            };
+            (partition, listed)
+        })
+        .collect())
+}
+
+/// An hour partition's `(year, month, day, hour)`, ordered chronologically.
+type Hour = (i32, u32, u32, u32);
+
+/// Split a tenant-relative key `year=YYYY/month=MM/day=DD/hour=HH/<name>` into
+/// its hour and object name; `None` for any other shape.
+fn parse_partition_object(relative: &str) -> Option<(Hour, &str)> {
+    let mut segments = relative.split('/');
+    let year = parse_partition_segment(segments.next()?, "year", 4)?;
+    let month = parse_partition_segment(segments.next()?, "month", 2)?;
+    let day = parse_partition_segment(segments.next()?, "day", 2)?;
+    let hour = parse_partition_segment(segments.next()?, "hour", 2)?;
+    let name = segments.next().filter(|name| !name.is_empty())?;
+    if segments.next().is_some() {
+        return None;
+    }
+    Some(((i32::try_from(year).ok()?, month, day, hour), name))
 }
 
 /// Whether the partition's hour ended at least `grace_nanos` before `now` (the
@@ -70,44 +189,6 @@ pub(super) fn is_sealed(
         >= start
             .saturating_add(HOUR_NANOS)
             .saturating_add(policy.grace_nanos)
-}
-
-/// Whether a partition is worth compacting per `policy`: at least two live
-/// files, and either more than `min_files` of them or one smaller than
-/// `small_file_bytes`. Resolves the live set + sizes from one
-/// [`Store::list_with_sizes_blocking`] — when a manifest is present it restricts
-/// the live set to the named files; otherwise every committed `*.parquet` under
-/// the prefix is live (the glob fallback).
-pub(super) fn is_candidate(
-    store: &Store,
-    partition: &PartitionKey,
-    policy: &CompactionPolicy,
-) -> Result<bool, CompactionError> {
-    let prefix = partition_data_prefix(partition);
-    let manifest = read_manifest(store, partition)?;
-    let live_names: Option<HashSet<&str>> = manifest
-        .as_ref()
-        .map(|m| m.files.iter().map(String::as_str).collect());
-    let entries = store
-        .list_with_sizes_blocking(Some(&prefix))
-        .map_err(|e| store_io("list", &prefix, e))?;
-    let sizes: Vec<u64> = entries
-        .iter()
-        .filter(|(key, _)| is_committed_parquet(key) && is_immediate_child(key, &prefix))
-        .filter(|(key, _)| {
-            live_names
-                .as_ref()
-                .is_none_or(|n| n.contains(basename(key)))
-        })
-        .map(|(_, size)| *size)
-        .collect();
-    if sizes.len() < 2 {
-        return Ok(false);
-    }
-    if sizes.len() > policy.min_files {
-        return Ok(true);
-    }
-    Ok(sizes.iter().any(|&len| len < policy.small_file_bytes))
 }
 
 /// Enumerate the tenant's `year=/month=/day=/hour=` leaf partitions that hold

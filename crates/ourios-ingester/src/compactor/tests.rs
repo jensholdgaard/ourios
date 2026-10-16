@@ -430,11 +430,13 @@ fn sweep_scans_every_tenant() {
 #[test]
 fn sweep_isolates_a_failing_tenant() {
     // Arrange — tenant "a" is a healthy sealed candidate; tenant
-    // "b" has a malformed manifest.json, so planning it errors.
+    // "b" has a malformed manifest.json, so planning it errors. b holds two
+    // files: planning reads a manifest only where two or more are listed
+    // (RFC 0009 §3.3, 2026-10-16 amendment).
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
     write_sealed_candidate(&store, "a");
-    write_file(&store, "b", 1, TS0);
+    write_sealed_candidate(&store, "b");
     // Corrupt b's manifest on the local store (its partition dir exists
     // after the write above); planning b then fails to parse it.
     let b_dir = PartitionKey::derive(&rec("b", 1, TS0))

@@ -34,13 +34,16 @@ superseded-by: —
 > `ETag` of its last verified hit. When its next listing shows the same
 > frontier and the same `ETag`, it stops there instead of reading the
 > artifact again. The skipped read could only have been a hit, so the
-> freshness argument of §2.1 is unchanged and queries are untouched. It
+> freshness argument of §2.1 holds for every change that completed before
+> the listing. A change that lands between the listing and the skipped
+> read is repaired one pass late (§3.7). Queries are untouched. It
 > does not shrink the per-tenant listing itself, which is most of a
 > pass's requests on a tenant with a long audit history; §7 lists the
 > options for that as open questions for the maintainer. In-place notes
-> in §3.3, §3.5 and §6; new scenarios RFC0060.12–.15 (`drafted`); §9
-> records the history. The frontmatter status and RFC0060.1–.11 are
-> unchanged.
+> in §3.3, §3.5 and §6, and an amended RFC0060.10 (a hit or publish no
+> longer forces an acquisition on the next pass, only a listing). New
+> scenarios RFC0060.12–.16 (`drafted`); §9 records the history. The
+> frontmatter status and RFC0060.1–.9 and .11 are unchanged.
 
 ## 1. Summary
 
@@ -320,9 +323,25 @@ lists and reads for itself. S3's listings are strongly consistent, so
 the listing reflects every write and delete that completed before it,
 by any process: another querier replica, an ingester elsewhere, or a
 bucket lifecycle rule. That is why the proof needs no in-process
-signal and holds in multi-process deployments. A write that lands
-after the listing is the race every acquisition already has between
-its `LIST` and its `GET`. The next pass sees it.
+signal and holds in multi-process deployments.
+
+**The one interleaving it does not cover.** The proof is about the
+store as the listing saw it. The artifact `GET` is not pinned to the
+listed version: it reads whatever is at the key when it runs. If
+another process replaces or deletes the artifact after the listing and
+before that `GET`, the acquisition the skip replaces would have read the
+new state. On a deletion it would have folded and published. The skip
+does neither. So "exactly the store after the acquisition it replaces"
+holds for every change that completed before the listing, and not for
+one that lands between the listing and the would-be `GET`. That change
+is in the next pass's listing (a different tag, or no artifact) and is
+repaired there. The repair is late by at most one pass, `interval` plus
+the pass's run time. This RFC accepts that delay. Query correctness
+does not depend on it: a query in that window lists and reads for
+itself, and pays the fold that the old pass might have paid. The same
+window already exists without §3.7 for a change that lands just after a
+pass's `GET`. §3.7 moves the window's start from the `GET` to the
+listing, a few milliseconds earlier. RFC0060.16 states the behaviour.
 
 **Tags.** On the S3 backend the tag is the object's `ETag`, compared
 after stripping one pair of surrounding double quotes, since some
@@ -470,6 +489,13 @@ path, and a second publisher contends for the CAS.
 >   pass again
 > - **And** once a successful listing no longer names the tenant, its
 >   counter is dropped; a failed listing drops nothing.
+>
+> *Amendment 2026-10-16 (#1008, `drafted`).* The third **And** becomes:
+> after a hit or a publish, back-off no longer skips the tenant. The next
+> pass lists it, and acquires it unless §3.7's skip applies; RFC0060.12
+> says when it does. After a publish the skip never applies on the next
+> pass, since a publish leaves no verified listing (RFC0060.14), so the
+> existing test's "a hit, on the next pass" after a publish still holds.
 
 > **Scenario RFC0060.11 — Passes are spaced from their end, never overlap**
 > - **Given** paused time, `interval: 5m`, and a pass whose fold is
@@ -496,20 +522,29 @@ and are `drafted`.
 > - **Given** a tenant with a verified listing
 > - **When** before the next pass (a) a new audit object appears, (b) an
 >   audit object is removed, (c) another writer replaces the artifact
->   with one at the same frontier, or (d) the artifact is removed
+>   with a valid one at the same frontier whose tag differs from the
+>   verified one, or (d) the artifact is removed
 > - **Then** that pass runs the acquisition: (a) and (b) are `stale`
 >   lookups and fold, (c) is a `hit` that records a new verified
 >   listing, and (d) is a `miss` that folds in full and publishes
 > - **And** in every case the store afterwards equals what the
->   acquisition would leave without §3.7.
+>   acquisition would leave without §3.7
+> - **And** a replacement with the same bytes that keeps the same
+>   `ETag` (a single-part S3 `PUT` of identical content) is not a
+>   change: the pass skips it, correctly, since a read would return the
+>   same bytes.
 
 > **Scenario RFC0060.14 — Only a verified hit is remembered**
 > - **Given** a tenant whose pass acquisition publishes (a stale or
 >   missing artifact), abstains, fails, or reads an artifact whose tag
 >   differs from the listed one
-> - **When** the next pass lists the same frontier
+> - **When** the next pass that §3.3's back-off does not skip for that
+>   tenant lists the same frontier (the very next pass after a publish
+>   or a mismatched read; a later one after an abstention or failure)
 > - **Then** it reads the artifact (no skip), and only after that read
 >   is a hit with matching tags does a later pass skip
+> - **And** the back-off is unchanged by §3.7: an abstention or failure
+>   still skips the passes §3.3 says, and drops the verified listing
 > - **And** once a successful tenant listing no longer names a tenant,
 >   its verified listing is dropped; a failed listing drops nothing.
 
@@ -519,8 +554,20 @@ and are `drafted`.
 > - **Then** its `load template_map` span has its `S3.ListObjectsV2`
 >   children and no `S3.GetObject` child, and carries no
 >   `ourios.template_map.lookup.outcome`
-> - **And** after another writer `PUT`s a different artifact, the next
->   pass has an `S3.GetObject` child again.
+> - **And** after another writer `PUT`s an artifact with different
+>   bytes (so a different `ETag`), the next pass has an `S3.GetObject`
+>   child again.
+
+> **Scenario RFC0060.16 — A deletion after the listing is repaired one
+> pass late**
+> - **Given** a tenant with a verified listing
+> - **When** another process deletes the artifact after a pass's tenant
+>   listing and before the pass decides
+> - **Then** that pass skips: it reads nothing and publishes nothing
+> - **And** the next pass's listing shows no artifact, and that pass
+>   acquires a `miss`, folds and publishes
+> - **And** a query between the two passes answers correctly, paying the
+>   fold itself.
 
 ## 6. Testing strategy
 
@@ -548,6 +595,7 @@ already cover what it calls.
 > | RFC0060.13 | `rfc0060_13_any_change_in_the_listing_reads_again` | same file; (a)–(d) as four cases over one store |
 > | RFC0060.14 | `rfc0060_14_only_a_verified_hit_is_remembered` | same file, plus unit tests of the tag comparison in `map_refresh` / `audit_scan` |
 > | RFC0060.15 | `rfc0060_15_the_skip_on_s3_reads_no_artifact` | same file, `#[ignore]`d, run by the `s3-integration` CI job (LocalStack) |
+> | RFC0060.16 | `rfc0060_16_a_deletion_after_the_listing_is_repaired_one_pass_late` | same file; a test hook deletes the artifact right after the tenant listing |
 >
 > The local backend's tag is exercised by .12–.14; the S3 `ETag` path,
 > including the listing that carries it, by .15.
@@ -639,6 +687,13 @@ decision:
   recorded only on a hit whose read tag equals the listed one; a pass
   whose listing matches it reads nothing. In-place notes in §3.3 (the
   measured per-pass request count), §3.5 (no new name; the skip's span
-  shape) and §6 (test map). New scenarios RFC0060.12–.15. New open
+  shape) and §6 (test map). Amends RFC0060.10: after a hit or a
+  publish the next pass lists the tenant and acquires it unless §3.7's
+  skip applies. States the one interleaving §3.7 does not cover, a
+  change between the listing and the skipped read, and accepts its
+  one-pass repair delay. New scenarios RFC0060.12–.16. New open
   questions in §7 on the listing pages and on an `unchanged` lookup
-  outcome. RFC0060.1–.11 and the frontmatter status are unchanged.
+  outcome. RFC0060.1–.9, .11 and the frontmatter status are unchanged.
+  Review (Copilot, #1028): the race qualification and RFC0060.16, the
+  RFC0060.10 amendment, a different tag in RFC0060.13 (c), and the
+  back-off-eligible pass in RFC0060.14.

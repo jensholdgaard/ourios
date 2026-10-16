@@ -96,21 +96,17 @@ pub struct CompactionOutcome {
     /// Rows an erasure filter removed (RFC 0047 §3.6); `0` without one.
     pub rows_dropped: u64,
     /// The commit, or `None` when nothing was committed: too few live files
-    /// (fewer than two to consolidate; none for an erasure), a bootstrap
-    /// manifest lost to a concurrent compactor before anything was
-    /// written, or a final manifest swap lost after the rewrite.
+    /// (fewer than two to consolidate; none for an erasure), or a manifest
+    /// commit lost to a concurrent compactor after the rewrite.
     ///
-    /// For a consolidation only the last is a failure, and it is
+    /// For a consolidation only the latter is a failure, and it is
     /// distinguished by [`commit_lost`](Self::commit_lost). An erasure
-    /// ([`RowHooks::drop`]) is the exception: any `None` with
-    /// `files_before > 0`, a lost bootstrap included, leaves live rows
-    /// unrewritten, so its caller must treat it as a failure too and not
+    /// ([`RowHooks::drop`]) treats any `None` with `files_before > 0` as a
+    /// failure: it leaves live rows unrewritten, so its caller must not
     /// advance the erasure marker.
     pub committed: Option<Committed>,
-    /// Whether the rewrite was written but its final manifest swap lost.
-    /// `false` for every other no-op, including a lost bootstrap: that
-    /// race is decided before anything is written, and the winner owns
-    /// the partition.
+    /// Whether the rewrite was written but its manifest commit lost.
+    /// `false` for every other no-op.
     pub commit_lost: bool,
     /// Non-live files that could not be removed: superseded inputs after
     /// a commit, or the discarded rewrite after a lost one. The manifest
@@ -221,17 +217,15 @@ impl std::error::Error for CompactionError {
 ///
 /// Returns `committed: None` when the partition has fewer than two live files
 /// (nothing to consolidate), or when a manifest compare-and-swap is lost to a
-/// concurrent compactor (S3 only). A lost bootstrap happens before anything is
-/// written and is a plain no-op. A lost final swap sets
-/// [`CompactionOutcome::commit_lost`]: the consolidated file no manifest names
-/// is deleted immediately (a failed delete is counted in
+/// concurrent compactor (S3 only). A lost commit, the first create-if-absent
+/// included, sets [`CompactionOutcome::commit_lost`]: the consolidated file no
+/// manifest names is deleted immediately (a failed delete is counted in
 /// [`CompactionOutcome::gc_failures`]), the inputs stay live, and the
 /// compaction sweep surfaces the loss as a sweep error so it is retried.
 ///
 /// That classification is for consolidation. An erasure through
 /// [`compact_partition_hooked`] with a [`RowHooks::drop`] rewrites a
-/// single-file partition too, and even a lost bootstrap there is a failure;
-/// see [`CompactionOutcome::committed`].
+/// single-file partition too; see [`CompactionOutcome::committed`].
 ///
 /// # Errors
 ///
@@ -472,32 +466,11 @@ fn compact_sorted_hooked(
     // is independent of the store's listing order (RFC0036.4).
     inputs.sort();
 
-    // Claim the partition before writing anything. The bootstrap consumes
-    // nothing and names no compacted file, so it changes nothing visible: the
-    // live set is still every flush file (RFC0009.3 — no torn read), and the
-    // output stays invisible until the commit names it, as any unnamed
-    // compacted file does. The bootstrap is a create-if-absent conditional
-    // PUT (supported on both backends); a lost race means another compactor
-    // owns this partition, so back off as a no-op rather than fight it.
-    let (base_generation, commit_etag) = if let Some(manifest) = &existing {
-        (manifest.generation, etag)
-    } else {
-        let bootstrap = Manifest::new(1, Vec::new(), Vec::new());
-        match bootstrap
-            .publish_cas(store, &key, None)
-            .map_err(CompactionError::Manifest)?
-        {
-            Published::Won => {}
-            Published::Lost => return Ok(no_op_outcome(inputs.len())),
-        }
-        // Re-read to learn the bootstrap generation's ETag for the CAS commit
-        // (the S3 path; the local overwrite commit ignores it). A peer that
-        // committed in between owns the partition now: back off.
-        match bootstrap_etag(store, &key, &bootstrap)? {
-            Claim::Held { etag } => (1, etag),
-            Claim::Overtaken => return Ok(no_op_outcome(inputs.len())),
-        }
-    };
+    // The output stays invisible until the commit names it, as any unnamed
+    // compacted file does, so nothing needs claiming first (RFC 0009 §3.4).
+    // With no manifest yet the commit is a create-if-absent at generation 1;
+    // a peer that created one first wins, and this commit is lost.
+    let base_generation = existing.as_ref().map_or(0, |m| m.generation);
 
     // RFC 0036 §3.3 adaptive row-group threshold: estimate the output size
     // as the sum of the live input files' sizes (the sorted output is the
@@ -545,12 +518,17 @@ fn compact_sorted_hooked(
     // event is deterministic regardless of listing order.
     let input_files = basenames(&inputs);
     let commit = next_manifest(existing.as_ref(), generation, &consolidated, &input_files);
-    match commit_manifest(store, &key, &commit, commit_etag.as_deref())? {
+    let base = match &existing {
+        Some(_) => Base::Current(etag.as_deref()),
+        None => Base::Absent,
+    };
+    match commit_manifest(store, &key, &commit, base)? {
         Published::Won => {}
-        // Lost the CAS race (S3 only — the local overwrite always wins): the
-        // work is left for the next sweep, and the consolidated file, which
-        // no manifest names, is removed now rather than left to a
-        // `gc_orphans` pass an erasure rewrite never runs.
+        // Lost the race (a first create-if-absent, or an S3 CAS — the local
+        // overwrite of an existing manifest always wins): the work is left
+        // for the next sweep, and the consolidated file, which no manifest
+        // names, is removed now rather than left to a `gc_orphans` pass an
+        // erasure rewrite never runs.
         Published::Lost => return Ok(lost_commit_outcome(store, &written.key, inputs.len())),
     }
 

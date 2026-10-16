@@ -785,10 +785,8 @@ fn compact_candidate(
 }
 
 /// `outcome`, or the sweep error it must be rather than a no-op. A lost
-/// final swap always is. An erasure is too whenever it left live rows
-/// unrewritten, even after losing only the bootstrap, because its marker
-/// must not advance past rows still on disk. A consolidation that lost the
-/// bootstrap wrote nothing and left the partition to the winner.
+/// manifest commit always is. An erasure is too whenever it left live rows
+/// unrewritten, because its marker must not advance past rows still on disk.
 fn check_committed(
     outcome: CompactionOutcome,
     erasing: bool,

@@ -619,8 +619,8 @@ async fn rfc0019_4_compaction_operates_on_s3() {
         "compaction consolidated the partition to a single live file",
     );
     assert!(
-        consolidated.generation >= 2,
-        "the manifest was swapped via the conditional-PUT CAS (bootstrap gen 1 → commit gen ≥ 2), got {}",
+        consolidated.generation >= 1,
+        "the manifest was committed via the conditional PUT (first commit creates gen 1), got {}",
         consolidated.generation,
     );
 

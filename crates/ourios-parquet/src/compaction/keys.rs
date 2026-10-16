@@ -93,38 +93,8 @@ pub(super) fn read_manifest(
         .map(|(manifest, _etag)| manifest))
 }
 
-/// Re-read `key`'s manifest after a successful bootstrap publish, taking the
-/// `ETag` from the same read as the content: the compare-and-swap token the S3
-/// commit needs. [`Claim::Held`] only while the manifest is still exactly
-/// `bootstrap`; [`Claim::Overtaken`] when a peer has already committed over
-/// it, or it vanished.
-pub(super) fn bootstrap_etag(
-    store: &Store,
-    key: &str,
-    bootstrap: &Manifest,
-) -> Result<Claim, CompactionError> {
-    Ok(
-        match Manifest::read_with_etag(store, key).map_err(CompactionError::Manifest)? {
-            Some((read, etag)) if read == *bootstrap => Claim::Held { etag },
-            _ => Claim::Overtaken,
-        },
-    )
-}
-
-/// Whether this compaction still owns the bootstrap it published.
-pub(super) enum Claim {
-    /// The manifest is still the bootstrap; `etag` is the compare-and-swap
-    /// token for the commit (`None` if the backend exposes none).
-    Held { etag: Option<String> },
-    /// A peer committed over the bootstrap. Back off: a commit based on the
-    /// bootstrap would overwrite the peer's output and consumed list with
-    /// this compaction's stale view of the inputs.
-    Overtaken,
-}
-
 /// An outcome that **committed nothing** (`committed: None`, zero rows/bytes):
-/// a partition below the input minimum, or a bootstrap lost to another
-/// compactor before anything was written.
+/// a partition below the input minimum.
 pub(super) fn no_op_outcome(files_before: usize) -> CompactionOutcome {
     CompactionOutcome {
         files_before,

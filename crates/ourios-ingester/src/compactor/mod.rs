@@ -21,8 +21,9 @@ use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
     Committed, CompactionError, CompactionOutcome, CompactionPolicy, CompactionStats, PartitionKey,
-    PromotedAttributes, RowFilter, RowHooks, RowObserver, Store, compact_partition_hooked,
-    gc_orphans, hour_partitions, percent_decode_tenant, percent_encode_tenant, plan_candidates,
+    PlanCounts, PromotedAttributes, RowFilter, RowHooks, RowObserver, Store,
+    compact_partition_hooked, gc_orphans, hour_partitions, percent_decode_tenant,
+    percent_encode_tenant, plan_candidates_counted,
 };
 
 #[cfg(feature = "openfga")]
@@ -77,12 +78,21 @@ impl IngestError {
     #[must_use]
     pub fn error_type(&self) -> &'static str {
         match self {
-            Self::Compaction(CompactionError::Read(_)) => "read",
-            Self::Compaction(CompactionError::Write(_)) => "write",
-            Self::Compaction(CompactionError::Manifest(_)) => "manifest",
-            Self::Compaction(CompactionError::Io { .. }) | Self::Io { .. } => "io",
-            Self::Compaction(_) => "_OTHER",
+            Self::Compaction(e) => compaction_error_type(e),
+            Self::Io { .. } => "io",
         }
+    }
+}
+
+/// The `error.type` of a compaction failure, shared by the sweep and its
+/// planning phase.
+fn compaction_error_type(error: &CompactionError) -> &'static str {
+    match error {
+        CompactionError::Read(_) => "read",
+        CompactionError::Write(_) => "write",
+        CompactionError::Manifest(_) => "manifest",
+        CompactionError::Io { .. } => "io",
+        _ => "_OTHER",
     }
 }
 
@@ -193,7 +203,7 @@ fn store_error(op: &'static str, key: &str, e: &ourios_parquet::StoreError) -> I
 pub struct TenantSweep {
     /// Tenant the counts are for.
     pub tenant: String,
-    /// Sealed candidate partitions [`plan_candidates`] selected.
+    /// Sealed candidate partitions [`plan_candidates`](ourios_parquet::plan_candidates) selected.
     pub candidates_found: usize,
     /// How many of those actually consolidated (committed) this sweep.
     pub partitions_compacted: usize,
@@ -212,7 +222,7 @@ pub struct CompactedFile {
 
 /// Run one compaction sweep over `store`, as of wall-clock
 /// `now_unix_nanos`: for each tenant, select its sealed candidate
-/// partitions ([`plan_candidates`]) and consolidate each
+/// partitions ([`plan_candidates`](ourios_parquet::plan_candidates)) and consolidate each
 /// ([`compact_partition_hooked`]), accumulating a [`SweepReport`].
 ///
 /// Resilient: a tenant whose planning fails, or a partition whose
@@ -323,19 +333,59 @@ type TenantPlan<'t> = (&'t str, Result<Vec<PartitionKey>, CompactionError>);
 /// late write into a sealed hour) is planned by the next one. The plans
 /// hold one key, the tenant plus four integers, per *candidate*: they grow
 /// with the compaction backlog, not with the retained history.
+///
+/// The whole pass is the RFC 0038 §3.8 `plan partitions` phase, carrying its
+/// store work summed over the tenants.
 fn plan_tenants<'t>(
     store: &Store,
     tenants: &'t [String],
     sealed_at: u64,
     policy: &CompactionPolicy,
 ) -> Vec<TenantPlan<'t>> {
-    tenants
+    let span = tracing::info_span!(
+        "plan partitions",
+        otel.kind = "internal",
+        ourios.file_set.list_request_count = tracing::field::Empty,
+        ourios.file_set.listed_objects = tracing::field::Empty,
+        ourios.file_set.manifest_read_count = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    );
+    let _phase = span.enter();
+    let mut counts = PlanCounts::default();
+    let plans: Vec<TenantPlan<'t>> = tenants
         .iter()
         .map(|tenant| {
-            let planned = plan_candidates(store, tenant, sealed_at, policy);
+            let (planned, tenant_counts) =
+                plan_candidates_counted(store, tenant, sealed_at, policy);
+            counts += tenant_counts;
             (tenant.as_str(), planned)
         })
-        .collect()
+        .collect();
+    record_plan(&span, counts, &plans);
+    plans
+}
+
+/// Set the planning phase's counts, and mark it `Error` with the first
+/// failed tenant's class: the sweep skips that tenant and goes on.
+fn record_plan(span: &tracing::Span, counts: PlanCounts, plans: &[TenantPlan<'_>]) {
+    // `i64`: tracing-opentelemetry renders a `u64` field as a string.
+    let as_count = |count: usize| i64::try_from(count).unwrap_or(i64::MAX);
+    span.record(
+        ourios_semconv::OURIOS_FILE_SET_LIST_REQUEST_COUNT,
+        as_count(counts.list_requests),
+    );
+    span.record(
+        ourios_semconv::OURIOS_FILE_SET_LISTED_OBJECTS,
+        as_count(counts.listed_objects),
+    );
+    span.record(
+        ourios_semconv::OURIOS_FILE_SET_MANIFEST_READ_COUNT,
+        as_count(counts.manifest_reads),
+    );
+    if let Some(error) = plans.iter().find_map(|(_, planned)| planned.as_ref().err()) {
+        ourios_core::telemetry::record_span_error(span, compaction_error_type(error));
+    }
 }
 
 /// A [`SweepHooks::observe`] callback.

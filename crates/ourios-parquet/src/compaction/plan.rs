@@ -35,14 +35,177 @@ pub fn plan_candidates(
     now_unix_nanos: u64,
     policy: &CompactionPolicy,
 ) -> Result<Vec<PartitionKey>, CompactionError> {
-    let mut selected = Vec::new();
-    for partition in hour_partitions(store, tenant)? {
-        if is_sealed(&partition, now_unix_nanos, policy) && is_candidate(store, &partition, policy)?
-        {
-            selected.push(partition);
+    plan_candidates_counted(store, tenant, now_unix_nanos, policy).0
+}
+
+/// [`plan_candidates`], with the store work it did: the RFC 0038 §3.8
+/// counts, which are returned on the error path too (the work up to the
+/// failure).
+pub fn plan_candidates_counted(
+    store: &Store,
+    tenant: &str,
+    now_unix_nanos: u64,
+    policy: &CompactionPolicy,
+) -> (Result<Vec<PartitionKey>, CompactionError>, PlanCounts) {
+    let mut lister = Lister::new(store);
+    let selected = lister.candidates(tenant, now_unix_nanos, policy);
+    (selected, lister.counts)
+}
+
+/// The store work one planning pass did (RFC 0038 §3.8).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PlanCounts {
+    /// Store listing calls, failed ones included.
+    pub list_requests: usize,
+    /// Objects those listings returned, before any filtering. A delimited
+    /// roll-up returns only common prefixes, which are not objects.
+    pub listed_objects: usize,
+    /// Manifest reads issued, whether the manifest was present, absent or
+    /// unreadable: one per sealed partition examined.
+    pub manifest_reads: usize,
+}
+
+impl std::ops::AddAssign for PlanCounts {
+    fn add_assign(&mut self, other: Self) {
+        self.list_requests += other.list_requests;
+        self.listed_objects += other.listed_objects;
+        self.manifest_reads += other.manifest_reads;
+    }
+}
+
+/// The planning walk's store calls, each counted as it is made.
+struct Lister<'s> {
+    store: &'s Store,
+    counts: PlanCounts,
+}
+
+impl<'s> Lister<'s> {
+    fn new(store: &'s Store) -> Self {
+        Self {
+            store,
+            counts: PlanCounts::default(),
         }
     }
-    Ok(selected)
+
+    fn candidates(
+        &mut self,
+        tenant: &str,
+        now_unix_nanos: u64,
+        policy: &CompactionPolicy,
+    ) -> Result<Vec<PartitionKey>, CompactionError> {
+        let mut selected = Vec::new();
+        for partition in self.hour_partitions(tenant)? {
+            if is_sealed(&partition, now_unix_nanos, policy)
+                && self.is_candidate(&partition, policy)?
+            {
+                selected.push(partition);
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Whether a partition is worth compacting per `policy`: at least two
+    /// live files, and either more than `min_files` of them or one smaller
+    /// than `small_file_bytes`. Resolves the live set + sizes from one
+    /// [`Store::list_with_sizes_blocking`] — when a manifest is present it
+    /// restricts the live set to the named files; otherwise every committed
+    /// `*.parquet` under the prefix is live (the glob fallback).
+    fn is_candidate(
+        &mut self,
+        partition: &PartitionKey,
+        policy: &CompactionPolicy,
+    ) -> Result<bool, CompactionError> {
+        let prefix = partition_data_prefix(partition);
+        self.counts.manifest_reads += 1;
+        let manifest = read_manifest(self.store, partition)?;
+        let live_names: Option<HashSet<&str>> = manifest
+            .as_ref()
+            .map(|m| m.files.iter().map(String::as_str).collect());
+        self.counts.list_requests += 1;
+        let entries = self
+            .store
+            .list_with_sizes_blocking(Some(&prefix))
+            .map_err(|e| store_io("list", &prefix, e))?;
+        self.counts.listed_objects += entries.len();
+        let sizes: Vec<u64> = entries
+            .iter()
+            .filter(|(key, _)| is_committed_parquet(key) && is_immediate_child(key, &prefix))
+            .filter(|(key, _)| {
+                live_names
+                    .as_ref()
+                    .is_none_or(|n| n.contains(basename(key)))
+            })
+            .map(|(_, size)| *size)
+            .collect();
+        if sizes.len() < 2 {
+            return Ok(false);
+        }
+        if sizes.len() > policy.min_files {
+            return Ok(true);
+        }
+        Ok(sizes.iter().any(|&len| len < policy.small_file_bytes))
+    }
+
+    /// [`hour_partitions`]' walk, counting each roll-up listing.
+    fn hour_partitions(&mut self, tenant: &str) -> Result<Vec<PartitionKey>, CompactionError> {
+        let root = format!("data/tenant_id={}", percent_encode_tenant(tenant));
+        let mut partitions = Vec::new();
+        for (year_prefix, year) in self.numbered_child_prefixes(&root, "year", 4)? {
+            // `year` is a calendar year; skip the (unreachable for Ourios
+            // output) value that wouldn't fit the `PartitionKey` `i32`.
+            let Ok(year) = i32::try_from(year) else {
+                continue;
+            };
+            for (month_prefix, month) in self.numbered_child_prefixes(&year_prefix, "month", 2)? {
+                for (day_prefix, day) in self.numbered_child_prefixes(&month_prefix, "day", 2)? {
+                    for (_hour_prefix, hour) in
+                        self.numbered_child_prefixes(&day_prefix, "hour", 2)?
+                    {
+                        partitions.push(PartitionKey {
+                            tenant_id: tenant.to_owned(),
+                            year,
+                            month,
+                            day,
+                            hour,
+                        });
+                    }
+                }
+            }
+        }
+        // Ascending tuple order is chronological (oldest sealed partition
+        // first); dedup after the sort is a belt-and-braces guard (the
+        // rollup yields each partition once).
+        partitions.sort_by_key(|p| (p.year, p.month, p.day, p.hour));
+        partitions.dedup();
+        Ok(partitions)
+    }
+
+    /// Roll up the immediate child common-prefixes of `parent` (one
+    /// delimiter level, via [`Store::list_common_prefixes_blocking`]) and
+    /// parse each one's trailing `<name>=NN` segment in the canonical
+    /// zero-padded form, returning `(child_prefix, value)` for the matches.
+    /// A non-canonical child (`month=4`, `month=004`) parses to `None` and is
+    /// dropped — the same way the pre-RFC-0019 `read_dir` walk skipped
+    /// non-canonical directory names (RFC 0005 §3.4).
+    fn numbered_child_prefixes(
+        &mut self,
+        parent: &str,
+        name: &str,
+        width: usize,
+    ) -> Result<Vec<(String, u32)>, CompactionError> {
+        self.counts.list_requests += 1;
+        let children = self
+            .store
+            .list_common_prefixes_blocking(Some(parent))
+            .map_err(|e| store_io("list", parent, e))?;
+        Ok(children
+            .into_iter()
+            .filter_map(|child| {
+                let value = parse_partition_segment(basename(&child), name, width)?;
+                Some((child, value))
+            })
+            .collect())
+    }
 }
 
 /// Whether the partition's hour ended at least `grace_nanos` before `now` (the
@@ -72,44 +235,6 @@ pub(super) fn is_sealed(
             .saturating_add(policy.grace_nanos)
 }
 
-/// Whether a partition is worth compacting per `policy`: at least two live
-/// files, and either more than `min_files` of them or one smaller than
-/// `small_file_bytes`. Resolves the live set + sizes from one
-/// [`Store::list_with_sizes_blocking`] — when a manifest is present it restricts
-/// the live set to the named files; otherwise every committed `*.parquet` under
-/// the prefix is live (the glob fallback).
-pub(super) fn is_candidate(
-    store: &Store,
-    partition: &PartitionKey,
-    policy: &CompactionPolicy,
-) -> Result<bool, CompactionError> {
-    let prefix = partition_data_prefix(partition);
-    let manifest = read_manifest(store, partition)?;
-    let live_names: Option<HashSet<&str>> = manifest
-        .as_ref()
-        .map(|m| m.files.iter().map(String::as_str).collect());
-    let entries = store
-        .list_with_sizes_blocking(Some(&prefix))
-        .map_err(|e| store_io("list", &prefix, e))?;
-    let sizes: Vec<u64> = entries
-        .iter()
-        .filter(|(key, _)| is_committed_parquet(key) && is_immediate_child(key, &prefix))
-        .filter(|(key, _)| {
-            live_names
-                .as_ref()
-                .is_none_or(|n| n.contains(basename(key)))
-        })
-        .map(|(_, size)| *size)
-        .collect();
-    if sizes.len() < 2 {
-        return Ok(false);
-    }
-    if sizes.len() > policy.min_files {
-        return Ok(true);
-    }
-    Ok(sizes.iter().any(|&len| len < policy.small_file_bytes))
-}
-
 /// Enumerate the tenant's `year=/month=/day=/hour=` leaf partitions that hold
 /// objects, walking the Hive levels with a **delimiter rollup** at each step:
 /// from `data/tenant_id=<enc>` roll up the `year=` child prefixes, then for each
@@ -125,59 +250,7 @@ pub(super) fn is_candidate(
 ///
 /// [`CompactionError`] when the store's prefixes cannot be listed.
 pub fn hour_partitions(store: &Store, tenant: &str) -> Result<Vec<PartitionKey>, CompactionError> {
-    let root = format!("data/tenant_id={}", percent_encode_tenant(tenant));
-    let mut partitions = Vec::new();
-    for (year_prefix, year) in numbered_child_prefixes(store, &root, "year", 4)? {
-        // `year` is a calendar year; skip the (unreachable for Ourios output)
-        // value that wouldn't fit the `PartitionKey` `i32`.
-        let Ok(year) = i32::try_from(year) else {
-            continue;
-        };
-        for (month_prefix, month) in numbered_child_prefixes(store, &year_prefix, "month", 2)? {
-            for (day_prefix, day) in numbered_child_prefixes(store, &month_prefix, "day", 2)? {
-                for (_hour_prefix, hour) in numbered_child_prefixes(store, &day_prefix, "hour", 2)?
-                {
-                    partitions.push(PartitionKey {
-                        tenant_id: tenant.to_owned(),
-                        year,
-                        month,
-                        day,
-                        hour,
-                    });
-                }
-            }
-        }
-    }
-    // Ascending tuple order is chronological (oldest sealed partition first);
-    // dedup after the sort is a belt-and-braces guard (the rollup yields each
-    // partition once).
-    partitions.sort_by_key(|p| (p.year, p.month, p.day, p.hour));
-    partitions.dedup();
-    Ok(partitions)
-}
-
-/// Roll up the immediate child common-prefixes of `parent` (one delimiter level,
-/// via [`Store::list_common_prefixes_blocking`]) and parse each one's trailing
-/// `<name>=NN` segment in the canonical zero-padded form, returning
-/// `(child_prefix, value)` for the matches. A non-canonical child (`month=4`,
-/// `month=004`) parses to `None` and is dropped — the same way the pre-RFC-0019
-/// `read_dir` walk skipped non-canonical directory names (RFC 0005 §3.4).
-pub(super) fn numbered_child_prefixes(
-    store: &Store,
-    parent: &str,
-    name: &str,
-    width: usize,
-) -> Result<Vec<(String, u32)>, CompactionError> {
-    let children = store
-        .list_common_prefixes_blocking(Some(parent))
-        .map_err(|e| store_io("list", parent, e))?;
-    Ok(children
-        .into_iter()
-        .filter_map(|child| {
-            let value = parse_partition_segment(basename(&child), name, width)?;
-            Some((child, value))
-        })
-        .collect())
+    Lister::new(store).hour_partitions(tenant)
 }
 
 /// Parse one canonical Hive segment `<prefix>=<zero-padded number>` to its

@@ -11,6 +11,26 @@ superseded-by: —
 
 # RFC 0009 — Background compaction: small-file consolidation
 
+> **Amendment (2026-10-16, #1027, maintainer-approved) — planning reads a
+> tenant once, not every partition.** Candidate planning
+> (§3.3) lists each tenant's data prefix once, recursively, and decides
+> every partition from that listing. It reads a partition's manifest only
+> when the listing shows two or more committed `*.parquet` objects there.
+> A settled partition (one live file) then costs no request of its own, so
+> a sweep's planning cost follows the objects a tenant holds (about 1,000
+> per listing page), not the hours it has retained. The candidate
+> predicate is unchanged; only the reads it is computed from change. No
+> state is persisted or cached. Adds the in-place note in §3.3, scenarios
+> RFC0009.8–.12 (§5), their test map (§6), the alternatives and open
+> questions (§7) and the history (§9). Erasure and the graph backfill keep
+> walking every hour partition, so they are unaffected (RFC0009.12). The
+> accepted text below is left as written and the frontmatter stays
+> `accepted` for the seven original criteria. The new scenarios were
+> approved with the amendment and move through `red` and `green` with
+> their tests. Refs #1019 (item 2). Records a pre-existing gap found while
+> drafting it: a late write into an already-compacted partition is not
+> re-flagged (#1026; §3.3 note, §7).
+
 > **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
 > the completed-backlog batch flip; thesis-gates passed at `validated`.
 >
@@ -154,6 +174,84 @@ keep satisfied. Late data that
 arrives after a partition is compacted lands as a new small file and
 re-flags the partition as a candidate — compaction is idempotent and
 re-runnable (§3.5).
+
+> **Amendment (2026-10-16, #1027, maintainer-approved) — how the
+> candidates are read.**
+> The predicate above is unchanged. What changes is the reads it is
+> computed from, because planning had become the sweep's dominant cost
+> (#1019: about one listing and one manifest read per retained hour
+> partition, at about 55 ms each, every sweep, growing with history and
+> not with the work there is).
+>
+> **Before.** For each tenant, a delimiter walk enumerates the
+> `year=/month=/day=/hour=` prefixes. Then, for every sealed partition,
+> one `GET manifest.json` (a 404 when there is none) and one listing of
+> the partition.
+>
+> **After.** For each tenant, the planner makes **one recursive listing**
+> of `data/tenant_id=<enc>/` (the backend pages it, 1,000 keys per page on
+> S3). It groups the listed keys by hour partition, parsing each Hive
+> segment in the canonical zero-padded form as today (a non-canonical
+> segment is skipped), and keeps only keys that sit directly in a
+> partition. Partitions are visited oldest first. For each sealed
+> partition, with *C* the committed `*.parquet` objects listed there and
+> their sizes:
+>
+> 1. **|C| < 2** — not a candidate, and no further request. The live set
+>    is a subset of *C* whatever a manifest says, so fewer than two
+>    listed files means fewer than two live files. This covers the
+>    settled partition (one consolidated file and its manifest), a lone
+>    small file, and a partition holding only a manifest or `*.tmp`
+>    objects.
+> 2. **|C| ≥ 2, no `manifest.json` listed** — the live set is *C* (the
+>    glob fallback). Decided from the listing; no manifest read.
+> 3. **|C| ≥ 2, `manifest.json` listed** — one `GET manifest.json`; the
+>    live set is *C* restricted to the names it lists, as today.
+>
+> The candidate test is then the one above: at least two live files, and
+> either more than `compaction_min_files` or one below the small-file
+> size. The result is the same as the per-partition reads would give on
+> the same objects (RFC0009.9). The listing replaces those reads; it does
+> not summarise them, so there is nothing to persist, invalidate or keep
+> consistent between compactor processes.
+>
+> **Visibility timing changes slightly.** The per-partition reads looked
+> at each partition when the walk reached it, so a write that landed
+> before then was seen in the same sweep. Now the tenant is read once, at
+> the start of its planning: a write that lands after that listing waits
+> for the next sweep, even if the partition comes later in the walk. The
+> delay is at most one sweep interval. A late write is never lost and
+> never skipped for good: every sweep lists the tenant afresh
+> (RFC0009.10).
+>
+> **Erasure and backfill are unaffected.** Only consolidation planning
+> changes. The RFC 0047 §3.6 erasure pass and the RFC 0048 graph
+> backfill still enumerate every hour partition of the tenant through
+> `hour_partitions` (`compactor/erasure.rs`, `compactor/backfill.rs`) and
+> visit each one. They never use the candidate planner. A settled
+> single-file partition, which the planner skips without a read, is
+> still rewritten by an erasure whose rows it holds (RFC0009.12).
+>
+> **Cost.** Per tenant per sweep: one logical listing, served as
+> ⌈objects ÷ 1,000⌉ page requests on S3, plus
+> one manifest read per sealed partition that holds two or more committed
+> files and a manifest. A settled partition costs nothing beyond its two
+> keys in the listing. At the H4 steady state of one file and one
+> manifest per hour, a year of history is about 17,500 keys, or 18 pages.
+> The listing is held in memory while the tenant is planned: about 100
+> bytes per key, so a few MB per year of history, released before the
+> tenant's partitions are compacted.
+>
+> **Late writes into a compacted partition (#1026).** The sentence above
+> ("late data that arrives after a partition is compacted … re-flags the
+> partition") does not hold today, and this amendment does not change
+> that. Once a partition has a manifest, the manifest is the live set
+> (§3.4). A late writer's file is not in it, so readers, the planner and
+> `visit_partition_rows` ignore it, and `gc_orphans` would delete it as
+> an orphan. Under this amendment such a partition falls under case 3 (the
+> late file makes |C| ≥ 2), so it is read every sweep, and still not
+> selected. Fixing it changes the manifest contract and is left to its
+> own amendment (§7).
 
 ### 3.4 The atomic-publish protocol — per-partition manifest
 
@@ -430,6 +528,63 @@ bytes, not a base metric.
     latency (RFC 0007 §6 B2 bench) does not grow proportionally to the
     pre-compaction file count.
 
+> **Amendment (2026-10-16, #1027, maintainer-approved) — planning
+> cost.** RFC0009.8–.12 cover the §3.3 note on how candidates are read.
+
+- **RFC0009.8 — a settled partition costs no request of its own `[H4 /
+  #1019]`**
+  - **Given** a tenant with many sealed partitions, each holding one
+    committed `*.parquet` (some with a `manifest.json`, some without)
+  - **When** its candidates are planned
+  - **Then** none is selected, and planning makes exactly one logical
+    recursive listing of the tenant's prefix: no request per partition
+    and no `GET`. The backend may serve that listing as several page
+    requests (1,000 keys per page on S3); the page count follows the
+    tenant's object count, not its partition count.
+
+- **RFC0009.9 — the selection is unchanged `[H4 / RFC0009.1]`**
+  - **Given** any set of sealed and unsealed partitions, each with any
+    number of committed files of any size, with or without a manifest
+    naming any subset of them, and with orphans and `*.parquet.tmp`
+    objects
+  - **When** its candidates are planned
+  - **Then** the selection, in order, is exactly what the per-partition
+    reads (a manifest read and a partition listing for every sealed
+    partition) select on the same objects.
+  - **And** a partition whose listing holds two or more committed files
+    and a manifest is selected or skipped by the manifest's live set,
+    never by the listing alone.
+
+- **RFC0009.10 — a late write into a settled partition is re-planned
+  `[H4 / §3.3]`**
+  - **Given** a sealed partition with no manifest and one committed file
+    at or above the small-file size, which a planning pass did not select
+  - **When** a writer later lands a second committed file in it, below
+    the small-file size, and candidates are planned again
+  - **Then** the partition is selected. (A late file at or above the
+    small-file size leaves two large files, which §3.3 does not select
+    until there are more than `compaction_min_files`; see
+    `plan_skips_when_files_are_large_and_few`.)
+  - **And** given a compacted partition (a manifest naming its one file)
+    that receives a late file, the next pass reads its manifest rather
+    than skipping it. Whether it is then selected is #1026's to decide;
+    until then it is not, as today.
+
+- **RFC0009.11 — planning keeps no state `[§3.6 / multiple compactors]`**
+  - **Given** a store with sealed candidates
+  - **When** candidates are planned, by one planner or by two
+    independent ones over the same store
+  - **Then** no object is written, and both select the same partitions.
+
+- **RFC0009.12 — erasure still reaches a settled partition `[RFC 0047
+  §3.6 / CLAUDE.md §3.7]`**
+  - **Given** a sealed partition with one live file at or above the
+    small-file size, which candidate planning skips, holding rows an
+    erasure request matches
+  - **When** a sweep runs the erasure
+  - **Then** the partition is rewritten without the matching rows, and
+    the other rows are kept.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -453,6 +608,26 @@ Mapped to `CLAUDE.md` §6.2:
   throughput) + D3 (file count under load); re-run the RFC 0007 §6 B2
   latency bench post-compaction to show the per-file footer-read
   residual (§2.1) shrinks.
+
+> **Amendment (2026-10-16, #1027, maintainer-approved) — test map for
+> RFC0009.8–.12.** RFC0009.8–.11 are
+> in `ourios-parquet`'s compaction suite, against a local store seen
+> through a request-counting `ObjectStore` wrapper. On the local backend
+> one logical listing is one `list` call on the wrapper, so the wrapper
+> counts logical listings, not the S3 pages behind them.
+>
+> | Scenario | Test | Kind |
+> |---|---|---|
+> | RFC0009.8 | `rfc0009_8_settled_partitions_cost_no_request_of_their_own` — 48 settled partitions (half with a manifest): no `GET`, exactly one logical listing, the same as a 1-partition tenant | integration |
+> | RFC0009.9 | `rfc0009_9_listing_plan_selects_what_per_partition_reads_select` — proptest over partitions × files × sizes × manifest subsets × orphans/tmp; the oracle is the pre-amendment per-partition predicate, kept in the test module | property |
+> | RFC0009.9 | `rfc0009_9_a_manifest_decides_when_two_files_are_listed` — two listed files, a manifest naming one: not selected, one `GET` | unit |
+> | RFC0009.10 | `rfc0009_10_a_late_write_into_a_settled_partition_is_replanned` — one file above the small-file size, planned (skipped, no `GET`); a late file below the small-file size lands; planned again (selected) | integration |
+> | RFC0009.10 | `rfc0009_10_a_late_write_into_a_compacted_partition_is_read` — compacted partition plus a late file: one `GET` of its manifest, not selected (pins today's #1026 behaviour; that fix updates this assertion) | integration |
+> | RFC0009.11 | `rfc0009_11_planning_writes_nothing_and_two_planners_agree` — store listing unchanged after planning; two `Store` handles plan the same list | integration |
+> | RFC0009.12 | `rfc0009_12_erasure_rewrites_a_settled_partition_the_planner_skips` (in `ourios-ingester`'s compactor suite, next to the erasure tests) — one file above the small-file size, confirmed skipped by `plan_candidates`; an erasure sweep rewrites it, drops the matching row, keeps the other | integration |
+>
+> The existing `plan_*` tests stay as they are; they pin the predicate
+> the amendment keeps.
 
 ## 7. Open questions
 
@@ -505,6 +680,64 @@ history is legible):
   check (OTel assistant / `weaver` / rego policy packages) and fix any
   divergence before instrumentation lands.
 
+> **Amendment (2026-10-16, #1027, maintainer-approved) — planning cost
+> (#1019 item 2).**
+
+**Alternatives considered for the planning cost.** The recommended
+design is the one-listing planner in the §3.3 note. Each alternative
+below was weighed against the same constraint: never skip a partition
+that holds more than one live file, or a live file below the small-file
+size.
+
+- **A per-tenant "settled-through" watermark in object storage.** The
+  compactor records "every partition up to hour *H* was settled when I
+  looked", and the planner skips them. Rejected: a late write lands in
+  any old hour at any time (the partition comes from the record's own
+  timestamp, and the receiver has no admission window), and the writer
+  runs in the receiver, a different process from the compactor (§3.2,
+  the chart's separate `compactor` Deployment). Lowering the watermark
+  safely needs the writer to record a dirty mark *before* its put, and
+  the compactor to consume marks only once their puts must have landed.
+  That puts a new object-store write on the flush path, adds a second
+  artefact to RFC 0005 with its own migration story, and still rests on
+  an assumption about how long a put can take. The one-listing planner
+  needs none of it.
+- **An in-memory cache of settled partitions, invalidated by writes.**
+  Rejected: the compactor does not see the receiver's writes (separate
+  processes), so nothing would invalidate it. A cache with a periodic
+  full re-check bounds the delay but breaks the constraint above in
+  between.
+- **A manifest cache keyed by `ETag`.** Keep each partition's parsed
+  manifest in memory and re-read it only when the listing shows a new
+  `ETag`. Not needed: after the §3.3 note, only partitions with two or
+  more listed files read a manifest, and those are the candidates and
+  the #1026 case. It also needs the listing to carry `ETag`s, which the
+  store seam does not expose today. Revisit if those reads show up.
+- **One recursive listing per day prefix instead of per tenant.** Bounds
+  memory to one day of keys, at about 24× the requests of the tenant
+  listing (still about 50× fewer than today). Kept as the fallback if a
+  tenant's listing ever gets too large to hold (see below).
+- **Keep the per-partition reads but drop the manifest `GET` when the
+  partition listing shows one file.** Halves the cost and stays
+  O(history). Subsumed by the recommended design.
+
+**Open (amendment):**
+
+- [ ] **Late writes into a compacted partition (#1026).** The manifest
+  hides them from readers and the planner, and `gc_orphans` would delete
+  them. The fix changes the §3.4 manifest contract (the writer appends
+  to the manifest, or a file newer than the manifest's commit counts as
+  live). Its own amendment; RFC0009.10's second arm is updated with it.
+- [ ] **Listing size.** The tenant listing is materialised while the
+  tenant is planned (§3.3 note). Stream it, or fall back to per-day
+  listings, if a tenant's key count ever makes that matter. At the H4
+  steady state it is a few MB per year of history.
+- [ ] **A sealed non-candidate with two or more listed files** (two
+  large files, or one live file plus an orphan that `gc_orphans` never
+  reaches because the partition is never a candidate) reads its
+  manifest every sweep. Bounded by the number of such partitions, not
+  by history. Running `gc_orphans` on them would clear the orphan case.
+
 ## 8. References
 
 - `docs/hazards.md` H4 (small-file problem) — the hazard this
@@ -523,3 +756,15 @@ history is legible):
   (small-file count under sustained load).
 - Apache Iceberg / Delta Lake atomic metadata-swap commit — design
   inspiration for §3.4 (the idea, not the machinery).
+
+## 9. Amendment history
+
+- **2026-10-16 — planning reads a tenant once (#1027,
+  maintainer-approved).** Candidate planning lists each tenant's data
+  prefix once and reads a partition's manifest only when two or more
+  committed files are listed there, so a settled partition costs no
+  request of its own (§3.3 note). The candidate predicate is unchanged
+  and no state is kept. Erasure (RFC 0047 §3.6) and the graph backfill
+  (RFC 0048) keep walking every hour partition (RFC0009.12). New
+  scenarios RFC0009.8–.12 (§5) and their test map (§6); alternatives and open questions in §7. Records the late-write
+  gap #1026 (§3.3 note, §7). Refs #1019.

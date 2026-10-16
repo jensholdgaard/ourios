@@ -93,35 +93,47 @@ async fn rfc0038_3_span_context_survives_spawn_boundaries() {
     provider.force_flush().expect("spans flush");
     let spans = exporter.get_finished_spans().expect("spans exported");
 
-    // Boundary 1 assertions — the batch span crossed `tokio::spawn`, and its
-    // WAL-commit child nests correctly (context propagated within the task).
-    let batch = spans_named(&spans, "ingest logs");
-    let commit = spans_named(&spans, "commit wal");
+    assert_ingest_spans(&spans);
+    assert_sweep_spans(&spans);
+}
+
+/// Boundary 1 — the batch span crossed `tokio::spawn`, and its WAL-commit
+/// child nests correctly (context propagated within the task).
+fn assert_ingest_spans(spans: &[SpanData]) {
+    let batch = spans_named(spans, "ingest logs");
+    let commit = spans_named(spans, "commit wal");
     assert_eq!(
-        batch.len(),
-        1,
-        "one `ingest logs` span survived tokio::spawn, got {:?}",
+        (batch.len(), commit.len()),
+        (1, 1),
+        "one `ingest logs` span survived tokio::spawn, with one `commit wal`, got {:?}",
         spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
     );
-    assert_eq!(commit.len(), 1, "one `commit wal` span, got {spans:?}");
     assert_eq!(
-        commit[0].parent_span_id,
-        batch[0].span_context.span_id(),
-        "`commit wal` nests under `ingest logs` across the spawn boundary",
+        (commit[0].parent_span_id, commit[0].span_context.trace_id()),
+        (
+            batch[0].span_context.span_id(),
+            batch[0].span_context.trace_id()
+        ),
+        "`commit wal` nests under `ingest logs` across the spawn boundary, in one trace",
     );
-    assert_eq!(
-        commit[0].span_context.trace_id(),
-        batch[0].span_context.trace_id(),
-        "child and batch share one trace",
-    );
+}
 
-    // Boundary 2 assertion — exactly one `sweep partitions` span crossed
-    // `spawn_blocking` (the long interval means a single tick before abort).
-    let sweep = spans_named(&spans, "sweep partitions");
+/// Boundary 2 — exactly one `sweep partitions` span crossed `spawn_blocking`
+/// (the long interval means a single tick before abort), with its RFC 0038
+/// §3.8 planning phase nested under it on the same thread.
+fn assert_sweep_spans(spans: &[SpanData]) {
+    let sweep = spans_named(spans, "sweep partitions");
     assert_eq!(
         sweep.len(),
         1,
         "one `sweep partitions` span survived spawn_blocking, got {:?}",
         spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+    );
+    let plan = spans_named(spans, "plan partitions");
+    assert_eq!(plan.len(), 1, "one `plan partitions` span, got {spans:?}");
+    assert_eq!(
+        plan[0].parent_span_id,
+        sweep[0].span_context.span_id(),
+        "`plan partitions` nests under `sweep partitions` across spawn_blocking",
     );
 }

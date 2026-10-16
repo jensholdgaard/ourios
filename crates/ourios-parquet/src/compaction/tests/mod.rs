@@ -1142,3 +1142,85 @@ fn plan_for_a_tenant_with_no_data_is_empty() {
     // Assert
     assert!(selected.is_empty());
 }
+
+/// Put `names` as raw objects under tenant `a`'s 2026-04-02 hour `hour`.
+fn put_in_hour(store: &Store, hour: u32, names: &[&str]) {
+    for name in names {
+        store
+            .put_blocking(
+                &format!("data/tenant_id=a/year=2026/month=04/day=02/hour={hour:02}/{name}"),
+                b"x".to_vec(),
+            )
+            .expect("put");
+    }
+}
+
+#[test]
+fn planning_counts_its_listings_and_manifest_reads() {
+    // Arrange — hour 10 sealed with two files and no manifest; hour 12
+    // still open at `NOW_SEALED` (12:58).
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    put_in_hour(&store, 10, &["x.parquet", "y.parquet"]);
+    put_in_hour(&store, 12, &["z.parquet"]);
+
+    // Act
+    let (selected, counts) =
+        plan_candidates_counted(&store, "a", NOW_SEALED, &CompactionPolicy::default());
+
+    // Assert — one recursive listing of the tenant, returning all three
+    // objects (the open hour's too); no manifest is listed, so none is read
+    // (RFC 0009 §3.3, 2026-10-16 amendment).
+    assert_eq!(selected.expect("plan"), vec![partition()]);
+    assert_eq!(
+        counts,
+        PlanCounts {
+            list_requests: 1,
+            listed_objects: 3,
+            manifest_reads: 0,
+        }
+    );
+}
+
+#[test]
+fn planning_keeps_its_counts_on_the_error_path() {
+    // Arrange — a sealed partition whose manifest does not parse.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    put_in_hour(&store, 10, &["x.parquet", "y.parquet"]);
+    put_in_hour(&store, 10, &[MANIFEST_FILENAME]);
+
+    // Act
+    let (selected, counts) =
+        plan_candidates_counted(&store, "a", NOW_SEALED, &CompactionPolicy::default());
+
+    // Assert — the tenant listing ran first and returned the partition's
+    // three objects; the failed manifest read after it still counts.
+    assert!(selected.is_err(), "an unparseable manifest fails planning");
+    assert_eq!(
+        counts,
+        PlanCounts {
+            list_requests: 1,
+            listed_objects: 3,
+            manifest_reads: 1,
+        }
+    );
+}
+
+#[test]
+fn planning_a_tenant_with_no_data_makes_one_listing() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+
+    let (selected, counts) =
+        plan_candidates_counted(&store, "ghost", NOW_SEALED, &CompactionPolicy::default());
+
+    assert!(selected.expect("plan").is_empty());
+    assert_eq!(
+        counts,
+        PlanCounts {
+            list_requests: 1,
+            ..PlanCounts::default()
+        }
+    );
+}

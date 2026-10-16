@@ -11,8 +11,8 @@ superseded-by: —
 
 # RFC 0009 — Background compaction: small-file consolidation
 
-> **Amendment 2026-10-16 — planning reads a tenant once, not every
-> partition (`drafted`, pending maintainer approval).** Candidate planning
+> **Amendment (2026-10-16, #1027, maintainer-approved) — planning reads a
+> tenant once, not every partition.** Candidate planning
 > (§3.3) lists each tenant's data prefix once, recursively, and decides
 > every partition from that listing. It reads a partition's manifest only
 > when the listing shows two or more committed `*.parquet` objects there.
@@ -21,11 +21,13 @@ superseded-by: —
 > per listing page), not the hours it has retained. The candidate
 > predicate is unchanged; only the reads it is computed from change. No
 > state is persisted or cached. Adds the in-place note in §3.3, scenarios
-> RFC0009.8–.11 (§5), their test map (§6), the alternatives and open
-> questions (§7) and the history (§9). The accepted text below is left as
-> written and the frontmatter stays `accepted` for the seven original
-> criteria; the new scenarios are `drafted` until the maintainer approves
-> them. Refs #1019 (item 2). Records a pre-existing gap found while
+> RFC0009.8–.12 (§5), their test map (§6), the alternatives and open
+> questions (§7) and the history (§9). Erasure and the graph backfill keep
+> walking every hour partition, so they are unaffected (RFC0009.12). The
+> accepted text below is left as written and the frontmatter stays
+> `accepted` for the seven original criteria. The new scenarios were
+> approved with the amendment and move through `red` and `green` with
+> their tests. Refs #1019 (item 2). Records a pre-existing gap found while
 > drafting it: a late write into an already-compacted partition is not
 > re-flagged (#1026; §3.3 note, §7).
 
@@ -173,7 +175,8 @@ arrives after a partition is compacted lands as a new small file and
 re-flags the partition as a candidate — compaction is idempotent and
 re-runnable (§3.5).
 
-> **Amendment 2026-10-16 (`drafted`) — how the candidates are read.**
+> **Amendment (2026-10-16, #1027, maintainer-approved) — how the
+> candidates are read.**
 > The predicate above is unchanged. What changes is the reads it is
 > computed from, because planning had become the sweep's dominant cost
 > (#1019: about one listing and one manifest read per retained hour
@@ -220,6 +223,14 @@ re-runnable (§3.5).
 > delay is at most one sweep interval. A late write is never lost and
 > never skipped for good: every sweep lists the tenant afresh
 > (RFC0009.10).
+>
+> **Erasure and backfill are unaffected.** Only consolidation planning
+> changes. The RFC 0047 §3.6 erasure pass and the RFC 0048 graph
+> backfill still enumerate every hour partition of the tenant through
+> `hour_partitions` (`compactor/erasure.rs`, `compactor/backfill.rs`) and
+> visit each one. They never use the candidate planner. A settled
+> single-file partition, which the planner skips without a read, is
+> still rewritten by an erasure whose rows it holds (RFC0009.12).
 >
 > **Cost.** Per tenant per sweep: one logical listing, served as
 > ⌈objects ÷ 1,000⌉ page requests on S3, plus
@@ -517,9 +528,8 @@ bytes, not a base metric.
     latency (RFC 0007 §6 B2 bench) does not grow proportionally to the
     pre-compaction file count.
 
-> **Amendment 2026-10-16 (`drafted`) — planning cost.** RFC0009.8–.11
-> cover the §3.3 note on how candidates are read. They are `drafted`
-> until the maintainer approves the amendment.
+> **Amendment (2026-10-16, #1027, maintainer-approved) — planning
+> cost.** RFC0009.8–.12 cover the §3.3 note on how candidates are read.
 
 - **RFC0009.8 — a settled partition costs no request of its own `[H4 /
   #1019]`**
@@ -566,6 +576,15 @@ bytes, not a base metric.
     independent ones over the same store
   - **Then** no object is written, and both select the same partitions.
 
+- **RFC0009.12 — erasure still reaches a settled partition `[RFC 0047
+  §3.6 / CLAUDE.md §3.7]`**
+  - **Given** a sealed partition with one live file at or above the
+    small-file size, which candidate planning skips, holding rows an
+    erasure request matches
+  - **When** a sweep runs the erasure
+  - **Then** the partition is rewritten without the matching rows, and
+    the other rows are kept.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -590,7 +609,8 @@ Mapped to `CLAUDE.md` §6.2:
   latency bench post-compaction to show the per-file footer-read
   residual (§2.1) shrinks.
 
-> **Amendment 2026-10-16 (`drafted`) — test map for RFC0009.8–.11.** All
+> **Amendment (2026-10-16, #1027, maintainer-approved) — test map for
+> RFC0009.8–.12.** RFC0009.8–.11 are
 > in `ourios-parquet`'s compaction suite, against a local store seen
 > through a request-counting `ObjectStore` wrapper. On the local backend
 > one logical listing is one `list` call on the wrapper, so the wrapper
@@ -604,6 +624,7 @@ Mapped to `CLAUDE.md` §6.2:
 > | RFC0009.10 | `rfc0009_10_a_late_write_into_a_settled_partition_is_replanned` — one file above the small-file size, planned (skipped, no `GET`); a late file below the small-file size lands; planned again (selected) | integration |
 > | RFC0009.10 | `rfc0009_10_a_late_write_into_a_compacted_partition_is_read` — compacted partition plus a late file: one `GET` of its manifest, not selected (pins today's #1026 behaviour; that fix updates this assertion) | integration |
 > | RFC0009.11 | `rfc0009_11_planning_writes_nothing_and_two_planners_agree` — store listing unchanged after planning; two `Store` handles plan the same list | integration |
+> | RFC0009.12 | `rfc0009_12_erasure_rewrites_a_settled_partition_the_planner_skips` (in `ourios-ingester`'s compactor suite, next to the erasure tests) — one file above the small-file size, confirmed skipped by `plan_candidates`; an erasure sweep rewrites it, drops the matching row, keeps the other | integration |
 >
 > The existing `plan_*` tests stay as they are; they pin the predicate
 > the amendment keeps.
@@ -659,7 +680,8 @@ history is legible):
   check (OTel assistant / `weaver` / rego policy packages) and fix any
   divergence before instrumentation lands.
 
-> **Amendment 2026-10-16 (`drafted`) — planning cost (#1019 item 2).**
+> **Amendment (2026-10-16, #1027, maintainer-approved) — planning cost
+> (#1019 item 2).**
 
 **Alternatives considered for the planning cost.** The recommended
 design is the one-listing planner in the §3.3 note. Each alternative
@@ -737,11 +759,12 @@ size.
 
 ## 9. Amendment history
 
-- **2026-10-16 — planning reads a tenant once (`drafted`, pending
-  maintainer approval).** Candidate planning lists each tenant's data
+- **2026-10-16 — planning reads a tenant once (#1027,
+  maintainer-approved).** Candidate planning lists each tenant's data
   prefix once and reads a partition's manifest only when two or more
   committed files are listed there, so a settled partition costs no
   request of its own (§3.3 note). The candidate predicate is unchanged
-  and no state is kept. New scenarios RFC0009.8–.11 (§5) and their test
-  map (§6); alternatives and open questions in §7. Records the late-write
+  and no state is kept. Erasure (RFC 0047 §3.6) and the graph backfill
+  (RFC 0048) keep walking every hour partition (RFC0009.12). New
+  scenarios RFC0009.8–.12 (§5) and their test map (§6); alternatives and open questions in §7. Records the late-write
   gap #1026 (§3.3 note, §7). Refs #1019.

@@ -490,7 +490,7 @@ path, and a second publisher contends for the CAS.
 > - **And** once a successful listing no longer names the tenant, its
 >   counter is dropped; a failed listing drops nothing.
 >
-> *Amendment (2026-10-16, #1008, maintainer-approved).* The third **And** becomes:
+> *Amendment (2026-10-16, #1008, maintainer-approved).* The second **And** becomes:
 > after a hit or a publish, back-off no longer skips the tenant. The next
 > pass lists it, and acquires it unless §3.7's skip applies; RFC0060.12
 > says when it does. After a publish the skip never applies on the next

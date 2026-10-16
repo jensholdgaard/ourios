@@ -321,13 +321,14 @@ fn a_failed_sweep_marks_its_span_error() {
     assert_eq!(error_type.as_deref(), Some("io"));
 }
 
-/// A candidate whose manifest bootstrap loses to another compactor wrote
-/// nothing and belongs to the winner, so the sweep stays a clean no-op. The
-/// bootstrap is made to lose by occupying the manifest key with a
-/// directory: it reads as absent, so the create-if-absent runs, and is
+/// A peer creates the partition's first manifest while this compaction
+/// rewrites it: this compaction's create-if-absent commit is lost, its
+/// output is cleaned up, and the sweep reports the loss so it is retried.
+/// The peer is modelled by occupying the manifest key with a directory: it
+/// reads as absent, so the rewrite runs, and the create-if-absent is
 /// refused as already existing.
 #[test]
-fn sweep_leaves_a_candidate_whose_bootstrap_lost_as_a_no_op() {
+fn sweep_cleans_up_a_candidate_whose_first_commit_lost() {
     // Arrange
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
@@ -350,9 +351,16 @@ fn sweep_leaves_a_candidate_whose_bootstrap_lost_as_a_no_op() {
         .collect();
     assert_eq!(
         (report.partitions_compacted, found, report.errors.len()),
-        (0, vec![1], 0),
+        (0, vec![1], 1),
         "{report:?}"
     );
+    let parquet: Vec<_> = store
+        .list_blocking(Some("data/"))
+        .expect("list")
+        .into_iter()
+        .filter(|k| k.ends_with(".parquet"))
+        .collect();
+    assert_eq!(parquet.len(), 2, "only the inputs remain: {parquet:?}");
 }
 
 fn outcome(files_before: usize, commit_lost: bool) -> CompactionOutcome {
@@ -387,19 +395,18 @@ fn a_lost_final_swap_is_a_sweep_error() {
     );
 }
 
-/// A lost bootstrap is benign for a consolidation but not for an erasure,
-/// whose rows are still on disk; a partition with nothing to rewrite is a
-/// no-op for both.
+/// An erasure whose first commit is lost is an error, since its rows are
+/// still on disk; a partition with nothing to rewrite is a no-op for both
+/// an erasure and a consolidation.
 #[test]
-fn a_lost_bootstrap_is_an_error_only_for_an_erasure() {
+fn an_erasure_whose_first_commit_is_lost_is_an_error() {
     let verdicts = [
-        check_committed(outcome(2, false), false).is_err(),
-        check_committed(outcome(2, false), true).is_err(),
+        check_committed(outcome(2, true), true).is_err(),
         check_committed(outcome(0, false), false).is_err(),
         check_committed(outcome(0, false), true).is_err(),
     ];
 
-    assert_eq!(verdicts, [false, true, false, false]);
+    assert_eq!(verdicts, [true, false, false]);
 }
 
 /// A lost swap whose discarded rewrite could not be deleted keeps that
@@ -543,9 +550,9 @@ fn write_records(store: &Store, records: &[MinedRecord]) -> String {
 }
 
 /// Lay down what a compactor killed before its commit leaves: the two
-/// inputs, its bootstrap manifest at generation 1 (which consumes nothing,
-/// so the inputs stay live), and their consolidated rows under an unnamed
-/// output for generation 2. Returns that output's key.
+/// inputs under a manifest at generation 1 that consumes nothing (so the
+/// inputs stay live), and their consolidated rows under an unnamed output
+/// for generation 2. Returns that output's key.
 fn crash_before_commit(store: &Store, records: &[MinedRecord; 2]) -> String {
     write_records(store, &records[..1]);
     write_records(store, &records[1..]);
@@ -679,7 +686,10 @@ fn sweep_emits_a_compaction_audit_event() {
         output_file.ends_with(".parquet") && !input_files.contains(output_file),
         "output is the new consolidated file, distinct from the inputs",
     );
-    assert_eq!(*generation, 2, "bootstrap gen 1, commit gen 2");
+    assert_eq!(
+        *generation, 1,
+        "the first commit creates the manifest at gen 1"
+    );
     assert_eq!(*rows, 2);
 }
 

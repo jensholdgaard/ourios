@@ -88,6 +88,7 @@ use ourios_parquet::{columns, promoted};
 /// (`{n}` when `n` is in no class). It is captured here at `compile` time so
 /// `apply`/`compile_predicate` need neither the [`AliasMap`] nor the tenant —
 /// the per-tenant resolution has already happened.
+#[derive(Clone)]
 pub(crate) struct Plan {
     pub(crate) window: (u64, u64),
     predicate: Predicate,

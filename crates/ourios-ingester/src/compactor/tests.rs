@@ -309,6 +309,69 @@ fn erasure_keeps_the_rows_phase_when_its_manifest_swap_lost() {
     assert_eq!(pending, vec![ErasurePhase::Rows]);
 }
 
+/// RFC0009.12 — an erasure still rewrites a settled partition: one live
+/// file at or above the small-file size, which candidate planning skips
+/// without reading it. Erasure walks every hour partition itself.
+#[test]
+fn rfc0009_12_erasure_rewrites_a_settled_partition_the_planner_skips() {
+    // Arrange — one file holding a row to erase (template 1) and one to keep.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    let records = [rec("a", 1, TS0), rec("a", 2, TS0 + 1_000_000)];
+    let partition = PartitionKey::derive(&records[0]).expect("derive");
+    let mut w = Writer::open_in(&store, partition.clone()).expect("open writer");
+    w.append_records(&records).expect("append");
+    w.close().expect("close");
+    let policy = CompactionPolicy {
+        small_file_bytes: 1,
+        ..CompactionPolicy::default()
+    };
+    assert!(
+        plan_candidates(&store, "a", NOW_SEALED, &policy)
+            .expect("plan")
+            .is_empty(),
+        "the partition is settled: the planner skips it",
+    );
+    request_erasure(&store, "a", "c-1").expect("request");
+    let erase_template_1 = |record: &MinedRecord, _: &str| record.template_id == 1;
+    let mut hooks = SweepHooks {
+        observe: None,
+        erasure_match: Some(&erase_template_1),
+        gauges: None,
+    };
+
+    // Act
+    let report = run_sweep_hooked(
+        &store,
+        NOW_SEALED,
+        &policy,
+        &PromotedAttributes::default(),
+        &mut hooks,
+    )
+    .expect("sweep");
+
+    // Assert
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let candidates: Vec<_> = report
+        .per_tenant
+        .iter()
+        .map(|t| t.candidates_found)
+        .collect();
+    assert_eq!(candidates, vec![0], "no consolidation candidate");
+    let outcomes: Vec<_> = report
+        .erasures
+        .iter()
+        .map(|o| (o.partitions_rewritten, o.rows_dropped))
+        .collect();
+    assert_eq!(outcomes, vec![(1, 1)], "{report:?}");
+    let mut kept = Vec::new();
+    ourios_parquet::compaction::visit_partition_rows(&store, &partition, |batch| {
+        kept.extend(batch.iter().map(|r| r.template_id));
+    })
+    .expect("read");
+    assert_eq!(kept, vec![2], "the erased row is gone, the other kept");
+}
+
 #[test]
 fn sweep_compacts_a_sealed_candidate() {
     // Arrange

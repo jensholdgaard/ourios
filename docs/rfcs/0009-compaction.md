@@ -460,10 +460,37 @@ back-compatible). Both are recorded as resolved decisions in §7.
 > listing shows and the later manifest consumed is excluded, and its rows
 > are in a compacted file that manifest names. The reverse order could
 > miss rows, because an old manifest plus a listing taken after the
-> inputs were deleted shows neither. Compacted files are resolved from
-> `files` by name, as today, so a reader that then finds one deleted by a
-> later commit fails as it does now. The compactor reads the manifest
+> inputs were deleted shows neither. The compactor reads the manifest
 > first, but its CAS rejects any commit based on a stale read.
+>
+> **A resolution can still go stale before the files are opened.** The
+> store-backed resolver (`live_keys_from_listing`) fetches only the
+> manifests its listing shows, to avoid a 404 `GET` for every partition
+> that has none. So if the listing comes before a partition's **first**
+> commit, the resolver applies the glob fallback to flush names that the
+> commit then consumes and deletes. The same happens to a compacted file
+> named by a manifest that a later commit replaces and deletes. In both
+> cases the stale key is one whose rows a committed file already holds,
+> because a data file is deleted only after a won commit replaces it.
+> Opening that key returns not-found and never silently returns fewer
+> rows. The querier therefore treats a not-found on a resolved data key as
+> a stale resolution:
+>
+> 1. It discards the plan, resolves the file set again (a fresh listing,
+>    then the manifests it shows), and re-runs the query.
+> 2. It does this at most twice more (three attempts in all), and only
+>    while no row has been sent to the caller.
+> 3. After that, or once rows have been sent, the not-found surfaces as
+>    a storage error that names the key. Rows are never returned short.
+>
+> The local resolver reads each partition's manifest at resolution time,
+> so it sees a first manifest. It meets the same not-found only when a
+> commit deletes files between resolution and execution, and it takes the
+> same retry. A fresh manifest `GET` for every unmanifested partition
+> would also close the first-commit case. It is not chosen, because it
+> brings back the per-partition 404 that the listing avoids, for a race
+> that needs a commit and its deletes to land inside one query's
+> resolution (RFC0009.18).
 >
 > **Manifest size.** `consumed` grows by the flush files compacted into
 > the partition: a few dozen names per hour at today's flush cadence,
@@ -495,31 +522,59 @@ back-compatible). Both are recorded as resolved decisions in §7.
 >    the rewrite, and would surface with the erased rows if it were made
 >    visible without this rule, so the rule and the erasure change land
 >    together.)
-> 2. **A flush file that lands while the rows phase runs.** After an
->    erasure rewrite commits, the partition's live set holds only compacted
->    files. So any live flush file seen afterwards landed after that
->    partition's rewrite listing. Before the marker advances to `tuples`,
->    the rows phase re-lists the tenant once more (a **confirming pass**)
->    and rewrites again, with the same drop filter, every partition that
->    holds a live flush file. It repeats until a pass finds none, for at
->    most 8 rounds, the bound the tuple phase already uses. If flush files
->    are still arriving after that, the marker stays in `rows` and the next
->    sweep retries. The pass may drop rows of the conversation that were
->    acknowledged after the request. That is over-erasure, which is the
->    safe direction for an erasure, and it is limited to the rows phase.
-> 3. **A row acknowledged before the request but published after the rows
->    phase ended.** This happens when a receiver publishes from its WAL
->    late, after a long flush backlog or a restart that replays the WAL
->    (RFC 0008). The rows phase does not start until the marker is older
->    than `erasure_settle`, measured as the store's `LastModified` of the
->    marker against the compactor's clock. The default is twice the
->    receiver's maximum flush interval plus `compaction_grace`, so in normal
->    operation every row acknowledged before the request is already in a
->    flush file when the rows phase lists the tenant. A WAL replay after an
->    outage longer than `erasure_settle` can still publish such a row after
->    the erasure has finished. RFC 0047 §3.6 scopes erasure to "the rows
->    durable at the rewrite", and this residual is recorded against that
->    scope (§7, decision D3), not hidden.
+> 2. **A file that lands, or is committed, while the rows phase runs.**
+>    The rows phase records, for each partition it rewrites, the generation
+>    its erasure commit won. After that commit the partition's live set is
+>    exactly that commit's compacted file. Before the marker advances to
+>    `tuples`, the rows phase runs a **confirming pass**: it re-lists the
+>    tenant and reads the manifest of every partition. A partition must be
+>    rewritten again, with the same drop filter, if it holds a live flush
+>    file, or if its generation is no longer the one recorded for it. A
+>    generation that moved on means another commit landed since: an
+>    ordinary consolidation by a second compactor (S3 allows more than
+>    one) may have folded a late file holding the conversation's rows into
+>    a new compacted file, which then shows no live flush file. Each
+>    rewrite records its new generation. A partition that no erasure commit
+>    has touched yet (it was created during the phase) counts as changed.
+>    The pass repeats until a pass finds nothing to rewrite, for at most 8
+>    rounds, the bound the tuple phase already uses. If partitions are
+>    still changing after that, the marker stays in `rows` and the next
+>    sweep runs the whole rows phase again. The pass may drop rows of the
+>    conversation that were acknowledged after the request. That is
+>    over-erasure, which is the safe direction for an erasure, and it is
+>    limited to the rows phase. A confirming pass costs one listing plus
+>    one manifest `GET` per partition of the tenant, small next to the
+>    rewrite of every partition that the erasure already does.
+> 3. **A row acknowledged before the request but published after the
+>    confirming pass has passed its partition.** The receiver publishes from
+>    its WAL on its own cadence, in another process, and nothing tells the
+>    compactor that the receiver has published every row acknowledged
+>    before the request. A publish can therefore land after the last
+>    confirming pass has checked its partition but before the marker
+>    advances to `tuples`. It can also land later still: after a long flush
+>    backlog, or after a restart that replays the WAL (RFC 0008). Later
+>    sweeps retry only the tuple deletion, so such a row stays. Neither the
+>    8 rounds nor any delay closes this, because the race is with an
+>    unbounded publish. The rows phase does not start until the marker is
+>    older than `erasure_settle`, measured as the store's `LastModified` of
+>    the marker against the compactor's clock. The default is twice the
+>    receiver's maximum flush interval plus `compaction_grace`. That makes
+>    the window rare in normal operation: a pre-request row would have to
+>    be still unpublished `erasure_settle` after the request. It does not
+>    make the window empty. **This is the recorded residual (§7, decision
+>    D3).** RFC 0047 §3.6 scopes erasure to "the rows durable at the
+>    rewrite", and this amendment states the scope as: rows **published**
+>    before the last confirming pass checks their partition. Closing it
+>    needs a fence that the compactor can read across processes. The
+>    candidates, none specified here, are:
+>    - a per-receiver, per-tenant publication frontier exported to the
+>      store, which the rows phase waits on until every live receiver has
+>      published past the marker's creation. RFC 0055's `PUBLISHED`
+>      frontier is that watermark, but it is node-local and RFC 0055 is
+>      still `drafted`;
+>    - receivers that read pending markers and drop the conversation's rows
+>      at publish. This needs a receiver membership list, so the compactor
+>      knows that every receiver has seen the marker.
 >
 > **The rewrite is safe on unsealed partitions now.** An erasure keeps
 > rewriting every hour partition, including the current one (RFC0009.12).
@@ -544,9 +599,10 @@ back-compatible). Both are recorded as resolved decisions in §7.
 > - The erasure rewrite still passes no `observe` hook, so it never
 >   re-emits the tuples it is about to delete. The confirming pass in case
 >   2 uses the same rewrite, so it does not re-emit them either.
-> - In case 3, a row published after the erasure re-creates its tuples at
->   flush cadence, and both row and grant are visible again. This is the
->   same residual as case 3, on the graph side.
+> - In case 3, a row published after the last confirming pass re-creates
+>   its tuples at flush cadence (or at the next consolidation through
+>   `observe`), and both row and grant are visible again. This is the same
+>   residual as case 3, on the graph side.
 
 ### 3.5 Correctness, idempotency, crash safety
 
@@ -848,6 +904,28 @@ bytes, not a base metric.
     and a manifest is selected or skipped by the manifest's live set,
     never by the listing alone.
 
+> **Amendment 2026-10-16 (`drafted`, late writes) — RFC0009.9's oracle.**
+> The comparison stays: the listing planner must select exactly what
+> per-partition reads select on the same objects. Both sides change their
+> live-set rule to the format-2 rule of the §3.4 late-write note. The
+> oracle's per-partition read becomes "the compacted files the manifest
+> names, plus the listed flush files it does not consume", replacing "the
+> listed files restricted to the manifest's names". The generated
+> fixtures are in the new layout:
+>
+> - flush files and `….g<N>.parquet` compacted files;
+> - format-2 manifests whose `files` name any subset of the compacted
+>   files and whose `consumed` names any subset of the flush files;
+> - orphan compacted files with *N* ≤ *G* and in-flight ones with
+>   *N* > *G*;
+> - `*.parquet.tmp` objects.
+>
+> Under the old oracle, one compacted file plus an unconsumed small flush
+> file was skipped; under the new one it is selected (RFC0009.13). The
+> two-file non-candidate unit case stays, rebuilt as a manifest naming
+> one compacted file plus an **orphan compacted file** (unnamed, *N* ≤
+> *G*): two listed files, one `GET`, one live file, not selected.
+
 - **RFC0009.10 — a late write into a settled partition is re-planned
   `[H4 / §3.3]`**
   - **Given** a sealed partition with no manifest and one committed file
@@ -936,6 +1014,14 @@ bytes, not a base metric.
     manifest
   - **When** a compaction commits and deletes its inputs in between
   - **Then** the reader returns every row exactly once.
+  - **And** given a partition with **no** manifest when the store-backed
+    resolver lists it, when that partition's first commit creates the
+    manifest and deletes the inputs before the query opens them, then the
+    query re-resolves on the not-found and returns every row exactly once.
+    It never returns fewer rows.
+  - **And** when the resolution goes stale on all three attempts, or rows
+    have already been sent, the query fails with a storage error naming
+    the key, and does not return a short result.
 
 - **RFC0009.19 — a manifest in the old format is rejected
   `[CLAUDE.md §3.5]`**
@@ -959,16 +1045,26 @@ bytes, not a base metric.
   - **When** a flush file lands in that hour afterwards
   - **Then** its rows are read.
 
-- **RFC0009.22 — the confirming pass catches a flush during the rows
-  phase `[RFC 0047 §3.6]`**
+- **RFC0009.22 — the confirming pass catches what changed during the
+  rows phase `[RFC 0047 §3.6]`**
   - **Given** an erasure of *c* whose rewrite of a partition has
-    committed, and a flush file with a row of *c* (acknowledged before
-    the request) that lands there before the marker advances
+    committed at generation *E*, and a flush file with a row of *c* that
+    lands there before the confirming pass
   - **When** the rows phase finishes
-  - **Then** the marker advances only after a pass finds no live flush
-    file in any partition, and no row of *c* is read.
-  - **And** if flush files keep arriving for 8 rounds, the marker stays
+  - **Then** the marker advances only after a pass finds every
+    partition at its recorded generation with no live flush file, and no
+    row of *c* is read.
+  - **And** given the same late file, when a second compactor's ordinary
+    consolidation commits it into a new compacted file at *E* + 1 before
+    the confirming pass, the pass sees the generation change, rewrites the
+    partition, and no row of *c* is read.
+  - **And** if partitions keep changing for 8 rounds, the marker stays
     in `rows` and the sweep reports it.
+  - **And (residual, for maintainer approval, D3)** a pre-request row
+    whose flush publishes after the last confirming pass has checked its
+    partition is **not** erased. The marker advances, the row is read,
+    and its tuples are written again. The test pins this behaviour, so
+    the residual cannot quietly change without a scenario change.
 
 - **RFC0009.23 — the rows phase waits for `erasure_settle` `[RFC 0047
   §3.6]`**
@@ -1012,8 +1108,8 @@ Mapped to `CLAUDE.md` §6.2:
 > | Scenario | Test | Kind |
 > |---|---|---|
 > | RFC0009.8 | `rfc0009_8_settled_partitions_cost_no_request_of_their_own` — 48 settled partitions (half with a manifest): no `GET`, exactly one logical listing, the same as a 1-partition tenant | integration |
-> | RFC0009.9 | `rfc0009_9_listing_plan_selects_what_per_partition_reads_select` — proptest over partitions × files × sizes × manifest subsets × orphans/tmp; the oracle is the pre-amendment per-partition predicate, kept in the test module | property |
-> | RFC0009.9 | `rfc0009_9_a_manifest_decides_when_two_files_are_listed` — two listed files, a manifest naming one: not selected, one `GET` | unit |
+> | RFC0009.9 | `rfc0009_9_listing_plan_selects_what_per_partition_reads_select` — proptest over partitions × files × sizes × manifest subsets × orphans/tmp; the oracle is the pre-amendment per-partition predicate, kept in the test module (the late-write amendment changes the oracle's live-set rule and fixtures to format 2; see the note under RFC0009.9) | property |
+> | RFC0009.9 | `rfc0009_9_a_manifest_decides_when_two_files_are_listed` — two listed files, a manifest naming one: not selected, one `GET` (under the late-write amendment, the two files are a named compacted file and an orphan compacted file) | unit |
 > | RFC0009.10 | `rfc0009_10_a_late_write_into_a_settled_partition_is_replanned` — one file above the small-file size, planned (skipped, no `GET`); a late file below the small-file size lands; planned again (selected) | integration |
 > | RFC0009.10 | `rfc0009_10_a_late_write_into_a_compacted_partition_is_read` — compacted partition plus a late file: one `GET` of its manifest, not selected (pins today's #1026 behaviour; that fix updates this assertion) | integration |
 > | RFC0009.11 | `rfc0009_11_planning_writes_nothing_and_two_planners_agree` — store listing unchanged after planning; two `Store` handles plan the same list | integration |
@@ -1039,11 +1135,16 @@ Mapped to `CLAUDE.md` §6.2:
 > | RFC0009.15 | `rfc0009_15_a_flush_between_listing_and_commit_stays_live`: a hook between step 1 and step 3 writes a flush file | integration |
 > | RFC0009.16 | `rfc0009_16_a_lost_cas_leftover_is_never_live`: a CAS-simulating store, with the loser's delete failing | integration |
 > | RFC0009.17 | `rfc0009_17_gc_keeps_an_output_for_a_future_generation` | unit |
+> | RFC0009.9 | `rfc0009_9_*` (above): the oracle and generators move to the format-2 live-set rule, and the two-file non-candidate case uses an orphan compacted file. This is a contract change to RFC0009.9's test, approved with this amendment | property, unit |
 > | RFC0009.18 | `rfc0009_18_list_then_manifest_does_not_tear`: commit and input deletes injected between the resolver's listing and its manifest read | integration |
+> | RFC0009.18 | `rfc0009_18_first_manifest_after_listing_re_resolves`: a partition with no manifest is listed; its first commit and the input deletes are injected before execution; the query re-resolves and returns every row once, through `resolve_live_keys` | integration |
+> | RFC0009.18 | `rfc0009_18_stale_three_times_is_a_storage_error`: a not-found injected on every attempt gives a storage error naming the key, and no partial result | integration |
 > | RFC0009.19 | `rfc0009_19_an_old_format_manifest_is_rejected`: querier, planner and `compact_partition`, with the store unchanged afterwards | unit |
 > | RFC0009.20 | `rfc0009_20_erasure_rewrites_a_late_file_that_predates_it` | integration |
 > | RFC0009.21 | `rfc0009_21_a_flush_after_an_erasure_rewrite_is_read`: the current-hour case | integration |
 > | RFC0009.22 | `rfc0009_22_confirming_pass_rewrites_a_flush_during_the_rows_phase` and `rfc0009_22_rows_phase_stays_open_while_flushes_keep_arriving` | integration |
+> | RFC0009.22 | `rfc0009_22_confirming_pass_catches_a_consolidation_since_the_erasure`: a second `Sweep` handle consolidates the late file between the erasure rewrite and the confirming pass | integration |
+> | RFC0009.22 | `rfc0009_22_residual_a_publish_after_the_last_pass_is_not_erased`: a flush is injected after the final confirming listing and before the marker advances; the row stays readable (pins D3's residual) | integration |
 > | RFC0009.23 | `rfc0009_23_rows_phase_waits_for_erasure_settle`: an injected clock against the marker's `LastModified` | unit |
 >
 > The existing `rfc0009_4_*` GC tests keep their assertions. Their
@@ -1176,19 +1277,32 @@ size.
   unnamed `*.parquet` as consumed. That preserves today's visible data
   exactly, late files still lost, but it is migration tooling the
   policy says not to build.
-- [ ] **D3. Erasure residual.** Recommended: `erasure_settle` plus the
-  confirming pass. Together they cover every row published before the
-  rows phase ends, and they leave a row that a WAL replay publishes after
-  an outage longer than `erasure_settle` (§3.4 erasure note, case 3).
-  Alternatives:
-  - keep a completed marker as a tombstone for a retention window and
-    apply the drop filter, ahead of `observe`, in every compaction of the
-    tenant during it. This catches late replays at the next compaction,
-    but the rows are readable until then and new rows of the same id are
-    erased too;
-  - have the receiver drop the conversation's rows at publish while a
-    marker exists. That needs a per-row ingest instant the WAL does not
-    carry today.
+- [ ] **D3. Erasure residual (approve the scope as stated, or require a
+  fence).** Recommended: `erasure_settle` plus the generation-keyed
+  confirming pass, which together cover every row **published** before
+  the last confirming pass checks its partition, including rows that a
+  second compactor folds in meanwhile. The residual is that **a
+  pre-request row whose flush publishes after that pass is not erased**,
+  and nothing in this design makes that window empty. It covers three
+  cases (§3.4 erasure note, case 3; pinned by RFC0009.22's residual
+  arm):
+  - a flush that is still pending when the last pass checks its
+    partition;
+  - a long flush backlog;
+  - a WAL replay after an outage longer than `erasure_settle`.
+
+  The fences that would close it, each a design of its own:
+  - a per-receiver publication frontier exported to the store, which the
+    rows phase waits on. It builds on RFC 0055's `PUBLISHED`, which is
+    node-local and `drafted`;
+  - receivers that drop a marked conversation's rows at publish, plus a
+    receiver membership list, so the compactor knows that every receiver
+    has seen the marker;
+  - a completed marker kept as a tombstone for a retention window, with
+    the drop filter applied, ahead of `observe`, in every compaction of
+    the tenant during it. This catches late publishes at the next
+    compaction, but the rows are readable until then and new rows of
+    the same id are erased too.
 - [ ] **D4. Compacted-file name.** `<uuidv7>.g<N>.parquet` is proposed.
   Any form works that a flush name can never take and that carries *N*.
 
@@ -1249,6 +1363,10 @@ size.
   `<uuidv7>.g<N>.parquet`, so GC tells a lost-CAS leftover or an
   in-flight output apart from a late file without comparing clocks. The
   RFC 0047 §3.6 erasure covers late files through the live set, a
-  confirming pass and an `erasure_settle` delay. Old manifests are
-  rejected (breaking, no dual-read). §3.3 and §3.4 notes, §4 options,
+  generation-keyed confirming pass and an `erasure_settle` delay. A
+  pre-request row published after the last confirming pass is a recorded
+  residual (D3). A query whose resolution goes stale (a first manifest,
+  or deletes, after its listing) re-resolves on the not-found. RFC0009.9's
+  oracle moves to the format-2 rule. Old manifests are rejected
+  (breaking, no dual-read). §3.3 and §3.4 notes, §4 options,
   RFC0009.13–.23, test map, decisions D1–D4 in §7. Refs #1026.

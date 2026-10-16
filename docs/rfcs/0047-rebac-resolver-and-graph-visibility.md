@@ -496,14 +496,21 @@ below the server deadline stays the fail-closed pattern.
 > file is also hidden from every reader, so nothing leaks. The RFC 0009
 > amendment makes late files live and extends this erasure to them. The
 > rewrite's inputs are the live set, which now includes late files. A
-> confirming pass before the marker advances to `tuples` rewrites any
-> partition that took a flush during the rows phase. The rows phase
-> waits until the marker is older than `erasure_settle`, so rows
-> acknowledged before the request have been published. It also records
-> the residual this section's "rows durable at the rewrite" leaves: a WAL
-> replay after a long outage can publish a pre-request row, and its
-> tuples, after the erasure. The OpenFGA model and the tuple shapes do
-> not change. See RFC 0009 §3.4 (erasure note) and RFC0009.20–.23.
+> confirming pass runs before the marker advances to `tuples`. It
+> rewrites any partition that holds a live flush file, or whose manifest
+> generation has moved past the one the erasure committed, which catches
+> a late file that another compactor's consolidation folded in. The rows
+> phase does not start until the marker is older than `erasure_settle`.
+> The amendment also restates this section's scope, "rows durable at the
+> rewrite", as **rows published before the last confirming pass checks
+> their partition**, and records the residual for maintainer approval.
+> No fence stops the receivers from publishing across the move to
+> `tuples`. So a pre-request row whose flush publishes after that pass,
+> whether still pending, backlogged, or replayed from the WAL after an
+> outage, is not erased and writes its tuples again. The fences that
+> would close it are listed in RFC 0009 §7 D3. The OpenFGA model and the
+> tuple shapes do not change. See RFC 0009 §3.4 (erasure note) and
+> RFC0009.20–.23.
 
 ### 3.7 Operational posture
 

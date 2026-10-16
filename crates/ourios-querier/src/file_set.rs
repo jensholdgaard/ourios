@@ -1374,6 +1374,64 @@ mod tests {
         assert!(files[0].ends_with("a.parquet"));
     }
 
+    /// The compacted output a manifest names.
+    const NAMED_OUTPUT: &str = "00000000-0000-7000-8000-000000000002.g2.parquet";
+
+    /// A compacted partition that took a late write (RFC0009.13): the
+    /// manifest names one output and consumed one input; beside them lie an
+    /// unconsumed late flush file and an unnamed output of an earlier
+    /// generation. Returns the tenant directory.
+    fn compacted_with_late_write(root: &std::path::Path) -> PathBuf {
+        let (tenant, partition) = tenant_and_partition(root);
+        for name in [
+            "input.parquet",
+            "late.parquet",
+            NAMED_OUTPUT,
+            "00000000-0000-7000-8000-000000000001.g1.parquet",
+        ] {
+            std::fs::write(partition.join(name), b"x").expect("write file");
+        }
+        let manifest = ourios_parquet::Manifest::new(
+            2,
+            vec![NAMED_OUTPUT.to_string()],
+            vec!["input.parquet".to_string()],
+        );
+        std::fs::write(
+            partition.join(ourios_parquet::MANIFEST_FILENAME),
+            manifest.to_json().expect("manifest json"),
+        )
+        .expect("write manifest");
+        tenant
+    }
+
+    /// Sorted file names of `paths`.
+    fn sorted_names<P: AsRef<std::path::Path>>(paths: &[P]) -> Vec<String> {
+        let mut names: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.as_ref().file_name()?.to_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// RFC0009.13 — both resolvers read the named output and the late flush
+    /// file, and leave out the consumed input and the unnamed output.
+    #[test]
+    fn rfc0009_13_querier_reads_a_late_file_beside_a_compacted_one() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let tenant = compacted_with_late_write(tmp.path());
+        let fetched = crate::fetch_count::FetchCounter::default();
+
+        let local = resolve_live_files(&tenant, None, &mut Tally::new(&fetched)).expect("local");
+        let store = Store::local(tmp.path()).expect("local store");
+        let keyed = resolve_live_keys(&store, TENANT_PREFIX, None, &mut Tally::new(&fetched))
+            .expect("store");
+
+        let expected = [NAMED_OUTPUT, "late.parquet"];
+        assert_eq!(sorted_names(&local), expected, "local resolver");
+        assert_eq!(sorted_names(&keyed), expected, "store resolver");
+    }
+
     /// A store of `partitions` hour partitions on 2026-04-02, each with a
     /// manifest that consumed `b.parquet`, so only `a.parquet` is live,
     /// seen through a [`SlowStore`] whose GETs answer later partitions first.

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::audit_fetch::{FetchPool, fetch_in_order};
 use crate::fetch_count::FetchCounter;
-use ourios_parquet::ManifestError;
+use ourios_parquet::{ManifestError, compacted_generation};
 use tracing::Instrument as _;
 
 /// Resolve the live data files a query must read under `dir` (a
@@ -67,16 +67,13 @@ pub(super) fn resolve_live_files(
         // path it can't prove out of range, so no in-window data is lost.
         let keep = window.is_none_or(|(start, end)| hour_partition_in_window(&d, start, end));
         if keep {
-            match read_local_manifest(&d, tally).map_err(|e| QueryError::Storage {
+            let manifest = read_local_manifest(&d, tally).map_err(|e| QueryError::Storage {
                 detail: format!("manifest in {}: {e}", d.display()),
-            })? {
-                // Manifest is authoritative: only its named files are live.
-                Some(manifest) => {
-                    files.extend(manifest.files.into_iter().map(|name| d.join(name)));
-                }
-                // No manifest → glob fallback for this partition.
-                None => files.append(&mut parquets),
-            }
+            })?;
+            let listed = std::mem::take(&mut parquets);
+            files.extend(live_in_partition(manifest.as_ref(), listed, |name| {
+                d.join(name)
+            }));
         }
         for subdir in subdirs {
             let (Some(level), Some(window)) = (level, window) else {
@@ -273,6 +270,17 @@ pub(super) async fn resolve_data_urls(
         })
 }
 
+/// Resolve `scope` again only to compare it with an earlier resolution, after
+/// a scan over that one failed (RFC0009.18). Not a `resolve files` phase of
+/// its own: the query's phase count stays one per scan attempt.
+pub(super) async fn recheck_data_urls(
+    backend: &Backend,
+    ctx: &SessionContext,
+    scope: DataScope<'_>,
+) -> Result<Vec<ListingTableUrl>, QueryError> {
+    resolve_in_phase(backend, ctx, scope, &tracing::Span::none()).await
+}
+
 async fn resolve_in_phase(
     backend: &Backend,
     ctx: &SessionContext,
@@ -322,14 +330,47 @@ pub(super) fn resolve_live_set(
 ) -> Result<LiveSet, QueryError> {
     match backend {
         Backend::Local(root) => {
-            let tenant_dir = root.join(prefix);
-            let live_files = resolve_live_files(&tenant_dir, window, tally)?;
-            local_file_urls(&tenant_dir, &live_files).map(LiveSet::Urls)
+            resolve_local_urls(&root.join(prefix), window, tally).map(LiveSet::Urls)
         }
         Backend::Remote(store) => {
             resolve_live_keys(store, prefix, window, tally).map(LiveSet::Keys)
         }
     }
+}
+
+/// Resolutions the local backend makes before a file that keeps vanishing
+/// between its listing and its canonicalization fails the query.
+const LOCAL_RESOLVE_ATTEMPTS: u32 = 3;
+
+/// [`resolve_live_files`] then [`canonical_file_urls`] for `tenant_dir`. A file
+/// that vanished between the two was deleted by a commit that already holds
+/// its rows (RFC 0009 §3.4, RFC0009.18), so the listing is stale: list again,
+/// a bounded number of times. Each attempt runs the whole resolution, the
+/// canonical-path tenant check included.
+fn resolve_local_urls(
+    tenant_dir: &std::path::Path,
+    window: Option<(u64, u64)>,
+    tally: &mut Tally<'_>,
+) -> Result<Vec<ListingTableUrl>, QueryError> {
+    let mut attempt = 1;
+    loop {
+        let live_files = resolve_live_files(tenant_dir, window, tally)?;
+        #[cfg(test)]
+        crate::test_support::after_local_listing(tenant_dir);
+        match canonical_file_urls(tenant_dir, &live_files) {
+            Ok(urls) => return Ok(urls),
+            Err(Canonical::Vanished(_)) if attempt < LOCAL_RESOLVE_ATTEMPTS => attempt += 1,
+            Err(Canonical::Vanished(e) | Canonical::Failed(e)) => return Err(e),
+        }
+    }
+}
+
+/// Why [`canonical_file_urls`] failed.
+enum Canonical {
+    /// A listed file no longer exists.
+    Vanished(QueryError),
+    /// Anything else, a tenant-root escape included.
+    Failed(QueryError),
 }
 
 /// The S3 analog of [`resolve_live_files`]: resolve the live data-file **keys**
@@ -626,27 +667,40 @@ fn live_keys_from_listing(
 
     let mut live = Vec::new();
     for (dir, partition_keys) in by_partition {
-        match manifests.remove(dir) {
-            // Manifest is authoritative: only its named files are live (joined
-            // onto the partition key as `<dir>/<name>`).
-            Some(manifest) => {
-                live.extend(
-                    manifest
-                        .files
-                        .into_iter()
-                        .map(|name| format!("{dir}/{name}")),
-                );
-            }
-            // No manifest → glob fallback for this partition's committed files.
-            None => live.extend(
-                partition_keys
-                    .into_iter()
-                    .filter(|(key, _)| key.ends_with(".parquet"))
-                    .map(|(key, _)| key.to_owned()),
-            ),
-        }
+        let manifest = manifests.remove(dir);
+        let listed = partition_keys
+            .into_iter()
+            .filter(|(key, _)| key.ends_with(".parquet"))
+            .map(|(key, _)| key.to_owned());
+        live.extend(live_in_partition(manifest.as_ref(), listed, |name| {
+            format!("{dir}/{name}")
+        }));
     }
     Ok(live)
+}
+
+/// One partition's live files under the RFC 0009 §3.4 live-set rule, as the
+/// compactor computes them: the compacted files `manifest` names, by name
+/// (`locate` joins a name onto the partition), plus every `listed` flush
+/// file it does not consume. With no manifest that is every listed flush
+/// file; a compacted file is never live unless named.
+fn live_in_partition<T: AsRef<std::path::Path>>(
+    manifest: Option<&Manifest>,
+    listed: impl IntoIterator<Item = T>,
+    locate: impl Fn(&str) -> T,
+) -> Vec<T> {
+    let live = ourios_parquet::LiveSet::new(manifest);
+    let named = manifest
+        .into_iter()
+        .flat_map(|m| &m.files)
+        .map(|name| locate(name));
+    let flush = listed.into_iter().filter(|item| {
+        item.as_ref()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| compacted_generation(name).is_none() && live.is_live(name))
+    });
+    named.chain(flush).collect()
 }
 
 /// Build the `DataFusion` table URLs for the **local** backend: every resolved
@@ -663,33 +717,46 @@ fn live_keys_from_listing(
 /// characters are handled without a hand-built `file://…` string.
 /// `year/month/day/hour` stay path-only (not file columns) and the query
 /// filters only data columns, so no table partition columns are declared.
-pub(super) fn local_file_urls(
+///
+/// A listed file that has since vanished is told apart from every other
+/// failure ([`Canonical::Vanished`]), so the caller can list again.
+fn canonical_file_urls(
     tenant_dir: &std::path::Path,
     live_files: &[PathBuf],
-) -> Result<Vec<ListingTableUrl>, QueryError> {
+) -> Result<Vec<ListingTableUrl>, Canonical> {
     if live_files.is_empty() {
         return Ok(Vec::new());
     }
-    let tenant_root = tenant_dir.canonicalize().map_err(|e| QueryError::Storage {
-        detail: format!("canonicalize {}: {e}", tenant_dir.display()),
+    let tenant_root = tenant_dir.canonicalize().map_err(|e| {
+        Canonical::Failed(QueryError::Storage {
+            detail: format!("canonicalize {}: {e}", tenant_dir.display()),
+        })
     })?;
     let mut seen = std::collections::HashSet::new();
     let mut urls = Vec::with_capacity(live_files.len());
     for file in live_files {
-        let abs = file.canonicalize().map_err(|e| QueryError::Storage {
-            detail: format!("canonicalize {}: {e}", file.display()),
+        let abs = file.canonicalize().map_err(|e| {
+            let error = QueryError::Storage {
+                detail: format!("canonicalize {}: {e}", file.display()),
+            };
+            match e.kind() {
+                std::io::ErrorKind::NotFound => Canonical::Vanished(error),
+                _ => Canonical::Failed(error),
+            }
         })?;
         if !abs.starts_with(&tenant_root) {
-            return Err(QueryError::Storage {
+            return Err(Canonical::Failed(QueryError::Storage {
                 detail: format!(
                     "resolved file {} escapes tenant partition root {}",
                     abs.display(),
                     tenant_root.display(),
                 ),
-            });
+            }));
         }
         if seen.insert(abs.clone()) {
-            urls.push(ListingTableUrl::parse(abs.display().to_string()).map_err(storage_err)?);
+            let url = ListingTableUrl::parse(abs.display().to_string())
+                .map_err(|e| Canonical::Failed(storage_err(e)))?;
+            urls.push(url);
         }
     }
     Ok(urls)
@@ -891,11 +958,14 @@ mod tests {
         store.put_blocking(key, b"x".to_vec()).expect("put");
     }
 
-    fn put_manifest(store: &Store, dir: &str, files: &[&str]) {
-        let manifest = ourios_parquet::Manifest {
-            generation: 1,
-            files: files.iter().map(ToString::to_string).collect(),
-        };
+    /// A manifest in `dir` that consumes the flush files `retired`, so every
+    /// other flush file there stays live (RFC 0009 §3.4).
+    fn put_manifest(store: &Store, dir: &str, retired: &[&str]) {
+        let manifest = ourios_parquet::Manifest::new(
+            1,
+            Vec::new(),
+            retired.iter().map(ToString::to_string).collect(),
+        );
         store
             .put_blocking(
                 &format!("{dir}/{}", ourios_parquet::MANIFEST_FILENAME),
@@ -969,7 +1039,7 @@ mod tests {
             store,
             &format!("{}/c.parquet.tmp", hour_prefix(2026, 4, 2, 10)),
         );
-        put_manifest(store, &hour_prefix(2026, 4, 2, 11), &["a.parquet"]);
+        put_manifest(store, &hour_prefix(2026, 4, 2, 11), &["orphan.parquet"]);
         put(
             store,
             &format!("{}/orphan.parquet", hour_prefix(2026, 4, 2, 11)),
@@ -979,7 +1049,7 @@ mod tests {
             &format!("{}/f.parquet", hour_prefix(2025, 12, 31, 23)),
         );
         put(store, &format!("{}/f.parquet", hour_prefix(2026, 1, 1, 0)));
-        put_manifest(store, &hour_prefix(2025, 12, 31, 23), &["f.parquet"]);
+        put_manifest(store, &hour_prefix(2025, 12, 31, 23), &[]);
     }
 
     /// Stray keys below parsed Hive ancestors (`year=2026`, then the
@@ -1336,15 +1406,12 @@ mod tests {
 
     #[test]
     fn resolve_manifest_is_authoritative() {
-        // Arrange — two files on disk, a manifest naming only one.
+        // Arrange — two files on disk, a manifest that consumed one.
         let tmp = tempfile::tempdir().expect("temp");
         let (tenant, partition) = tenant_and_partition(tmp.path());
         std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
         std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
-        let manifest = ourios_parquet::Manifest {
-            generation: 1,
-            files: vec!["a.parquet".to_string()],
-        };
+        let manifest = ourios_parquet::Manifest::new(1, Vec::new(), vec!["b.parquet".to_string()]);
         std::fs::write(
             partition.join(ourios_parquet::MANIFEST_FILENAME),
             manifest.to_json().unwrap(),
@@ -1364,8 +1431,66 @@ mod tests {
         assert!(files[0].ends_with("a.parquet"));
     }
 
+    /// The compacted output a manifest names.
+    const NAMED_OUTPUT: &str = "00000000-0000-7000-8000-000000000002.g2.parquet";
+
+    /// A compacted partition that took a late write (RFC0009.13): the
+    /// manifest names one output and consumed one input; beside them lie an
+    /// unconsumed late flush file and an unnamed output of an earlier
+    /// generation. Returns the tenant directory.
+    fn compacted_with_late_write(root: &std::path::Path) -> PathBuf {
+        let (tenant, partition) = tenant_and_partition(root);
+        for name in [
+            "input.parquet",
+            "late.parquet",
+            NAMED_OUTPUT,
+            "00000000-0000-7000-8000-000000000001.g1.parquet",
+        ] {
+            std::fs::write(partition.join(name), b"x").expect("write file");
+        }
+        let manifest = ourios_parquet::Manifest::new(
+            2,
+            vec![NAMED_OUTPUT.to_string()],
+            vec!["input.parquet".to_string()],
+        );
+        std::fs::write(
+            partition.join(ourios_parquet::MANIFEST_FILENAME),
+            manifest.to_json().expect("manifest json"),
+        )
+        .expect("write manifest");
+        tenant
+    }
+
+    /// Sorted file names of `paths`.
+    fn sorted_names<P: AsRef<std::path::Path>>(paths: &[P]) -> Vec<String> {
+        let mut names: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.as_ref().file_name()?.to_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// RFC0009.13 — both resolvers read the named output and the late flush
+    /// file, and leave out the consumed input and the unnamed output.
+    #[test]
+    fn rfc0009_13_querier_reads_a_late_file_beside_a_compacted_one() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let tenant = compacted_with_late_write(tmp.path());
+        let fetched = crate::fetch_count::FetchCounter::default();
+
+        let local = resolve_live_files(&tenant, None, &mut Tally::new(&fetched)).expect("local");
+        let store = Store::local(tmp.path()).expect("local store");
+        let keyed = resolve_live_keys(&store, TENANT_PREFIX, None, &mut Tally::new(&fetched))
+            .expect("store");
+
+        let expected = [NAMED_OUTPUT, "late.parquet"];
+        assert_eq!(sorted_names(&local), expected, "local resolver");
+        assert_eq!(sorted_names(&keyed), expected, "store resolver");
+    }
+
     /// A store of `partitions` hour partitions on 2026-04-02, each with a
-    /// manifest naming `a.parquet` plus a retired `b.parquet` it excludes,
+    /// manifest that consumed `b.parquet`, so only `a.parquet` is live,
     /// seen through a [`SlowStore`] whose GETs answer later partitions first.
     fn manifested_partitions(
         root: &std::path::Path,
@@ -1386,7 +1511,7 @@ mod tests {
             let dir = hour_prefix(2026, 4, 2, hour);
             put(&plain, &format!("{dir}/a.parquet"));
             put(&plain, &format!("{dir}/b.parquet"));
-            put_manifest(&plain, &dir, &["a.parquet"]);
+            put_manifest(&plain, &dir, &["b.parquet"]);
         }
         let mut slow = None;
         let wrapped = plain.wrap_backend(|inner| {

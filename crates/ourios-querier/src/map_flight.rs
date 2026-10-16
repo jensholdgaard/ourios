@@ -43,7 +43,9 @@ type Shared = Result<(Arc<TemplateMap>, u64, Persisted), QueryError>;
 /// once (RFC 0033): at compile time when the DSL uses `resolves_to` (the
 /// alias fold), otherwise lazily while rendering rows, so the alias map and
 /// the registry can never come from different frontiers within one query
-/// (§3.1's one-artifact rationale).
+/// (§3.1's one-artifact rationale). Cloning shares the map; a query's
+/// retries reuse its one acquisition rather than acquiring again.
+#[derive(Clone)]
 pub(crate) struct MapAcquisition {
     pub(crate) map: Arc<TemplateMap>,
     /// The acquisition's bytes ([`crate::QueryResult::registry_bytes_read`]),

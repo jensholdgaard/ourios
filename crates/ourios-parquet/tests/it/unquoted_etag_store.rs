@@ -17,7 +17,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use ourios_parquet::{PartitionKey, S3Config, Store, Writer, compact_partition};
+use ourios_core::record::MinedRecord;
+use ourios_parquet::compaction::visit_partition_rows;
+use ourios_parquet::{Manifest, PartitionKey, S3Config, Store, Writer, compact_partition};
 
 use super::rfc0013_object_store::rec_for;
 
@@ -211,14 +213,43 @@ struct State {
     objects: Objects,
     next_etag: Mutex<u64>,
     if_match_puts: AtomicUsize,
+    interleave: Mutex<Option<Interleave>>,
 }
 
-fn get(objects: &Objects, key: &str, stream: &TcpStream) {
-    let found = objects
+/// A change another process makes to the bucket, applied once, on the first
+/// `GET` (a listing or an object read): after that request's answer is
+/// computed and before it is sent, so the client sees the old state in that
+/// answer and the new state in every later one.
+type Interleave = Box<dyn FnOnce(&mut BTreeMap<String, (Vec<u8>, String)>) + Send>;
+
+impl State {
+    fn interleave_on_first_read(&self, change: Interleave) {
+        *self
+            .interleave
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(change);
+    }
+
+    fn run_interleave(&self) {
+        let change = self
+            .interleave
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(change) = change {
+            change(&mut self.objects.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+    }
+}
+
+fn get(state: &State, key: &str, stream: &TcpStream) {
+    let found = state
+        .objects
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(key)
         .cloned();
+    state.run_interleave();
     match found {
         Some((bytes, etag)) => respond(
             stream,
@@ -239,9 +270,6 @@ fn get(objects: &Objects, key: &str, stream: &TcpStream) {
 }
 
 fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
-    let State {
-        objects, next_etag, ..
-    } = state;
     let Some(req) = read_request(stream) else {
         return;
     };
@@ -252,42 +280,79 @@ fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
         .trim_start_matches('/')
         .to_string();
     match req.method.as_str() {
-        "GET" if key.is_empty() => {
-            let xml = list(objects, &req);
-            respond(stream, "200 OK", &[], xml.as_bytes());
-        }
-        "GET" | "HEAD" => get(objects, &key, stream),
-        "PUT" => {
-            if req.header("if-match").is_some() {
-                state.if_match_puts.fetch_add(1, Ordering::SeqCst);
-            }
-            let mut objects = objects.lock().unwrap_or_else(PoisonError::into_inner);
-            let current = objects.get(&key).map(|(_, etag)| etag);
-            if precondition_holds(mode, &req, current) {
-                let mut n = next_etag.lock().unwrap_or_else(PoisonError::into_inner);
-                *n += 1;
-                let etag = format!("e{n}");
-                objects.insert(key, (req.body, etag.clone()));
-                respond(stream, "200 OK", &[("ETag", format!("\"{etag}\""))], b"");
-            } else {
-                respond(
-                    stream,
-                    "412 Precondition Failed",
-                    &[],
-                    b"<Error><Code>PreconditionFailed</Code></Error>",
-                );
-            }
-        }
-        "DELETE" => {
-            objects
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&key);
-            respond(stream, "204 No Content", &[], b"");
-        }
-        "POST" if req.query("delete").is_some() => bulk_delete(objects, &req, stream),
+        "GET" if key.is_empty() => list_objects(state, &req, stream),
+        "GET" | "HEAD" => get(state, &key, stream),
+        "PUT" => put(Fake { mode, state }, PutRequest { req, key }, stream),
+        "DELETE" => delete(state, &key, stream),
+        "POST" if req.query("delete").is_some() => bulk_delete(&state.objects, &req, stream),
         _ => respond(stream, "405 Method Not Allowed", &[], b""),
     }
+}
+
+/// `ListObjectsV2`, answered from the state before any interleaved change.
+fn list_objects(state: &State, req: &Request, stream: &TcpStream) {
+    let xml = list(&state.objects, req);
+    state.run_interleave();
+    respond(stream, "200 OK", &[], xml.as_bytes());
+}
+
+/// The fake as one request sees it: how it compares tags, and its state.
+#[derive(Clone, Copy)]
+struct Fake<'s> {
+    mode: IfMatch,
+    state: &'s State,
+}
+
+/// A `PUT` and the object key it targets.
+struct PutRequest {
+    req: Request,
+    key: String,
+}
+
+/// `PUT`, plain or conditional as the fake's mode compares tags.
+fn put(fake: Fake<'_>, put: PutRequest, stream: &TcpStream) {
+    if put.req.header("if-match").is_some() {
+        fake.state.if_match_puts.fetch_add(1, Ordering::SeqCst);
+    }
+    let Some(etag) = store_if_precondition_holds(fake, put) else {
+        respond(
+            stream,
+            "412 Precondition Failed",
+            &[],
+            b"<Error><Code>PreconditionFailed</Code></Error>",
+        );
+        return;
+    };
+    respond(stream, "200 OK", &[("ETag", format!("\"{etag}\""))], b"");
+}
+
+/// Store `req`'s body at `key` under a fresh `ETag` when its conditional
+/// headers hold; that `ETag`, or `None` for a failed precondition.
+fn store_if_precondition_holds(fake: Fake<'_>, put: PutRequest) -> Option<String> {
+    let Fake { mode, state } = fake;
+    let PutRequest { req, key } = put;
+    let mut objects = state.objects.lock().unwrap_or_else(PoisonError::into_inner);
+    let current = objects.get(&key).map(|(_, etag)| etag);
+    if !precondition_holds(mode, &req, current) {
+        return None;
+    }
+    let mut n = state
+        .next_etag
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    *n += 1;
+    let etag = format!("e{n}");
+    objects.insert(key, (req.body, etag.clone()));
+    Some(etag)
+}
+
+fn delete(state: &State, key: &str, stream: &TcpStream) {
+    state
+        .objects
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(key);
+    respond(stream, "204 No Content", &[], b"");
 }
 
 /// `DeleteObjects` (`POST ?delete`), which `object_store` uses for every
@@ -405,10 +470,11 @@ fn put_if_match_still_loses_with_a_stale_etag() {
 }
 
 /// #807: a sealed two-file partition on such a store consolidates — the
-/// commit wins instead of being discarded as a lost race.
+/// commit wins instead of being discarded as a lost race. An existing
+/// manifest makes the commit an `If-Match` swap, the request #807 was about.
 #[test]
 fn compaction_commits_on_an_unquoted_etag_store() {
-    let store = unquoted_etag_store();
+    let (store, state) = fake_store(IfMatch::Unquoted);
     let partition = PartitionKey::derive(&rec_for("tenant-a", 0)).expect("derive");
     for i in 0..2 {
         let mut writer = Writer::open_in(&store, partition.clone()).expect("open writer");
@@ -417,6 +483,7 @@ fn compaction_commits_on_an_unquoted_etag_store() {
             .expect("append");
         writer.close().expect("close");
     }
+    seed_empty_manifest(&store, &partition);
 
     let outcome = compact_partition(&store, &partition).expect("compact");
 
@@ -425,6 +492,20 @@ fn compaction_commits_on_an_unquoted_etag_store() {
         .expect("the manifest swap commits instead of losing its CAS");
     assert_eq!(committed.input_files.len(), 2);
     assert_eq!(outcome.rows, 2);
+    assert!(
+        state.if_match_puts.load(Ordering::SeqCst) > 0,
+        "the commit was an If-Match swap"
+    );
+}
+
+/// An existing format-2 manifest in `partition` that consumes nothing, so
+/// the next commit there is an `If-Match` swap and the inputs stay live.
+fn seed_empty_manifest(store: &Store, partition: &PartitionKey) {
+    let manifest_key = format!("{}/manifest.json", name_prefix(partition));
+    let existing = Manifest::new(1, Vec::new(), Vec::new());
+    store
+        .put_blocking(&manifest_key, existing.to_json().expect("json"))
+        .expect("seed manifest");
 }
 
 /// A store that honours the quoted `ETag` is unaffected: the first swap wins
@@ -490,6 +571,9 @@ fn a_lost_final_swap_removes_its_rewrite() {
             .expect("append");
         writer.close().expect("close");
     }
+    // An existing manifest makes the commit an `If-Match` swap, which this
+    // store never honours.
+    seed_empty_manifest(&store, &partition);
     let parquet_keys = || -> Vec<String> {
         let mut keys: Vec<_> = store
             .list_blocking(Some("data/"))
@@ -584,4 +668,100 @@ fn put_if_match_leads_with_the_spelling_that_last_won() {
             b"v2".to_vec()
         );
     }
+}
+
+/// The bytes of one committed Parquet file holding `rows`, written through a
+/// throwaway local store, for a test to place in the fake bucket.
+fn parquet_bytes(partition: &PartitionKey, rows: &[MinedRecord]) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("temp");
+    let local = Store::local(dir.path()).expect("local store");
+    let mut writer = Writer::open_in(&local, partition.clone()).expect("open writer");
+    writer.append_records(rows).expect("append");
+    let key = writer.close().expect("close").key;
+    local.get_blocking(&key).expect("get")
+}
+
+/// Write each of `rows` as its own flush file; their keys.
+fn write_flush_files(store: &Store, partition: &PartitionKey, rows: &[MinedRecord]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let mut writer = Writer::open_in(store, partition.clone()).expect("open writer");
+            writer
+                .append_records(std::slice::from_ref(row))
+                .expect("append");
+            writer.close().expect("close").key
+        })
+        .collect()
+}
+
+/// The `time_unix_nano` of every row `visit_partition_rows` yields, sorted.
+fn visited_times(store: &Store, partition: &PartitionKey) -> Vec<u64> {
+    let mut times = Vec::new();
+    visit_partition_rows(store, partition, |batch| {
+        times.extend(batch.iter().map(|r| r.time_unix_nano));
+    })
+    .expect("visit");
+    times.sort_unstable();
+    times
+}
+
+fn name_of(key: &str) -> String {
+    key.rsplit_once('/').expect("partition key").1.to_owned()
+}
+
+fn name_prefix(partition: &PartitionKey) -> String {
+    partition
+        .data_path(std::path::Path::new(""))
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// A peer's commit at generation 2: its output `out` holding `rows`, and a
+/// manifest naming it and consuming `consumed`, as objects to add.
+fn peer_commit(
+    partition: &PartitionKey,
+    out: &str,
+    rows: &[MinedRecord],
+    consumed: Vec<String>,
+) -> BTreeMap<String, (Vec<u8>, String)> {
+    let prefix = name_prefix(partition);
+    let manifest = Manifest::new(2, vec![out.to_owned()], consumed);
+    BTreeMap::from([
+        (
+            format!("{prefix}/{out}"),
+            (parquet_bytes(partition, rows), "peer-out".to_owned()),
+        ),
+        (
+            format!("{prefix}/manifest.json"),
+            (
+                manifest.to_json().expect("json"),
+                "peer-manifest".to_owned(),
+            ),
+        ),
+    ])
+}
+
+/// RFC0009.18 (compactor read path): a partition's first commit lands between
+/// `visit_partition_rows`' listing and its manifest read, and deletes the
+/// inputs. The visit sees that commit through the manifest and reads every row
+/// once, from the compacted file it names.
+#[test]
+fn visit_reads_every_row_across_a_first_commit_between_its_reads() {
+    let (store, state) = fake_store(IfMatch::Either);
+    let partition = PartitionKey::derive(&rec_for("tenant-a", 0)).expect("derive");
+    let rows = [rec_for("tenant-a", 0), rec_for("tenant-a", 1)];
+    let inputs = write_flush_files(&store, &partition, &rows);
+    let out = "00000000-0000-7000-8000-000000000001.g2.parquet";
+    let consumed = inputs.iter().map(|k| name_of(k)).collect();
+    let commit = peer_commit(&partition, out, &rows, consumed);
+    state.interleave_on_first_read(Box::new(move |objects| {
+        objects.extend(commit);
+        for input in &inputs {
+            objects.remove(input);
+        }
+    }));
+
+    let times = visited_times(&store, &partition);
+
+    assert_eq!(times, rows.map(|r| r.time_unix_nano), "every row, once");
 }

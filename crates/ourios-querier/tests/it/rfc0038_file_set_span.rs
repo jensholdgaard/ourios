@@ -419,8 +419,8 @@ fn narrow_counts() -> [Option<Value>; 4] {
     expected([5, 3, 1, 1])
 }
 
-/// Plant a manifest in the partition whose key contains `hour`, naming only
-/// one of its data files and retiring the rest.
+/// Plant a manifest in the partition whose key contains `hour` that consumes
+/// all of its data files but one, retiring them.
 fn retire_all_but_one(store: &Store, hour: &str) {
     let keys: Vec<String> = store
         .list_with_sizes_blocking(Some("data"))
@@ -429,14 +429,13 @@ fn retire_all_but_one(store: &Store, hour: &str) {
         .map(|(key, _)| key)
         .filter(|key| key.contains(hour) && key.ends_with(".parquet"))
         .collect();
-    let [kept, _, ..] = &keys[..] else {
+    let [kept, retired @ ..] = &keys[..] else {
         panic!("two data files in {hour}: {keys:?}");
     };
-    let (partition, name) = kept.rsplit_once('/').expect("a partition key");
-    let manifest = ourios_parquet::Manifest {
-        generation: 1,
-        files: vec![name.to_owned()],
-    };
+    assert!(!retired.is_empty(), "two data files in {hour}: {keys:?}");
+    let (partition, _) = kept.rsplit_once('/').expect("a partition key");
+    let name = |key: &String| key.rsplit_once('/').expect("a partition key").1.to_owned();
+    let manifest = ourios_parquet::Manifest::new(1, Vec::new(), retired.iter().map(name).collect());
     store
         .put_blocking(
             &format!("{partition}/{}", ourios_parquet::MANIFEST_FILENAME),

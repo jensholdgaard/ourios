@@ -113,10 +113,11 @@ impl<'s> Lister<'s> {
     }
 
     /// Whether a partition is worth compacting per `policy` (see
-    /// [`meets_policy`]). The live set is the listed files, restricted to
-    /// the manifest's names when a manifest is listed; that manifest is read
-    /// only when two or more files are listed, since fewer can't be two live
-    /// files.
+    /// [`meets_policy`]). The live set is the listed files that are live
+    /// under the RFC 0009 §3.4 rule ([`LiveSet`]): with no manifest listed,
+    /// the flush files; otherwise also the named compacted files, less the
+    /// consumed flush files. The manifest is read only when two or more files
+    /// are listed, since fewer can't be two live files.
     fn is_candidate(
         &mut self,
         partition: &PartitionKey,
@@ -132,13 +133,11 @@ impl<'s> Lister<'s> {
         } else {
             None
         };
-        let live: Option<HashSet<&str>> = manifest
-            .as_ref()
-            .map(|m| m.files.iter().map(String::as_str).collect());
+        let live = LiveSet::new(manifest.as_ref());
         let sizes: Vec<u64> = listed
             .files
             .iter()
-            .filter(|(name, _)| live.as_ref().is_none_or(|l| l.contains(name.as_str())))
+            .filter(|(name, _)| live.is_live(name))
             .map(|(_, size)| *size)
             .collect();
         Ok(meets_policy(&sizes, policy))
@@ -343,14 +342,17 @@ pub(super) fn parse_partition_segment(segment: &str, prefix: &str, width: usize)
     (digits == format!("{value:0width$}")).then_some(value)
 }
 
-/// The partition's live data-file *keys*: the manifest's named files joined to
-/// the partition prefix when a manifest is present (authoritative), else every
-/// committed `*.parquet` object under the prefix (`*.parquet.tmp` and
-/// `manifest.json` are excluded by suffix). Mirrors the querier's resolution.
 /// Visit every live row of `partition`, batch by batch, without rewriting
-/// anything — the read half of the compaction path (manifest-listed files
-/// when a manifest exists, committed Parquet objects otherwise), for the
-/// RFC 0048 §3.4 backfill.
+/// anything — the read half of the compaction path under the RFC 0009 §3.4
+/// live-set rule, for the RFC 0048 §3.4 backfill.
+///
+/// The partition is listed **before** its manifest is read, as the querier
+/// resolves (RFC 0009 §3.4, reader order). A commit that lands between the two
+/// reads is then seen through its manifest: the flush files it consumed are
+/// excluded and the compacted file it names is read by name. The reverse order
+/// would pair an older manifest with a listing taken after the commit deleted
+/// its inputs, and silently visit fewer rows. A commit that deletes a listed
+/// file after both reads makes its `get` fail loudly.
 ///
 /// # Errors
 ///
@@ -360,8 +362,9 @@ pub fn visit_partition_rows(
     partition: &PartitionKey,
     mut visit: impl FnMut(&[MinedRecord]),
 ) -> Result<(), CompactionError> {
+    let listed = list_partition(store, partition)?;
     let manifest = read_manifest(store, partition)?;
-    for key in live_file_keys(store, partition, manifest.as_ref())? {
+    for key in live_keys_of(partition, manifest.as_ref(), listed) {
         let bytes = store
             .get_blocking(&key)
             .map_err(|e| store_io("get", &key, e))?;

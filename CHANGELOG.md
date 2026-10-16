@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.13.4] - 2026-10-16
+
+### Added
+
+- Record the file-set listing and manifest counts on resolve files (#1023) (f265be6)
+- Record ourios.tenant on the per-partition compaction metrics (#1022) (92600e7)
+- Record client.address, client.port and user_agent.original on http server spans (#1021) (df13f95)
+- Span the union-schema footer inference as infer schema (#1018) (21c2115)
+
+### Documentation
+
+- Mark rfc0038.1's query arm green (#1024) (b72dc47)
+- Amend §3.7 with an infer schema phase span (#1017) (427ff72)
+
+### Performance
+
+- Plan each tenant once per sweep (#1020) (14abb6c)
+
 ## [0.13.3] - 2026-10-15
 
 ### Added

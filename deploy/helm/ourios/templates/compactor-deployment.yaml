@@ -15,6 +15,10 @@ metadata:
     app.kubernetes.io/component: compactor
 spec:
   replicas: 1
+  # RFC0009.24: a rolling update would briefly run two compactors on the same
+  # store, and local-backend manifest commits are last-writer-wins.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "ourios.selectorLabels" . | nindent 6 }}

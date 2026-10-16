@@ -672,10 +672,12 @@ pod sweeping, the receiver and querier disable compaction in their config file
 (`compaction.enabled: false`), so a **single dedicated `compactor` Deployment
 (1 replica)** is the only sweeper.
 
-Scaling that compactor `Deployment` past 1 replica is **safe but unnecessary**:
-the manifest publish-CAS commit (RFC 0009 §3.2 / RFC0013.3–.4) makes concurrent
-sweeps correct — a losing sweeper's consolidated file is just an orphan a later
-sweep reclaims — but it duplicates the per-interval object listing for no gain.
+Keep it at **1 replica**. The Deployment uses the `Recreate` strategy, so an
+upgrade stops the old compactor pod before it starts the new one (RFC0009.24).
+On the local (PVC) backend the manifest commit is last-writer-wins, so two
+compactors running at once can lose rows. On S3 the publish-CAS commit
+(RFC0013.3–.4) keeps concurrent sweeps correct for the data, but a second
+sweeper can still recreate graph tuples that an erasure deleted (#1034).
 A `replicas: 1` Deployment self-heals (k8s reschedules a dead pod; a brief gap
 in this background maintenance is harmless), so leader election isn't needed and
 is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.

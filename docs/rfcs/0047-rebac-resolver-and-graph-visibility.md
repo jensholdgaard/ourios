@@ -490,7 +490,7 @@ server-side deadline behaviour on `streamed-list-objects` remains
 undocumented (a source-level question); the client-side `list_timeout_ms`
 below the server deadline stays the fail-closed pattern.
 
-> **Note 2026-10-16 (`drafted`, RFC 0009 late-write amendment, #1026).**
+> **Note (2026-10-16, RFC 0009 late-write amendment #1033, maintainer-approved; #1026).**
 > The rewrite above covers only the files a partition's manifest names,
 > so a late write into a compacted partition is skipped by it. Today that
 > file is also hidden from every reader, so nothing leaks. The RFC 0009
@@ -505,7 +505,7 @@ below the server deadline stays the fail-closed pattern.
 > phase does not start until the marker is older than `erasure_settle`.
 > The amendment also restates this section's scope, "rows durable at the
 > rewrite", as **rows published before the last confirming pass checks
-> their partition**, and records the residual for maintainer approval.
+> their partition**, and records the residual, which the maintainer accepted (RFC 0009 §7 D3).
 > No fence stops the receivers from publishing across the move to
 > `tuples`. So a pre-request row whose flush publishes after that pass,
 > whether still pending, backlogged, or replayed from the WAL after an

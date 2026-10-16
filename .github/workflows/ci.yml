@@ -635,6 +635,19 @@ jobs:
           if [ "$mcp_seen" -eq 0 ]; then
             echo "::warning::MCP execute_tool span not observed in live-check — the gen_ai.*/mcp.* attribute + exemption path was not exercised this run (the best-effort MCP handshake likely failed)"
           fi
+          # The probe query above is mandatory, so its `POST /v1/query` server
+          # span must carry the caller attributes (#1005); curl sends a
+          # User-Agent by default.
+          missing_client=""
+          for attr in client.address client.port user_agent.original; do
+            seen="$(jq --arg a "$attr" '[.. | objects | select(.name? == $a)] | length' "$report")"
+            if [ "$seen" -eq 0 ]; then
+              missing_client="$missing_client $attr"
+            fi
+          done
+          if [ -n "$missing_client" ]; then
+            echo "::error::the query server span reached weaver without:$missing_client"
+          fi
           unexpected="$(jq '[.. | objects
             | select(.type? == "PolicyFinding" and .level? == "violation")
             | select(( (.id == "deprecated")
@@ -657,7 +670,7 @@ jobs:
           if [ "$server_status" -ne 0 ]; then
             echo "::error::ourios-server exited with status $server_status"
           fi
-          [ "$unexpected" -eq 0 ] && [ "$server_status" -eq 0 ]
+          [ "$unexpected" -eq 0 ] && [ "$server_status" -eq 0 ] && [ -z "$missing_client" ]
       # The WAL's rotation, floor and latch events (RFC0052.7) and the
       # listener events (#873) fire only when a disk fails, a tenant pins
       # the floor, an accept fails or a certificate goes bad, which the

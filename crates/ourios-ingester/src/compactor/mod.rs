@@ -162,6 +162,8 @@ mod graph_tests;
 #[cfg(test)]
 mod sweep_progress_tests;
 #[cfg(test)]
+mod tenant_metrics_tests;
+#[cfg(test)]
 mod tests;
 
 // Scope glue: siblings and the test module reach each other's items

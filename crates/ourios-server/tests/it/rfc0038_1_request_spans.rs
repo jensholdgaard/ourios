@@ -197,10 +197,7 @@ async fn query_span(
 }
 
 fn error_type(span: &opentelemetry_sdk::trace::SpanData) -> Option<Value> {
-    span.attributes
-        .iter()
-        .find(|kv| kv.key.as_str() == "error.type")
-        .map(|kv| kv.value.clone())
+    attribute(span, "error.type")
 }
 
 // Semconv HTTP server spans: a 4xx is the client's error, so the span's
@@ -233,5 +230,101 @@ async fn a_5xx_query_marks_the_server_span_error() {
         matches!(error_type(&span), Some(Value::String(s)) if s.as_str() == "500"),
         "error.type = {:?}",
         error_type(&span),
+    );
+}
+
+/// Serve the query router on a real loopback listener, send one
+/// `POST /v1/query` (with `user_agent` as its `User-Agent`, when given) and
+/// return the client socket's own address with the exported query span.
+///
+/// The serve loop `tokio::spawn`s each connection, which a scoped
+/// `with_subscriber` does not cross; on a current-thread runtime a
+/// thread-default subscriber reaches it, since every task runs on this thread.
+async fn served_query_span(user_agent: Option<&str>) -> (std::net::SocketAddr, SpanData) {
+    use tokio::io::AsyncWriteExt as _;
+
+    let bucket = tempfile::tempdir().expect("temp");
+    let app = ourios_server::querier::router(bucket.path().to_path_buf(), WINDOW_NANOS);
+    let (exporter, provider, subscriber) = scoped_tracer();
+    let _default = tracing::subscriber::set_default(subscriber);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let server_addr = listener.local_addr().expect("local addr");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(ourios_serving::serve::serve_http(
+        ourios_serving::serve::PlainListener::new(
+            listener,
+            ourios_serving::tls_serve::LISTENER_QUERIER,
+        ),
+        app,
+        async {
+            let _ = stopped.await;
+        },
+    ));
+
+    let mut stream = tokio::net::TcpStream::connect(server_addr)
+        .await
+        .expect("connect");
+    let client_addr = stream.local_addr().expect("client addr");
+    let body = "template_id == 1";
+    let user_agent = user_agent.map_or_else(String::new, |ua| format!("user-agent: {ua}\r\n"));
+    let request = format!(
+        "POST /v1/query HTTP/1.1\r\nhost: localhost\r\ncontent-type: text/plain\r\n\
+         x-ourios-tenant: acme\r\n{user_agent}content-length: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let response = crate::raw_http::read_response(&mut stream).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "response = {response}"
+    );
+
+    let _ = stop.send(());
+    server.await.expect("server task");
+    provider.force_flush().expect("spans flush");
+    let span = exporter
+        .get_finished_spans()
+        .expect("spans exported")
+        .into_iter()
+        .find(|span| span.name.as_ref() == "POST /v1/query")
+        .expect("the query span");
+    (client_addr, span)
+}
+
+fn attribute(span: &SpanData, key: &str) -> Option<Value> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.clone())
+}
+
+// Issue #1005: the query server span identifies its caller. With no trusted
+// proxy, `client.*` is the socket peer, the same as `network.peer.*`.
+#[tokio::test(flavor = "current_thread")]
+async fn the_query_span_records_the_client_and_its_user_agent() {
+    let (client, span) = served_query_span(Some("probe/1.0 (fixed-rate)")).await;
+    let address = Value::from(client.ip().to_string());
+    let port = Value::I64(i64::from(client.port()));
+    assert_eq!(attribute(&span, "client.address"), Some(address.clone()));
+    assert_eq!(attribute(&span, "client.port"), Some(port.clone()));
+    assert_eq!(attribute(&span, "network.peer.address"), Some(address));
+    assert_eq!(attribute(&span, "network.peer.port"), Some(port));
+    assert_eq!(
+        attribute(&span, "user_agent.original"),
+        Some(Value::from("probe/1.0 (fixed-rate)")),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_query_without_a_user_agent_records_none() {
+    let (client, span) = served_query_span(None).await;
+    assert_eq!(attribute(&span, "user_agent.original"), None);
+    assert_eq!(
+        attribute(&span, "client.address"),
+        Some(Value::from(client.ip().to_string())),
     );
 }

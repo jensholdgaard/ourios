@@ -285,7 +285,9 @@ impl CompactionMetrics {
     /// UCUM units the registry (`metrics.yaml` in the shared `ourios-semconv` repo)
     /// declares for each.
     ///
-    /// The attribute-free counters are seeded with a zero measurement so
+    /// The counters with no required attribute are seeded with an untagged
+    /// zero measurement (their `ourios.tenant` is conditional on a committed
+    /// partition, #1016) so
     /// they are visible to the exporter before the first sweep records
     /// anything (RFC 0001 §6.8 collect-on-read). `sweeps` and `duration`
     /// are **not** seeded: their `ourios.compaction.result` attribute is
@@ -354,29 +356,35 @@ impl CompactionMetrics {
 
     /// Record one committed partition rewrite, the moment its manifest
     /// commits: `partitions`, `files`, `rows`, both `io` directions, and
-    /// the H4 `file.size` sample. Recorded per partition, not per sweep, so
-    /// a sweep working through a large backlog shows its progress while it
-    /// runs.
+    /// the H4 `file.size` sample, each attributed to the partition's tenant
+    /// (#1016). Recorded per partition, not per sweep, so a sweep working
+    /// through a large backlog shows its progress while it runs.
     pub fn record_partition(&self, commit: &PartitionCommitted<'_>) {
-        self.partitions.add(1, &[]);
-        self.files.add(commit.files, &[]);
-        self.rows.add(commit.rows, &[]);
-        self.record_io(commit.bytes_read, commit.bytes_written);
+        let tenant = KeyValue::new(semconv::OURIOS_TENANT, commit.tenant.to_owned());
+        let attrs = std::slice::from_ref(&tenant);
+        self.partitions.add(1, attrs);
+        self.files.add(commit.files, attrs);
+        self.rows.add(commit.rows, attrs);
+        self.record_io(commit.bytes_read, commit.bytes_written, attrs);
         self.record_file_size(commit.tenant, commit.bytes_written);
-        self.record_input(commit);
+        self.record_input(commit, &tenant);
     }
 
     /// The partition's input shape: its file count, and its size both as
     /// stored and as the RFC 0036 §3.2 budget estimates it decoded.
-    fn record_input(&self, commit: &PartitionCommitted<'_>) {
-        self.input_files.record(commit.files, &[]);
+    fn record_input(&self, commit: &PartitionCommitted<'_>, tenant: &KeyValue) {
+        self.input_files
+            .record(commit.files, std::slice::from_ref(tenant));
         for (kind, bytes) in [
             ("encoded", commit.bytes_read),
             ("decoded_estimate", commit.decoded_bytes_estimate),
         ] {
             self.input_size.record(
                 bytes,
-                &[KeyValue::new(semconv::OURIOS_COMPACTION_SIZE_KIND, kind)],
+                &[
+                    KeyValue::new(semconv::OURIOS_COMPACTION_SIZE_KIND, kind),
+                    tenant.clone(),
+                ],
             );
         }
     }
@@ -414,7 +422,8 @@ impl CompactionMetrics {
         self.sweeps.add(1, &attrs);
         self.duration.record(elapsed.as_secs_f64(), &attrs);
         // Both directions surface on every sweep, a no-op one included.
-        self.record_io(0, 0);
+        // A sweep has no single tenant, so this observation carries none.
+        self.record_io(0, 0, &[]);
 
         // A sweep that failed before scanning the store yields no
         // per-tenant data, so the backlog map is deliberately left as-is:
@@ -466,7 +475,8 @@ impl CompactionMetrics {
                 .compacted_files
                 .iter()
                 .fold(0_u64, |acc, f| acc.saturating_add(f.bytes));
-            self.record_io(report.bytes_read, bytes_written);
+            // A report's totals span every tenant swept: no tenant.
+            self.record_io(report.bytes_read, bytes_written, &[]);
             for file in &report.compacted_files {
                 self.record_file_size(&file.tenant, file.bytes);
             }
@@ -474,14 +484,13 @@ impl CompactionMetrics {
         self.record_end(result.is_err(), result.as_ref().ok(), elapsed);
     }
 
-    /// Bytes moved, split by direction.
-    fn record_io(&self, read: u64, written: u64) {
-        self.io
-            .add(read, &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "read")]);
-        self.io.add(
-            written,
-            &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "write")],
-        );
+    /// Bytes moved, split by direction, with `attrs` on both.
+    fn record_io(&self, read: u64, written: u64, attrs: &[KeyValue]) {
+        for (direction, bytes) in [("read", read), ("write", written)] {
+            let mut all = vec![KeyValue::new(semconv::OURIOS_IO_DIRECTION, direction)];
+            all.extend_from_slice(attrs);
+            self.io.add(bytes, &all);
+        }
     }
 
     /// The H4 detector: one per-tenant sample per consolidated file, so

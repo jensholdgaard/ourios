@@ -8,6 +8,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::audit_fetch::{FetchPool, fetch_in_order};
 use crate::fetch_count::FetchCounter;
@@ -37,40 +38,26 @@ use tracing::Instrument as _;
 /// rather than silently masked as "no data" — a wrong zero-row answer
 /// is worse than a surfaced error.
 ///
-/// Every manifest byte read is added to `fetched`.
+/// Every manifest byte read is added to the tally's `fetched`, and the
+/// directory reads and manifest reads to its counts.
 pub(super) fn resolve_live_files(
     dir: &std::path::Path,
     window: Option<(u64, u64)>,
-    fetched: &FetchCounter,
+    tally: &mut Tally<'_>,
 ) -> Result<Vec<PathBuf>, QueryError> {
-    let io_err = |op: &str, p: &std::path::Path, e: &std::io::Error| QueryError::Storage {
-        detail: format!("{op} {}: {e}", p.display()),
-    };
     let mut files = Vec::new();
     // `Some(level)` while the walk is still cutting through the window's Hive
     // ancestors; `None` below a subtree the window covers whole (or cannot be
     // parsed), where only the per-partition prune applies.
     let mut stack = vec![(dir.to_path_buf(), window.map(|_| HiveLevel::Year))];
     while let Some((d, level)) = stack.pop() {
-        let entries = match std::fs::read_dir(&d) {
-            Ok(entries) => entries,
-            // The dir (or a subdir, lost to a concurrent housekeeping
-            // unlink) simply isn't there → not data, not an error.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(io_err("read_dir", &d, &e)),
+        let Some(DirListing {
+            subdirs,
+            mut parquets,
+        }) = read_local_dir(&d, &mut tally.counts)?
+        else {
+            continue;
         };
-        let mut subdirs = Vec::new();
-        let mut parquets = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| io_err("read_dir entry", &d, &e))?;
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => subdirs.push(path),
-                Ok(_) if path.extension().is_some_and(|x| x == "parquet") => parquets.push(path),
-                Ok(_) => {}
-                Err(e) => return Err(io_err("file_type", &path, &e)),
-            }
-        }
         // Partition-level time pruning (RFC 0007): when the query has a
         // time range, skip a leaf partition whose `hour=HH` span can't
         // overlap it — so DataFusion never opens those footers. This is
@@ -80,7 +67,7 @@ pub(super) fn resolve_live_files(
         // path it can't prove out of range, so no in-window data is lost.
         let keep = window.is_none_or(|(start, end)| hour_partition_in_window(&d, start, end));
         if keep {
-            match read_local_manifest(&d, fetched).map_err(|e| QueryError::Storage {
+            match read_local_manifest(&d, tally).map_err(|e| QueryError::Storage {
                 detail: format!("manifest in {}: {e}", d.display()),
             })? {
                 // Manifest is authoritative: only its named files are live.
@@ -110,19 +97,121 @@ pub(super) fn resolve_live_files(
     Ok(files)
 }
 
-/// `<partition_dir>/manifest.json`, counting the bytes read into `fetched`;
-/// `Ok(None)` when absent (the glob fallback), as [`Manifest::read`].
+/// One local directory's entries: its subdirectories and its committed
+/// `*.parquet` files.
+struct DirListing {
+    subdirs: Vec<PathBuf>,
+    parquets: Vec<PathBuf>,
+}
+
+/// Read directory `d` as one listing call, counting it and the non-directory
+/// entries it returns into `counts`. `Ok(None)` when `d` is not there.
+fn read_local_dir(
+    d: &std::path::Path,
+    counts: &mut ResolutionCounts,
+) -> Result<Option<DirListing>, QueryError> {
+    let io_err = |op: &str, p: &std::path::Path, e: &std::io::Error| QueryError::Storage {
+        detail: format!("{op} {}: {e}", p.display()),
+    };
+    counts.list_requests += 1;
+    let entries = match std::fs::read_dir(d) {
+        Ok(entries) => entries,
+        // The dir (or a subdir, lost to a concurrent housekeeping
+        // unlink) simply isn't there → not data, not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err("read_dir", d, &e)),
+    };
+    let mut listing = DirListing {
+        subdirs: Vec::new(),
+        parquets: Vec::new(),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| io_err("read_dir entry", d, &e))?;
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => listing.subdirs.push(path),
+            Ok(_) if path.extension().is_some_and(|x| x == "parquet") => {
+                counts.listed_objects += 1;
+                listing.parquets.push(path);
+            }
+            Ok(_) => counts.listed_objects += 1,
+            Err(e) => return Err(io_err("file_type", &path, &e)),
+        }
+    }
+    Ok(Some(listing))
+}
+
+/// `<partition_dir>/manifest.json`, counting the bytes read into the tally's
+/// `fetched`; `Ok(None)` when absent (the glob fallback), as
+/// [`Manifest::read`]. An absent manifest is not a manifest read (the S3
+/// twin never issues that GET), but a failed one is.
 fn read_local_manifest(
     partition_dir: &std::path::Path,
-    fetched: &FetchCounter,
+    tally: &mut Tally<'_>,
 ) -> Result<Option<Manifest>, ManifestError> {
     match std::fs::read(partition_dir.join(MANIFEST_FILENAME)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            tally.counts.manifest_reads += 1;
+            Err(ManifestError::Io(e))
+        }
         Ok(bytes) => {
-            fetched.add(bytes.len() as u64);
+            tally.counts.manifest_reads += 1;
+            tally.fetched.add(bytes.len() as u64);
             Manifest::from_json(&bytes).map(Some)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(ManifestError::Io(e)),
+    }
+}
+
+/// The RFC 0038 §3.7.2 work counts of one file-set resolution, kept on the
+/// error path too.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResolutionCounts {
+    /// Store listing calls, or directory reads on the local walk.
+    pub(super) list_requests: usize,
+    /// Objects those listings returned, before window and manifest filtering.
+    pub(super) listed_objects: usize,
+    /// Manifest reads.
+    pub(super) manifest_reads: usize,
+}
+
+impl ResolutionCounts {
+    /// Set the counts on the `resolve files` span. `i64`, not `usize`/`u64`:
+    /// tracing-opentelemetry renders a `u64` field as a string, and §3.7.2
+    /// wants a count.
+    fn record(self, span: &tracing::Span) {
+        for (key, count) in [
+            (
+                ourios_semconv::OURIOS_FILE_SET_LIST_REQUEST_COUNT,
+                self.list_requests,
+            ),
+            (
+                ourios_semconv::OURIOS_FILE_SET_LISTED_OBJECTS,
+                self.listed_objects,
+            ),
+            (
+                ourios_semconv::OURIOS_FILE_SET_MANIFEST_READ_COUNT,
+                self.manifest_reads,
+            ),
+        ] {
+            span.record(key, i64::try_from(count).unwrap_or(i64::MAX));
+        }
+    }
+}
+
+/// What one resolution accounts for as it runs: the session's fetched
+/// manifest bytes and the resolution's own work counts.
+pub(super) struct Tally<'a> {
+    fetched: &'a FetchCounter,
+    pub(super) counts: ResolutionCounts,
+}
+
+impl<'a> Tally<'a> {
+    pub(super) fn new(fetched: &'a FetchCounter) -> Self {
+        Self {
+            fetched,
+            counts: ResolutionCounts::default(),
+        }
     }
 }
 
@@ -161,6 +250,9 @@ pub(super) async fn resolve_data_urls(
         "resolve files",
         otel.kind = "internal",
         ourios.tenant = scope.tenant.as_str(),
+        ourios.file_set.list_request_count = tracing::field::Empty,
+        ourios.file_set.listed_objects = tracing::field::Empty,
+        ourios.file_set.manifest_read_count = tracing::field::Empty,
         ourios.file_set.live_files = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,
@@ -189,14 +281,19 @@ async fn resolve_in_phase(
 ) -> Result<Vec<ListingTableUrl>, QueryError> {
     // The manifest reads count toward the session's fetched bytes.
     let fetched = fetch_count::counter(ctx).unwrap_or_default();
-    let resolved = crate::phase::spawn_blocking(span, {
+    let (resolved, counts) = crate::phase::spawn_blocking(span, {
         let backend = backend.clone();
         let prefix = scope.prefix.to_owned();
         let window = scope.window;
-        move || resolve_live_set(&backend, &prefix, window, &fetched)
+        move || {
+            let mut tally = Tally::new(&fetched);
+            let resolved = resolve_live_set(&backend, &prefix, window, &mut tally);
+            Ok((resolved, tally.counts))
+        }
     })
     .await?;
-    match (resolved, backend) {
+    counts.record(span);
+    match (resolved?, backend) {
         (LiveSet::Urls(urls), _) => Ok(urls),
         (LiveSet::Keys(keys), Backend::Remote(store)) => object_store_urls(ctx, store, &keys),
         // Keys come only from the remote branch of `resolve_live_set`,
@@ -221,16 +318,16 @@ pub(super) fn resolve_live_set(
     backend: &Backend,
     prefix: &str,
     window: Option<(u64, u64)>,
-    fetched: &FetchCounter,
+    tally: &mut Tally<'_>,
 ) -> Result<LiveSet, QueryError> {
     match backend {
         Backend::Local(root) => {
             let tenant_dir = root.join(prefix);
-            let live_files = resolve_live_files(&tenant_dir, window, fetched)?;
+            let live_files = resolve_live_files(&tenant_dir, window, tally)?;
             local_file_urls(&tenant_dir, &live_files).map(LiveSet::Urls)
         }
         Backend::Remote(store) => {
-            resolve_live_keys(store, prefix, window, fetched).map(LiveSet::Keys)
+            resolve_live_keys(store, prefix, window, tally).map(LiveSet::Keys)
         }
     }
 }
@@ -260,22 +357,30 @@ pub(super) fn resolve_live_keys(
     store: &Store,
     prefix: &str,
     window: Option<(u64, u64)>,
-    fetched: &FetchCounter,
+    tally: &mut Tally<'_>,
 ) -> Result<Vec<String>, QueryError> {
     let keys = match window {
-        Some(window) => window_listing(store, prefix, window)?,
-        None => list_recursive(store, prefix)?,
+        Some(window) => window_listing(store, prefix, window, &mut tally.counts)?,
+        None => list_recursive(store, prefix, &mut tally.counts)?,
     };
-    live_keys_from_listing(store, &keys, window, fetched)
+    live_keys_from_listing(store, &keys, window, tally)
 }
 
-/// Every `(key, size)` under `prefix`, recursively.
-fn list_recursive(store: &Store, prefix: &str) -> Result<Vec<(String, u64)>, QueryError> {
-    store
+/// Every `(key, size)` under `prefix`, recursively, as one listing call
+/// counted into `counts`.
+fn list_recursive(
+    store: &Store,
+    prefix: &str,
+    counts: &mut ResolutionCounts,
+) -> Result<Vec<(String, u64)>, QueryError> {
+    counts.list_requests += 1;
+    let keys = store
         .list_with_sizes_blocking(Some(prefix))
         .map_err(|e| QueryError::Storage {
             detail: format!("list data prefix {prefix}: {e}"),
-        })
+        })?;
+    counts.listed_objects += keys.len();
+    Ok(keys)
 }
 
 /// The Hive time level a delimited listing's children sit at, carrying the
@@ -302,27 +407,32 @@ enum HiveLevel {
 /// Relative to listing everything and pruning afterwards, the one difference
 /// is that nothing below a parsed ancestor whose whole span misses the window
 /// is listed — the Hive path is the proof those keys are out of range.
+///
+/// Every listing call, and the objects it returns, is counted into `counts`.
 fn window_listing(
     store: &Store,
     prefix: &str,
     (start, end): (u64, u64),
+    counts: &mut ResolutionCounts,
 ) -> Result<Vec<(String, u64)>, QueryError> {
     let mut keys = Vec::new();
     let mut pending = vec![(prefix.to_owned(), HiveLevel::Year)];
     while let Some((dir, level)) = pending.pop() {
+        counts.list_requests += 1;
         let listing =
             store
                 .list_delimited_blocking(Some(&dir))
                 .map_err(|e| QueryError::Storage {
                     detail: format!("list data prefix {dir}: {e}"),
                 })?;
+        counts.listed_objects += listing.objects.len();
         keys.extend(listing.objects);
         for child in listing.common_prefixes {
             let segment = child.rsplit('/').next().unwrap_or(&child);
             match visit(level, segment, &PathBuf::from(&child), (start, end)) {
                 Visit::Skip => {}
                 Visit::Descend(next) => pending.push((child, next)),
-                Visit::List => keys.extend(list_recursive(store, &child)?),
+                Visit::List => keys.extend(list_recursive(store, &child, counts)?),
             }
         }
     }
@@ -418,7 +528,8 @@ fn child_span(level: HiveLevel, segment: &str) -> Option<(HiveLevel, u64, u64)> 
 /// order) through the process-wide [`FetchPool`], so a query spanning many
 /// partitions keeps several GETs in flight instead of paying one round trip
 /// per partition. Returns each manifest under its partition directory;
-/// every manifest byte read is added to `fetched`.
+/// every manifest byte read is added to the tally's `fetched`, and every
+/// GET issued, failed or not, to its manifest reads.
 ///
 /// A listed manifest that cannot be read is an error, not "no manifest": the
 /// glob fallback would bring back the inputs the manifest retired, counting
@@ -426,18 +537,25 @@ fn child_span(level: HiveLevel, segment: &str) -> Option<(HiveLevel, u64, u64)> 
 fn read_store_manifests(
     store: &Store,
     manifests: Vec<(String, u64)>,
-    fetched: &FetchCounter,
+    tally: &mut Tally<'_>,
 ) -> Result<HashMap<String, Manifest>, QueryError> {
     let objects: Arc<[(String, u64)]> = manifests.into();
     let mut read = HashMap::with_capacity(objects.len());
+    // The GETs run on the pool's threads, so they count into a shared cell.
+    let gets = Arc::new(AtomicUsize::new(0));
     let store = store.clone();
-    fetch_in_order(
+    let fetched = tally.fetched;
+    let result = fetch_in_order(
         FetchPool::shared(),
         Arc::clone(&objects),
-        Arc::new(move |key: &str| {
-            store
-                .get_bytes_blocking(key)
-                .map_err(|e| manifest_error(key, &ManifestError::Io(std::io::Error::other(e))))
+        Arc::new({
+            let gets = Arc::clone(&gets);
+            move |key: &str| {
+                gets.fetch_add(1, Ordering::Relaxed);
+                store
+                    .get_bytes_blocking(key)
+                    .map_err(|e| manifest_error(key, &ManifestError::Io(std::io::Error::other(e))))
+            }
         }),
         |index, bytes| {
             let key = &objects[index].0;
@@ -447,8 +565,13 @@ fn read_store_manifests(
             read.insert(dir.to_owned(), manifest);
             Ok(())
         },
-    )?;
-    Ok(read)
+    );
+    // On a failure the pool lets GETs its workers already claimed run to
+    // completion, detached from this resolution, so a claimed GET can still
+    // be issued after this read. The error-path count is the GETs issued up
+    // to the failure, not those detached workers' late ones.
+    tally.counts.manifest_reads += gets.load(Ordering::Relaxed);
+    result.map(|()| read)
 }
 
 fn manifest_error(key: &str, e: &ManifestError) -> QueryError {
@@ -461,13 +584,13 @@ fn manifest_error(key: &str, e: &ManifestError) -> QueryError {
 /// directory, drop the partitions an `hour=HH` window prune proves out of
 /// range, and resolve each remaining one through its manifest or the glob
 /// fallback. `keys` must hold every key of each partition it touches — a
-/// partition's manifest counts only when it is in the same listing. Every
-/// manifest byte read is added to `fetched`.
+/// partition's manifest counts only when it is in the same listing. The
+/// manifest reads are accounted into `tally`.
 fn live_keys_from_listing(
     store: &Store,
     keys: &[(String, u64)],
     window: Option<(u64, u64)>,
-    fetched: &FetchCounter,
+    tally: &mut Tally<'_>,
 ) -> Result<Vec<String>, QueryError> {
     // Group keys by partition directory (the key up to its last `/`).
     let mut by_partition: std::collections::BTreeMap<&str, Vec<(&str, u64)>> =
@@ -499,7 +622,7 @@ fn live_keys_from_listing(
                 .map(|(key, size)| ((*key).to_owned(), *size))
         })
         .collect();
-    let mut manifests = read_store_manifests(store, listed_manifests, fetched)?;
+    let mut manifests = read_store_manifests(store, listed_manifests, tally)?;
 
     let mut live = Vec::new();
     for (dir, partition_keys) in by_partition {
@@ -725,7 +848,7 @@ mod tests {
         );
     }
 
-    use super::live_keys_from_listing;
+    use super::{Tally, live_keys_from_listing};
     use crate::test_support::{Call, CountingStore};
 
     const TENANT_PREFIX: &str = "data/tenant_id=a";
@@ -880,7 +1003,7 @@ mod tests {
             store,
             &keys,
             window,
-            &crate::fetch_count::FetchCounter::default(),
+            &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
         )
         .expect("resolve")
     }
@@ -902,7 +1025,7 @@ mod tests {
             &wrapped,
             TENANT_PREFIX,
             Some(window),
-            &crate::fetch_count::FetchCounter::default(),
+            &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
         )
         .expect("resolve");
 
@@ -958,7 +1081,7 @@ mod tests {
             &wrapped,
             TENANT_PREFIX,
             Some(window),
-            &crate::fetch_count::FetchCounter::default(),
+            &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
         )
         .expect("resolve");
 
@@ -1052,7 +1175,7 @@ mod tests {
                 &store,
                 TENANT_PREFIX,
                 window,
-                &crate::fetch_count::FetchCounter::default(),
+                &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
             )
             .expect("resolve");
             let mut expected = full_listing_oracle(&store, window);
@@ -1093,7 +1216,7 @@ mod tests {
             let mut local: Vec<String> = resolve_live_files(
                 &tenant_dir,
                 window,
-                &crate::fetch_count::FetchCounter::default(),
+                &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
             )
             .expect("local resolve")
             .into_iter()
@@ -1107,7 +1230,7 @@ mod tests {
                 &store,
                 TENANT_PREFIX,
                 window,
-                &crate::fetch_count::FetchCounter::default(),
+                &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
             )
             .expect("remote resolve");
             remote.sort_unstable();
@@ -1134,7 +1257,7 @@ mod tests {
                 &store,
                 TENANT_PREFIX,
                 window,
-                &crate::fetch_count::FetchCounter::default(),
+                &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
             )
             .expect("resolve");
             assert!(live.is_empty(), "window {window:?}: {live:?}");
@@ -1157,8 +1280,12 @@ mod tests {
         let ghost = tmp.path().join("data/tenant_id=ghost");
 
         // Act
-        let files = resolve_live_files(&ghost, None, &crate::fetch_count::FetchCounter::default())
-            .expect("resolve");
+        let files = resolve_live_files(
+            &ghost,
+            None,
+            &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
+        )
+        .expect("resolve");
 
         // Assert
         assert!(files.is_empty());
@@ -1172,8 +1299,12 @@ mod tests {
         std::fs::write(partition.join("x.parquet.tmp"), b"partial").expect("write tmp");
 
         // Act
-        let files = resolve_live_files(&tenant, None, &crate::fetch_count::FetchCounter::default())
-            .expect("resolve");
+        let files = resolve_live_files(
+            &tenant,
+            None,
+            &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
+        )
+        .expect("resolve");
 
         // Assert
         assert!(files.is_empty(), "uncommitted .tmp files are not live");
@@ -1188,8 +1319,12 @@ mod tests {
         std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
 
         // Act
-        let files = resolve_live_files(&tenant, None, &crate::fetch_count::FetchCounter::default())
-            .expect("resolve");
+        let files = resolve_live_files(
+            &tenant,
+            None,
+            &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
+        )
+        .expect("resolve");
 
         // Assert
         assert_eq!(
@@ -1217,8 +1352,12 @@ mod tests {
         .expect("write manifest");
 
         // Act
-        let files = resolve_live_files(&tenant, None, &crate::fetch_count::FetchCounter::default())
-            .expect("resolve");
+        let files = resolve_live_files(
+            &tenant,
+            None,
+            &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
+        )
+        .expect("resolve");
 
         // Assert
         assert_eq!(files.len(), 1, "only the manifest's file is live");
@@ -1269,7 +1408,8 @@ mod tests {
         let fetched = crate::fetch_count::FetchCounter::default();
 
         // Act
-        let live = resolve_live_keys(&store, TENANT_PREFIX, None, &fetched).expect("resolve");
+        let live = resolve_live_keys(&store, TENANT_PREFIX, None, &mut Tally::new(&fetched))
+            .expect("resolve");
 
         // Assert
         let expected: Vec<_> = (0..12)
@@ -1306,7 +1446,7 @@ mod tests {
             &store,
             TENANT_PREFIX,
             None,
-            &crate::fetch_count::FetchCounter::default(),
+            &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
         );
 
         // Assert
@@ -1331,10 +1471,104 @@ mod tests {
         .expect("write manifest");
 
         // Act
-        let result =
-            resolve_live_files(&tenant, None, &crate::fetch_count::FetchCounter::default());
+        let result = resolve_live_files(
+            &tenant,
+            None,
+            &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
+        );
 
         // Assert
         assert!(matches!(result, Err(QueryError::Storage { .. })));
+    }
+
+    /// `store`'s resolution under `window`, with the counts it tallied.
+    fn counted_resolution(
+        store: &Store,
+        window: Option<Window>,
+    ) -> (Result<Vec<String>, QueryError>, super::ResolutionCounts) {
+        let fetched = crate::fetch_count::FetchCounter::default();
+        let mut tally = Tally::new(&fetched);
+        let live = resolve_live_keys(store, TENANT_PREFIX, window, &mut tally);
+        (live, tally.counts)
+    }
+
+    /// RFC 0038 §3.7.2 on S3: one listing request per `list_*` call on the
+    /// store and one manifest read per manifest GET, for every window shape.
+    #[test]
+    fn resolution_counts_are_the_store_calls() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let (plain, wrapped, counter) = counted(tmp.path());
+        seed_history(&plain);
+        seed_irregular(&plain);
+        for window in [
+            None,
+            Some((ns("2026-04-02T10:20"), ns("2026-04-02T10:30"))),
+            Some((ns("2025-12-31T23:30"), ns("2026-01-01T00:30"))),
+            Some((ns("2024-02-15T07:00"), ns("2026-03-02T05:00"))),
+        ] {
+            counter.reset();
+            let (live, counts) = counted_resolution(&wrapped, window);
+            live.expect("resolve");
+            let calls = counter.calls();
+            let count = |pred: fn(&Call) -> bool| calls.iter().filter(|c| pred(c)).count();
+            assert_eq!(
+                counts.list_requests,
+                count(|c| matches!(c, Call::List(_) | Call::ListDelimited(_))),
+                "window {window:?}: {calls:?}",
+            );
+            assert_eq!(
+                counts.manifest_reads,
+                count(|c| matches!(c, Call::Get(_))),
+                "window {window:?}: {calls:?}",
+            );
+        }
+    }
+
+    /// Unwindowed, the one recursive listing returns every key under the
+    /// tenant, each counted before any manifest filtering.
+    #[test]
+    fn listed_objects_count_every_key_before_filtering() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let (_, wrapped, counter) = counted(tmp.path());
+        manifested_partitions(tmp.path(), 3, None);
+
+        let (live, counts) = counted_resolution(&wrapped, None);
+
+        assert_eq!(live.expect("resolve").len(), 3, "one live file a partition");
+        assert_eq!(
+            counts,
+            super::ResolutionCounts {
+                list_requests: 1,
+                listed_objects: 9,
+                manifest_reads: 3,
+            },
+        );
+        assert_eq!(counter.listed_keys().len(), 9);
+    }
+
+    /// A resolution that fails on a manifest keeps the work it did: the
+    /// listing and every manifest GET issued up to the failing one.
+    #[test]
+    fn a_failed_resolution_keeps_its_counts() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let broken = format!(
+            "{}/{}",
+            hour_prefix(2026, 4, 2, 5),
+            ourios_parquet::MANIFEST_FILENAME
+        );
+        let (store, _) = manifested_partitions(tmp.path(), 8, Some(broken));
+
+        let (live, counts) = counted_resolution(&store, None);
+
+        assert!(live.is_err());
+        assert_eq!(counts.list_requests, 1);
+        assert_eq!(
+            counts.listed_objects, 24,
+            "three keys in each of 8 partitions"
+        );
+        assert!(
+            (6..=8).contains(&counts.manifest_reads),
+            "the GETs up to the failing sixth: {counts:?}",
+        );
     }
 }

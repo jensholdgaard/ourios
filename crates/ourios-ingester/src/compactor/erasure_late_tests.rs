@@ -836,3 +836,97 @@ fn rfc0009_23_a_marker_replaced_after_the_listing_is_aged_from_its_read() {
     );
     assert_eq!(templates(&store, &partition), [1, 2]);
 }
+
+/// One captured `ourios.compaction.erasure.deferred` event: its tenant and
+/// deferral reason attributes.
+type Deferred = (String, String);
+
+/// A `Layer` capturing the deferral events' attributes.
+struct CaptureDeferrals(Arc<Mutex<Vec<Deferred>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureDeferrals {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        #[derive(Default)]
+        struct Fields(Deferred);
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    ourios_semconv::OURIOS_TENANT => value.clone_into(&mut self.0.0),
+                    ourios_semconv::OURIOS_COMPACTION_ERASURE_DEFERRAL_REASON => {
+                        value.clone_into(&mut self.0.1);
+                    }
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        if event.metadata().name() != ourios_semconv::EVENT_OURIOS_COMPACTION_ERASURE_DEFERRED {
+            return;
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(fields.0);
+    }
+}
+
+/// The deferral events `run` logs.
+fn deferrals(run: impl FnOnce()) -> Vec<Deferred> {
+    let events: Arc<Mutex<Vec<Deferred>>> = Arc::default();
+    let subscriber = {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry().with(CaptureDeferrals(Arc::clone(&events)))
+    };
+    tracing::subscriber::with_default(subscriber, run);
+    events
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// A request deferred by `erasure_settle` logs the registry-named
+/// `ourios.compaction.erasure.deferred` event with reason `settling`.
+#[test]
+fn a_settling_deferral_logs_the_deferred_event() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    flush(&store, &[rec("a", 1, TS0)]);
+    request_erasure(&store, "a", "c-1").expect("request");
+    let policy = CompactionPolicy {
+        erasure_settle_nanos: HOUR,
+        ..CompactionPolicy::default()
+    };
+
+    let events = deferrals(|| {
+        sweep_at(
+            &store,
+            SweepClock::sealed_at(NOW_SEALED),
+            &policy,
+            &erase_template_1,
+        );
+    });
+
+    assert_eq!(events, [("a".to_owned(), "settling".to_owned())]);
+}
+
+/// A request deferred by a running backfill logs the same event with
+/// reason `backfill_in_progress`.
+#[test]
+fn a_backfill_deferral_logs_the_deferred_event() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    flush(&store, &[rec("a", 1, TS0)]);
+    request_erasure(&store, "a", "c-1").expect("request");
+    assert!(acquire_backfill_lock(&store, "a").expect("lock"));
+
+    let events = deferrals(|| {
+        sweep(&store, &erase_template_1);
+    });
+
+    assert_eq!(
+        events,
+        [("a".to_owned(), "backfill_in_progress".to_owned())]
+    );
+}

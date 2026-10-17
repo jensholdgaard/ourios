@@ -200,22 +200,11 @@ pub(super) fn erase_pending(
         // here (defer), and one that acquires after it sees this marker
         // under its own lock (refuse + release).
         if backfill_lock_held(sweep.store, &request.tenant)? {
-            sweep.report.erasures_deferred.push(request.marker.clone());
-            tracing::info!(
-                "erasure of tenant {:?} conversation {:?} deferred: backfill in progress",
-                request.tenant,
-                request.conversation_id,
-            );
+            defer(sweep, &request, Deferral::BackfillInProgress);
             continue;
         }
         if request.phase == ErasurePhase::Rows && !settled(sweep, &request, settle_nanos) {
-            sweep.report.erasures_deferred.push(request.marker.clone());
-            tracing::info!(
-                "erasure of tenant {:?} conversation {:?} deferred: requested less than \
-                 erasure_settle ago",
-                request.tenant,
-                request.conversation_id,
-            );
+            defer(sweep, &request, Deferral::Settling);
             continue;
         }
         let mut outcome = ErasureOutcome {
@@ -239,6 +228,42 @@ pub(super) fn erase_pending(
         sweep.report.erasures.push(outcome);
     }
     Ok(())
+}
+
+/// Why a pending erasure request is not started this sweep.
+#[derive(Debug, Clone, Copy)]
+enum Deferral {
+    /// A graph backfill holds the tenant's lock (RFC 0048 §3.4).
+    BackfillInProgress,
+    /// Younger than `erasure_settle` (RFC 0009 §3.4).
+    Settling,
+}
+
+impl Deferral {
+    /// The `ourios.compaction.erasure.deferral_reason` value.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::BackfillInProgress => "backfill_in_progress",
+            Self::Settling => "settling",
+        }
+    }
+}
+
+/// Leave `request` pending this sweep: record it in the report and log the
+/// `ourios.compaction.erasure.deferred` event.
+fn defer(sweep: &mut Sweep<'_, '_>, request: &ErasureRequest, deferral: Deferral) {
+    sweep.report.erasures_deferred.push(request.marker.clone());
+    tracing::info!(
+        name: ourios_semconv::EVENT_OURIOS_COMPACTION_ERASURE_DEFERRED,
+        {
+            { ourios_semconv::OURIOS_TENANT } = request.tenant.as_str(),
+            { ourios_semconv::OURIOS_COMPACTION_ERASURE_DEFERRAL_REASON } = deferral.reason(),
+        },
+        "erasure of tenant {:?} conversation {:?} deferred: {}",
+        request.tenant,
+        request.conversation_id,
+        deferral.reason(),
+    );
 }
 
 /// Whether `request` is older than `settle_nanos` by the sweep's clock, so

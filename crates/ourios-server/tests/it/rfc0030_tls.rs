@@ -139,7 +139,7 @@ async fn warnings_before_ready(config_yaml: &str, tmp: &tempfile::TempDir, needl
     // write + close before the spawn — no handle stays open across it.
     std::fs::write(&config_path, config_yaml).expect("write config");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .arg("--config")
         .arg(&config_path)
         .env("EDGE_TOKEN", "rfc0030-test-token")
@@ -335,7 +335,7 @@ async fn rfc0030_8_served_end_to_end() {
     )
     .expect("write config");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .arg("--config")
         .arg(&config_path)
         .env("EDGE_TOKEN", BEARER)

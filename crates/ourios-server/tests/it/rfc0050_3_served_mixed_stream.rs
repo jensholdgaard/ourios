@@ -96,7 +96,7 @@ async fn spawn_with_config(
     config: &std::path::Path,
     expected: &[&str],
 ) -> (Child, Vec<SocketAddr>) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .arg("--config")
         .arg(config)
         .stdout(Stdio::piped())

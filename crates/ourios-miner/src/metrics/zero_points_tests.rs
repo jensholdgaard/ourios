@@ -193,9 +193,9 @@ fn a_real_merge_counts_on_its_members_zero_series() {
     assert_eq!(harness.counters(), expected);
 }
 
-/// An exact 1.0 is alone in `(0.999, 1.0]`.
+/// `0.99` and `0.999` split the values just under the 1.0 decision boundary.
 #[test]
-fn an_exact_match_lands_in_its_own_confidence_bucket() {
+fn the_buckets_resolve_values_just_under_the_decision_boundary() {
     let harness = Harness::new(Temporality::Cumulative);
     let acme = TenantId::new("acme");
     harness.metrics.record_line(&acme, None, 1.0);
@@ -215,11 +215,11 @@ fn an_exact_match_lands_in_its_own_confidence_bucket() {
     let bounds: Vec<f64> = point.bounds().collect();
     assert_eq!(bounds, CONFIDENCE_BUCKETS);
     let counts: Vec<u64> = point.bucket_counts().collect();
-    let exact = bounds
+    let boundary = bounds
         .iter()
         .position(|bound| (*bound - 1.0).abs() < f64::EPSILON)
         .expect("a 1.0 boundary");
-    assert!((bounds[exact - 1] - 0.999).abs() < f64::EPSILON);
-    assert_eq!(counts[exact], 1, "1.0 alone in (0.999, 1.0]: {counts:?}");
-    assert_eq!(counts[exact - 1], 1, "0.995 in (0.99, 0.999]: {counts:?}");
+    assert!((bounds[boundary - 1] - 0.999).abs() < f64::EPSILON);
+    assert_eq!(counts[boundary], 1, "1.0 in (0.999, 1.0]: {counts:?}");
+    assert_eq!(counts[boundary - 1], 1, "0.995 in (0.99, 0.999]: {counts:?}");
 }

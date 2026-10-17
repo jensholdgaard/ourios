@@ -88,7 +88,7 @@ const RESERVOIR_CAP: usize = 1024;
 /// Bucket boundaries for `ourios.miner.confidence` (`similarity /
 /// threshold`), exactly as RFC 0001 §6.8 fixes them: straddling the §6.3
 /// decision boundary at 1.0, with `+Inf` implicit. Buckets are
-/// upper-inclusive, so an exact `1.0` lands alone in `(0.999, 1.0]`.
+/// upper-inclusive; `0.99` and `0.999` resolve the values just under 1.0.
 const CONFIDENCE_BUCKETS: [f64; 13] = [
     0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99, 0.999, 1.0, 1.05, 1.2, 1.5, 2.0,
 ];

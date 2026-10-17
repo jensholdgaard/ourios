@@ -1,0 +1,81 @@
+# OTel Collector config for the local closed loop (`just closed-loop-collector`).
+# Local development only — never a deployment artefact (that's `deploy/`).
+# Runs as a native `otelcol-contrib` binary; no container runtime.
+#
+# Claude Code's logs go to the local Ourios and nowhere else. Everything else
+# (Claude Code's traces and metrics, and Ourios's own logs, traces and
+# metrics) goes to Dash0, tagged deployment.environment.name=development.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+      http:
+        endpoint: 127.0.0.1:4318
+
+processors:
+  batch:
+  resource/environment:
+    attributes:
+      - key: deployment.environment.name
+        value: development
+        action: insert
+
+connectors:
+  # Route on the resource's service.name: only `claude-code` logs reach the
+  # Ourios exporter, and no route sends them to Dash0.
+  routing/logs:
+    default_pipelines: [logs/dash0]
+    table:
+      - context: resource
+        condition: attributes["service.name"] == "claude-code"
+        pipelines: [logs/ourios]
+
+exporters:
+  otlp_http/ourios:
+    endpoint: http://127.0.0.1:24318
+    # RFC 0046: the tenant is named out of band on every export.
+    headers:
+      x-ourios-tenant: claude-code
+  otlp_http/dash0:
+    endpoint: https://ingress.eu-west-1.aws.dash0.com
+    headers:
+      Authorization: Bearer ${env:DASH0_AUTHORIZATION_TOKEN}
+
+service:
+  # The Collector's own metrics, pushed over OTLP straight to Dash0 instead of
+  # the default Prometheus pull endpoint on :8888.
+  telemetry:
+    resource:
+      deployment.environment.name: development
+    metrics:
+      readers:
+        - periodic:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: https://ingress.eu-west-1.aws.dash0.com/v1/metrics
+                headers:
+                  - name: Authorization
+                    value: Bearer ${env:DASH0_AUTHORIZATION_TOKEN}
+  pipelines:
+    logs/in:
+      receivers: [otlp]
+      processors: [resource/environment]
+      exporters: [routing/logs]
+    logs/ourios:
+      receivers: [routing/logs]
+      processors: [batch]
+      exporters: [otlp_http/ourios]
+    logs/dash0:
+      receivers: [routing/logs]
+      processors: [batch]
+      exporters: [otlp_http/dash0]
+    traces:
+      receivers: [otlp]
+      processors: [resource/environment, batch]
+      exporters: [otlp_http/dash0]
+    metrics:
+      receivers: [otlp]
+      processors: [resource/environment, batch]
+      exporters: [otlp_http/dash0]

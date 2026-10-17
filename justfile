@@ -396,6 +396,76 @@ jaeger-env:
     # trace context between the two processes, just the same backend).
     ENV
 
+# Download the pinned `otelcol-contrib` release into scratch/bin/ and verify it
+# against the release's published checksums. Homebrew does not package the
+# contrib distribution.
+closed-loop-install version="0.157.0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -s)-$(uname -m)" in
+      Darwin-arm64) target=darwin_arm64 ;;
+      Darwin-x86_64) target=darwin_amd64 ;;
+      Linux-x86_64) target=linux_amd64 ;;
+      Linux-aarch64) target=linux_arm64 ;;
+      *) echo "unsupported platform: $(uname -s)-$(uname -m)"; exit 1 ;;
+    esac
+    tarball="otelcol-contrib_{{version}}_${target}.tar.gz"
+    base="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{{version}}"
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+    curl -fsSL -o "$work/$tarball" "$base/$tarball"
+    curl -fsSL -o "$work/sums.txt" "$base/opentelemetry-collector-releases_otelcol-contrib_checksums.txt"
+    (cd "$work" && grep " $tarball\$" sums.txt | shasum -a 256 -c -)
+    mkdir -p scratch/bin
+    tar -xzf "$work/$tarball" -C scratch/bin otelcol-contrib
+    scratch/bin/otelcol-contrib --version
+
+# Run the local closed-loop Collector (`dev/observability/closed-loop-collector.yaml`)
+# as a native binary on 127.0.0.1:4317/4318: Claude Code's logs go to
+# `dogfood-server` only; Claude Code's traces and metrics and Ourios's own
+# telemetry go to Dash0. Needs `otelcol-contrib` on PATH or in scratch/bin/
+# (`just closed-loop-install`), and DASH0_AUTHORIZATION_TOKEN in .env (gitignored). Start `closed-loop-ourios`
+# too, and run `just closed-loop-env` for the Claude Code settings.
+closed-loop-collector:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin="$(command -v otelcol-contrib || echo scratch/bin/otelcol-contrib)"
+    [ -x "$bin" ] || { echo "otelcol-contrib not found (PATH or scratch/bin/)"; exit 1; }
+    set -a; [ -f .env ] && . ./.env; set +a
+    : "${DASH0_AUTHORIZATION_TOKEN:?set DASH0_AUTHORIZATION_TOKEN in .env}"
+    exec "$bin" --config dev/observability/closed-loop-collector.yaml
+
+# `dogfood-server` with its own logs, traces and metrics exported through the
+# closed-loop Collector (and so to Dash0), tagged as a development deployment.
+# gRPC on 4317: the server binary is built without `ourios-telemetry`'s
+# `http-proto` feature, so it exports over gRPC whatever the protocol says.
+closed-loop-ourios:
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=development \
+    just dogfood-server
+
+# Print the `env` block for ~/.claude/settings.json that points Claude Code at
+# the closed-loop Collector. Claude Code ignores OTEL_* exporter variables in a
+# repository's .claude/settings*.json, so this must go in the user settings
+# (or the launching shell), and Claude Code must be restarted to pick it up.
+# Prompt, tool-detail and response capture stay off; the logs only reach the
+# local Ourios, but `OTEL_LOG_TOOL_CONTENT` would put tool output on spans,
+# and spans go to Dash0.
+closed-loop-env:
+    #!/usr/bin/env bash
+    cat <<'JSON'
+    "env": {
+      "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+      "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+      "OTEL_METRICS_EXPORTER": "otlp",
+      "OTEL_LOGS_EXPORTER": "otlp",
+      "OTEL_TRACES_EXPORTER": "otlp",
+      "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+      "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+      "OTEL_RESOURCE_ATTRIBUTES": "deployment.environment.name=development"
+    }
+    JSON
+
 # Clean build artefacts (cargo target + mdBook output).
 clean:
     cargo clean || true

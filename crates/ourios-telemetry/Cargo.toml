@@ -64,10 +64,11 @@ serde_json = { version = "1", default-features = false, features = ["std"], opti
 # `weaver registry live-check`.
 testing = ["opentelemetry_sdk/testing", "dep:serde_json"]
 # OTLP/HTTP with protobuf payloads, chosen per signal by the standard
-# `OTEL_EXPORTER_OTLP[_<SIGNAL>]_PROTOCOL=http/protobuf`. Off by default so the
-# server keeps its gRPC-only build; the fuzz harnesses enable it to reach a TLS
-# OTLP/HTTP backend without a tokio runtime (the blocking client runs on its
-# own thread).
+# `OTEL_EXPORTER_OTLP[_<SIGNAL>]_PROTOCOL=http/protobuf`; unset keeps gRPC. The
+# server enables it, and the fuzz harnesses use it to reach a TLS OTLP/HTTP
+# backend without a tokio runtime. The blocking client is built on its own
+# thread and the SDK's batch processors and periodic reader export from their
+# own threads, so it never blocks a tokio worker.
 http-proto = [
     "opentelemetry-otlp/http-proto",
     "opentelemetry-otlp/reqwest-blocking-client",

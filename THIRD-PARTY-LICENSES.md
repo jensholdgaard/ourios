@@ -19,14 +19,14 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 346 |
-| `MIT` | 67 |
+| `Apache-2.0` | 355 |
+| `MIT` | 68 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 10 |
 | `ISC` | 4 |
 | `Zlib` | 3 |
+| `CDLA-Permissive-2.0` | 2 |
 | `CC0-1.0` | 1 |
-| `CDLA-Permissive-2.0` | 1 |
 
 ## Licenses
 
@@ -1846,6 +1846,7 @@ Used by:
 Used by:
 
 - `opentelemetry-proto` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto>
+- `rustls-platform-verifier` 0.7.1 — <https://github.com/rustls/rustls-platform-verifier>
 - `unarray` 0.1.4 — <https://github.com/cameron1024/unarray>
 
 <details>
@@ -2509,6 +2510,7 @@ Used by:
 - `hex` 0.4.3 — <https://github.com/KokaKiwi/rust-hex>
 - `humantime` 2.4.0 — <https://github.com/chronotope/humantime>
 - `is_terminal_polyfill` 1.70.2 — <https://github.com/polyfill-rs/is_terminal_polyfill>
+- `jni-sys` 0.4.1 — <https://github.com/jni-rs/jni-sys>
 - `once_cell_polyfill` 1.70.2 — <https://github.com/polyfill-rs/once_cell_polyfill>
 - `quick-error` 1.2.3 — <http://github.com/tailhook/quick-error>
 
@@ -3168,6 +3170,7 @@ limitations under the License.
 Used by:
 
 - `reqwest` 0.12.28 — <https://github.com/seanmonstar/reqwest>
+- `reqwest` 0.13.5 — <https://github.com/seanmonstar/reqwest>
 
 <details>
 <summary>Full license text</summary>
@@ -4977,6 +4980,7 @@ Used by:
 - `security-framework-sys` 2.17.0 — <https://github.com/kornelski/rust-security-framework>
 - `security-framework` 3.7.0 — <https://github.com/kornelski/rust-security-framework>
 - `signal-hook-registry` 1.4.8 — <https://github.com/vorner/signal-hook>
+- `simd_cesu8` 1.2.0 — <https://github.com/seancroach/simd_cesu8>
 - `smallvec` 1.15.2 — <https://github.com/servo/rust-smallvec>
 - `socket2` 0.6.5 — <https://github.com/rust-lang/socket2>
 - `stable_deref_trait` 1.2.1 — <https://github.com/storyyeller/stable_deref_trait>
@@ -6996,10 +7000,14 @@ Used by:
 - `half` 2.7.1 — <https://github.com/VoidStarKat/half-rs>
 - `ident_case` 1.0.1 — <https://github.com/TedDriggs/ident_case>
 - `itoa` 1.0.18 — <https://github.com/dtolnay/itoa>
+- `jni-macros` 0.22.4 — <https://github.com/jni-rs/jni-rs>
+- `jni-sys-macros` 0.4.1 — <https://github.com/jni-rs/jni-sys>
+- `jni` 0.22.4 — <https://github.com/jni-rs/jni-rs>
 - `libc` 0.2.190 — <https://github.com/rust-lang/libc>
 - `miniz_oxide` 0.9.1 — <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide>
 - `num-conv` 0.2.2 — <https://github.com/jhpratt/num-conv>
 - `opentelemetry-appender-tracing` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-appender-tracing>
+- `opentelemetry-http` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http>
 - `opentelemetry-otlp` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp>
 - `opentelemetry` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry>
 - `opentelemetry_sdk` 0.32.1 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk>
@@ -7021,6 +7029,7 @@ Used by:
 - `ref-cast` 1.0.25 — <https://github.com/dtolnay/ref-cast>
 - `rmcp-macros` 2.2.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
 - `rmcp` 2.2.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
+- `rustls-platform-verifier-android` 0.2.0 — <https://github.com/rustls/rustls-platform-verifier>
 - `rustversion` 1.0.22 — <https://github.com/dtolnay/rustversion>
 - `ryu` 1.0.23 — <https://github.com/dtolnay/ryu>
 - `semver` 1.0.28 — <https://github.com/dtolnay/semver>
@@ -8081,6 +8090,7 @@ express Statement of Purpose.
 
 Used by:
 
+- `webpki-root-certs` 1.0.9 — <https://github.com/rustls/webpki-roots>
 - `webpki-roots` 1.0.8 — <https://github.com/rustls/webpki-roots>
 
 <details>
@@ -9688,6 +9698,43 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
+- `combine` 4.6.8 — <https://github.com/Marwes/combine>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Markus Westerlind
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
 
 ```
 

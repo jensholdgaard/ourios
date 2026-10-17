@@ -937,6 +937,10 @@ pub const OURIOS_COMPACTION_ORPHAN_FAILED_COUNT: &str = "ourios.compaction.orpha
 pub const OURIOS_COMPACTION_ORPHAN_RECLAIMED_COUNT: &str =
     "ourios.compaction.orphan.reclaimed_count";
 
+/// `ourios.compaction.partition.unsealed_count` attribute key.
+pub const OURIOS_COMPACTION_PARTITION_UNSEALED_COUNT: &str =
+    "ourios.compaction.partition.unsealed_count";
+
 /// `ourios.compaction.phase` attribute key.
 pub const OURIOS_COMPACTION_PHASE: &str = "ourios.compaction.phase";
 
@@ -966,6 +970,12 @@ pub const OURIOS_INGEST_BARRIER_CAPTURE_OUTCOME: &str = "ourios.ingest.barrier.c
 
 /// `ourios.ingest.barrier.cut.outcome` attribute key.
 pub const OURIOS_INGEST_BARRIER_CUT_OUTCOME: &str = "ourios.ingest.barrier.cut.outcome";
+
+/// `ourios.ingest.batch.record_count` attribute key.
+pub const OURIOS_INGEST_BATCH_RECORD_COUNT: &str = "ourios.ingest.batch.record_count";
+
+/// `ourios.ingest.batch.size` attribute key.
+pub const OURIOS_INGEST_BATCH_SIZE: &str = "ourios.ingest.batch.size";
 
 /// `ourios.ingest.json.lenient` attribute key.
 pub const OURIOS_INGEST_JSON_LENIENT: &str = "ourios.ingest.json.lenient";
@@ -1003,6 +1013,10 @@ pub const OURIOS_RECEIVER_TEMPLATE_IDS_FLOOR: &str = "ourios.receiver.template_i
 
 /// `ourios.server.listener.name` attribute key.
 pub const OURIOS_SERVER_LISTENER_NAME: &str = "ourios.server.listener.name";
+
+/// `ourios.server.telemetry.requested_protocol` attribute key.
+pub const OURIOS_SERVER_TELEMETRY_REQUESTED_PROTOCOL: &str =
+    "ourios.server.telemetry.requested_protocol";
 
 /// `ourios.service` attribute key.
 pub const OURIOS_SERVICE: &str = "ourios.service";
@@ -1189,6 +1203,10 @@ pub const EVENT_OURIOS_SERVER_LISTENER_CONNECTION_ERROR: &str =
 
 /// `ourios.server.signal_handler.error` log event name.
 pub const EVENT_OURIOS_SERVER_SIGNAL_HANDLER_ERROR: &str = "ourios.server.signal_handler.error";
+
+/// `ourios.server.telemetry.protocol_unsupported` log event name.
+pub const EVENT_OURIOS_SERVER_TELEMETRY_PROTOCOL_UNSUPPORTED: &str =
+    "ourios.server.telemetry.protocol_unsupported";
 
 /// `ourios.server.tls.plaintext_credentials` log event name.
 pub const EVENT_OURIOS_SERVER_TLS_PLAINTEXT_CREDENTIALS: &str =

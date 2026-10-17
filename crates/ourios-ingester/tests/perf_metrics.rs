@@ -9,7 +9,8 @@
 use opentelemetry_sdk::metrics::data::{
     AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
 };
-use ourios_ingester::metrics::{IngestMetrics, SinkMetrics};
+use ourios_core::tenant::TenantId;
+use ourios_ingester::metrics::{AcceptedBatch, IngestMetrics, SinkMetrics};
 use ourios_semconv as semconv;
 use std::time::Duration;
 
@@ -42,6 +43,20 @@ fn u64_sum(rms: &[ResourceMetrics], name: &str, want: Option<&str>) -> u64 {
             Some(t) => dp.attributes().any(|kv| {
                 kv.key.as_str() == semconv::OURIOS_SINK_FLUSH_TRIGGER && kv.value.as_str() == t
             }),
+        })
+        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+        .sum()
+}
+
+/// Sum of a u64 counter's datapoints whose `ourios.tenant` equals `tenant`.
+fn tenant_sum(rms: &[ResourceMetrics], name: &str, tenant: &str) -> u64 {
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = data(rms, name) else {
+        panic!("{name} should be a u64 sum");
+    };
+    sum.data_points()
+        .filter(|dp| {
+            dp.attributes()
+                .any(|kv| kv.key.as_str() == semconv::OURIOS_TENANT && kv.value.as_str() == tenant)
         })
         .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
         .sum()
@@ -84,7 +99,13 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
     let sink = SinkMetrics::new();
 
     // Act — record a representative slice of the perf signals.
-    ingest.record_batch(10, 0, false, Duration::from_millis(2));
+    ingest.record_batch(&AcceptedBatch {
+        tenant: &TenantId::new("tenant-a"),
+        record_count: 10,
+        severity_out_of_range: 0,
+        lenient_json: false,
+        elapsed: Duration::from_millis(2),
+    });
     sink.record_flush("size", 5, Duration::from_millis(7));
     sink.record_flush("rotation", 3, Duration::from_millis(9));
     sink.record_flush_error(None);
@@ -100,6 +121,15 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
     // Throughput counters carry the recorded totals.
     assert_eq!(u64_sum(&rms, semconv::OURIOS_INGEST_RECORDS, None), 10);
     assert_eq!(u64_sum(&rms, semconv::OURIOS_INGEST_BATCHES, None), 1);
+    // Both throughput counters attribute the batch to its tenant.
+    assert_eq!(
+        tenant_sum(&rms, semconv::OURIOS_INGEST_RECORDS, "tenant-a"),
+        10
+    );
+    assert_eq!(
+        tenant_sum(&rms, semconv::OURIOS_INGEST_BATCHES, "tenant-a"),
+        1
+    );
 
     // `flush.records` splits by the required `trigger` dimension.
     assert_eq!(

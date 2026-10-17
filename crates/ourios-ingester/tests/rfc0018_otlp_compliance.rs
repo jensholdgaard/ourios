@@ -21,7 +21,7 @@ use opentelemetry_sdk::metrics::data::{
     AggregatedMetrics, MetricData, ResourceMetrics, SumDataPoint,
 };
 use ourios_core::tenant::TenantId;
-use ourios_ingester::metrics::IngestMetrics;
+use ourios_ingester::metrics::{AcceptedBatch, IngestMetrics};
 use ourios_ingester::receiver::{materialize_record, materialize_resource_logs};
 use ourios_semconv as semconv;
 
@@ -145,7 +145,13 @@ async fn rfc0018_6_out_of_range_severity_preserved() {
     // counter via error.type (OTel "recording errors on metrics" convention).
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test-rfc0018-6");
     let ingest = IngestMetrics::new();
-    ingest.record_batch(4, 2, false, Duration::from_millis(1));
+    ingest.record_batch(&AcceptedBatch {
+        tenant: &TenantId::new("tenant-a"),
+        record_count: 4,
+        severity_out_of_range: 2,
+        lenient_json: false,
+        elapsed: Duration::from_millis(1),
+    });
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
 
@@ -165,8 +171,20 @@ async fn rfc0018_6_out_of_range_severity_preserved() {
     // instrument, path on an attribute, the same shape as error.type.
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test-rfc0018-6b");
     let ingest = IngestMetrics::new();
-    ingest.record_batch(1, 0, true, Duration::from_millis(1));
-    ingest.record_batch(1, 0, false, Duration::from_millis(1));
+    ingest.record_batch(&AcceptedBatch {
+        tenant: &TenantId::new("tenant-a"),
+        record_count: 1,
+        severity_out_of_range: 0,
+        lenient_json: true,
+        elapsed: Duration::from_millis(1),
+    });
+    ingest.record_batch(&AcceptedBatch {
+        tenant: &TenantId::new("tenant-a"),
+        record_count: 1,
+        severity_out_of_range: 0,
+        lenient_json: false,
+        elapsed: Duration::from_millis(1),
+    });
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
     let batches = rms

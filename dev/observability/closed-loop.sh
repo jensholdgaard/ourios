@@ -43,8 +43,7 @@ await_ready() {
     sleep 1
   done
   echo "$name not listening on $port after ${ready_timeout}s; stopping it (see $dir/$name.log)" >&2
-  kill "$pid" 2>/dev/null || true
-  rm -f "$dir/$name.state"
+  stop "$name" >&2 || true
   return 1
 }
 
@@ -65,6 +64,7 @@ stop() {
 }
 
 up() {
+  command -v lsof >/dev/null || { echo "lsof is required for the readiness check; install it first" >&2; exit 1; }
   mkdir -p "$dir" scratch/dogfood/store scratch/dogfood/wal
   local collector_bin ourios_bin target_dir pid
   collector_bin="$(command -v otelcol-contrib || echo scratch/bin/otelcol-contrib)"

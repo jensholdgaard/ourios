@@ -12,6 +12,7 @@ use crate::writer::DEFAULT_ZSTD_LEVEL;
 mod bounded_sort;
 mod late_writes;
 mod plan_cost;
+mod plan_reclaim;
 
 /// 2026-04-02T10:58:00 UTC — offsets stay within hour 10, so
 /// every record shares one partition.

@@ -54,9 +54,34 @@ pub fn plan_candidates_counted(
     now_unix_nanos: u64,
     policy: &CompactionPolicy,
 ) -> (Result<Vec<PartitionKey>, CompactionError>, PlanCounts) {
+    let (plan, counts) = plan_compaction_counted(store, tenant, now_unix_nanos, policy);
+    (plan.map(|plan| plan.candidates), counts)
+}
+
+/// [`plan_candidates_counted`], with the sealed partitions the orphan GC
+/// should also visit (RFC 0009 §3.6, orphan-GC amendment), read from the
+/// same listing and manifest reads, so the counts are the same.
+pub fn plan_compaction_counted(
+    store: &Store,
+    tenant: &str,
+    now_unix_nanos: u64,
+    policy: &CompactionPolicy,
+) -> (Result<CompactionPlan, CompactionError>, PlanCounts) {
     let mut lister = Lister::new(store);
-    let selected = lister.candidates(tenant, now_unix_nanos, policy);
-    (selected, lister.counts)
+    let plan = lister.plan(tenant, now_unix_nanos, policy);
+    (plan, lister.counts)
+}
+
+/// One tenant's sealed partitions a sweep works on, each list oldest first.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CompactionPlan {
+    /// The consolidation candidates ([`plan_candidates`]).
+    pub candidates: Vec<PartitionKey>,
+    /// Non-candidates whose listing shows an object outside the live set: a
+    /// `*.parquet.tmp`, or, beside a manifest, a committed file it does not
+    /// name. Their orphan GC is derived from the listing alone, so a sweep
+    /// interrupted before its GC pass leaves nothing a later one misses.
+    pub reclaimable: Vec<PartitionKey>,
 }
 
 /// The store work one planning pass did (RFC 0038 §3.8).
@@ -95,52 +120,41 @@ impl<'s> Lister<'s> {
         }
     }
 
-    fn candidates(
+    fn plan(
         &mut self,
         tenant: &str,
         now_unix_nanos: u64,
         policy: &CompactionPolicy,
-    ) -> Result<Vec<PartitionKey>, CompactionError> {
-        let mut selected = Vec::new();
+    ) -> Result<CompactionPlan, CompactionError> {
+        let mut plan = CompactionPlan::default();
         for (partition, listed) in self.listed_partitions(tenant)? {
-            if is_sealed(&partition, now_unix_nanos, policy)
-                && self.is_candidate(&partition, &listed, policy)?
-            {
-                selected.push(partition);
+            if !is_sealed(&partition, now_unix_nanos, policy) {
+                continue;
+            }
+            let manifest = self.listed_manifest(&partition, &listed)?;
+            let live = LiveSet::new(manifest.as_ref());
+            if is_candidate(&listed, &live, policy) {
+                plan.candidates.push(partition);
+            } else if has_orphan(&listed, &live) {
+                plan.reclaimable.push(partition);
             }
         }
-        Ok(selected)
+        Ok(plan)
     }
 
-    /// Whether a partition is worth compacting per `policy` (see
-    /// [`meets_policy`]). The live set is the listed files that are live
-    /// under the RFC 0009 §3.4 rule ([`LiveSet`]): with no manifest listed,
-    /// the flush files; otherwise also the named compacted files, less the
-    /// consumed flush files. The manifest is read only when two or more files
-    /// are listed, since fewer can't be two live files.
-    fn is_candidate(
+    /// The partition's manifest, read only when two or more committed files
+    /// are listed beside one: fewer can't be two live files, nor a dead file
+    /// beside a live one.
+    fn listed_manifest(
         &mut self,
         partition: &PartitionKey,
         listed: &ListedPartition,
-        policy: &CompactionPolicy,
-    ) -> Result<bool, CompactionError> {
-        if listed.files.len() < 2 {
-            return Ok(false);
+    ) -> Result<Option<Manifest>, CompactionError> {
+        if !listed.reads_manifest() {
+            return Ok(None);
         }
-        let manifest = if listed.has_manifest {
-            self.counts.manifest_reads += 1;
-            read_manifest(self.store, partition)?
-        } else {
-            None
-        };
-        let live = LiveSet::new(manifest.as_ref());
-        let sizes: Vec<u64> = listed
-            .files
-            .iter()
-            .filter(|(name, _)| live.is_live(name))
-            .map(|(_, size)| *size)
-            .collect();
-        Ok(meets_policy(&sizes, policy))
+        self.counts.manifest_reads += 1;
+        read_manifest(self.store, partition)
     }
 
     /// Group one recursive listing of the tenant's data prefix by hour
@@ -171,6 +185,8 @@ impl<'s> Lister<'s> {
             let listed = partitions.entry(hour).or_default();
             if name == MANIFEST_FILENAME {
                 listed.has_manifest = true;
+            } else if name.ends_with(".parquet.tmp") {
+                listed.has_tmp = true;
             } else if is_committed_parquet(name) {
                 listed.files.push((name.to_owned(), *size));
             }
@@ -258,6 +274,40 @@ struct ListedPartition {
     /// Committed `*.parquet` objects as `(file name, size in bytes)`.
     files: Vec<(String, u64)>,
     has_manifest: bool,
+    /// An interrupted publish (`*.parquet.tmp`) is listed.
+    has_tmp: bool,
+}
+
+impl ListedPartition {
+    /// Whether planning reads the manifest: two or more committed files
+    /// listed beside one.
+    fn reads_manifest(&self) -> bool {
+        self.has_manifest && self.files.len() >= 2
+    }
+}
+
+/// Whether a partition is worth compacting per `policy` (see
+/// [`meets_policy`]): its listed files that are live under the RFC 0009
+/// §3.4 rule ([`LiveSet`]).
+fn is_candidate(listed: &ListedPartition, live: &LiveSet<'_>, policy: &CompactionPolicy) -> bool {
+    let sizes: Vec<u64> = listed
+        .files
+        .iter()
+        .filter(|(name, _)| live.is_live(name))
+        .map(|(_, size)| *size)
+        .collect();
+    meets_policy(&sizes, policy)
+}
+
+/// Whether the listing shows an object [`gc_orphans`] would delete, by its
+/// own rule ([`LiveSet::is_orphan`]): an interrupted publish, or a listed
+/// file that is an orphan under the manifest planning read (or under no
+/// manifest, when none is listed). A manifest left unread (one committed
+/// file beside it) can't make a lone file an orphan, so only a
+/// `*.parquet.tmp` counts there.
+fn has_orphan(listed: &ListedPartition, live: &LiveSet<'_>) -> bool {
+    let names_known = !listed.has_manifest || listed.reads_manifest();
+    listed.has_tmp || (names_known && listed.files.iter().any(|(name, _)| live.is_orphan(name)))
 }
 
 /// The RFC 0009 §3.3 candidate test over a partition's live file sizes: at

@@ -20,12 +20,13 @@ processors:
     attributes:
       - key: deployment.environment.name
         value: development
-        action: insert
+        action: upsert
 
 connectors:
   # Route on the resource's service.name, failing closed: only the named
-  # self-telemetry services reach Dash0, and every other log, Claude Code's
-  # whatever its service.name, stays in the local Ourios.
+  # self-telemetry services reach Dash0 and every other log stays in the local
+  # Ourios. Claude Code's logs therefore stay local unless its service.name is
+  # set to one of those two names.
   routing/logs:
     default_pipelines: [logs/ourios]
     table:

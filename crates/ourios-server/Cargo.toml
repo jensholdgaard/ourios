@@ -98,6 +98,9 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # no new crate (§3.1).
 rmcp = { version = "2.1.0", default-features = false, features = ["macros", "server", "transport-streamable-http-server"] }
 schemars = { version = "1.2.1", default-features = false, features = ["derive"] }
+# The `/mcp` response body wrapper that keeps the SERVER span open while
+# rmcp streams the tool result (RFC0039.6). Already in the tree via axum.
+http-body = { version = "1", default-features = false }
 
 [dev-dependencies]
 # RFC 0030 test CAs / leaf certs, minted at test time — no committed

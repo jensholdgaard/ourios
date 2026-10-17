@@ -905,11 +905,45 @@ async fn mcp_server_span_traced(
         .extensions_mut()
         .insert(McpTraceContext(tracing::Span::current().context()));
     let response = next.run(request).await;
-    ourios_core::telemetry::record_http_server_status(
-        &tracing::Span::current(),
-        response.status().as_u16(),
-    );
-    response
+    let span = tracing::Span::current();
+    ourios_core::telemetry::record_http_server_status(&span, response.status().as_u16());
+    response.map(|inner| Body::new(SpanScopedBody { inner, span }))
+}
+
+/// A response body that keeps the request's SERVER span open while it
+/// streams.
+///
+/// rmcp answers a stateful `POST` with an SSE stream whose head is returned
+/// before the JSON-RPC request is dispatched, so the tool runs while the body
+/// streams; ending the span at the head cuts the request short of the work it
+/// carried. The bridge stamps a span's end at its last *exit*, so holding a
+/// handle is not enough: every poll enters the span, and the last poll — the
+/// one that sees the stream end — is where the request ends.
+struct SpanScopedBody {
+    inner: Body,
+    span: tracing::Span,
+}
+
+impl http_body::Body for SpanScopedBody {
+    type Data = <Body as http_body::Body>::Data;
+    type Error = <Body as http_body::Body>::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let _entered = this.span.enter();
+        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Build the `/mcp` sub-router: the streamable-HTTP MCP service behind

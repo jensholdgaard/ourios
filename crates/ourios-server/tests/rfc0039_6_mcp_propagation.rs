@@ -229,6 +229,16 @@ async fn rfc0039_6_mcp_tool_call_joins_the_caller_trace() {
         SpanKind::Internal,
         "and so it stays INTERNAL — a kind the spec defines as excluding remote parents",
     );
+    // rmcp answers a stateful `tools/call` with an SSE stream whose head goes
+    // out before the tool runs; the request is only over once that stream is.
+    assert!(
+        server[0].start_time <= tool[0].start_time && tool[0].end_time <= server[0].end_time,
+        "the SERVER span covers the tool execution: server {:?}..{:?}, tool {:?}..{:?}",
+        server[0].start_time,
+        server[0].end_time,
+        tool[0].start_time,
+        tool[0].end_time,
+    );
 
     // --- RFC0039.2 for `/mcp`: the untraced handshake rooted itself. ---
     let rooted: Vec<_> = named(&spans, "POST /mcp")

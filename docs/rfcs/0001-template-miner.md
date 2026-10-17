@@ -475,6 +475,21 @@ direction and the primary obligation lives in those other RFCs.
 >   `ourios.miner.template.version_changes`,
 >   `ourios.miner.duration`) with the instrument kinds and
 >   attributes listed there
+>
+> > **Amendment (2026-10-17, #1051, maintainer-approved) — per-tenant
+> > zero points.** "No synthetic zero-traffic points" is replaced by
+> > §6.8's per-tenant zero rule. The scenario gains:
+> > - **And** after one clean line for a tenant the miner has not seen
+> >   before, `ourios.miner.merges`, `ourios.miner.parse_failures`,
+> >   `ourios.miner.params.overflow` and
+> >   `ourios.miner.template.version_changes` each carry a `0` point
+> >   for that tenant, on exactly the attribute sets §6.8 names
+> > - **And** no zero point carries `ourios.service`, and every
+> >   `ourios.miner.template_change` / `ourios.miner.parse_failure.reason`
+> >   value on a zero point is a member of that registry enum
+> > - **And** a second line for the same tenant adds no zero point,
+> >   and a real event later counts on the same series its member's
+> >   zero point opened
 
 > **Scenario §3.2.1 — Default per-parameter byte limit is 256**
 > - **Given** a tenant configuration with no per-parameter byte
@@ -2183,6 +2198,48 @@ metric stream* (an SDK in-memory reader in tests): the registry pins
 the mandatory set; the collection proves each instrument is registered
 and emits real data under the required attributes.
 
+> **Amendment (2026-10-17, #1051, maintainer-approved) — per-tenant
+> zero points.** A counter that has seen no event exports nothing, so
+> a dashboard could not tell "zero for this tenant" from "not wired".
+> The rule above is narrowed. Every exported point still carries only
+> valid attribute values: no sentinel, and every `required` attribute
+> present.
+> - **Trigger.** The first time a `MinerCluster` sees a tenant, before
+>   that line's own measurements, it records `0` once for that tenant
+>   on each of the four lazily-created counters:
+>   `ourios.miner.merges`, `ourios.miner.parse_failures`,
+>   `ourios.miner.params.overflow` and
+>   `ourios.miner.template.version_changes`.
+>   - "Sees" means any record the cluster ingests, WAL replay included.
+>   - Each new cluster (a restart) records the points again. Adding
+>     `0` to a cumulative counter changes no value.
+> - **Attribute sets.**
+>   - `ourios.tenant` (`required`): the tenant.
+>   - `ourios.service` (`recommended`) is **omitted**. A tenant's
+>     services are open-ended, so the dimension has no natural first
+>     value. Omitting a `recommended` attribute is valid, and the zero
+>     point is the tenant-level series. Lines without a
+>     `service.name` already count on that series.
+>   - A `required` closed-enum attribute cannot be omitted and must
+>     not take a sentinel, so the counter records one zero point per
+>     member of the registry enum:
+>     - `ourios.miner.merges` gets one per `ourios.miner.template_change`
+>       member (`template_widened`, `template_type_expanded`);
+>     - `ourios.miner.parse_failures` gets one per
+>       `ourios.miner.parse_failure.reason` member (`below_floor`,
+>       `empty_line`, `tokenizer_failure`, `degenerate_widening`,
+>       `line_too_long`, `template_ceiling`, `id_reservation_failed`).
+>   - `ourios.miner.params.overflow` and
+>     `ourios.miner.template.version_changes` record one point each,
+>     on `ourios.tenant` alone.
+> - **Cost.** The rule adds eleven series per tenant, a number fixed
+>   by the registry enums, not by traffic. The histograms and the
+>   observable gauges are unchanged: they already export on a
+>   tenant's first line.
+> - **Scope.** `ourios.miner.upstream_template.processed` and the
+>   alias counters (§6.7) are outside the rule, as they are outside
+>   §3.1.2.
+
 The metrics enumerated in `[§3.1]` are mandatory. Full set (the
 dotted-`ourios.miner.*` registry names; the dimensions shown are
 exported as **attributes**, not labels — `tenant` is `ourios.tenant`,
@@ -2219,6 +2276,15 @@ name them directly per `[§3.1]` rather than spelling out a
 The histogram bucket boundaries are tuned to straddle the decision
 boundary at 1.0 (see §6.3): default buckets
 `[0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0, +Inf]`.
+
+> **Amendment (2026-10-17, #1051, maintainer-approved) — buckets
+> near 1.0.** The default buckets are now
+> `[0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99, 0.999, 1.0, 1.05, 1.2, 1.5,
+> 2.0, +Inf]`. OTel buckets are upper-inclusive, so before this change
+> an exact `1.0` (a line that matched its template exactly) shared
+> `(0.95, 1.0]` with lines just under it. It now lands alone in
+> `(0.999, 1.0]`, so the share of exact matches can be read off the
+> histogram without the in-process gauges.
 
 ### 6.9 Persistence and recovery
 
@@ -2669,6 +2735,17 @@ resolves bidirectionally between RFC and tests.
   > provider-bound reader), not `global::meter`, which `clippy.toml` now
   > disallows. The test also asserts the collected scope carries
   > `otel.scope.version` equal to the crate version.
+
+  > **Amendment (2026-10-17, #1051, maintainer-approved).** Two
+  > further tests in `ourios-miner`:
+  > - A collection after one clean line for a fresh tenant asserts the
+  >   per-tenant zero points of §6.8 (the four counters, their exact
+  >   attribute sets, no `ourios.service`, enum members only). A
+  >   second line and a second tenant check "once per tenant", and a
+  >   real merge checks that it counts on its member's zero series.
+  > - The unit test pinning `ourios.miner.confidence`'s boundaries
+  >   pins the amended list, and a recorded `1.0` lands in the
+  >   `(0.999, 1.0]` bucket.
 
 - **Data-model contract tests**: small unit tests against the
   `template_id` query semantics that RFC 0002's DSL compiles to.

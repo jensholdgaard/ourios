@@ -77,7 +77,8 @@ use keys::*;
 #[allow(unused_imports, clippy::wildcard_imports)]
 use plan::*;
 pub use plan::{
-    PlanCounts, hour_partitions, plan_candidates, plan_candidates_counted, visit_partition_rows,
+    CompactionPlan, PlanCounts, hour_partitions, plan_candidates, plan_candidates_counted,
+    plan_compaction_counted, visit_partition_rows,
 };
 #[allow(unused_imports, clippy::wildcard_imports)]
 use sort::*;

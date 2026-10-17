@@ -35,7 +35,7 @@ use ourios_parquet::MemoryPhase;
 use ourios_semconv as semconv;
 
 use crate::compactor::{
-    FailedSweep, IngestError, PartitionCommitted, SweepGauges, SweepReport, to_u64,
+    DELETE_FAILED, FailedSweep, IngestError, PartitionCommitted, SweepGauges, SweepReport, to_u64,
 };
 
 /// Per-tenant current backlog (sealed-but-uncompacted partition count)
@@ -54,6 +54,9 @@ pub struct CompactionMetrics {
     files: Counter<u64>,
     rows: Counter<u64>,
     orphan_files: Counter<u64>,
+    /// `ourios.compaction.orphan.reclaimed`, per tenant, `error.type` on a
+    /// failed delete.
+    orphan_reclaimed: Counter<u64>,
     duration: Histogram<f64>,
     io: Counter<u64>,
     file_size: Histogram<u64>,
@@ -190,6 +193,11 @@ const COMPACTION_ORPHAN_FILES: MetricDef = (
     semconv::OURIOS_COMPACTION_ORPHAN_FILES_DESCRIPTION,
     semconv::OURIOS_COMPACTION_ORPHAN_FILES_UNIT,
 );
+const COMPACTION_ORPHAN_RECLAIMED: MetricDef = (
+    semconv::OURIOS_COMPACTION_ORPHAN_RECLAIMED,
+    semconv::OURIOS_COMPACTION_ORPHAN_RECLAIMED_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_ORPHAN_RECLAIMED_UNIT,
+);
 const COMPACTION_SWEEPS: MetricDef = (
     semconv::OURIOS_COMPACTION_SWEEPS,
     semconv::OURIOS_COMPACTION_SWEEPS_DESCRIPTION,
@@ -323,6 +331,7 @@ impl CompactionMetrics {
             files,
             rows,
             orphan_files,
+            orphan_reclaimed: counter(meter, COMPACTION_ORPHAN_RECLAIMED),
             duration: meter
                 .f64_histogram(semconv::OURIOS_COMPACTION_DURATION)
                 .with_description(semconv::OURIOS_COMPACTION_DURATION_DESCRIPTION)
@@ -432,7 +441,25 @@ impl CompactionMetrics {
         // the failure itself surfaces via `sweeps{result="error"}`.
         if let Some(report) = report {
             self.orphan_files.add(to_u64(report.gc_failures), &[]);
+            self.record_orphan_gc(report);
             self.record_backlog(report);
+        }
+    }
+
+    /// Each tenant's orphan GC: deleted files without `error.type`, failed
+    /// deletes with it. Zero counts add no point, so a tenant with nothing
+    /// to reclaim emits nothing.
+    fn record_orphan_gc(&self, report: &SweepReport) {
+        for gc in &report.orphan_gc {
+            let tenant = KeyValue::new(semconv::OURIOS_TENANT, gc.tenant.clone());
+            if gc.reclaimed > 0 {
+                self.orphan_reclaimed
+                    .add(gc.reclaimed, std::slice::from_ref(&tenant));
+            }
+            if gc.failed > 0 {
+                let failed = KeyValue::new(super::ERROR_TYPE, DELETE_FAILED);
+                self.orphan_reclaimed.add(gc.failed, &[tenant, failed]);
+            }
         }
     }
 
@@ -679,6 +706,7 @@ mod tests {
             rows_compacted: 100,
             gc_failures: 1,
             orphans_reclaimed: 0,
+            orphan_gc: Vec::new(),
             errors: Vec::new(),
             compaction_events: Vec::new(),
             bytes_read: 4096,

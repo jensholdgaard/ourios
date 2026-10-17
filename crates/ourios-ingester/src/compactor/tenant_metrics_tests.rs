@@ -17,7 +17,7 @@ use crate::metrics::CompactionMetrics;
 /// Per tenant, the summed value of a u64 counter's datapoints, or the
 /// summed sample count of a u64 histogram's; datapoints with no tenant are
 /// keyed by the empty string. Only datapoints matching `filter` count.
-fn by_tenant(
+pub(super) fn by_tenant(
     rms: &[ResourceMetrics],
     name: &str,
     filter: Option<(&str, &str)>,
@@ -60,7 +60,7 @@ fn by_tenant(
     totals
 }
 
-fn tenants(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+pub(super) fn tenants(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
     pairs.iter().map(|&(t, v)| (t.to_owned(), v)).collect()
 }
 

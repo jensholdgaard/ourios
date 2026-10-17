@@ -154,6 +154,15 @@ pub const OURIOS_COMPACTION_ORPHAN_FILES_DESCRIPTION: &str =
 /// `ourios.compaction.orphan.files` unit (UCUM).
 pub const OURIOS_COMPACTION_ORPHAN_FILES_UNIT: &str = "{file}";
 
+/// `ourios.compaction.orphan.reclaimed` (counter, unit `{file}`).
+pub const OURIOS_COMPACTION_ORPHAN_RECLAIMED: &str = "ourios.compaction.orphan.reclaimed";
+
+/// `ourios.compaction.orphan.reclaimed` description (the registry `brief`).
+pub const OURIOS_COMPACTION_ORPHAN_RECLAIMED_DESCRIPTION: &str = "Delete attempts of the compaction sweep's orphan GC pass, one per orphan file (RFC 0009 RFC0009.4). A successful delete response carries no `error.type`; a failed delete carries `error.type` (`io`), and the file is left for a later pass, which counts it again. Only an explicit not-found result is not counted, so an idempotent success (S3 answers a delete of an absent key with success) can count a file another actor already removed.";
+
+/// `ourios.compaction.orphan.reclaimed` unit (UCUM).
+pub const OURIOS_COMPACTION_ORPHAN_RECLAIMED_UNIT: &str = "{file}";
+
 /// `ourios.compaction.partition.input.files` (histogram, unit `{file}`).
 pub const OURIOS_COMPACTION_PARTITION_INPUT_FILES: &str = "ourios.compaction.partition.input.files";
 
@@ -916,6 +925,13 @@ pub const LOG_RECORD_TEMPLATE: &str = "log.record.template";
 
 /// `ourios.audit_sink.flush.outcome` attribute key.
 pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outcome";
+
+/// `ourios.compaction.orphan.failed_count` attribute key.
+pub const OURIOS_COMPACTION_ORPHAN_FAILED_COUNT: &str = "ourios.compaction.orphan.failed_count";
+
+/// `ourios.compaction.orphan.reclaimed_count` attribute key.
+pub const OURIOS_COMPACTION_ORPHAN_RECLAIMED_COUNT: &str =
+    "ourios.compaction.orphan.reclaimed_count";
 
 /// `ourios.compaction.phase` attribute key.
 pub const OURIOS_COMPACTION_PHASE: &str = "ourios.compaction.phase";

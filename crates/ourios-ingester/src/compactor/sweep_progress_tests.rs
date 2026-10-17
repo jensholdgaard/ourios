@@ -183,7 +183,7 @@ fn the_planning_pass_plans_each_tenant_once() {
 
     let counts: Vec<(&str, usize)> = plans
         .iter()
-        .map(|(tenant, planned)| (*tenant, planned.as_ref().expect("planned").len()))
+        .map(|(tenant, planned)| (*tenant, planned.as_ref().expect("planned").candidates.len()))
         .collect();
     assert_eq!(counts, vec![("a", 3), ("b", 1), ("none", 0)]);
 }

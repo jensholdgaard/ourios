@@ -20,10 +20,10 @@ use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    Committed, CompactionError, CompactionOutcome, CompactionPolicy, CompactionStats, PartitionKey,
-    PlanCounts, PromotedAttributes, RowFilter, RowHooks, RowObserver, Store,
-    compact_partition_hooked, gc_orphans, hour_partitions, percent_decode_tenant,
-    percent_encode_tenant, plan_candidates_counted,
+    Committed, CompactionError, CompactionOutcome, CompactionPlan, CompactionPolicy,
+    CompactionStats, PartitionKey, PlanCounts, PromotedAttributes, RowFilter, RowHooks,
+    RowObserver, Store, compact_partition_hooked, hour_partitions, percent_decode_tenant,
+    percent_encode_tenant, plan_compaction_counted,
 };
 
 #[cfg(feature = "openfga")]
@@ -122,8 +122,13 @@ pub struct SweepReport {
     /// Orphan files (dead inputs / consolidated / `*.tmp` left by a
     /// crashed prior compaction) reclaimed this sweep by `gc_orphans`
     /// (RFC0009.4 — crash safety: orphans are reclaimable on a later
-    /// sweep). Counts only candidate partitions visited this sweep.
+    /// sweep). Counts the partitions the plan marked for GC: the candidates
+    /// and the sealed non-candidates whose listing shows an orphan.
     pub orphans_reclaimed: u64,
+    /// One entry per successfully planned tenant: what its orphan GC
+    /// deleted and failed to delete, for `ourios.compaction.orphan.reclaimed`
+    /// (RFC 0009 §3.6).
+    pub orphan_gc: Vec<TenantOrphanGc>,
     /// Erasure markers skipped this sweep because their tenant holds a
     /// backfill lock (RFC 0048 §3.4 — the fence; retried next sweep).
     pub erasures_deferred: Vec<String>,
@@ -169,6 +174,9 @@ mod erasure;
 mod graph_phase;
 #[cfg(all(test, feature = "openfga"))]
 mod graph_tests;
+mod reclaim;
+#[cfg(test)]
+mod reclaim_tests;
 #[cfg(test)]
 mod sweep_progress_tests;
 #[cfg(test)]
@@ -187,6 +195,8 @@ pub use daemon::*;
 pub use erasure::*;
 #[cfg(feature = "openfga")]
 use graph_phase::GraphPhase;
+pub(crate) use reclaim::DELETE_FAILED;
+pub use reclaim::TenantOrphanGc;
 
 fn store_error(op: &'static str, key: &str, e: &ourios_parquet::StoreError) -> IngestError {
     IngestError::Io {
@@ -324,7 +334,7 @@ impl Drop for Countdown<'_> {
 
 /// One tenant's sealed consolidation candidates, or why planning them
 /// failed.
-type TenantPlan<'t> = (&'t str, Result<Vec<PartitionKey>, CompactionError>);
+type TenantPlan<'t> = (&'t str, Result<CompactionPlan, CompactionError>);
 
 /// Plan every tenant once, up front. Planning lists each tenant's objects
 /// and reads the manifest of every sealed partition holding two or more
@@ -358,7 +368,7 @@ fn plan_tenants<'t>(
         .iter()
         .map(|tenant| {
             let (planned, tenant_counts) =
-                plan_candidates_counted(store, tenant, sealed_at, policy);
+                plan_compaction_counted(store, tenant, sealed_at, policy);
             counts += tenant_counts;
             (tenant.as_str(), planned)
         })
@@ -580,7 +590,8 @@ struct Target<'p> {
 
 impl Sweep<'_, '_> {
     /// The consolidation pass over every tenant, planned once
-    /// ([`plan_tenants`]), counting the candidates down ([`Countdown`]).
+    /// ([`plan_tenants`]), counting the candidates down ([`Countdown`]),
+    /// then the orphan-reclaim pass over the same candidates.
     fn consolidate_all(
         &mut self,
         tenants: &[String],
@@ -590,13 +601,15 @@ impl Sweep<'_, '_> {
         let plans = plan_tenants(self.store, tenants, self.clock.sealed_at, policy);
         let planned = plans
             .iter()
-            .map(|(_, planned)| planned.as_ref().map_or(0, Vec::len))
+            .map(|(_, planned)| planned.as_ref().map_or(0, |plan| plan.candidates.len()))
             .sum();
         let countdown = Countdown::start(hooks.gauges, planned);
-        for (tenant, planned) in plans {
+        for (tenant, planned) in &plans {
             let observe = hooks.observe.as_deref_mut();
-            self.tenant(tenant, planned, observe, &countdown);
+            let candidates = planned.as_ref().map(|plan| plan.candidates.as_slice());
+            self.tenant(tenant, candidates, observe, &countdown);
         }
+        self.reclaim_all(&plans);
     }
 
     /// Consolidate `tenant`'s planned candidates, counting each down. A
@@ -604,7 +617,7 @@ impl Sweep<'_, '_> {
     fn tenant(
         &mut self,
         tenant: &str,
-        planned: Result<Vec<PartitionKey>, CompactionError>,
+        planned: Result<&[PartitionKey], &CompactionError>,
         mut observe: Option<&mut SweepObserver<'_>>,
         countdown: &Countdown<'_>,
     ) {
@@ -619,7 +632,7 @@ impl Sweep<'_, '_> {
             }
         };
         let mut compacted_here = 0usize;
-        for partition in &candidates {
+        for partition in candidates {
             let target = Target { tenant, partition };
             if self.consolidate(target, observe.as_deref_mut()) {
                 compacted_here += 1;
@@ -633,15 +646,14 @@ impl Sweep<'_, '_> {
         });
     }
 
-    /// Consolidate the partition, then reclaim its orphans; whether it
-    /// committed.
+    /// Consolidate the partition; whether it committed.
     fn consolidate(&mut self, target: Target<'_>, observe: Option<&mut SweepObserver<'_>>) -> bool {
         let Target { tenant, partition } = target;
         let mut observe = observe.map(|observe| move |rows: &[MinedRecord]| observe(tenant, rows));
         let observe = observe
             .as_mut()
             .map(|observe| observe as &mut dyn FnMut(&[MinedRecord]));
-        let committed = match self.rewrite(target, observe, None) {
+        match self.rewrite(target, observe, None) {
             Ok(outcome) => {
                 self.report.gc_failures += outcome.gc_failures;
                 outcome.committed.is_some()
@@ -651,25 +663,6 @@ impl Sweep<'_, '_> {
                 e.record(&mut self.report, &context);
                 false
             }
-        };
-        self.reclaim_orphans(target);
-        committed
-    }
-
-    /// Reclaim the orphans a prior crashed compaction of the partition left
-    /// (RFC0009.4). It runs after the rewrite: a crashed output written for
-    /// the generation this rewrite just committed is dead only now
-    /// (RFC0009.17), and the partition may not be a candidate again.
-    /// Manifest-authoritative, so it never touches a live file; a scan
-    /// error is recorded, not fatal.
-    fn reclaim_orphans(&mut self, target: Target<'_>) {
-        let Target { tenant, partition } = target;
-        match gc_orphans(self.store, partition) {
-            Ok(gc) => self.report.orphans_reclaimed += gc.reclaimed,
-            Err(e) => self.report.errors.push(format!(
-                "gc-orphans {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
-                partition.year, partition.month, partition.day, partition.hour,
-            )),
         }
     }
 

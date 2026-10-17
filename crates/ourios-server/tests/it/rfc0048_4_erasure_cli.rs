@@ -25,7 +25,7 @@ async fn run(tmp: &tempfile::TempDir, args: &[&str]) -> Output {
     }
     timeout(
         Duration::from_secs(15),
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        crate::server_bin::command()
             .arg("--config")
             .arg(&config_path)
             .args(args)
@@ -56,7 +56,7 @@ async fn rfc0048_5_backfill_validates_graph_columns() {
     .expect("write config");
     let output = timeout(
         Duration::from_secs(15),
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        crate::server_bin::command()
             .arg("--config")
             .arg(&config_path)
             .args(["graph", "backfill", "--tenant", "acme"])

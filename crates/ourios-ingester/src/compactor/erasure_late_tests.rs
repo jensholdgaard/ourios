@@ -707,3 +707,132 @@ fn rfc0009_22_a_peer_commit_after_the_no_op_rewrite_is_caught_by_the_confirming_
         "the peer's row of the conversation is erased"
     );
 }
+
+/// A store backend that replaces the erasure marker `marker` (a delete,
+/// then a fresh write) just before its first read: a finished request
+/// removed and a new one for the same conversation recreated between the
+/// sweep's listing of markers and its read of this one.
+#[derive(Debug)]
+struct ReplaceMarkerBeforeRead {
+    inner: Arc<dyn object_store::ObjectStore>,
+    marker: PathBuf,
+    replaced: AtomicBool,
+}
+
+impl std::fmt::Display for ReplaceMarkerBeforeRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReplaceMarkerBeforeRead({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for ReplaceMarkerBeforeRead {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let is_marker = location.as_ref().starts_with("erasure/");
+        if is_marker && !self.replaced.swap(true, Ordering::SeqCst) {
+            std::fs::remove_file(&self.marker).expect("the old request finishes");
+            std::fs::write(&self.marker, br#"{"phase":"rows"}"#).expect("a new request");
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// RFC0009.23 — the request instant comes from the same read as the marker's
+/// body. An old, settled marker that is replaced by a new request between the
+/// sweep's listing and its read is aged from the new marker, so the new
+/// request still waits for `erasure_settle`.
+#[test]
+fn rfc0009_23_a_marker_replaced_after_the_listing_is_aged_from_its_read() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let plain = store_at(bucket.path());
+    let partition = partition_of(TS0);
+    flush(&plain, &[rec("a", 1, TS0), rec("a", 2, TS0 + 1_000)]);
+    request_erasure(&plain, "a", "c-1").expect("request");
+    let marker = bucket.path().join(erasure_marker_key("a", "c-1"));
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3_600);
+    std::fs::File::options()
+        .write(true)
+        .open(&marker)
+        .expect("open marker")
+        .set_modified(two_hours_ago)
+        .expect("age the old marker");
+    let store = plain.wrap_backend(|inner| {
+        Arc::new(ReplaceMarkerBeforeRead {
+            inner,
+            marker,
+            replaced: AtomicBool::new(false),
+        })
+    });
+    let policy = CompactionPolicy {
+        erasure_settle_nanos: HOUR,
+        ..CompactionPolicy::default()
+    };
+
+    let report = sweep_at(
+        &store,
+        SweepClock::sealed_at(NOW_SEALED),
+        &policy,
+        &erase_template_1,
+    );
+
+    assert_eq!(report.erasures_deferred.len(), 1, "{report:?}");
+    assert!(
+        report.erasures.is_empty(),
+        "the new request is not erased yet"
+    );
+    assert_eq!(templates(&store, &partition), [1, 2]);
+}

@@ -134,13 +134,12 @@ pub(super) fn pending_erasures_under(
     store: &Store,
     prefix: &str,
 ) -> Result<Vec<ErasureRequest>, IngestError> {
-    let mut markers = store
-        .list_objects_blocking(Some(prefix))
+    let mut keys = store
+        .list_blocking(Some(prefix))
         .map_err(|e| store_error("list erasure markers", prefix, &e))?;
-    markers.sort_by(|a, b| a.key.cmp(&b.key));
+    keys.sort();
     let mut requests = Vec::new();
-    for marker in markers {
-        let key = marker.key;
+    for key in keys {
         let Some(rest) = key.strip_prefix(ERASURE_PREFIX) else {
             continue;
         };
@@ -157,11 +156,13 @@ pub(super) fn pending_erasures_under(
         ) else {
             continue;
         };
-        let body = store
-            .get_blocking_opt(&key)
+        // The body and the request instant come from one GET, so they
+        // describe the same marker even if it is replaced after the listing.
+        let got = store
+            .get_with_modified_blocking_opt(&key)
             .map_err(|e| store_error("read erasure marker", &key, &e))?;
         // A marker removed between the listing and this read is finished.
-        let Some(body) = body else {
+        let Some((body, requested_at_unix_nanos)) = got else {
             continue;
         };
         // The marker body is `{"phase": "rows" | "tuples"}`, parsed
@@ -177,7 +178,7 @@ pub(super) fn pending_erasures_under(
             conversation_id: conversation,
             marker: key,
             phase,
-            requested_at_unix_nanos: marker.last_modified_unix_nanos,
+            requested_at_unix_nanos,
         });
     }
     Ok(requests)

@@ -63,16 +63,13 @@ fn is_plain_opaque_tag(tag: &str) -> bool {
 pub type EtaggedBytes = (Vec<u8>, Option<String>);
 
 /// One object of a recursive listing, as returned by
-/// [`Store::list_objects_blocking`]: its store-relative key, its size, the
-/// `ETag` the backend listed for it (`None` when it lists none), and when the
-/// store last modified it, by the store's own clock (Unix nanoseconds; `0` for
-/// an instant before the epoch or past the nanosecond range).
+/// [`Store::list_objects_blocking`]: its store-relative key, its size, and
+/// the `ETag` the backend listed for it (`None` when it lists none).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListedObject {
     pub key: String,
     pub size: u64,
     pub e_tag: Option<String>,
-    pub last_modified_unix_nanos: u64,
 }
 
 /// One `/`-delimited level of a listing, as returned by
@@ -749,16 +746,10 @@ impl Store {
                     .map(|p| p.as_ref().to_owned())
                     .collect::<Vec<_>>()
                     .join("/");
-                let last_modified_unix_nanos = m
-                    .last_modified
-                    .timestamp_nanos_opt()
-                    .and_then(|nanos| u64::try_from(nanos).ok())
-                    .unwrap_or(0);
                 Some(ListedObject {
                     key,
                     size: m.size,
                     e_tag: m.e_tag,
-                    last_modified_unix_nanos,
                 })
             })
             .collect();
@@ -1050,6 +1041,50 @@ impl Store {
                 Ok(())
             }
             (Err(e), _) => Err(StoreError::Backend(e)),
+        }
+    }
+
+    /// Read the object at `key` together with when the store last modified
+    /// it, by the store's own clock (Unix nanoseconds; `0` for an instant
+    /// before the epoch or past the nanosecond range), both from the one
+    /// `GET`, so they always describe the same version of the object.
+    ///
+    /// # Errors
+    /// As [`Self::get`].
+    pub async fn get_with_modified(&self, key: &str) -> Result<(Vec<u8>, u64), StoreError> {
+        let got = self
+            .inner
+            .get(&self.resolve(key)?)
+            .await
+            .map_err(StoreError::Backend)?;
+        let last_modified = got
+            .meta
+            .last_modified
+            .timestamp_nanos_opt()
+            .and_then(|nanos| u64::try_from(nanos).ok())
+            .unwrap_or(0);
+        let bytes = got.bytes().await.map_err(StoreError::Backend)?;
+        Ok((bytes.to_vec(), last_modified))
+    }
+
+    /// Blocking [`Self::get_with_modified`], mapping a missing object to
+    /// `None`.
+    ///
+    /// # Errors
+    /// As [`Self::get_with_modified`], except a not-found object yields
+    /// `Ok(None)`; plus [`StoreError::Runtime`] if the bridge runtime can't be
+    /// built.
+    pub fn get_with_modified_blocking_opt(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
+        let (store, key) = (self.clone(), key.to_owned());
+        match self.bridge(Operation::Get, async move {
+            store.get_with_modified(&key).await
+        }) {
+            Ok(got) => Ok(Some(got)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
         }
     }
 

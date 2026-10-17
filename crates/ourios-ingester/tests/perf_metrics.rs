@@ -90,6 +90,73 @@ fn assert_instruments_exported(rms: &[ResourceMetrics]) {
     );
 }
 
+/// The throughput counters carry the one recorded batch's totals, attributed
+/// to its tenant.
+fn assert_ingest_throughput(rms: &[ResourceMetrics]) {
+    assert_eq!(u64_sum(rms, semconv::OURIOS_INGEST_RECORDS, None), 10);
+    assert_eq!(u64_sum(rms, semconv::OURIOS_INGEST_BATCHES, None), 1);
+    // Both throughput counters attribute the batch to its tenant.
+    assert_eq!(
+        tenant_sum(rms, semconv::OURIOS_INGEST_RECORDS, "tenant-a"),
+        10
+    );
+    assert_eq!(
+        tenant_sum(rms, semconv::OURIOS_INGEST_BATCHES, "tenant-a"),
+        1
+    );
+}
+
+/// The sink counters and histogram carry the two recorded flushes, one
+/// flush error, one derive error and the net buffer usage.
+fn assert_sink_totals(rms: &[ResourceMetrics]) {
+    // `flush.records` splits by the required `trigger` dimension.
+    assert_eq!(
+        u64_sum(rms, semconv::OURIOS_SINK_FLUSH_RECORDS, Some("size")),
+        5,
+        "size-triggered flush rows",
+    );
+    assert_eq!(
+        u64_sum(rms, semconv::OURIOS_SINK_FLUSH_RECORDS, Some("rotation")),
+        3,
+        "rotation-triggered flush rows",
+    );
+    assert!(
+        u64_sum(rms, semconv::OURIOS_SINK_FLUSH_RECORDS, Some("age")) == 0,
+        "no age-triggered flush was recorded",
+    );
+
+    // Errors counted; buffer usage nets the two deltas.
+    assert_eq!(u64_sum(rms, semconv::OURIOS_SINK_FLUSH_ERRORS, None), 1);
+    assert_eq!(u64_sum(rms, semconv::OURIOS_SINK_DERIVE_ERRORS, None), 1);
+    let AggregatedMetrics::I64(MetricData::Sum(usage)) =
+        data(rms, semconv::OURIOS_SINK_BUFFER_USAGE)
+    else {
+        panic!("buffer.usage should be an i64 sum (UpDownCounter)");
+    };
+    assert_eq!(
+        usage
+            .data_points()
+            .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+            .sum::<i64>(),
+        60,
+        "buffer.usage nets +100 -40",
+    );
+
+    // The flush.duration histogram's count is the flush count (2).
+    let AggregatedMetrics::F64(MetricData::Histogram(hist)) =
+        data(rms, semconv::OURIOS_SINK_FLUSH_DURATION)
+    else {
+        panic!("flush.duration should be an f64 histogram");
+    };
+    assert_eq!(
+        hist.data_points()
+            .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
+            .sum::<u64>(),
+        2,
+        "two flushes recorded (size + rotation)",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn ingest_and_sink_metrics_export_under_their_registry_names() {
     // Arrange — install an in-memory global provider, then build the
@@ -118,63 +185,6 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
     let rms = exporter.get_finished_metrics().expect("metrics exported");
     assert_instruments_exported(&rms);
 
-    // Throughput counters carry the recorded totals.
-    assert_eq!(u64_sum(&rms, semconv::OURIOS_INGEST_RECORDS, None), 10);
-    assert_eq!(u64_sum(&rms, semconv::OURIOS_INGEST_BATCHES, None), 1);
-    // Both throughput counters attribute the batch to its tenant.
-    assert_eq!(
-        tenant_sum(&rms, semconv::OURIOS_INGEST_RECORDS, "tenant-a"),
-        10
-    );
-    assert_eq!(
-        tenant_sum(&rms, semconv::OURIOS_INGEST_BATCHES, "tenant-a"),
-        1
-    );
-
-    // `flush.records` splits by the required `trigger` dimension.
-    assert_eq!(
-        u64_sum(&rms, semconv::OURIOS_SINK_FLUSH_RECORDS, Some("size")),
-        5,
-        "size-triggered flush rows",
-    );
-    assert_eq!(
-        u64_sum(&rms, semconv::OURIOS_SINK_FLUSH_RECORDS, Some("rotation")),
-        3,
-        "rotation-triggered flush rows",
-    );
-    assert!(
-        u64_sum(&rms, semconv::OURIOS_SINK_FLUSH_RECORDS, Some("age")) == 0,
-        "no age-triggered flush was recorded",
-    );
-
-    // Errors counted; buffer usage nets the two deltas.
-    assert_eq!(u64_sum(&rms, semconv::OURIOS_SINK_FLUSH_ERRORS, None), 1);
-    assert_eq!(u64_sum(&rms, semconv::OURIOS_SINK_DERIVE_ERRORS, None), 1);
-    let AggregatedMetrics::I64(MetricData::Sum(usage)) =
-        data(&rms, semconv::OURIOS_SINK_BUFFER_USAGE)
-    else {
-        panic!("buffer.usage should be an i64 sum (UpDownCounter)");
-    };
-    assert_eq!(
-        usage
-            .data_points()
-            .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
-            .sum::<i64>(),
-        60,
-        "buffer.usage nets +100 -40",
-    );
-
-    // The flush.duration histogram's count is the flush count (2).
-    let AggregatedMetrics::F64(MetricData::Histogram(hist)) =
-        data(&rms, semconv::OURIOS_SINK_FLUSH_DURATION)
-    else {
-        panic!("flush.duration should be an f64 histogram");
-    };
-    assert_eq!(
-        hist.data_points()
-            .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
-            .sum::<u64>(),
-        2,
-        "two flushes recorded (size + rotation)",
-    );
+    assert_ingest_throughput(&rms);
+    assert_sink_totals(&rms);
 }

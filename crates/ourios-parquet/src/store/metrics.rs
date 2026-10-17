@@ -816,9 +816,52 @@ mod tests {
     /// check runs alone, in a child process of this test binary.
     #[test]
     fn sequential_bridged_calls_do_not_create_threads() {
+        run_alone(FRESH_PROCESS_TEST);
+    }
+
+    /// The full name of [`bridge_threads_outlive_an_idle_gap_in_a_fresh_process`].
+    const IDLE_GAP_TEST: &str =
+        "store::metrics::tests::bridge_threads_outlive_an_idle_gap_in_a_fresh_process";
+
+    /// As [`sequential_bridged_calls_do_not_create_threads`], across an
+    /// idle gap.
+    #[test]
+    fn bridged_calls_after_an_idle_gap_do_not_create_threads() {
+        run_alone(IDLE_GAP_TEST);
+    }
+
+    /// The local backend runs its file I/O on the bridge runtime's
+    /// blocking pool. Tokio retires an idle blocking thread after ten
+    /// seconds by default, so a store that is called less often than that
+    /// would start a thread per call.
+    #[test]
+    #[ignore = "run alone by bridged_calls_after_an_idle_gap_do_not_create_threads"]
+    fn bridge_threads_outlive_an_idle_gap_in_a_fresh_process() {
+        let harness = Harness::new();
+        let root = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(root.path())
+            .expect("local store")
+            .with_metrics(harness.metrics.clone());
+        store
+            .put_blocking("k", b"v".to_vec())
+            .expect("warm the bridge");
+        store.get_bytes_blocking("k").expect("get");
+        let before = harness.threads_created();
+        std::thread::sleep(Duration::from_secs(11));
+        store.get_bytes_blocking("k").expect("get after the gap");
+        let created = harness.threads_created() - before;
+        assert!(
+            created < 1.0,
+            "a call after an idle gap created {created} threads"
+        );
+    }
+
+    /// Run the ignored test `name` alone, in a child process of this test
+    /// binary: the bridge runtime and its thread count are process-wide.
+    fn run_alone(name: &str) {
         let exe = std::env::current_exe().expect("test binary");
         let out = std::process::Command::new(exe)
-            .args([FRESH_PROCESS_TEST, "--exact", "--ignored", "--nocapture"])
+            .args([name, "--exact", "--ignored", "--nocapture"])
             .output()
             .expect("run the child");
         let stdout = String::from_utf8_lossy(&out.stdout);

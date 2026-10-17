@@ -153,8 +153,99 @@ async fn handshake(router: &Router) -> String {
     session
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc0039_6_mcp_tool_call_joins_the_caller_trace() {
+/// The tool span: the caller's trace, a LOCAL parent, and inside its parent's
+/// time range.
+fn assert_tool_span(spans: &[SpanData], server: &SpanData) {
+    let tool = named(spans, "execute_tool list_templates");
+    assert_eq!(
+        tool.len(),
+        1,
+        "one `execute_tool list_templates` span, got {:?}",
+        spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        tool[0].span_context.trace_id().to_string(),
+        CALLER_TRACE,
+        "the tool span joins the caller's trace across rmcp's dispatch spawn",
+    );
+    assert_eq!(
+        tool[0].parent_span_id,
+        server.span_context.span_id(),
+        "the tool span nests under the local SERVER span, not the remote caller",
+    );
+    assert_eq!(
+        tool[0].span_kind,
+        SpanKind::Internal,
+        "and so it stays INTERNAL — a kind the spec defines as excluding remote parents",
+    );
+    // rmcp answers a stateful `tools/call` with an SSE stream whose head goes
+    // out before the tool runs; the request is only over once that stream is.
+    assert!(
+        server.start_time <= tool[0].start_time && tool[0].end_time <= server.end_time,
+        "the SERVER span covers the tool execution: server {:?}..{:?}, tool {:?}..{:?}",
+        server.start_time,
+        server.end_time,
+        tool[0].start_time,
+        tool[0].end_time,
+    );
+}
+
+/// RFC0039.2 for `/mcp`: the untraced handshake rooted itself.
+fn assert_handshake_rooted(spans: &[SpanData]) {
+    let rooted: Vec<_> = named(spans, "POST /mcp")
+        .into_iter()
+        .filter(|s| s.span_context.trace_id().to_string() != CALLER_TRACE)
+        .collect();
+    assert!(
+        !rooted.is_empty(),
+        "the handshake requests, carrying no traceparent, are their own roots",
+    );
+    for span in rooted {
+        assert_eq!(
+            span.parent_span_id,
+            opentelemetry::trace::SpanId::INVALID,
+            "a request with no inbound context has no parent",
+        );
+    }
+}
+
+/// The `GET /mcp` stream is the session's long-lived notification channel,
+/// not one request's work: its SERVER span ends at the response head and is
+/// exported while the stream is still open.
+async fn assert_get_stream_span_ends_at_head(
+    router: &Router,
+    session: &str,
+    provider: &SdkTracerProvider,
+    exporter: &InMemorySpanExporter,
+) {
+    exporter.reset();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/mcp")
+        .header(header::ACCEPT, "text/event-stream")
+        .header(header::HOST, "127.0.0.1")
+        .header("mcp-session-id", session)
+        .body(Body::empty())
+        .expect("build request");
+    let open_stream = router.clone().oneshot(request).await.expect("oneshot");
+    assert_eq!(
+        open_stream.status(),
+        StatusCode::OK,
+        "GET /mcp opens the stream"
+    );
+
+    provider.force_flush().expect("spans flush");
+    let spans = exporter.get_finished_spans().expect("spans exported");
+    assert_eq!(
+        named(&spans, "GET /mcp").len(),
+        1,
+        "the GET span ended at the head while its stream stays open, got {:?}",
+        spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+    );
+    drop(open_stream);
+}
+
+fn install_global_tracer() -> (InMemorySpanExporter, SdkTracerProvider) {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -167,7 +258,12 @@ async fn rfc0039_6_mcp_tool_call_joins_the_caller_trace() {
     // What the handler's `extract_context` resolves through; `ourios_telemetry::init`
     // installs this in production (RFC 0039 §3.1).
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    (exporter, provider)
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0039_6_mcp_tool_call_joins_the_caller_trace() {
+    let (exporter, provider) = install_global_tracer();
     let bucket = tempfile::tempdir().expect("temp");
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
@@ -205,55 +301,8 @@ async fn rfc0039_6_mcp_tool_call_joins_the_caller_trace() {
             .collect::<Vec<_>>(),
     );
     assert_server_span(server[0]);
+    assert_tool_span(&spans, server[0]);
+    assert_handshake_rooted(&spans);
 
-    // --- The tool span: caller's trace, but a LOCAL parent. ---
-    let tool = named(&spans, "execute_tool list_templates");
-    assert_eq!(
-        tool.len(),
-        1,
-        "one `execute_tool list_templates` span, got {:?}",
-        spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
-    );
-    assert_eq!(
-        tool[0].span_context.trace_id().to_string(),
-        CALLER_TRACE,
-        "the tool span joins the caller's trace across rmcp's dispatch spawn",
-    );
-    assert_eq!(
-        tool[0].parent_span_id,
-        server[0].span_context.span_id(),
-        "the tool span nests under the local SERVER span, not the remote caller",
-    );
-    assert_eq!(
-        tool[0].span_kind,
-        SpanKind::Internal,
-        "and so it stays INTERNAL — a kind the spec defines as excluding remote parents",
-    );
-    // rmcp answers a stateful `tools/call` with an SSE stream whose head goes
-    // out before the tool runs; the request is only over once that stream is.
-    assert!(
-        server[0].start_time <= tool[0].start_time && tool[0].end_time <= server[0].end_time,
-        "the SERVER span covers the tool execution: server {:?}..{:?}, tool {:?}..{:?}",
-        server[0].start_time,
-        server[0].end_time,
-        tool[0].start_time,
-        tool[0].end_time,
-    );
-
-    // --- RFC0039.2 for `/mcp`: the untraced handshake rooted itself. ---
-    let rooted: Vec<_> = named(&spans, "POST /mcp")
-        .into_iter()
-        .filter(|s| s.span_context.trace_id().to_string() != CALLER_TRACE)
-        .collect();
-    assert!(
-        !rooted.is_empty(),
-        "the handshake requests, carrying no traceparent, are their own roots",
-    );
-    for span in rooted {
-        assert_eq!(
-            span.parent_span_id,
-            opentelemetry::trace::SpanId::INVALID,
-            "a request with no inbound context has no parent",
-        );
-    }
+    assert_get_stream_span_ends_at_head(&router, &session, &provider, &exporter).await;
 }

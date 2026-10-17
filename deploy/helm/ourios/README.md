@@ -262,6 +262,15 @@ of wrapping it in chart-specific keys. The authoritative lists:
   — `OTEL_EXPORTER_OTLP_PROTOCOL`, per-signal `_ENDPOINT` overrides,
   `_HEADERS`, `_TIMEOUT`, `_COMPRESSION`, …
 
+The transport is `grpc` unless `OTEL_EXPORTER_OTLP_PROTOCOL` (or a per-signal
+`OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_PROTOCOL`, which wins) is
+`http/protobuf`. Ourios keeps gRPC as its default where the OTLP spec defaults
+to `http/protobuf`, so existing deployments pointed at a `:4317` endpoint keep
+working. `http/json` is not supported and falls back to gRPC. Over
+`http/protobuf`, `otel.exporterEndpoint` is the base URL (e.g.
+`http://collector:4318`) and the SDK appends `/v1/traces`, `/v1/metrics` and
+`/v1/logs`; TLS verifies against the system CA store.
+
 Two things worth setting deliberately before running this in anger:
 
 - **Sampling.** The SDK default is `parentbased_always_on`, so *every* request

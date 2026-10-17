@@ -176,19 +176,20 @@ fn a_real_merge_counts_on_its_members_zero_series() {
     harness.metrics.record_merge(&acme, "template_widened");
 
     let mut expected = zero_points("acme");
-    for (name, points) in &mut expected {
-        if name == semconv::OURIOS_MINER_MERGES {
-            for (attrs, value) in points.iter_mut() {
-                if attrs.contains("template_widened") {
-                    *value = 1;
-                }
-            }
-        }
-        if name == semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES {
-            for value in points.values_mut() {
-                *value = 1;
-            }
-        }
+    let merges = expected
+        .get_mut(semconv::OURIOS_MINER_MERGES)
+        .expect("merges zero points");
+    let widened = merges
+        .keys()
+        .find(|attrs| attrs.contains("template_widened"))
+        .cloned()
+        .expect("the widened member");
+    merges.insert(widened, 1);
+    let version_changes = expected
+        .get_mut(semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES)
+        .expect("version-change zero point");
+    for value in version_changes.values_mut() {
+        *value = 1;
     }
     assert_eq!(harness.counters(), expected);
 }

@@ -123,6 +123,9 @@ async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
     assert_tenant_zero_points(&rms, "acme");
 }
 
+/// One counter's points: each point's attributes, sorted, and its value.
+type Series = Vec<(Vec<(String, String)>, u64)>;
+
 /// Every counter the per-tenant zero rule covers has a series for
 /// `tenant` without `ourios.service`, one per member of its required
 /// enum attribute: a member the workload never hit reads `0`.
@@ -130,77 +133,91 @@ fn assert_tenant_zero_points(
     rms: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
     tenant: &str,
 ) {
-    use opentelemetry_sdk::metrics::data::{
-        AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
-    };
-
-    let series = |name: &str| -> Vec<(Vec<(String, String)>, u64)> {
-        let metric = rms
-            .iter()
-            .flat_map(ResourceMetrics::scope_metrics)
-            .flat_map(ScopeMetrics::metrics)
-            .find(|m| m.name() == name)
-            .unwrap_or_else(|| panic!("{name} exported"));
-        let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
-            panic!("{name} is a u64 sum");
-        };
-        sum.data_points()
-            .map(|dp| {
-                let attrs = dp
-                    .attributes()
-                    .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
-                    .collect();
-                (attrs, dp.value())
-            })
-            .collect()
-    };
-    let tenant_only = |attrs: &[(String, String)], extra: Option<(&str, &str)>| {
-        let mut want = vec![(ourios_semconv::OURIOS_TENANT.to_owned(), tenant.to_owned())];
-        want.extend(extra.map(|(k, v)| (k.to_owned(), v.to_owned())));
-        let mut have = attrs.to_vec();
-        have.sort();
-        want.sort();
-        have == want
-    };
-
-    let merges = series(ourios_semconv::OURIOS_MINER_MERGES);
-    assert!(
-        merges.iter().any(|(attrs, value)| *value == 0
-            && tenant_only(
-                attrs,
-                Some((
-                    ourios_semconv::OURIOS_MINER_TEMPLATE_CHANGE,
-                    "template_type_expanded"
-                ))
-            )),
+    let merges = sum_series(rms, ourios_semconv::OURIOS_MINER_MERGES);
+    let type_expanded = tenant_attrs(
+        tenant,
+        Some((
+            ourios_semconv::OURIOS_MINER_TEMPLATE_CHANGE,
+            "template_type_expanded",
+        )),
+    );
+    assert_eq!(
+        series_value(&merges, &type_expanded),
+        Some(0),
         "no type-expansion happened, so its member reads 0: {merges:?}"
     );
-    let failures = series(ourios_semconv::OURIOS_MINER_PARSE_FAILURES);
+
+    let failures = sum_series(rms, ourios_semconv::OURIOS_MINER_PARSE_FAILURES);
     for reason in [
         "below_floor",
         "tokenizer_failure",
         "template_ceiling",
         "id_reservation_failed",
     ] {
-        assert!(
-            failures.iter().any(|(attrs, value)| *value == 0
-                && tenant_only(
-                    attrs,
-                    Some((ourios_semconv::OURIOS_MINER_PARSE_FAILURE_REASON, reason))
-                )),
+        let attrs = tenant_attrs(
+            tenant,
+            Some((ourios_semconv::OURIOS_MINER_PARSE_FAILURE_REASON, reason)),
+        );
+        assert_eq!(
+            series_value(&failures, &attrs),
+            Some(0),
             "{reason} has a zero series: {failures:?}"
         );
     }
+
     for name in [
         ourios_semconv::OURIOS_MINER_PARAMS_OVERFLOW,
         ourios_semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES,
     ] {
-        let points = series(name);
+        let points = sum_series(rms, name);
         assert!(
-            points.iter().any(|(attrs, _)| tenant_only(attrs, None)),
+            series_value(&points, &tenant_attrs(tenant, None)).is_some(),
             "{name} has a tenant-level series: {points:?}"
         );
     }
+}
+
+/// The points of the u64 counter `name`.
+fn sum_series(rms: &[opentelemetry_sdk::metrics::data::ResourceMetrics], name: &str) -> Series {
+    use opentelemetry_sdk::metrics::data::{
+        AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
+    };
+
+    let metric = rms
+        .iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(ScopeMetrics::metrics)
+        .find(|m| m.name() == name)
+        .unwrap_or_else(|| panic!("{name} exported"));
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+        panic!("{name} is a u64 sum");
+    };
+    sum.data_points()
+        .map(|dp| {
+            let mut attrs: Vec<(String, String)> = dp
+                .attributes()
+                .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
+                .collect();
+            attrs.sort();
+            (attrs, dp.value())
+        })
+        .collect()
+}
+
+/// `ourios.tenant` and at most one more attribute, sorted.
+fn tenant_attrs(tenant: &str, extra: Option<(&str, &str)>) -> Vec<(String, String)> {
+    let mut attrs = vec![(ourios_semconv::OURIOS_TENANT.to_owned(), tenant.to_owned())];
+    attrs.extend(extra.map(|(k, v)| (k.to_owned(), v.to_owned())));
+    attrs.sort();
+    attrs
+}
+
+/// The value of the point whose attributes are exactly `attrs`.
+fn series_value(series: &Series, attrs: &[(String, String)]) -> Option<u64> {
+    series
+        .iter()
+        .find(|(have, _)| have.as_slice() == attrs)
+        .map(|(_, value)| *value)
 }
 
 /// Miner instruments exported with the registry description and unit: the

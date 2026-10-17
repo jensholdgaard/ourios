@@ -943,11 +943,10 @@ struct SpanScopedBody {
 
 impl SpanScopedBody {
     fn new(inner: Body, span: tracing::Span) -> Self {
-        Self {
-            inner,
-            span,
-            ended: false,
-        }
+        // An already-empty body (a `202`) may never be polled; it ended with
+        // the response head.
+        let ended = http_body::Body::is_end_stream(&inner);
+        Self { inner, span, ended }
     }
 }
 
@@ -1078,8 +1077,9 @@ mod span_scoped_body_tests {
         }
     }
 
-    /// Wrap `body`, poll it once, idle, then drop it; the span's duration.
-    fn span_duration(body: Body) -> Duration {
+    /// Wrap `body` in a span the middleware has already entered and left,
+    /// poll it `polls` times, idle, then drop it; the span's duration.
+    fn span_duration(body: Body, polls: usize) -> Duration {
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
@@ -1088,9 +1088,13 @@ mod span_scoped_body_tests {
             tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)),
         );
         tracing::subscriber::with_default(subscriber, || {
-            let mut wrapped = SpanScopedBody::new(body, tracing::info_span!("POST /mcp"));
+            let span = tracing::info_span!("POST /mcp");
+            span.in_scope(|| {});
+            let mut wrapped = SpanScopedBody::new(body, span);
             let mut cx = Context::from_waker(Waker::noop());
-            let _ = Pin::new(&mut wrapped).poll_frame(&mut cx);
+            for _ in 0..polls {
+                let _ = Pin::new(&mut wrapped).poll_frame(&mut cx);
+            }
             std::thread::sleep(IDLE);
             drop(wrapped);
         });
@@ -1105,13 +1109,19 @@ mod span_scoped_body_tests {
 
     #[test]
     fn an_abandoned_stream_ends_when_it_is_dropped() {
-        let duration = span_duration(Body::new(Pending));
+        let duration = span_duration(Body::new(Pending), 1);
         assert!(duration >= IDLE, "{duration:?}");
     }
 
     #[test]
     fn a_finished_body_ends_at_its_last_poll() {
-        let duration = span_duration(Body::from("done"));
+        let duration = span_duration(Body::from("done"), 1);
+        assert!(duration < IDLE, "{duration:?}");
+    }
+
+    #[test]
+    fn an_empty_body_never_polled_ends_with_the_response() {
+        let duration = span_duration(Body::empty(), 0);
         assert!(duration < IDLE, "{duration:?}");
     }
 }

@@ -472,7 +472,9 @@ closed-loop-down:
 # the closed-loop Collector. Claude Code ignores OTEL_* exporter variables in a
 # repository's .claude/settings*.json, so this must go in the user settings
 # (or the launching shell), and Claude Code must be restarted to pick it up.
-# Prompts and tool details are captured: they land in Claude Code's logs, which
+# Every signal's endpoint and protocol is pinned to the local Collector, so an
+# inherited per-signal OTEL_EXPORTER_OTLP_* setting can't send captured content
+# straight to a remote backend. Prompts and tool details are captured: they land in Claude Code's logs, which
 # only reach the local Ourios, and the Collector strips the same content from
 # Claude Code's spans before they go to the remote backend. Tool content,
 # assistant responses and raw API bodies stay off.
@@ -487,6 +489,12 @@ closed-loop-env:
       "OTEL_TRACES_EXPORTER": "otlp",
       "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
       "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+      "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://127.0.0.1:4318/v1/logs",
+      "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/protobuf",
+      "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://127.0.0.1:4318/v1/traces",
+      "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+      "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://127.0.0.1:4318/v1/metrics",
+      "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
       "OTEL_SERVICE_NAME": "claude-code",
       "OTEL_LOG_USER_PROMPTS": "1",
       "OTEL_LOG_TOOL_DETAILS": "1",

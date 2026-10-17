@@ -103,7 +103,7 @@ async fn rfc0048_3_unpromoted_identity_column_is_a_startup_error() {
         .expect("write config");
         let output = timeout(
             Duration::from_secs(15),
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+            crate::server_bin::command()
                 .arg("--config")
                 .arg(&config_path)
                 .env("RFC0048_TOKEN", "tok-a")
@@ -137,7 +137,7 @@ async fn rfc0048_7_list_deadline_event_at_startup() {
         tmp.path().join("wal").display(),
     )
     .expect("write config");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .arg("--config")
         .arg(&config_path)
         .env("RFC0048_TOKEN", "tok-a")

@@ -2,9 +2,10 @@
 # Local development only — never a deployment artefact (that's `deploy/`).
 # Runs as a native `otelcol-contrib` binary; no container runtime.
 #
-# Claude Code's logs go to the local Ourios and nowhere else. Everything else
-# (Claude Code's traces and metrics, and Ourios's own logs, traces and
-# metrics) goes to Dash0, tagged deployment.environment.name=development.
+# Logs go to the local Ourios unless they come from Ourios itself or this
+# Collector, so Claude Code's logs never leave the machine. Traces and
+# metrics (Claude Code's and Ourios's own) go to Dash0, tagged
+# deployment.environment.name=development.
 receivers:
   otlp:
     protocols:
@@ -22,14 +23,15 @@ processors:
         action: insert
 
 connectors:
-  # Route on the resource's service.name: only `claude-code` logs reach the
-  # Ourios exporter, and no route sends them to Dash0.
+  # Route on the resource's service.name, failing closed: only the named
+  # self-telemetry services reach Dash0, and every other log, Claude Code's
+  # whatever its service.name, stays in the local Ourios.
   routing/logs:
-    default_pipelines: [logs/dash0]
+    default_pipelines: [logs/ourios]
     table:
       - context: resource
-        condition: attributes["service.name"] == "claude-code"
-        pipelines: [logs/ourios]
+        condition: attributes["service.name"] == "ourios-server" or attributes["service.name"] == "otelcol-contrib"
+        pipelines: [logs/dash0]
 
 exporters:
   otlp_http/ourios:

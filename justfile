@@ -409,8 +409,9 @@ closed-loop-install version="0.157.0":
       Linux-aarch64) target=linux_arm64 ;;
       *) echo "unsupported platform: $(uname -s)-$(uname -m)"; exit 1 ;;
     esac
-    tarball="otelcol-contrib_{{version}}_${target}.tar.gz"
-    base="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{{version}}"
+    version="$1"
+    tarball="otelcol-contrib_${version}_${target}.tar.gz"
+    base="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${version}"
     work="$(mktemp -d)"
     trap 'rm -rf "$work"' EXIT
     curl -fsSL -o "$work/$tarball" "$base/$tarball"
@@ -439,8 +440,15 @@ closed-loop-collector:
 # closed-loop Collector (and so to Dash0), tagged as a development deployment.
 # gRPC on 4317: the server binary is built without `ourios-telemetry`'s
 # `http-proto` feature, so it exports over gRPC whatever the protocol says.
+# Every exporter setting is set here, per signal included, so a shell still
+# carrying `dogfood-env`'s block can't redirect or disable a signal.
 closed-loop-ourios:
+    OTEL_LOGS_EXPORTER=otlp OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp \
     OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_SERVICE_NAME=ourios-server \
     OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=development \
     just dogfood-server
 
@@ -462,6 +470,7 @@ closed-loop-env:
       "OTEL_TRACES_EXPORTER": "otlp",
       "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
       "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+      "OTEL_SERVICE_NAME": "claude-code",
       "OTEL_RESOURCE_ATTRIBUTES": "deployment.environment.name=development"
     }
     JSON

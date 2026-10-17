@@ -84,7 +84,8 @@ pub struct CompactionPlan {
     pub reclaimable: Vec<PartitionKey>,
 }
 
-/// The store work one planning pass did (RFC 0038 §3.8).
+/// The store work one planning pass did (RFC 0038 §3.8), and the listed
+/// partitions it left alone because they were not yet sealed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PlanCounts {
     /// Store listing calls, failed ones included.
@@ -96,6 +97,9 @@ pub struct PlanCounts {
     /// not: one per sealed partition whose listing holds two or more
     /// committed files and a manifest (RFC 0009 §3.3).
     pub manifest_reads: usize,
+    /// Listed partitions whose hour plus the grace has not yet passed, so
+    /// the pass skipped them: why a sweep over fresh data is a no-op.
+    pub unsealed_partitions: usize,
 }
 
 impl std::ops::AddAssign for PlanCounts {
@@ -103,6 +107,7 @@ impl std::ops::AddAssign for PlanCounts {
         self.list_requests += other.list_requests;
         self.listed_objects += other.listed_objects;
         self.manifest_reads += other.manifest_reads;
+        self.unsealed_partitions += other.unsealed_partitions;
     }
 }
 
@@ -129,6 +134,7 @@ impl<'s> Lister<'s> {
         let mut plan = CompactionPlan::default();
         for (partition, listed) in self.listed_partitions(tenant)? {
             if !is_sealed(&partition, now_unix_nanos, policy) {
+                self.counts.unsealed_partitions += 1;
                 continue;
             }
             let manifest = self.listed_manifest(&partition, &listed)?;

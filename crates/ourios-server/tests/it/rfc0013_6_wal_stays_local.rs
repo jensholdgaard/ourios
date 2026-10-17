@@ -134,7 +134,7 @@ async fn rfc0013_6_wal_stays_local() {
 
     // Act: spawn the server, ingest one batch over HTTP, then SIGTERM so the
     // graceful-shutdown drain flushes the sink to Parquet.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", &bucket_root)
         .env("OURIOS_RECEIVER_ENABLED", "1")
         .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")

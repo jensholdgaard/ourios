@@ -452,6 +452,70 @@ closed-loop-ourios:
     OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=development \
     just dogfood-server
 
+# Start the whole closed loop in the background: the Collector and the local
+# Ourios run detached (they outlive the terminal and a Claude Code restart),
+# their PIDs go to scratch/closed-loop/*.pid and their output to *.log next to
+# them. The binaries are launched directly, not through `just`, so the PID
+# file names the process that holds the ports. Stop both with
+# `just closed-loop-down`.
+closed-loop-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=scratch/closed-loop
+    mkdir -p "$dir" scratch/dogfood/store scratch/dogfood/wal
+    running() { [ -f "$dir/$1.pid" ] && kill -0 "$(cat "$dir/$1.pid")" 2>/dev/null; }
+    bin="$(command -v otelcol-contrib || echo scratch/bin/otelcol-contrib)"
+    [ -x "$bin" ] || { echo "otelcol-contrib not found; run 'just closed-loop-install'"; exit 1; }
+    set -a; [ -f .env ] && . ./.env; set +a
+    : "${DASH0_AUTHORIZATION_TOKEN:?set DASH0_AUTHORIZATION_TOKEN in .env}"
+    if running collector; then
+      echo "collector already running (pid $(cat "$dir/collector.pid"))"
+    else
+      nohup "$bin" --config dev/observability/closed-loop-collector.yaml \
+        > "$dir/collector.log" 2>&1 < /dev/null &
+      echo $! > "$dir/collector.pid"
+      echo "collector started (pid $!), log $dir/collector.log"
+    fi
+    if running ourios; then
+      echo "ourios already running (pid $(cat "$dir/ourios.pid"))"
+    else
+      cargo build -q -p ourios-server
+      export OURIOS_DOGFOOD_ROOT="$(pwd)/scratch/dogfood"
+      # gRPC on 4317, every exporter setting pinned; see closed-loop-ourios.
+      OTEL_LOGS_EXPORTER=otlp OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp \
+      OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:4317 \
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4317 \
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4317 \
+      OTEL_SERVICE_NAME=ourios-server \
+      OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=development \
+        nohup target/debug/ourios-server --config dogfood-config.yaml \
+        > "$dir/ourios.log" 2>&1 < /dev/null &
+      echo $! > "$dir/ourios.pid"
+      echo "ourios started (pid $!), log $dir/ourios.log"
+    fi
+
+# Stop what `closed-loop-up` started, Ourios first so its last telemetry
+# still reaches the Collector. SIGTERM, then wait for each process to exit.
+closed-loop-down:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=scratch/closed-loop
+    for name in ourios collector; do
+      pidfile="$dir/$name.pid"
+      [ -f "$pidfile" ] || { echo "$name: not started by closed-loop-up"; continue; }
+      pid="$(cat "$pidfile")"
+      if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid"
+        for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+        if kill -0 "$pid" 2>/dev/null; then echo "$name (pid $pid) still running after 10s"; exit 1; fi
+        echo "$name stopped (pid $pid)"
+      else
+        echo "$name: not running"
+      fi
+      rm -f "$pidfile"
+    done
+
 # Print the `env` block for ~/.claude/settings.json that points Claude Code at
 # the closed-loop Collector. Claude Code ignores OTEL_* exporter variables in a
 # repository's .claude/settings*.json, so this must go in the user settings

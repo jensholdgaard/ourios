@@ -111,7 +111,7 @@ fn store(bucket: &Path) {
 /// bootstrap, on one runtime worker, with every exporter off and
 /// `RUST_LOG=off`, so its stderr carries only the scan's own lines.
 fn spawn_server(bucket: &Path, wal_root: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", bucket)
         .env("OURIOS_RECEIVER_ENABLED", "1")
         .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")

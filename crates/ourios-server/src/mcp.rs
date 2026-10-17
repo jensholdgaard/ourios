@@ -911,11 +911,77 @@ async fn mcp_server_span_traced(
         .extensions_mut()
         .insert(McpTraceContext(tracing::Span::current().context()));
     let response = next.run(request).await;
-    ourios_core::telemetry::record_http_server_status(
-        &tracing::Span::current(),
-        response.status().as_u16(),
-    );
-    response
+    let span = tracing::Span::current();
+    ourios_core::telemetry::record_http_server_status(&span, response.status().as_u16());
+    // Only a POST's stream is the request's own work (the tool result). The
+    // GET stream is the session's long-lived notification channel; its span
+    // ends at the head. Should Ourios ever send notifications on it, each gets
+    // its own span linked to the GET span — an RFC 0039 amendment then.
+    if method == axum::http::Method::POST {
+        response.map(|inner| Body::new(SpanScopedBody::new(inner, span)))
+    } else {
+        response
+    }
+}
+
+/// A `POST /mcp` response body that keeps the request's SERVER span open
+/// while it streams.
+///
+/// rmcp answers a stateful `POST` with an SSE stream whose head is returned
+/// before the JSON-RPC request is dispatched, so the tool runs while the body
+/// streams; ending the span at the head cuts the request short of the work it
+/// carried. The bridge stamps a span's end at its last *exit*, so holding a
+/// handle is not enough: every poll enters the span, and the last poll — the
+/// one that sees the stream end — is where the request ends. A body dropped
+/// before its end (the client went away) is entered once more on drop, so the
+/// request ends when it was abandoned rather than at its last poll.
+struct SpanScopedBody {
+    inner: Body,
+    span: tracing::Span,
+    ended: bool,
+}
+
+impl SpanScopedBody {
+    fn new(inner: Body, span: tracing::Span) -> Self {
+        // An already-empty body (a `202`) may never be polled; it ended with
+        // the response head.
+        let ended = http_body::Body::is_end_stream(&inner);
+        Self { inner, span, ended }
+    }
+}
+
+impl Drop for SpanScopedBody {
+    fn drop(&mut self) {
+        if !self.ended {
+            let _entered = self.span.enter();
+        }
+    }
+}
+
+impl http_body::Body for SpanScopedBody {
+    type Data = <Body as http_body::Body>::Data;
+    type Error = <Body as http_body::Body>::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let _entered = this.span.enter();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(polled, std::task::Poll::Ready(None)) || this.inner.is_end_stream() {
+            this.ended = true;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Build the `/mcp` sub-router: the streamable-HTTP MCP service behind
@@ -978,6 +1044,86 @@ pub(crate) fn mcp_router(
         // of the request — including an auth rejection, which is part of what
         // the caller experienced (RFC0039.6).
         .layer(middleware::from_fn(mcp_server_span))
+}
+
+#[cfg(test)]
+mod span_scoped_body_tests {
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use http_body::{Body as _, Frame};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use tracing_subscriber::prelude::*;
+
+    use super::SpanScopedBody;
+
+    const IDLE: Duration = Duration::from_millis(50);
+
+    /// An SSE stream whose next event never comes.
+    struct Pending;
+
+    impl http_body::Body for Pending {
+        type Data = bytes::Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    /// Wrap `body` in a span the middleware has already entered and left,
+    /// poll it `polls` times, idle, then drop it; the span's duration.
+    fn span_duration(body: Body, polls: usize) -> Duration {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("POST /mcp");
+            span.in_scope(|| {});
+            let mut wrapped = SpanScopedBody::new(body, span);
+            let mut cx = Context::from_waker(Waker::noop());
+            for _ in 0..polls {
+                let _ = Pin::new(&mut wrapped).poll_frame(&mut cx);
+            }
+            std::thread::sleep(IDLE);
+            drop(wrapped);
+        });
+        provider.force_flush().expect("spans flush");
+        let spans = exporter.get_finished_spans().expect("spans exported");
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        spans[0]
+            .end_time
+            .duration_since(spans[0].start_time)
+            .expect("the span ends after it starts")
+    }
+
+    #[test]
+    fn an_abandoned_stream_ends_when_it_is_dropped() {
+        let duration = span_duration(Body::new(Pending), 1);
+        assert!(duration >= IDLE, "{duration:?}");
+    }
+
+    #[test]
+    fn a_finished_body_ends_at_its_last_poll() {
+        let duration = span_duration(Body::from("done"), 1);
+        assert!(duration < IDLE, "{duration:?}");
+    }
+
+    #[test]
+    fn an_empty_body_never_polled_ends_with_the_response() {
+        let duration = span_duration(Body::empty(), 0);
+        assert!(duration < IDLE, "{duration:?}");
+    }
 }
 
 #[cfg(test)]

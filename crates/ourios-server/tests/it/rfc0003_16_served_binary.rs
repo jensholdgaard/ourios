@@ -132,7 +132,7 @@ async fn rfc0003_16_served_binary_binds_round_trips_and_shuts_down() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let wal_root = tmp.path().join("wal");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", tmp.path())
         .env("OURIOS_RECEIVER_ENABLED", "1")
         .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")

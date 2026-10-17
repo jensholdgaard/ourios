@@ -17,7 +17,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::time::timeout;
 
 /// Scenario RFC0026.1 (startup error) — an *empty* `auth.tokens` list is a
@@ -38,7 +37,7 @@ async fn rfc0026_1_empty_token_list_is_a_startup_error() {
 
     let output = timeout(
         Duration::from_secs(15),
-        Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        crate::server_bin::command()
             .arg("--config")
             .arg(&config_path)
             // If the startup error ever regressed into a running server, the
@@ -73,7 +72,7 @@ async fn rfc0026_1_empty_token_list_is_a_startup_error() {
 #[tokio::test]
 async fn rfc0026_1_missing_auth_section_starts_open_with_a_warning() {
     let tmp = tempfile::TempDir::new().expect("temp");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", tmp.path())
         .env("OURIOS_QUERIER_ENABLED", "1")
         .env("OURIOS_QUERIER_HTTP_ADDR", "127.0.0.1:0")
@@ -332,7 +331,7 @@ async fn rfc0026_6_open_mode_parity() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let wal = tmp.path().join("wal");
     std::fs::create_dir_all(&wal).expect("wal dir");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", tmp.path())
         .env("OURIOS_QUERIER_ENABLED", "1")
         .env("OURIOS_QUERIER_HTTP_ADDR", "127.0.0.1:0")

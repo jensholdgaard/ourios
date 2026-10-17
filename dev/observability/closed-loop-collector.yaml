@@ -4,8 +4,11 @@
 #
 # Logs go to the local Ourios unless they come from Ourios itself or this
 # Collector, so Claude Code's logs never leave the machine. Traces and
-# metrics (Claude Code's and Ourios's own) go to Dash0, tagged
-# deployment.environment.name=development.
+# metrics (Claude Code's and Ourios's own) go to your own OTLP/HTTP backend,
+# tagged deployment.environment.name=development. The backend is local
+# configuration, read from the environment (`.env`, gitignored):
+#   CLOSED_LOOP_OTLP_ENDPOINT       base URL, e.g. https://otlp.example.com
+#   CLOSED_LOOP_OTLP_AUTHORIZATION  Authorization header value, if it needs one
 receivers:
   otlp:
     protocols:
@@ -24,7 +27,7 @@ processors:
 
 connectors:
   # Route on the resource's service.name, failing closed: only the named
-  # self-telemetry services reach Dash0 and every other log stays in the local
+  # self-telemetry services reach the backend and every other log stays in the local
   # Ourios. Claude Code's logs therefore stay local unless its service.name is
   # set to one of those two names.
   routing/logs:
@@ -32,7 +35,7 @@ connectors:
     table:
       - context: resource
         condition: attributes["service.name"] == "ourios-server" or attributes["service.name"] == "otelcol-contrib"
-        pipelines: [logs/dash0]
+        pipelines: [logs/backend]
 
 exporters:
   otlp_http/ourios:
@@ -40,13 +43,13 @@ exporters:
     # RFC 0046: the tenant is named out of band on every export.
     headers:
       x-ourios-tenant: claude-code
-  otlp_http/dash0:
-    endpoint: https://ingress.eu-west-1.aws.dash0.com
+  otlp_http/backend:
+    endpoint: ${env:CLOSED_LOOP_OTLP_ENDPOINT}
     headers:
-      Authorization: Bearer ${env:DASH0_AUTHORIZATION_TOKEN}
+      Authorization: ${env:CLOSED_LOOP_OTLP_AUTHORIZATION}
 
 service:
-  # The Collector's own metrics, pushed over OTLP straight to Dash0 instead of
+  # The Collector's own metrics, pushed over OTLP straight to the backend instead of
   # the default Prometheus pull endpoint on :8888.
   telemetry:
     resource:
@@ -57,10 +60,10 @@ service:
             exporter:
               otlp:
                 protocol: http/protobuf
-                endpoint: https://ingress.eu-west-1.aws.dash0.com/v1/metrics
+                endpoint: ${env:CLOSED_LOOP_OTLP_ENDPOINT}/v1/metrics
                 headers:
                   - name: Authorization
-                    value: Bearer ${env:DASH0_AUTHORIZATION_TOKEN}
+                    value: ${env:CLOSED_LOOP_OTLP_AUTHORIZATION}
   pipelines:
     logs/in:
       receivers: [otlp]
@@ -70,15 +73,15 @@ service:
       receivers: [routing/logs]
       processors: [batch]
       exporters: [otlp_http/ourios]
-    logs/dash0:
+    logs/backend:
       receivers: [routing/logs]
       processors: [batch]
-      exporters: [otlp_http/dash0]
+      exporters: [otlp_http/backend]
     traces:
       receivers: [otlp]
       processors: [resource/environment, batch]
-      exporters: [otlp_http/dash0]
+      exporters: [otlp_http/backend]
     metrics:
       receivers: [otlp]
       processors: [resource/environment, batch]
-      exporters: [otlp_http/dash0]
+      exporters: [otlp_http/backend]

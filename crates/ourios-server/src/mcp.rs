@@ -419,6 +419,7 @@ impl OuriosMcp {
             gen_ai.tool.name = "query_logs",
             mcp.method.name = "tools/call",
             mcp.session.id = tracing::field::Empty,
+            ourios.tenant = tracing::field::Empty,
             ourios.query.visibility.branch = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
             error.type = tracing::field::Empty,
@@ -441,6 +442,7 @@ impl OuriosMcp {
             tracing::Span::current().record("mcp.session.id", session);
         }
         let tenant_arg = normalize_tenant(&args.tenant)?;
+        tracing::Span::current().record("ourios.tenant", tenant_arg);
         let (_binding, visibility) = self.gate(&ctx, tenant_arg, "query_logs").await?;
         let statement = dsl::parse_statement(&args.query)
             .map_err(|e| ErrorData::invalid_params(format!("invalid query: {e}"), None))?;
@@ -521,6 +523,7 @@ impl OuriosMcp {
             gen_ai.tool.name = "list_templates",
             mcp.method.name = "tools/call",
             mcp.session.id = tracing::field::Empty,
+            ourios.tenant = tracing::field::Empty,
             ourios.query.visibility.branch = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
             error.type = tracing::field::Empty,
@@ -543,6 +546,7 @@ impl OuriosMcp {
             tracing::Span::current().record("mcp.session.id", session);
         }
         let tenant_arg = normalize_tenant(&args.tenant)?;
+        tracing::Span::current().record("ourios.tenant", tenant_arg);
         let (_binding, visibility) = self.gate(&ctx, tenant_arg, "list_templates").await?;
         if let Some(rejection) = crate::visibility::require_tenant_wide(visibility.as_ref()) {
             return Err(visibility_error(&rejection));
@@ -612,6 +616,7 @@ impl OuriosMcp {
             gen_ai.tool.name = "template_drift",
             mcp.method.name = "tools/call",
             mcp.session.id = tracing::field::Empty,
+            ourios.tenant = tracing::field::Empty,
             ourios.query.visibility.branch = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
             error.type = tracing::field::Empty,
@@ -634,6 +639,7 @@ impl OuriosMcp {
             tracing::Span::current().record("mcp.session.id", session);
         }
         let tenant_arg = normalize_tenant(&args.tenant)?;
+        tracing::Span::current().record("ourios.tenant", tenant_arg);
         let (_binding, visibility) = self.gate(&ctx, tenant_arg, "template_drift").await?;
         if let Some(rejection) = crate::visibility::require_tenant_wide(visibility.as_ref()) {
             return Err(visibility_error(&rejection));

@@ -524,7 +524,132 @@ impl object_store::ObjectStore for OnListing {
 fn rfc0009_22_a_peer_commit_after_a_no_op_rewrite_is_still_erased() {
     let bucket = tempfile::tempdir().expect("temp");
     let plain = store_at(bucket.path());
-    flush(&plain, &[rec("a", 2, TS0)]);
+    let (other, prefix, change) = tmp_only_partition_and_peer_commit(bucket.path(), &plain);
+    request_erasure(&plain, "a", "c-1").expect("request");
+    let store = plain.wrap_backend(|inner| {
+        Arc::new(OnListing {
+            inner,
+            scope: prefix.clone(),
+            nth: 2,
+            seen: AtomicU64::new(0),
+            change: Mutex::new(Some(change)),
+        })
+    });
+
+    let report = sweep(&store, &erase_template_1);
+
+    assert_eq!(phases(&report), [ErasurePhase::Tuples], "{report:?}");
+    assert!(
+        !templates(&store, &other).contains(&1),
+        "the peer's row of the conversation is erased"
+    );
+}
+
+/// A store backend that applies `change` once, as soon as the rewrite's own
+/// listing of the partition under `scope` has been answered: the first
+/// listing of that partition after a read of its manifest (a rewrite reads
+/// the manifest, then lists; a snapshot lists, then reads the manifest).
+#[derive(Debug)]
+struct AfterRewriteListing {
+    inner: Arc<dyn object_store::ObjectStore>,
+    scope: String,
+    manifest_read: Arc<AtomicBool>,
+    change: Arc<Mutex<Option<Vec<PeerWrite>>>>,
+}
+
+impl std::fmt::Display for AfterRewriteListing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AfterRewriteListing({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for AfterRewriteListing {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let key = location.as_ref();
+        if key.contains(&self.scope) && key.ends_with("manifest.json") {
+            self.manifest_read.store(true, Ordering::SeqCst);
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt as _;
+        let listing = self.inner.list(prefix);
+        let in_scope = prefix.is_some_and(|p| p.as_ref().contains(&self.scope));
+        if !(in_scope && self.manifest_read.load(Ordering::SeqCst)) {
+            return listing;
+        }
+        let change = Arc::clone(&self.change);
+        let after = futures::stream::once(async move {
+            let writes = change.lock().unwrap_or_else(PoisonError::into_inner).take();
+            for (path, bytes) in writes.into_iter().flatten() {
+                std::fs::write(path, bytes).expect("the peer's write");
+            }
+        })
+        .filter_map(|()| async { None });
+        listing.chain(after).boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A tmp-only partition at `TS0 + 3h` beside a flush in hour 10, and the
+/// files a peer writes when it publishes the conversation's row there and
+/// consolidates it: its generation-1 output and the manifest naming it.
+fn tmp_only_partition_and_peer_commit(
+    bucket: &Path,
+    plain: &Store,
+) -> (PartitionKey, String, Vec<PeerWrite>) {
+    flush(plain, &[rec("a", 2, TS0)]);
     let other_ts = TS0 + 3 * HOUR;
     let other = partition_of(other_ts);
     let prefix = format!("{}", other.data_path(Path::new("")).display());
@@ -540,27 +665,43 @@ fn rfc0009_22_a_peer_commit_after_a_no_op_rewrite_is_still_erased() {
         vec![output.rsplit_once('/').expect("key").1.to_owned()],
         Vec::new(),
     );
-    let change = vec![
-        (bucket.path().join(&output), bytes),
+    let writes = vec![
+        (bucket.join(&output), bytes),
         (
-            bucket.path().join(&prefix).join("manifest.json"),
+            bucket.join(&prefix).join("manifest.json"),
             manifest.to_json().expect("json"),
         ),
     ];
+    (other, prefix, writes)
+}
+
+/// RFC0009.22 — the peer publishes and consolidates the conversation's row
+/// right after the no-op rewrite's own listing, before anything reads the
+/// partition's generation again. The partition stays checked at the
+/// generation read before the rewrite, so the confirming pass sees it move
+/// past that, rewrites it, and the row is erased before the marker advances.
+#[test]
+fn rfc0009_22_a_peer_commit_after_the_no_op_rewrite_is_caught_by_the_confirming_pass() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let plain = store_at(bucket.path());
+    let (other, prefix, writes) = tmp_only_partition_and_peer_commit(bucket.path(), &plain);
     request_erasure(&plain, "a", "c-1").expect("request");
     let store = plain.wrap_backend(|inner| {
-        Arc::new(OnListing {
+        Arc::new(AfterRewriteListing {
             inner,
-            scope: prefix.clone(),
-            nth: 2,
-            seen: AtomicU64::new(0),
-            change: Mutex::new(Some(change)),
+            scope: prefix,
+            manifest_read: Arc::new(AtomicBool::new(false)),
+            change: Arc::new(Mutex::new(Some(writes))),
         })
     });
 
     let report = sweep(&store, &erase_template_1);
 
     assert_eq!(phases(&report), [ErasurePhase::Tuples], "{report:?}");
+    assert_eq!(
+        report.erasures[0].partitions_rewritten, 2,
+        "hour 10, then the peer's commit in the confirming pass"
+    );
     assert!(
         !templates(&store, &other).contains(&1),
         "the peer's row of the conversation is erased"

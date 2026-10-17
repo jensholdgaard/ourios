@@ -361,6 +361,7 @@ fn plan_tenants<'t>(
         ourios.file_set.list_request_count = tracing::field::Empty,
         ourios.file_set.listed_objects = tracing::field::Empty,
         ourios.file_set.manifest_read_count = tracing::field::Empty,
+        ourios.compaction.partition.unsealed_count = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,
     );
@@ -395,6 +396,10 @@ fn record_plan(span: &tracing::Span, counts: PlanCounts, plans: &[TenantPlan<'_>
     span.record(
         ourios_semconv::OURIOS_FILE_SET_MANIFEST_READ_COUNT,
         as_count(counts.manifest_reads),
+    );
+    span.record(
+        ourios_semconv::OURIOS_COMPACTION_PARTITION_UNSEALED_COUNT,
+        as_count(counts.unsealed_partitions),
     );
     if let Some(error) = plans.iter().find_map(|(_, planned)| planned.as_ref().err()) {
         ourios_core::telemetry::record_span_error(span, compaction_error_type(error));

@@ -834,6 +834,13 @@ mod tests {
     /// blocking pool. Tokio retires an idle blocking thread after ten
     /// seconds by default, so a store that is called less often than that
     /// would start a thread per call.
+    ///
+    /// A local GET is two `spawn_blocking` calls in a row (open, then
+    /// read), and tokio starts a second thread when the second call lands
+    /// before the first thread is back in the idle set. So even one
+    /// sequential caller can need two threads, depending on timing. A
+    /// concurrent warm-up grows the pool past that first, so the
+    /// measurement sees only what the gap does.
     #[test]
     #[ignore = "run alone by bridged_calls_after_an_idle_gap_do_not_create_threads"]
     fn bridge_threads_outlive_an_idle_gap_in_a_fresh_process() {
@@ -845,7 +852,15 @@ mod tests {
         store
             .put_blocking("k", b"v".to_vec())
             .expect("warm the bridge");
-        store.get_bytes_blocking("k").expect("get");
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..25 {
+                        store.get_bytes_blocking("k").expect("get");
+                    }
+                });
+            }
+        });
         let before = harness.threads_created();
         std::thread::sleep(Duration::from_secs(11));
         store.get_bytes_blocking("k").expect("get after the gap");

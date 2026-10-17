@@ -1280,6 +1280,7 @@ fn planning_counts_its_listings_and_manifest_reads() {
             list_requests: 1,
             listed_objects: 3,
             manifest_reads: 0,
+            unsealed_partitions: 1,
         }
     );
 }
@@ -1305,6 +1306,7 @@ fn planning_keeps_its_counts_on_the_error_path() {
             list_requests: 1,
             listed_objects: 3,
             manifest_reads: 1,
+            unsealed_partitions: 0,
         }
     );
 }

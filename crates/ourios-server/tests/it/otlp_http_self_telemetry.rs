@@ -61,17 +61,13 @@ async fn answer(stream: TcpStream, heads: mpsc::UnboundedSender<Head>) -> Option
         .ok()
 }
 
-/// The child's telemetry env is set from scratch: every inherited `OTEL_*`
-/// variable is dropped, and `RUST_LOG` is pinned because it also filters the
-/// OTLP log bridge, so a caller's `RUST_LOG=off` would leave nothing to export.
+/// The child's telemetry env is set from scratch: [`crate::server_bin::command`]
+/// drops every inherited `OTEL_*` variable, and this test turns the SDK back
+/// on. `RUST_LOG` is pinned because it also filters the OTLP log bridge, so a
+/// caller's `RUST_LOG=off` would leave nothing to export.
 fn spawn_server(bucket: &std::path::Path, endpoint: &str) -> Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ourios-server"));
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("OTEL_") {
-            command.env_remove(name);
-        }
-    }
-    command
+    crate::server_bin::command()
+        .env("OTEL_SDK_DISABLED", "false")
         .env("OURIOS_BUCKET_ROOT", bucket)
         .env("OURIOS_RECEIVER_ENABLED", "1")
         .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")

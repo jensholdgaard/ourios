@@ -123,7 +123,7 @@ async fn terminate_and_assert_clean(mut child: Child) {
 async fn rfc0016_5_role_gating_and_graceful_shutdown() {
     // Arrange: a compactor-only server (no querier role).
     let tmp = tempfile::TempDir::new().expect("temp");
-    let mut disabled = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut disabled = crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", tmp.path())
         // OURIOS_QUERIER_ENABLED deliberately unset.
         .stdout(Stdio::piped())
@@ -161,7 +161,7 @@ async fn rfc0016_5_role_gating_and_graceful_shutdown() {
         .expect("kill the disabled-role process");
 
     // Act: now enable the querier role on an ephemeral port.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", tmp.path())
         .env("OURIOS_QUERIER_ENABLED", "1")
         .env("OURIOS_QUERIER_HTTP_ADDR", "127.0.0.1:0")
@@ -189,7 +189,7 @@ async fn rfc0016_7_receiver_and_querier_compose_in_one_binary() {
     let wal_root = tmp.path().join("wal");
     write_records(tmp.path(), &[mined("acme", 1)]);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", tmp.path())
         .env("OURIOS_RECEIVER_ENABLED", "1")
         .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")

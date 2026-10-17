@@ -25,7 +25,12 @@ live_pid() {
   fi
 }
 
-record() { printf '%s\n%s\n' "$2" "$(started_at "$2")" > "$dir/$1.state"; }
+collector_config=dev/observability/closed-loop-collector.yaml
+config_digest() { shasum -a 256 "$collector_config" | cut -d' ' -f1; }
+
+# The state file holds the PID, its start time, and (for the Collector) the
+# digest of the config it was started with.
+record() { printf '%s\n%s\n%s\n' "$2" "$(started_at "$2")" "${3:-}" > "$dir/$1.state"; }
 
 # True when `pid` itself is listening on `port`, not merely something.
 listening_as() { lsof -nP -a -p "$1" -iTCP:"$2" -sTCP:LISTEN >/dev/null 2>&1; }
@@ -80,13 +85,23 @@ up() {
     | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
   ourios_bin="$target_dir/debug/ourios-server"
 
+  # A running Collector started from an older config (say, before a span
+  # scrubber was added) is restarted, so a config change is never silently
+  # left unapplied.
+  if pid="$(live_pid collector)" && [ "$(sed -n 3p "$dir/collector.state")" != "$(config_digest)" ]; then
+    echo "collector config changed; restarting it"
+    stop collector
+  fi
   if pid="$(live_pid collector)"; then
     echo "collector already running (pid $pid)"
   else
-    nohup "$collector_bin" --config dev/observability/closed-loop-collector.yaml \
+    # Start from a snapshot, so the recorded digest is of exactly the config
+    # the Collector runs even if the file is edited during startup.
+    cp "$collector_config" "$dir/collector.yaml"
+    nohup "$collector_bin" --config "$dir/collector.yaml" \
       > "$dir/collector.log" 2>&1 < /dev/null &
     pid=$!
-    record collector "$pid"
+    record collector "$pid" "$(shasum -a 256 "$dir/collector.yaml" | cut -d' ' -f1)"
     await_ready collector "$pid" 4318
     echo "collector ready (pid $pid), log $dir/collector.log"
   fi

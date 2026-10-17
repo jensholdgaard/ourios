@@ -670,7 +670,7 @@ fn build_compactor(
         let audit_store = store.clone().with_caller(ourios_parquet::Caller::AuditSink);
         let mut compactor = Compactor::new(
             store.with_caller(ourios_parquet::Caller::Compaction),
-            CompactionPolicy::default(),
+            compaction_policy(),
             config.compaction_interval,
         )
         .with_promoted_attributes(config.promoted.clone())
@@ -682,6 +682,21 @@ fn build_compactor(
     } else {
         tracing::info!(name: ourios_semconv::EVENT_OURIOS_SERVER_COMPACTION_DISABLED, "compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
         None
+    }
+}
+
+/// The compactor's policy: the RFC 0009 defaults, with the erasure rows
+/// phase waiting `erasure_settle` — twice the receiver's maximum flush
+/// interval plus the sealing grace — so rows acknowledged before a request
+/// are published before it rewrites (RFC 0009 §3.4 erasure note).
+fn compaction_policy() -> CompactionPolicy {
+    let defaults = CompactionPolicy::default();
+    let flush_nanos = u64::try_from(receiver::SINK_MAX_BUFFER_AGE.as_nanos()).unwrap_or(u64::MAX);
+    CompactionPolicy {
+        erasure_settle_nanos: flush_nanos
+            .saturating_mul(2)
+            .saturating_add(defaults.grace_nanos),
+        ..defaults
     }
 }
 

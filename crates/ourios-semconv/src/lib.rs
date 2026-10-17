@@ -926,6 +926,10 @@ pub const LOG_RECORD_TEMPLATE: &str = "log.record.template";
 /// `ourios.audit_sink.flush.outcome` attribute key.
 pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outcome";
 
+/// `ourios.compaction.erasure.deferral_reason` attribute key.
+pub const OURIOS_COMPACTION_ERASURE_DEFERRAL_REASON: &str =
+    "ourios.compaction.erasure.deferral_reason";
+
 /// `ourios.compaction.orphan.failed_count` attribute key.
 pub const OURIOS_COMPACTION_ORPHAN_FAILED_COUNT: &str = "ourios.compaction.orphan.failed_count";
 
@@ -1073,6 +1077,9 @@ pub const OURIOS_WAL_ROTATION_STATE: &str = "ourios.wal.rotation.state";
 
 /// `ourios.compaction.erasure.completed` log event name.
 pub const EVENT_OURIOS_COMPACTION_ERASURE_COMPLETED: &str = "ourios.compaction.erasure.completed";
+
+/// `ourios.compaction.erasure.deferred` log event name.
+pub const EVENT_OURIOS_COMPACTION_ERASURE_DEFERRED: &str = "ourios.compaction.erasure.deferred";
 
 /// `ourios.compaction.sweep.error` log event name.
 pub const EVENT_OURIOS_COMPACTION_SWEEP_ERROR: &str = "ourios.compaction.sweep.error";

@@ -170,6 +170,8 @@ pub struct SweepReport {
 mod backfill;
 mod daemon;
 mod erasure;
+#[cfg(test)]
+mod erasure_late_tests;
 #[cfg(feature = "openfga")]
 mod graph_phase;
 #[cfg(all(test, feature = "openfga"))]
@@ -561,7 +563,7 @@ fn sweep_committing(
         stats: hooks.gauges.map(SweepGauges::compaction),
     };
     sweep.consolidate_all(&tenants, policy, hooks);
-    match erase_pending(&mut sweep, hooks.erasure_match) {
+    match erase_pending(&mut sweep, hooks.erasure_match, policy.erasure_settle_nanos) {
         Ok(()) => Ok(sweep.report),
         Err(error) => Err(FailedSweep {
             error,

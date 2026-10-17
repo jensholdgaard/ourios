@@ -1169,6 +1169,7 @@ fn plan_selects_a_sealed_many_file_partition_via_count() {
         min_files: 4,
         small_file_bytes: 1,
         grace_nanos: CompactionPolicy::default().grace_nanos,
+        ..CompactionPolicy::default()
     };
 
     // Act
@@ -1195,6 +1196,7 @@ fn plan_skips_when_files_are_large_and_few() {
         min_files: 4,
         small_file_bytes: 1,
         grace_nanos: CompactionPolicy::default().grace_nanos,
+        ..CompactionPolicy::default()
     };
 
     // Act

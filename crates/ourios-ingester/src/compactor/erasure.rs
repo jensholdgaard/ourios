@@ -7,6 +7,9 @@
 // pre-split path resolving unchanged (epic #745 wave 1).
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use std::collections::HashMap;
+
+use ourios_parquet::partition_snapshot;
 
 /// One pending RFC 0047 §3.6 erasure: a durable request marker in the
 /// store (`erasure/tenant_id=<enc>/conversation=<enc>`, written by an
@@ -23,6 +26,9 @@ pub struct ErasureRequest {
     pub marker: String,
     /// Where the request stands.
     pub phase: ErasurePhase,
+    /// When the store last wrote the marker, by the store's clock (Unix
+    /// nanoseconds): the request instant `erasure_settle` is measured from.
+    pub requested_at_unix_nanos: u64,
 }
 
 /// The two phases of an erasure — rows first, tuples after (RFC 0047
@@ -150,11 +156,13 @@ pub(super) fn pending_erasures_under(
         ) else {
             continue;
         };
-        let body = store
-            .get_blocking_opt(&key)
+        // The body and the request instant come from one GET, so they
+        // describe the same marker even if it is replaced after the listing.
+        let got = store
+            .get_with_modified_blocking_opt(&key)
             .map_err(|e| store_error("read erasure marker", &key, &e))?;
         // A marker removed between the listing and this read is finished.
-        let Some(body) = body else {
+        let Some((body, requested_at_unix_nanos)) = got else {
             continue;
         };
         // The marker body is `{"phase": "rows" | "tuples"}`, parsed
@@ -170,6 +178,7 @@ pub(super) fn pending_erasures_under(
             conversation_id: conversation,
             marker: key,
             phase,
+            requested_at_unix_nanos,
         });
     }
     Ok(requests)
@@ -179,6 +188,7 @@ pub(super) fn pending_erasures_under(
 pub(super) fn erase_pending(
     sweep: &mut Sweep<'_, '_>,
     erasure_match: Option<&ErasureMatch<'_>>,
+    settle_nanos: u64,
 ) -> Result<(), IngestError> {
     for request in pending_erasures(sweep.store)? {
         // RFC 0048 §3.4: backfill and erasure exclude each other — a
@@ -190,12 +200,11 @@ pub(super) fn erase_pending(
         // here (defer), and one that acquires after it sees this marker
         // under its own lock (refuse + release).
         if backfill_lock_held(sweep.store, &request.tenant)? {
-            sweep.report.erasures_deferred.push(request.marker.clone());
-            tracing::info!(
-                "erasure of tenant {:?} conversation {:?} deferred: backfill in progress",
-                request.tenant,
-                request.conversation_id,
-            );
+            defer(sweep, &request, Deferral::BackfillInProgress);
+            continue;
+        }
+        if request.phase == ErasurePhase::Rows && !settled(sweep, &request, settle_nanos) {
+            defer(sweep, &request, Deferral::Settling);
             continue;
         }
         let mut outcome = ErasureOutcome {
@@ -221,64 +230,224 @@ pub(super) fn erase_pending(
     Ok(())
 }
 
+/// Why a pending erasure request is not started this sweep.
+#[derive(Debug, Clone, Copy)]
+enum Deferral {
+    /// A graph backfill holds the tenant's lock (RFC 0048 §3.4).
+    BackfillInProgress,
+    /// Younger than `erasure_settle` (RFC 0009 §3.4).
+    Settling,
+}
+
+impl Deferral {
+    /// The `ourios.compaction.erasure.deferral_reason` value.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::BackfillInProgress => "backfill_in_progress",
+            Self::Settling => "settling",
+        }
+    }
+}
+
+/// Leave `request` pending this sweep: record it in the report and log the
+/// `ourios.compaction.erasure.deferred` event.
+fn defer(sweep: &mut Sweep<'_, '_>, request: &ErasureRequest, deferral: Deferral) {
+    sweep.report.erasures_deferred.push(request.marker.clone());
+    tracing::info!(
+        name: ourios_semconv::EVENT_OURIOS_COMPACTION_ERASURE_DEFERRED,
+        {
+            { ourios_semconv::OURIOS_TENANT } = request.tenant.as_str(),
+            { ourios_semconv::OURIOS_COMPACTION_ERASURE_DEFERRAL_REASON } = deferral.reason(),
+        },
+        "erasure of tenant {:?} conversation {:?} deferred: {}",
+        request.tenant,
+        request.conversation_id,
+        deferral.reason(),
+    );
+}
+
+/// Whether `request` is older than `settle_nanos` by the sweep's clock, so
+/// the receivers have published what they acknowledged before it (RFC 0009
+/// §3.4 erasure note, `erasure_settle`).
+fn settled(sweep: &Sweep<'_, '_>, request: &ErasureRequest, settle_nanos: u64) -> bool {
+    (sweep.clock.now)() >= request.requested_at_unix_nanos.saturating_add(settle_nanos)
+}
+
+/// Confirming passes after the first rewrite of every partition before the
+/// rows phase gives up for this sweep (the tuple phase's bound).
+const CONFIRMING_ROUNDS: usize = 8;
+
+/// The generation each partition was at when this rows phase last checked
+/// it: the generation its erasure commit won, or the one it observed when
+/// there was nothing to rewrite.
+type Checked = HashMap<PartitionKey, u64>;
+
 /// Rewrite every partition of the request's tenant with the conversation's
-/// rows dropped; once all rewrote cleanly, advance the marker to `Tuples`.
+/// rows dropped, then confirm: rewrite again, for at most
+/// [`CONFIRMING_ROUNDS`] passes, every partition that has since taken a
+/// flush file or moved past its checked generation (a late file, or a
+/// second compactor's consolidation of one). Once a pass finds nothing to
+/// rewrite, advance the marker to `Tuples` (RFC 0009 §3.4 erasure note).
 fn erase_rows(sweep: &mut Sweep<'_, '_>, matches: &ErasureMatch<'_>, outcome: &mut ErasureOutcome) {
     let request = outcome.request.clone();
-    let partitions = match hour_partitions(sweep.store, &request.tenant) {
-        Ok(partitions) => partitions,
+    let id = request.conversation_id.as_str();
+    let drop = |record: &MinedRecord| matches(record, id);
+    let Some(partitions) = tenant_partitions(sweep, &request) else {
+        return;
+    };
+    let mut checked = Checked::new();
+    let mut erasing = Erasing {
+        drop: &drop,
+        outcome,
+        checked: &mut checked,
+    };
+    if !erase_each(sweep, &partitions, &mut erasing) {
+        return;
+    }
+    for _ in 0..CONFIRMING_ROUNDS {
+        let Some(changed) = changed_partitions(sweep, &request, erasing.checked) else {
+            return;
+        };
+        if changed.is_empty() {
+            advance_marker(sweep, erasing.outcome);
+            return;
+        }
+        if !erase_each(sweep, &changed, &mut erasing) {
+            return;
+        }
+    }
+    sweep.report.errors.push(format!(
+        "erase {:?} {:?}: partitions still changing after {CONFIRMING_ROUNDS} confirming \
+         passes — request left in the rows phase",
+        request.tenant, request.conversation_id
+    ));
+}
+
+/// The tenant's hour partitions, or `None` with the listing error recorded.
+fn tenant_partitions(
+    sweep: &mut Sweep<'_, '_>,
+    request: &ErasureRequest,
+) -> Option<Vec<PartitionKey>> {
+    match hour_partitions(sweep.store, &request.tenant) {
+        Ok(partitions) => Some(partitions),
         Err(e) => {
             sweep
                 .report
                 .errors
                 .push(format!("erase {:?}: list partitions: {e}", request.tenant));
-            return;
+            None
         }
-    };
-    let id = request.conversation_id.as_str();
-    let drop = |record: &MinedRecord| matches(record, id);
-    let mut clean = true;
-    for partition in &partitions {
-        clean &= erase_partition(sweep, partition, &drop, outcome);
-    }
-    if clean {
-        advance_marker(sweep, outcome);
     }
 }
 
+/// Erase from each of `partitions`, recording its checked generation;
+/// whether every one rewrote cleanly.
+fn erase_each(
+    sweep: &mut Sweep<'_, '_>,
+    partitions: &[PartitionKey],
+    erasing: &mut Erasing<'_, '_>,
+) -> bool {
+    let mut clean = true;
+    for partition in partitions {
+        match erase_partition(sweep, partition, erasing.drop, erasing.outcome) {
+            Some(generation) => {
+                erasing.checked.insert(partition.clone(), generation);
+            }
+            None => clean = false,
+        }
+    }
+    clean
+}
+
+/// One request's rows phase in progress: its filter, its outcome, and the
+/// generation each partition was checked at.
+struct Erasing<'e, 'f> {
+    drop: &'e RowFilter<'f>,
+    outcome: &'e mut ErasureOutcome,
+    checked: &'e mut Checked,
+}
+
+/// The partitions of the request's tenant a confirming pass must rewrite
+/// again: those holding a live flush file, at a generation other than their
+/// checked one, or not checked yet. `None` with the error recorded when the
+/// store cannot be read.
+fn changed_partitions(
+    sweep: &mut Sweep<'_, '_>,
+    request: &ErasureRequest,
+    checked: &Checked,
+) -> Option<Vec<PartitionKey>> {
+    let partitions = tenant_partitions(sweep, request)?;
+    let mut changed = Vec::new();
+    for partition in partitions {
+        match partition_snapshot(sweep.store, &partition) {
+            Ok(now) => {
+                let settled =
+                    now.live_flush_files == 0 && checked.get(&partition) == Some(&now.generation);
+                if !settled {
+                    changed.push(partition);
+                }
+            }
+            Err(e) => {
+                let hour = hour_label(&partition);
+                sweep.report.errors.push(format!(
+                    "erase {:?} {:?} {hour}: confirm: {e}",
+                    request.tenant, request.conversation_id
+                ));
+                return None;
+            }
+        }
+    }
+    Some(changed)
+}
+
 /// Rewrite one partition of the request's tenant without the rows `drop`
-/// matches; whether it rewrote cleanly. An erasure rewrite is a compaction
-/// like any other for the sweep's IO accounting and audit trail (RFC 0009
-/// §3.6): it reads and writes the partition and commits a generation, so
-/// `rewrite` records its commit as the consolidation pass does.
+/// matches; its checked generation, or `None` if it did not rewrite
+/// cleanly. An erasure rewrite is a compaction like any other for the
+/// sweep's IO accounting and audit trail (RFC 0009 §3.6): it reads and
+/// writes the partition and commits a generation, so `rewrite` records
+/// its commit as the consolidation pass does. A partition with nothing to
+/// rewrite is checked at the generation read **before** the rewrite: one
+/// read after it could already name a peer's commit of rows this rewrite
+/// never filtered, which the confirming pass would then wrongly take as
+/// checked.
 fn erase_partition(
     sweep: &mut Sweep<'_, '_>,
     partition: &PartitionKey,
     drop: &RowFilter<'_>,
     outcome: &mut ErasureOutcome,
-) -> bool {
+) -> Option<u64> {
     let request = &outcome.request;
     let target = Target {
         tenant: &request.tenant,
         partition,
     };
+    let context = || {
+        let hour = hour_label(partition);
+        format!(
+            "erase {:?} {:?} {hour}",
+            request.tenant, request.conversation_id
+        )
+    };
+    let before = match partition_snapshot(sweep.store, partition) {
+        Ok(before) => before,
+        Err(e) => {
+            sweep.report.errors.push(format!("{}: {e}", context()));
+            return None;
+        }
+    };
     match sweep.rewrite(target, None, Some(drop)) {
-        Ok(o) => {
-            if o.committed.is_some() {
+        Ok(o) => match o.committed {
+            Some(committed) => {
                 outcome.partitions_rewritten += 1;
                 outcome.rows_dropped += o.rows_dropped;
                 sweep.report.gc_failures += o.gc_failures;
+                Some(committed.generation)
             }
-            true
-        }
+            None => Some(before.generation),
+        },
         Err(e) => {
-            let hour = hour_label(partition);
-            let (tenant, id) = (&request.tenant, &request.conversation_id);
-            e.record(
-                &mut sweep.report,
-                &format!("erase {tenant:?} {id:?} {hour}"),
-            );
-            false
+            e.record(&mut sweep.report, &context());
+            None
         }
     }
 }

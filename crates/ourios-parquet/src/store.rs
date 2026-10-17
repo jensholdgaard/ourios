@@ -1044,6 +1044,50 @@ impl Store {
         }
     }
 
+    /// Read the object at `key` together with when the store last modified
+    /// it, by the store's own clock (Unix nanoseconds; `0` for an instant
+    /// before the epoch or past the nanosecond range), both from the one
+    /// `GET`, so they always describe the same version of the object.
+    ///
+    /// # Errors
+    /// As [`Self::get`].
+    pub async fn get_with_modified(&self, key: &str) -> Result<(Vec<u8>, u64), StoreError> {
+        let got = self
+            .inner
+            .get(&self.resolve(key)?)
+            .await
+            .map_err(StoreError::Backend)?;
+        let last_modified = got
+            .meta
+            .last_modified
+            .timestamp_nanos_opt()
+            .and_then(|nanos| u64::try_from(nanos).ok())
+            .unwrap_or(0);
+        let bytes = got.bytes().await.map_err(StoreError::Backend)?;
+        Ok((bytes.to_vec(), last_modified))
+    }
+
+    /// Blocking [`Self::get_with_modified`], mapping a missing object to
+    /// `None`.
+    ///
+    /// # Errors
+    /// As [`Self::get_with_modified`], except a not-found object yields
+    /// `Ok(None)`; plus [`StoreError::Runtime`] if the bridge runtime can't be
+    /// built.
+    pub fn get_with_modified_blocking_opt(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
+        let (store, key) = (self.clone(), key.to_owned());
+        match self.bridge(Operation::Get, async move {
+            store.get_with_modified(&key).await
+        }) {
+            Ok(got) => Ok(Some(got)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Blocking [`Self::get_with_etag`], mapping a missing object to `None`
     /// (the manifest's "no manifest yet" case) for sync call sites.
     ///

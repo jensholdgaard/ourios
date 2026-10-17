@@ -32,12 +32,14 @@ fn invariant_3_1_1_default_threshold_is_0_7() {
 ///       by `AliasMap`, §6.7, and are out of this scenario's scope);
 ///       the registry is the source of truth; and
 ///   (b) every instrument is registered on the `ourios.miner` meter
-///       and surfaces in the export on its **first real measurement**
-///       — no synthetic zero-traffic points. A small representative
+///       and surfaces in the export. A small representative
 ///       workload exercises every instrument (normal line,
 ///       template-widening near-duplicate, oversized-`param` line,
 ///       parse-failure line), then `force_flush` and assert each
-///       mandatory name is present.
+///       mandatory name is present; and
+///   (c) the 2026-10-17 amendment's per-tenant zero points: every
+///       registry-enum member of the counters' required attributes has
+///       a tenant-level series, including members the workload never hit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
     use ourios_config::MinerConfig;
@@ -118,6 +120,87 @@ async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
     // now backed by real data points carrying the required attributes.
     let rms = exporter.get_finished_metrics().expect("metrics exported");
     assert_mandatory_exported(&rms, &MANDATORY);
+    assert_tenant_zero_points(&rms, "acme");
+}
+
+/// Every counter the per-tenant zero rule covers has a series for
+/// `tenant` without `ourios.service`, one per member of its required
+/// enum attribute: a member the workload never hit reads `0`.
+fn assert_tenant_zero_points(
+    rms: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
+    tenant: &str,
+) {
+    use opentelemetry_sdk::metrics::data::{
+        AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
+    };
+
+    let series = |name: &str| -> Vec<(Vec<(String, String)>, u64)> {
+        let metric = rms
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .find(|m| m.name() == name)
+            .unwrap_or_else(|| panic!("{name} exported"));
+        let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+            panic!("{name} is a u64 sum");
+        };
+        sum.data_points()
+            .map(|dp| {
+                let attrs = dp
+                    .attributes()
+                    .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
+                    .collect();
+                (attrs, dp.value())
+            })
+            .collect()
+    };
+    let tenant_only = |attrs: &[(String, String)], extra: Option<(&str, &str)>| {
+        let mut want = vec![(ourios_semconv::OURIOS_TENANT.to_owned(), tenant.to_owned())];
+        want.extend(extra.map(|(k, v)| (k.to_owned(), v.to_owned())));
+        let mut have = attrs.to_vec();
+        have.sort();
+        want.sort();
+        have == want
+    };
+
+    let merges = series(ourios_semconv::OURIOS_MINER_MERGES);
+    assert!(
+        merges.iter().any(|(attrs, value)| *value == 0
+            && tenant_only(
+                attrs,
+                Some((
+                    ourios_semconv::OURIOS_MINER_TEMPLATE_CHANGE,
+                    "template_type_expanded"
+                ))
+            )),
+        "no type-expansion happened, so its member reads 0: {merges:?}"
+    );
+    let failures = series(ourios_semconv::OURIOS_MINER_PARSE_FAILURES);
+    for reason in [
+        "below_floor",
+        "tokenizer_failure",
+        "template_ceiling",
+        "id_reservation_failed",
+    ] {
+        assert!(
+            failures.iter().any(|(attrs, value)| *value == 0
+                && tenant_only(
+                    attrs,
+                    Some((ourios_semconv::OURIOS_MINER_PARSE_FAILURE_REASON, reason))
+                )),
+            "{reason} has a zero series: {failures:?}"
+        );
+    }
+    for name in [
+        ourios_semconv::OURIOS_MINER_PARAMS_OVERFLOW,
+        ourios_semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES,
+    ] {
+        let points = series(name);
+        assert!(
+            points.iter().any(|(attrs, _)| tenant_only(attrs, None)),
+            "{name} has a tenant-level series: {points:?}"
+        );
+    }
 }
 
 /// Miner instruments exported with the registry description and unit: the

@@ -172,7 +172,7 @@ async fn rfc0008_10_recovery_runs_before_serving_and_shutdown_snapshots_are_cohe
     // Act: spawn the server (recovery runs to completion before the
     // listeners bind — the reported addresses are the proof the bind
     // happened, and a recovery failure would abort startup).
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", tmp.path())
         .env("OURIOS_RECEIVER_ENABLED", "1")
         .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")
@@ -283,7 +283,7 @@ async fn rfc0008_10_shutdown_without_live_traffic_stamps_the_recovered_high_wate
 
     // Act: spawn, wait for the bound-address report (recovery is
     // complete by then), SIGTERM without sending a single request.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .env("OURIOS_BUCKET_ROOT", tmp.path())
         .env("OURIOS_RECEIVER_ENABLED", "1")
         .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")

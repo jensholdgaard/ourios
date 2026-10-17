@@ -60,7 +60,7 @@ fn auth_yaml(issuer: &str, api_url: &str, store_id: &str, model_id: &str) -> Str
 async fn cli(config_path: &std::path::Path, args: &[&str]) -> std::process::Output {
     timeout(
         Duration::from_secs(30),
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        crate::server_bin::command()
             .arg("--config")
             .arg(config_path)
             .args(args)

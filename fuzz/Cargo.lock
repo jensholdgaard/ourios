@@ -2565,6 +2565,7 @@ dependencies = [
  "rustix",
  "rustls",
  "tokio",
+ "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
 ]

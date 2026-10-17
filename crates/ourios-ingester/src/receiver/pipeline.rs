@@ -33,7 +33,7 @@ use ourios_wal::{
 use prost::Message;
 use tracing::Instrument as _;
 
-use crate::metrics::IngestMetrics;
+use crate::metrics::{AcceptedBatch, IngestMetrics};
 use crate::receiver::commit::{CommitCoordinator, CommitOutcome};
 use crate::receiver::tenant::assign;
 use ourios_serving::AuthBinding;
@@ -600,6 +600,9 @@ impl IngestPipeline {
         name = "ingest logs",
         fields(
             otel.kind = "server",
+            ourios.tenant = tenant.as_str(),
+            ourios.ingest.batch.record_count = log_record_count(&request),
+            ourios.ingest.batch.size = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
             error.type = tracing::field::Empty,
         )
@@ -665,6 +668,10 @@ impl IngestPipeline {
         // transport, so the codec's own bound cannot fail here.
         let payload = TenantBatch::encode(tenant.as_str(), &request.encode_to_vec())
             .map_err(ReceiveError::TenantFrame)?;
+        tracing::Span::current().record(
+            ourios_semconv::OURIOS_INGEST_BATCH_SIZE,
+            span_count(payload.len()),
+        );
 
         // Steps 1–2: every record under the selected tenant (RFC 0046 §3.2).
         let records = assign(request, &tenant);
@@ -759,12 +766,13 @@ impl IngestPipeline {
                     .iter()
                     .filter(|r| super::materialize::severity_is_out_of_range(r.severity_number))
                     .count();
-                self.metrics.record_batch(
-                    records.len(),
+                self.metrics.record_batch(&AcceptedBatch {
+                    tenant: &tenant,
+                    record_count: records.len(),
                     severity_out_of_range,
                     lenient_json,
-                    append_elapsed,
-                );
+                    elapsed: append_elapsed,
+                });
                 Ok(records.len())
             }
             // Sync failed: the frame is not durable and not acked; it
@@ -993,6 +1001,26 @@ impl IngestPipeline {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Log records across every `ResourceLogs` and `ScopeLogs` of an export,
+/// counted before the request is consumed so the `ingest logs` span carries
+/// it from its start (RFC 0038 §3.5).
+fn log_record_count(request: &ExportLogsServiceRequest) -> i64 {
+    span_count(
+        request
+            .resource_logs
+            .iter()
+            .flat_map(|resource| &resource.scope_logs)
+            .map(|scope| scope.log_records.len())
+            .sum(),
+    )
+}
+
+/// A count as a span attribute value: `i64`, since tracing-opentelemetry
+/// renders a `u64` field as a string.
+fn span_count(count: usize) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
 }
 
 /// Failure ingesting an export. Tenant-resolution failures reject the

@@ -26,7 +26,7 @@
 //! of which needs local-path canonicalisation.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -38,14 +38,16 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::data_schema_with_promoted;
-use crate::manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
+use crate::manifest::{
+    LiveSet, MANIFEST_FILENAME, Manifest, ManifestError, Published, compacted_generation,
+};
 use crate::partition::{PartitionKey, percent_encode_tenant};
 use crate::promoted::{PromotedAttributes, SERVICE_NAME_KEY, project_string_value};
 use crate::reader::{Reader, ReaderError};
 use crate::record_batch::mined_records_to_batch_with_promoted;
 use crate::store::{Store, StoreError};
 use crate::writer::{
-    ClusterKeys, DEFAULT_ZSTD_LEVEL, MAX_COMPACTED_RG_BYTES, SUB_BATCH_ROWS, Writer, WriterError,
+    ClusterKeys, CompactedOutput, MAX_COMPACTED_RG_BYTES, SUB_BATCH_ROWS, Writer, WriterError,
 };
 
 /// One hour in nanoseconds — the span a `…/hour=HH/` partition covers.
@@ -74,7 +76,10 @@ pub use commit::{OrphanGc, gc_orphans};
 use keys::*;
 #[allow(unused_imports, clippy::wildcard_imports)]
 use plan::*;
-pub use plan::{hour_partitions, plan_candidates, visit_partition_rows};
+pub use plan::{
+    CompactionPlan, PartitionSnapshot, PlanCounts, hour_partitions, partition_snapshot,
+    plan_candidates, plan_candidates_counted, plan_compaction_counted, visit_partition_rows,
+};
 #[allow(unused_imports, clippy::wildcard_imports)]
 use sort::*;
 pub use stats::{CompactionStats, MemoryPhase};
@@ -91,21 +96,17 @@ pub struct CompactionOutcome {
     /// Rows an erasure filter removed (RFC 0047 §3.6); `0` without one.
     pub rows_dropped: u64,
     /// The commit, or `None` when nothing was committed: too few live files
-    /// (fewer than two to consolidate; none for an erasure), a bootstrap
-    /// manifest lost to a concurrent compactor before anything was
-    /// written, or a final manifest swap lost after the rewrite.
+    /// (fewer than two to consolidate; none for an erasure), or a manifest
+    /// commit lost to a concurrent compactor after the rewrite.
     ///
-    /// For a consolidation only the last is a failure, and it is
+    /// For a consolidation only the latter is a failure, and it is
     /// distinguished by [`commit_lost`](Self::commit_lost). An erasure
-    /// ([`RowHooks::drop`]) is the exception: any `None` with
-    /// `files_before > 0`, a lost bootstrap included, leaves live rows
-    /// unrewritten, so its caller must treat it as a failure too and not
+    /// ([`RowHooks::drop`]) treats any `None` with `files_before > 0` as a
+    /// failure: it leaves live rows unrewritten, so its caller must not
     /// advance the erasure marker.
     pub committed: Option<Committed>,
-    /// Whether the rewrite was written but its final manifest swap lost.
-    /// `false` for every other no-op, including a lost bootstrap: that
-    /// race is decided before anything is written, and the winner owns
-    /// the partition.
+    /// Whether the rewrite was written but its manifest commit lost.
+    /// `false` for every other no-op.
     pub commit_lost: bool,
     /// Non-live files that could not be removed: superseded inputs after
     /// a commit, or the discarded rewrite after a lost one. The manifest
@@ -155,6 +156,13 @@ pub struct CompactionPolicy {
     /// sealed, absorbing late-arriving records (RFC 0009 §3.3, default
     /// 15 min), in nanoseconds.
     pub grace_nanos: u64,
+    /// How old an erasure request's marker must be, by the store's clock,
+    /// before the sweep starts its rows phase (RFC 0009 §3.4 erasure note,
+    /// `erasure_settle`), in nanoseconds: long enough that the receivers
+    /// have published what they acknowledged before the request. `0` here,
+    /// so a library caller erases at once; the server sets the RFC default,
+    /// twice the receiver's maximum flush interval plus `grace_nanos`.
+    pub erasure_settle_nanos: u64,
 }
 
 impl Default for CompactionPolicy {
@@ -163,6 +171,7 @@ impl Default for CompactionPolicy {
             min_files: 4,
             small_file_bytes: 128 * 1024 * 1024,
             grace_nanos: 15 * 60 * 1_000_000_000,
+            erasure_settle_nanos: 0,
         }
     }
 }
@@ -216,17 +225,15 @@ impl std::error::Error for CompactionError {
 ///
 /// Returns `committed: None` when the partition has fewer than two live files
 /// (nothing to consolidate), or when a manifest compare-and-swap is lost to a
-/// concurrent compactor (S3 only). A lost bootstrap happens before anything is
-/// written and is a plain no-op. A lost final swap sets
-/// [`CompactionOutcome::commit_lost`]: the consolidated file no manifest names
-/// is deleted immediately (a failed delete is counted in
+/// concurrent compactor (S3 only). A lost commit, the first create-if-absent
+/// included, sets [`CompactionOutcome::commit_lost`]: the consolidated file no
+/// manifest names is deleted immediately (a failed delete is counted in
 /// [`CompactionOutcome::gc_failures`]), the inputs stay live, and the
 /// compaction sweep surfaces the loss as a sweep error so it is retried.
 ///
 /// That classification is for consolidation. An erasure through
 /// [`compact_partition_hooked`] with a [`RowHooks::drop`] rewrites a
-/// single-file partition too, and even a lost bootstrap there is a failure;
-/// see [`CompactionOutcome::committed`].
+/// single-file partition too; see [`CompactionOutcome::committed`].
 ///
 /// # Errors
 ///
@@ -467,33 +474,11 @@ fn compact_sorted_hooked(
     // is independent of the store's listing order (RFC0036.4).
     inputs.sort();
 
-    // Make the reader manifest-authoritative *before* the consolidated file
-    // appears. With no prior manifest, a concurrent glob reader would otherwise
-    // see the inputs *and* the new file in the window before the commit (a
-    // double count). Bootstrapping a manifest naming the current inputs is the
-    // same set the glob already returns, so it changes nothing visible
-    // (RFC0009.3 — no torn read), and from then on the new file stays invisible
-    // until the commit names it. The bootstrap is a create-if-absent
-    // conditional PUT (supported on both backends); a lost race means another
-    // compactor owns this partition, so back off as a no-op rather than fight it.
-    let (base_generation, commit_etag) = if let Some(manifest) = &existing {
-        (manifest.generation, etag)
-    } else {
-        let bootstrap = Manifest {
-            generation: 1,
-            files: basenames(&inputs),
-        };
-        match bootstrap
-            .publish_cas(store, &key, None)
-            .map_err(CompactionError::Manifest)?
-        {
-            Published::Won => {}
-            Published::Lost => return Ok(no_op_outcome(inputs.len())),
-        }
-        // Re-read to learn the bootstrap generation's ETag for the CAS commit
-        // (the S3 path; the local overwrite commit ignores it).
-        (1, read_manifest_etag(store, &key)?)
-    };
+    // The output stays invisible until the commit names it, as any unnamed
+    // compacted file does, so nothing needs claiming first (RFC 0009 §3.4).
+    // With no manifest yet the commit is a create-if-absent at generation 1;
+    // a peer that created one first wins, and this commit is lost.
+    let base_generation = existing.as_ref().map_or(0, |m| m.generation);
 
     // RFC 0036 §3.3 adaptive row-group threshold: estimate the output size
     // as the sum of the live input files' sizes (the sorted output is the
@@ -513,16 +498,15 @@ fn compact_sorted_hooked(
     // so a mis-partitioned input aborts the compaction instead of being
     // silently merged. Row groups rotate at the §3.3 compacted
     // threshold and the file declares the §3.4 `sorting_columns`.
-    let writer = Writer::open_in_compacted(
-        store,
-        partition.clone(),
-        DEFAULT_ZSTD_LEVEL,
-        promoted.clone(),
+    let generation = base_generation.saturating_add(1);
+    let output = CompactedOutput {
         keys,
-        tuning.compacted_flush_bytes,
+        flush_override: tuning.compacted_flush_bytes,
         estimated_output_bytes,
-    )
-    .map_err(CompactionError::Write)?;
+        generation,
+    };
+    let writer = Writer::open_in_compacted(store, partition.clone(), promoted.clone(), output)
+        .map_err(CompactionError::Write)?;
     let plan = SortPlan {
         store,
         partition,
@@ -535,22 +519,24 @@ fn compact_sorted_hooked(
     let bytes_written = written.bytes_written;
     let consolidated = basename(&written.key).to_owned();
 
-    // Commit: swap the manifest to name only the consolidated file. The input
-    // names (the merged-away set) for the §3.6 audit event are already sorted
-    // (the §3.1 tie-break order), so the event is deterministic regardless of
-    // listing order.
-    let generation = base_generation.saturating_add(1);
+    // Commit: name only the consolidated file and consume the flush inputs. A
+    // flush file that landed after the inputs were listed is not consumed and
+    // stays live (RFC0009.15). The input names (the merged-away set) for the
+    // §3.6 audit event are already sorted (the §3.1 tie-break order), so the
+    // event is deterministic regardless of listing order.
     let input_files = basenames(&inputs);
-    let commit = Manifest {
-        generation,
-        files: vec![consolidated.clone()],
+    let commit = next_manifest(existing.as_ref(), generation, &consolidated, &input_files);
+    let base = match &existing {
+        Some(_) => Base::Current(etag.as_deref()),
+        None => Base::Absent,
     };
-    match commit_manifest(store, &key, &commit, commit_etag.as_deref())? {
+    match commit_manifest(store, &key, &commit, base)? {
         Published::Won => {}
-        // Lost the CAS race (S3 only — the local overwrite always wins): the
-        // work is left for the next sweep, and the consolidated file, which
-        // no manifest names, is removed now rather than left to a
-        // `gc_orphans` pass an erasure rewrite never runs.
+        // Lost the race (a first create-if-absent, or an S3 CAS — the local
+        // overwrite of an existing manifest always wins): the work is left
+        // for the next sweep, and the consolidated file, which no manifest
+        // names, is removed now rather than left to a `gc_orphans` pass an
+        // erasure rewrite never runs.
         Published::Lost => return Ok(lost_commit_outcome(store, &written.key, inputs.len())),
     }
 
@@ -561,6 +547,25 @@ fn compact_sorted_hooked(
     };
     let outcome = committed_outcome(&inputs, &totals, committed, bytes_written);
     Ok(announce_and_clean_up(store, &inputs, hooks, outcome))
+}
+
+/// The manifest a won commit at `generation` publishes: `output` is the only
+/// live compacted file, and the flush files among `inputs` join the ones
+/// `existing` already consumed (RFC 0009 §3.4 late-write note).
+fn next_manifest(
+    existing: Option<&Manifest>,
+    generation: u64,
+    output: &str,
+    inputs: &[String],
+) -> Manifest {
+    let mut consumed = existing.map(|m| m.consumed.clone()).unwrap_or_default();
+    consumed.extend(
+        inputs
+            .iter()
+            .filter(|name| compacted_generation(name).is_none())
+            .cloned(),
+    );
+    Manifest::new(generation, vec![output.to_owned()], consumed)
 }
 
 /// Sort `inputs` into `writer` and close it, leaving no phase's memory

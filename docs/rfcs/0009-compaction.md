@@ -11,6 +11,68 @@ superseded-by: —
 
 # RFC 0009 — Background compaction: small-file consolidation
 
+> **Amendment (2026-10-16, #1027, maintainer-approved) — planning reads a
+> tenant once, not every partition.** Candidate planning
+> (§3.3) lists each tenant's data prefix once, recursively, and decides
+> every partition from that listing. It reads a partition's manifest only
+> when the listing shows two or more committed `*.parquet` objects there.
+> A settled partition (one live file) then costs no request of its own, so
+> a sweep's planning cost follows the objects a tenant holds (about 1,000
+> per listing page), not the hours it has retained. The candidate
+> predicate is unchanged; only the reads it is computed from change. No
+> state is persisted or cached. Adds the in-place note in §3.3, scenarios
+> RFC0009.8–.12 (§5), their test map (§6), the alternatives and open
+> questions (§7) and the history (§9). Erasure and the graph backfill keep
+> walking every hour partition, so they are unaffected (RFC0009.12). The
+> accepted text below is left as written and the frontmatter stays
+> `accepted` for the seven original criteria. The new scenarios were
+> approved with the amendment and move through `red` and `green` with
+> their tests. Refs #1019 (item 2). Records a pre-existing gap found while
+> drafting it: a late write into an already-compacted partition is not
+> re-flagged (#1026; §3.3 note, §7).
+
+> **Amendment (2026-10-16, #1033, maintainer-approved) — late writes
+> stay live.** A record whose timestamp falls in an hour
+> partition that was already compacted is written as a new
+> `<uuidv7>.parquet` that the manifest does not name, so today it is
+> invisible to every reader and `gc_orphans` deletes it the next time the
+> partition is consolidated (#1026). The same happens to every flush into
+> the *current* hour after an erasure, because an erasure rewrites every
+> partition of the tenant and leaves a manifest in each. This amendment
+> changes what the manifest records: it names the **compacted files that
+> are live** and the **flush files a committed compaction consumed**, and
+> every other flush file is live. A flush file can then be deleted only
+> after a won commit has copied its rows, whatever crashes or races
+> happen, and the writer's flush path is unchanged. Adds the in-place
+> notes in §3.3 and §3.4, the alternatives in §4, scenarios
+> RFC0009.13–.24 (§5), their test map (§6), the decisions and open
+> questions (§7) and the history (§9), plus an in-place note in RFC 0047
+> §3.6 on erasure. **Breaking for the persisted layout:** a manifest
+> written before this amendment is rejected, with no dual-read (§3.4
+> note). The accepted text below is left as written, and the frontmatter
+> stays `accepted` for the seven original criteria. The maintainer
+> approved the amendment with decisions D1–D4 (§7). Its scenarios move
+> through `red` and `green` with their tests. Refs #1026.
+
+> **Amendment (2026-10-16, #1039, maintainer-approved) — orphan GC is
+> observable.** The sweep's orphan GC (`gc_orphans`, RFC0009.4) emits no
+> telemetry today: what it removed is summed into the sweep report and
+> never exported, and a delete it could not make is dropped.
+> `ourios.compaction.orphan.files` does not cover it, since that counter
+> counts the superseded inputs the committing rewrite could not delete.
+> This amendment adds one counter, `ourios.compaction.orphan.reclaimed`,
+> per tenant, with `error.type` on a file whose delete failed (§3.6), and
+> runs the GC as one pass after the consolidation pass, so the pass can
+> carry one RFC 0038 phase span (`reclaim orphans`, RFC 0038 §3.9). The
+> pass visits the candidates and, so that a sweep stopped before it loses
+> nothing, every sealed partition whose listing shows an orphan, picked
+> from the planner's one listing with no persisted state. The GC rule,
+> RFC0009.17 and the files GC may delete are unchanged. Adds the in-place
+> note in §3.6, scenarios RFC0009.25–.26 (§5), their test map (§6) and the
+> history (§9). The new names go to the ourios-semconv
+> registry. `ourios.compaction.orphan.files` keeps its meaning and its
+> attributes.
+
 > **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
 > the completed-backlog batch flip; thesis-gates passed at `validated`.
 >
@@ -155,6 +217,97 @@ arrives after a partition is compacted lands as a new small file and
 re-flags the partition as a candidate — compaction is idempotent and
 re-runnable (§3.5).
 
+> **Amendment (2026-10-16, #1027, maintainer-approved) — how the
+> candidates are read.**
+> The predicate above is unchanged. What changes is the reads it is
+> computed from, because planning had become the sweep's dominant cost
+> (#1019: about one listing and one manifest read per retained hour
+> partition, at about 55 ms each, every sweep, growing with history and
+> not with the work there is).
+>
+> **Before.** For each tenant, a delimiter walk enumerates the
+> `year=/month=/day=/hour=` prefixes. Then, for every sealed partition,
+> one `GET manifest.json` (a 404 when there is none) and one listing of
+> the partition.
+>
+> **After.** For each tenant, the planner makes **one recursive listing**
+> of `data/tenant_id=<enc>/` (the backend pages it, 1,000 keys per page on
+> S3). It groups the listed keys by hour partition, parsing each Hive
+> segment in the canonical zero-padded form as today (a non-canonical
+> segment is skipped), and keeps only keys that sit directly in a
+> partition. Partitions are visited oldest first. For each sealed
+> partition, with *C* the committed `*.parquet` objects listed there and
+> their sizes:
+>
+> 1. **|C| < 2** — not a candidate, and no further request. The live set
+>    is a subset of *C* whatever a manifest says, so fewer than two
+>    listed files means fewer than two live files. This covers the
+>    settled partition (one consolidated file and its manifest), a lone
+>    small file, and a partition holding only a manifest or `*.tmp`
+>    objects.
+> 2. **|C| ≥ 2, no `manifest.json` listed** — the live set is *C* (the
+>    glob fallback). Decided from the listing; no manifest read.
+> 3. **|C| ≥ 2, `manifest.json` listed** — one `GET manifest.json`; the
+>    live set is *C* restricted to the names it lists, as today.
+>
+> The candidate test is then the one above: at least two live files, and
+> either more than `compaction_min_files` or one below the small-file
+> size. The result is the same as the per-partition reads would give on
+> the same objects (RFC0009.9). The listing replaces those reads; it does
+> not summarise them, so there is nothing to persist, invalidate or keep
+> consistent between compactor processes.
+>
+> **Visibility timing changes slightly.** The per-partition reads looked
+> at each partition when the walk reached it, so a write that landed
+> before then was seen in the same sweep. Now the tenant is read once, at
+> the start of its planning: a write that lands after that listing waits
+> for the next sweep, even if the partition comes later in the walk. The
+> delay is at most one sweep interval. A late write is never lost and
+> never skipped for good: every sweep lists the tenant afresh
+> (RFC0009.10).
+>
+> **Erasure and backfill are unaffected.** Only consolidation planning
+> changes. The RFC 0047 §3.6 erasure pass and the RFC 0048 graph
+> backfill still enumerate every hour partition of the tenant through
+> `hour_partitions` (`compactor/erasure.rs`, `compactor/backfill.rs`) and
+> visit each one. They never use the candidate planner. A settled
+> single-file partition, which the planner skips without a read, is
+> still rewritten by an erasure whose rows it holds (RFC0009.12).
+>
+> **Cost.** Per tenant per sweep: one logical listing, served as
+> ⌈objects ÷ 1,000⌉ page requests on S3, plus
+> one manifest read per sealed partition that holds two or more committed
+> files and a manifest. A settled partition costs nothing beyond its two
+> keys in the listing. At the H4 steady state of one file and one
+> manifest per hour, a year of history is about 17,500 keys, or 18 pages.
+> The listing is held in memory while the tenant is planned: about 100
+> bytes per key, so a few MB per year of history, released before the
+> tenant's partitions are compacted.
+>
+> **Late writes into a compacted partition (#1026).** The sentence above
+> ("late data that arrives after a partition is compacted … re-flags the
+> partition") does not hold today, and this amendment does not change
+> that. Once a partition has a manifest, the manifest is the live set
+> (§3.4). A late writer's file is not in it, so readers, the planner and
+> `visit_partition_rows` ignore it, and `gc_orphans` would delete it as
+> an orphan. Under this amendment such a partition falls under case 3 (the
+> late file makes |C| ≥ 2), so it is read every sweep, and still not
+> selected. Fixing it changes the manifest contract and is left to its
+> own amendment (§7).
+
+> **Amendment (2026-10-16, #1033, maintainer-approved) — late writes re-flag the partition
+> again.** With the §3.4 late-write note, the sentence above holds as
+> written. A late flush file in a compacted partition is live, so the
+> partition has two live files (the compacted one and the late one), and
+> a late file below the small-file size makes it a candidate. The
+> listing planner above needs one change: a committed `*.parquet` is now
+> either a flush file or a compacted file (§3.4 note), and in case 2 (no
+> manifest) only the listed flush files are live. Case 1 still holds,
+> because the live set is still a subset of the listed files, and case 3
+> applies the §3.4 note's live-set rule instead of "*C* restricted to the
+> manifest's names". RFC0009.10's second arm changes from "read, not
+> selected" to "selected" (RFC0009.13).
+
 ### 3.4 The atomic-publish protocol — per-partition manifest
 
 A query (RFC 0007) plans over a partition by enumerating its committed
@@ -209,6 +362,300 @@ This protocol is an interaction with **RFC 0007** (the querier must
 read through the manifest) and a small extension to **RFC 0005** (the
 manifest is a new per-partition artifact — additive, optional,
 back-compatible). Both are recorded as resolved decisions in §7.
+
+> **Amendment (2026-10-16, #1033, maintainer-approved) — late writes stay live (#1026).**
+>
+> **The defect.** The receiver derives a record's partition from its own
+> timestamp (`PartitionKey::derive`), with no admission window, so a
+> record can land in any old hour at any time. The `Writer` puts a new
+> `<uuidv7>.parquet` and never touches `manifest.json`. Once a partition
+> has a manifest, the manifest above is the whole live set, so the late
+> file is invisible to the querier (`resolve_live_files`,
+> `resolve_live_keys`), the planner, `visit_partition_rows` and the
+> erasure rewrite, and `gc_orphans` deletes it the next time the
+> partition is consolidated. The same rule hides a flush that lands
+> between a compaction's listing and its commit, and, because the RFC
+> 0047 §3.6 erasure rewrites every hour partition including the current
+> one, every flush into the current hour after an erasure. The data was
+> acknowledged (WAL-before-ack, `CLAUDE.md` §3.4) and object storage is
+> its truth (§3.6), so this is a durability defect, not a freshness one.
+>
+> **The fix: the manifest records what compaction consumed, not the whole
+> live set.** It rests on telling the two writers' files apart by name.
+>
+> - A **flush file** is what the receiver's `Writer` puts:
+>   `<uuidv7>.parquet`, as today. The flush path does not change.
+> - A **compacted file** is what a compaction (or an erasure rewrite)
+>   writes: `<uuidv7>.g<N>.parquet`, where *N* is the manifest
+>   generation the compaction will commit at. Only the compactor writes
+>   this form.
+>
+> The manifest becomes:
+>
+> ```json
+> {"format": 2,
+>  "generation": 7,
+>  "files": ["0199f2c4-….g7.parquet"],
+>  "consumed": ["0199f1a0-….parquet", "0199f1b3-….parquet"]}
+> ```
+>
+> `files` lists only compacted files; `consumed` lists only flush files.
+> `consumed` is append-only: a commit adds names to it and never removes
+> one. The **live set** of a partition is
+>
+> - every compacted file named in `files`, plus
+> - every listed flush file that `consumed` does not name.
+>
+> With no manifest, `files` and `consumed` are both empty, so the live set
+> is every listed flush file (the glob fallback, unchanged), and a
+> compacted file is never live without a manifest that names it. One
+> function computes this rule, shared by the querier's two resolvers,
+> `live_file_keys`, `is_candidate`, `visit_partition_rows` and
+> `gc_orphans`.
+>
+> **Commit protocol (replaces steps 1–4 above).**
+>
+> 1. Read `manifest.json` and its `ETag` (absent ⇒ generation 0, empty
+>    lists). Then list the partition. The inputs are the live set by the
+>    rule above.
+> 2. Write the output as `<uuidv7>.g<N+1>.parquet`. Nothing names it, so
+>    no reader sees it. The bootstrap manifest of today's step is no
+>    longer needed: an unnamed compacted file is invisible with or
+>    without a manifest.
+> 3. Commit `{format: 2, generation: N+1, files: outputs, consumed:
+>    consumed ∪ flush inputs}` with the existing conditional PUT
+>    (`If-Match` on the `ETag`, or create-if-absent at generation 0) on
+>    S3, or the local atomic overwrite (RFC0019.7). This is the commit
+>    point. `outputs` is **every** file the compaction wrote, each named
+>    `….g<N+1>.parquet`. Today `compact_sorted` writes exactly one (`files:
+>    vec![consolidated]`), so `outputs` has one entry. A compaction that
+>    splits its output into the "one or few" files §3.1 allows names all of
+>    them in this one commit. Compacted inputs drop out of `files`.
+> 4. On a won commit, delete the inputs, best effort (unchanged). An
+>    input is never deleted before the commit that names every output has
+>    won. On a lost commit, delete every output, best effort; any that
+>    survive are orphans by the generation rule below.
+>
+> **Why a late file is never lost.** A flush file becomes invisible only
+> by entering `consumed`, and it enters `consumed` only in a won commit
+> whose output was written from it. A file that lands after step 1's
+> listing is not an input, so the commit does not consume it and it stays
+> live. A file that lands after the commit is live by the same rule, and
+> it makes the partition a candidate again (§3.3 note). Nothing compares
+> clocks: the rule depends only on names and on the manifest's contents.
+> Because `consumed` is never trimmed, a flush file whose put is retried
+> after its first copy was consumed and deleted reappears under a consumed
+> name and stays hidden; its rows are already in the output.
+>
+> **Orphans (replaces `gc_orphans`'s rule).** With manifest generation *G*:
+>
+> - a flush file is an orphan **only if `consumed` names it**. A flush
+>   file that the manifest does not mention is live, never an orphan;
+> - a compacted file `….g<N>.parquet` is an orphan if `files` does not
+>   name it **and** *N* ≤ *G*. Its commit at generation *N* either won
+>   (and a later commit has since replaced it) or lost to another commit
+>   at *N*. If *N* > *G*, a compaction may still be about to commit it,
+>   so it is kept;
+> - `*.parquet.tmp` is an interrupted local put, as today.
+>
+> This is also what makes a lost CAS safe. `compact_sorted` deletes its
+> unnamed output on a lost commit, but only best effort. A leftover
+> output is a compacted file whose generation the winner has already
+> reached, so it is never live and the next GC reclaims it. It cannot
+> pass for a late file, because late files are flush files.
+>
+> **Crash interleavings.** Each case leaves every acknowledged row in
+> exactly one live file:
+>
+> | Crash or race | What is left | Read as | Reclaimed by |
+> |---|---|---|---|
+> | Writer dies before its put completes | nothing on S3; a `*.parquet.tmp` locally | the WAL replays the batch (RFC 0008) | GC (`.tmp`) |
+> | Writer's put lands during a compaction, after step 1's listing | an unconsumed flush file | live, before and after the commit | never; it is compacted later |
+> | Compactor dies before step 3 | an unnamed output at *N*+1 > *G* | the inputs, unchanged | GC once a later commit reaches *N*+1 |
+> | Compactor dies after step 3, before or during step 4 | consumed inputs not yet deleted | the output only | GC (`consumed`) |
+> | Compactor loses the CAS, and its output delete fails | an unnamed output at *N*+1 ≤ *G* | the winner's generation | GC |
+> | Two compactors race at generation *N* (S3) | one wins, the other is a lost CAS | the winner's generation | as above |
+>
+> The local backend has no conditional update, so its commit stays
+> last-writer-wins (RFC0019.7), and it requires **at most one active
+> compactor per store at any instant**. A second local compactor is
+> unsafe today and remains unsafe. Two last-writer-wins commits can
+> replace a manifest after the other commit's inputs were deleted, and
+> those rows are lost. `replicas: 1` alone does not provide this. The
+> chart's compactor Deployment sets no `strategy`, so Kubernetes defaults
+> to `RollingUpdate` and can run the old and the replacement pod at the
+> same time on the same data volume. The implementation therefore sets
+> `strategy: { type: Recreate }` on the compactor Deployment
+> (`deploy/helm/ourios/templates/compactor-deployment.yaml`), so the old
+> pod has stopped before the new one starts (RFC0009.24). On S3 an
+> overlap is safe for the data, because of the CAS, but it still widens
+> the #1034 tuple race, so `Recreate` applies on every backend. A local
+> deployment outside the chart must give the same exclusivity itself
+> (§7).
+>
+> **Reader order.** A reader lists the partition first and reads the
+> manifest second, which is the order both querier resolvers and the
+> listing planner already use. That order cannot tear: a flush file the
+> listing shows and the later manifest consumed is excluded, and its rows
+> are in a compacted file that manifest names. The reverse order could
+> miss rows, because an old manifest plus a listing taken after the
+> inputs were deleted shows neither. The compactor reads the manifest
+> first, but its CAS rejects any commit based on a stale read.
+>
+> **A resolution can still go stale before the files are opened.** The
+> store-backed resolver (`live_keys_from_listing`) fetches only the
+> manifests its listing shows, to avoid a 404 `GET` for every partition
+> that has none. So if the listing comes before a partition's **first**
+> commit, the resolver applies the glob fallback to flush names that the
+> commit then consumes and deletes. The same happens to a compacted file
+> named by a manifest that a later commit replaces and deletes. In both
+> cases the stale key is one whose rows a committed file already holds,
+> because a data file is deleted only after a won commit replaces it.
+> Opening that key returns not-found and never silently returns fewer
+> rows. The querier therefore treats a not-found on a resolved data key as
+> a stale resolution:
+>
+> 1. It discards the plan, resolves the file set again (a fresh listing,
+>    then the manifests it shows), and re-runs the query.
+> 2. It does this at most twice more (three attempts in all), and only
+>    while no row has been sent to the caller.
+> 3. After that, or once rows have been sent, the not-found surfaces as
+>    a storage error that names the key. Rows are never returned short.
+>
+> The local resolver reads each partition's manifest at resolution time,
+> so it sees a first manifest. It meets the same not-found only when a
+> commit deletes files between resolution and execution, and it takes the
+> same retry. A fresh manifest `GET` for every unmanifested partition
+> would also close the first-commit case. It is not chosen, because it
+> brings back the per-partition 404 that the listing avoids, for a race
+> that needs a commit and its deletes to land inside one query's
+> resolution (RFC0009.18).
+>
+> **Manifest size.** `consumed` grows by the flush files compacted into
+> the partition: a few dozen names per hour at today's flush cadence,
+> about 50 bytes each. Trimming it is deliberately not offered; a trim
+> would reopen both the reader-order race and the retried-put case above
+> (§7).
+>
+> **Layout impact (breaking).** The manifest gains `format` and
+> `consumed`, `files` holds only `….g<N>.parquet` names, and compaction
+> output is renamed. A manifest without `"format": 2` is rejected with a
+> typed error that names the partition: no dual-read and no migration
+> tool, per the pre-production policy. In an old manifest the unnamed
+> `*.parquet` files are inputs left behind, late files and lost-CAS
+> outputs, all with the same name form, so no rule can tell them apart.
+> Pre-production stores start from an empty `data/` prefix. The
+> implementation PR carries a `!` and a `BREAKING CHANGE` footer. RFC 0005
+> needs no amendment: the manifest stays an optional per-partition
+> artefact owned here, and Parquet files and their schema are unchanged.
+
+> **Amendment (2026-10-16, #1033, maintainer-approved) — erasure covers late files (RFC
+> 0047 §3.6).** Today an erasure rewrites only the files a manifest names.
+> Once late files are live, an erased conversation's rows could reappear
+> from one, so the erasure's rows phase must account for every flush file
+> that can hold rows acknowledged before the request. Three cases:
+>
+> 1. **A late file that landed before the erasure.** It is live, so the
+>    rewrite's inputs include it and the commit consumes it. Nothing new is
+>    needed beyond the live-set rule. (Today this file is hidden, skipped by
+>    the rewrite, and would surface with the erased rows if it were made
+>    visible without this rule, so the rule and the erasure change land
+>    together.)
+> 2. **A file that lands, or is committed, while the rows phase runs.**
+>    The rows phase records, for each partition it visits, a **checked
+>    generation**:
+>
+>    - after a won erasure commit, the generation that commit won; the
+>      partition's live set is then exactly that commit's compacted files;
+>    - when the rewrite finds no live input and commits nothing, the
+>      generation it observed. That is 0 when there is no manifest, as in a
+>      partition holding only `*.parquet.tmp` objects or nothing live at
+>      all.
+>
+>    An empty partition that stays empty is therefore settled, not
+>    "changed" forever. Before the marker advances to
+>    `tuples`, the rows phase runs a **confirming pass**: it re-lists the
+>    tenant and reads the manifest of every partition. A partition must be
+>    rewritten again, with the same drop filter, if it holds a live flush
+>    file, or if its generation is no longer the one recorded for it. A
+>    generation that moved on means another commit landed since: an
+>    ordinary consolidation by a second compactor (S3 allows more than
+>    one) may have folded a late file holding the conversation's rows into
+>    a new compacted file, which then shows no live flush file. Each
+>    rewrite or empty check records its checked generation. A partition the
+>    phase has not visited yet (it was created during the phase) has no
+>    checked generation, so it is visited.
+>    The pass repeats until a pass finds nothing to rewrite, for at most 8
+>    rounds, the bound the tuple phase already uses. If partitions are
+>    still changing after that, the marker stays in `rows` and the next
+>    sweep runs the whole rows phase again. The pass may drop rows of the
+>    conversation that were acknowledged after the request. That is
+>    over-erasure, which is the safe direction for an erasure, and it is
+>    limited to the rows phase. A confirming pass costs one listing plus
+>    one manifest `GET` per partition of the tenant, small next to the
+>    rewrite of every partition that the erasure already does.
+> 3. **A row acknowledged before the request but published after the
+>    confirming pass has passed its partition.** The receiver publishes from
+>    its WAL on its own cadence, in another process, and nothing tells the
+>    compactor that the receiver has published every row acknowledged
+>    before the request. A publish can therefore land after the last
+>    confirming pass has checked its partition but before the marker
+>    advances to `tuples`. It can also land later still: after a long flush
+>    backlog, or after a restart that replays the WAL (RFC 0008). Later
+>    sweeps retry only the tuple deletion, so such a row stays. Neither the
+>    8 rounds nor any delay closes this, because the race is with an
+>    unbounded publish. The rows phase does not start until the marker is
+>    older than `erasure_settle`, measured as the store's `LastModified` of
+>    the marker against the compactor's clock. The default is twice the
+>    receiver's maximum flush interval plus `compaction_grace`. That makes
+>    the window rare in normal operation: a pre-request row would have to
+>    be still unpublished `erasure_settle` after the request. It does not
+>    make the window empty. **This is the recorded residual (§7, decision
+>    D3).** RFC 0047 §3.6 scopes erasure to "the rows durable at the
+>    rewrite", and this amendment states the scope as: rows **published**
+>    before the last confirming pass checks their partition. Closing it
+>    needs a fence that the compactor can read across processes. The
+>    candidates, none specified here, are:
+>    - a per-receiver, per-tenant publication frontier exported to the
+>      store, which the rows phase waits on until every live receiver has
+>      published past the marker's creation. RFC 0055's `PUBLISHED`
+>      frontier is that watermark, but it is node-local and RFC 0055 is
+>      still `drafted`;
+>    - receivers that read pending markers and drop the conversation's rows
+>      at publish. This needs a receiver membership list, so the compactor
+>      knows that every receiver has seen the marker.
+>
+> **The rewrite is safe on unsealed partitions now.** An erasure keeps
+> rewriting every hour partition, including the current one (RFC0009.12).
+> Under the live-set rule, a flush into a partition after its erasure
+> rewrite is live. Before this amendment it was hidden by the manifest
+> the rewrite left behind (RFC0009.21).
+>
+> **Graph tuples (RFC 0047 §3.3, RFC 0048 §3.4).** The emitter has three
+> feeds: the receiver's flush cadence (every published batch, late files
+> included, so a late row's tuples are written today even while the row
+> is hidden), the compaction pass's `observe` hook, and the backfill
+> through `visit_partition_rows`. Under this amendment the last two also
+> see late rows, because those rows are live. All three write with
+> `on_duplicate = ignore`, so this amendment adds no tuple that would not
+> otherwise exist. That does not make the feeds free of races with
+> erasure. A separate known residual exists today, independent of late
+> data: with more than one compactor, a sweep's buffered `observe`
+> tuples can be written after another sweep erased the conversation
+> (#1034, §7 next to D3). The OpenFGA model and the tuple shapes
+> do not change. The OpenFGA documentation assistant (2026-10-16)
+> confirmed the one point that matters for erasure: `on_duplicate =
+> ignore` skips only a tuple that **currently exists**, so a tuple that an
+> erasure deleted is created again by any later write of it. Two things
+> follow:
+>
+> - The erasure rewrite still passes no `observe` hook, so it never
+>   re-emits the tuples it is about to delete. The confirming pass in case
+>   2 uses the same rewrite, so it does not re-emit them either.
+> - In case 3, a row published after the last confirming pass re-creates
+>   its tuples at flush cadence (or at the next consolidation through
+>   `observe`), and both row and grant are visible again. This is the same
+>   residual as case 3, on the graph side.
 
 ### 3.5 Correctness, idempotency, crash safety
 
@@ -313,6 +760,80 @@ The H4 "file-count grows sub-linearly with bytes" signal is a derived
 alert over `ourios.storage.parquet.file.size` (count) and ingested
 bytes, not a base metric.
 
+> **Amendment (2026-10-16, #1039, maintainer-approved) — the orphan GC
+> pass gets a counter.** The table gains this row:
+>
+> | Metric | Instrument | Unit | Attributes | Source |
+> |---|---|---|---|---|
+> | `ourios.compaction.orphan.reclaimed` | Counter | `{file}` | `ourios.tenant` (required); `error.type` (iff the delete failed) | the GC pass's orphan delete attempts (RFC0009.4) |
+>
+> **What it counts.** Each delete `gc_orphans` issues for an orphan file,
+> once, under the tenant whose partition holds it. A successful delete
+> response adds one with no `error.type`. A failed delete adds one with
+> `error.type = io`, and the file is left for a later pass, which counts it
+> again when it tries again. Only an explicit not-found result adds
+> nothing. The count is of successful delete responses, not of files known
+> to have existed: S3 answers a `DELETE` of an absent key with success
+> (`Store::delete_blocking`), so a file another actor removed between the
+> listing and the delete is still counted there. On the local backend an
+> absent file is a not-found and is not counted. A partition whose GC scan fails (an unreadable manifest, a
+> failed listing) deletes nothing and adds nothing here; the scan failure
+> is a sweep error and marks the phase span (RFC 0038 §3.9). This follows
+> OpenTelemetry's guidance to report successes and failures on one metric
+> and tell them apart by `error.type`
+> ([recording errors](https://opentelemetry.io/docs/specs/semconv/general/recording-errors/#recording-errors-on-metrics)).
+> The failed fraction is
+> `reclaimed{error.type="io"} / reclaimed`.
+>
+> **What stays.** `ourios.compaction.orphan.files` keeps its meaning (the
+> superseded inputs the committing rewrite could not delete,
+> `gc_failures`) and stays without attributes. The two are distinct
+> events: an input left by a rewrite becomes an orphan, and a later GC
+> pass reclaims it, so one file can appear on both counters.
+>
+> **When the GC runs.** The sweep reclaims orphans in one pass, after the
+> consolidation pass and before the RFC 0047 erasure pass. Each
+> candidate's GC still runs after its own rewrite, which is what
+> RFC0009.17 needs: an output a crashed compaction wrote for the
+> generation this sweep commits is dead only once that commit is in. A
+> partition whose rewrite failed is still GC'd, as before. Moving the GC
+> out of the per-partition loop changes when, not what, it deletes: no
+> file becomes deletable earlier. Erasure rewrites still run no GC.
+>
+> **Which partitions: eligibility from the listing.** Running the GC only
+> on candidates is not restart-safe. If a sweep commits partition A and the
+> process stops before A's GC (while rewriting B, or between A's commit and
+> its cleanup, a window that already existed), A is left with one live file
+> beside a dead one. A is then no longer a candidate, and nothing would
+> visit it again. So the planner (§3.3) also returns, from the same one
+> listing per tenant, the sealed partitions that are not candidates but
+> whose listing shows an object `gc_orphans` would delete, judged by the
+> GC's own rule (the §3.4 late-write live set, `LiveSet::is_orphan`):
+>
+> - a `*.parquet.tmp` (an interrupted publish), with no manifest read; or
+> - a listed committed file that is an orphan under that rule: a consumed
+>   flush file, or a compacted file the manifest does not name whose
+>   generation the manifest has reached. The rule is applied with the
+>   manifest the planner already reads for the candidate test (it reads
+>   one exactly when two or more committed files are listed beside it), or
+>   with no manifest when none is listed, which is what `gc_orphans` itself
+>   sees, so this costs no extra request.
+>
+> Where a manifest is listed but not read (one committed file beside it),
+> a lone file cannot be an orphan beside a live one, so only a
+> `*.parquet.tmp` makes the partition eligible. The selection matches the
+> GC's verdict, including the RFC0009.17 generation guard: an unnamed
+> compacted file for a generation past the manifest's (an in-flight
+> output) and an unconsumed flush file (a live late write) are kept by the
+> GC and do not get a partition visited. A settled partition, one with no
+> orphan, still costs nothing beyond its share of the listing.
+> `gc_orphans` still decides each object when it runs. The selection is
+> derived from the listing alone, so it needs no persisted state and
+> survives a restart: the next sweep that lists the partition finds the
+> orphan. Only sealed partitions are visited, as before, so a writer's
+> in-progress publish in an open hour is never touched. The RFC 0038 §3.8
+> planning counts are unchanged, since no request is added.
+
 > **Validation gate.** This set is the OpenTelemetry semantic-
 > conventions **registry** at `semconv/registry/`, validated by
 > `weaver registry check` in CI (the `semconv` job, a required check)
@@ -372,6 +893,63 @@ bytes, not a base metric.
   file. (This was the leading alternative; the manifest won on
   read-path simplicity.)
 
+> **Amendment (2026-10-16, #1033, maintainer-approved) — late writes (#1026).** Three fix
+> directions were filed with the issue. The recommended design (§3.4
+> late-write note) is a fourth. Each was weighed against the same
+> requirements: a late file is visible to queries from the moment its put
+> completes, it counts toward the candidate predicate like any other live
+> file (so it is compacted once §3.3 selects its partition; two large live
+> files below `compaction_min_files` stay unselected, as RFC0009.10
+> states), it is never deleted as an orphan under any crash or lost CAS,
+> the flush path
+> stays as it is, and the design works with a writer and a compactor in
+> separate processes (the chart's separate compactor Deployment) on S3
+> and on the local backend.
+
+- **(1) The writer appends its file to the manifest by CAS.** It keeps
+  the manifest as the positive live set, and it is the runner-up.
+  Rejected for four reasons:
+  - It puts a manifest `GET` and a conditional `PUT` on every flush into
+    a manifested partition (two S3 round trips, about 55 ms each), and
+    those writes race the compactor's swap, so both sides need retry
+    loops and the compactor's commit becomes a merge.
+  - The local backend has no conditional update (`LocalFileSystem`
+    rejects `PutMode::Update`). A receiver and a compactor in separate
+    processes on one host would overwrite each other's manifest and lose
+    the late file again.
+  - Between the writer's put and its append, the file is unnamed and
+    looks like an orphan. A GC in that window deletes it, and the append
+    then names a missing file. Closing that needs an age gate on GC, which
+    is a clock, and a WAL checkpoint held until the append, which is a
+    change to the RFC 0052 publish barrier.
+  - Every partition with no manifest needs a create-if-absent race
+    between the writer and the compactor's bootstrap.
+- **(2) A UUIDv7-time rule.** The manifest records its commit instant,
+  and an unnamed `*.parquet` whose UUIDv7 time is later is live.
+  Rejected. The UUIDv7 time comes from the receiver's clock and the
+  commit instant from the compactor's, so a late file from a receiver
+  whose clock runs behind counts as an orphan and is deleted. A
+  compaction output, which also has a UUIDv7 name, that a compactor opened
+  after a concurrent commit counts as live and double-counts its rows.
+  That happens whenever `compact_sorted`'s best-effort delete of a
+  lost-CAS output fails. Both failures are silent.
+- **(3) The compactor folds unnamed files into the manifest after a
+  settle delay.** Rejected. The data is invisible for the delay, and
+  folding cannot tell a late file from an input a crashed compaction
+  left behind or a lost-CAS output, since all three are unnamed
+  `<uuidv7>.parquet`. Folding the wrong one double-counts rows. Telling
+  them apart needs the flush/compacted name split, and with that split
+  no delay is needed.
+- **Recommended: (4) the manifest records what compaction consumed.**
+  Flush and compacted files have distinct names, the manifest names live
+  compacted files and consumed flush files, and every other flush file
+  is live. The flush path does not change, there is no window of
+  invisibility, and no clocks are compared. A compacted file's name
+  carries the generation it was written for, so GC never touches an
+  in-flight output, and a lost-CAS leftover can never be mistaken for a
+  late file. The cost is a breaking manifest format and a manifest that
+  grows with the flush files compacted into each partition (§3.4 note).
+
 ## 5. Acceptance criteria
 
 > `Given / When / Then / And`; ids greppable from tests. These
@@ -430,6 +1008,245 @@ bytes, not a base metric.
     latency (RFC 0007 §6 B2 bench) does not grow proportionally to the
     pre-compaction file count.
 
+> **Amendment (2026-10-16, #1027, maintainer-approved) — planning
+> cost.** RFC0009.8–.12 cover the §3.3 note on how candidates are read.
+
+- **RFC0009.8 — a settled partition costs no request of its own `[H4 /
+  #1019]`**
+  - **Given** a tenant with many sealed partitions, each holding one
+    committed `*.parquet` (some with a `manifest.json`, some without)
+  - **When** its candidates are planned
+  - **Then** none is selected, and planning makes exactly one logical
+    recursive listing of the tenant's prefix: no request per partition
+    and no `GET`. The backend may serve that listing as several page
+    requests (1,000 keys per page on S3); the page count follows the
+    tenant's object count, not its partition count.
+
+- **RFC0009.9 — the selection is unchanged `[H4 / RFC0009.1]`**
+  - **Given** any set of sealed and unsealed partitions, each with any
+    number of committed files of any size, with or without a manifest
+    naming any subset of them, and with orphans and `*.parquet.tmp`
+    objects
+  - **When** its candidates are planned
+  - **Then** the selection, in order, is exactly what the per-partition
+    reads (a manifest read and a partition listing for every sealed
+    partition) select on the same objects.
+  - **And** a partition whose listing holds two or more committed files
+    and a manifest is selected or skipped by the manifest's live set,
+    never by the listing alone.
+
+> **Amendment (2026-10-16, #1033, maintainer-approved, late writes) — RFC0009.9's oracle.**
+> The comparison stays: the listing planner must select exactly what
+> per-partition reads select on the same objects. Both sides change their
+> live-set rule to the format-2 rule of the §3.4 late-write note. The
+> oracle's per-partition read becomes "the compacted files the manifest
+> names, plus the listed flush files it does not consume", replacing "the
+> listed files restricted to the manifest's names". The generated
+> fixtures are in the new layout:
+>
+> - flush files and `….g<N>.parquet` compacted files;
+> - format-2 manifests whose `files` name any subset of the compacted
+>   files and whose `consumed` names any subset of the flush files;
+> - orphan compacted files with *N* ≤ *G* and in-flight ones with
+>   *N* > *G*;
+> - `*.parquet.tmp` objects.
+>
+> Under the old oracle, one compacted file plus an unconsumed small flush
+> file was skipped; under the new one it is selected (RFC0009.13). The
+> two-file non-candidate unit case stays, rebuilt as a manifest naming
+> one compacted file plus an **orphan compacted file** (unnamed, *N* ≤
+> *G*): two listed files, one `GET`, one live file, not selected.
+
+- **RFC0009.10 — a late write into a settled partition is re-planned
+  `[H4 / §3.3]`**
+  - **Given** a sealed partition with no manifest and one committed file
+    at or above the small-file size, which a planning pass did not select
+  - **When** a writer later lands a second committed file in it, below
+    the small-file size, and candidates are planned again
+  - **Then** the partition is selected. (A late file at or above the
+    small-file size leaves two large files, which §3.3 does not select
+    until there are more than `compaction_min_files`; see
+    `plan_skips_when_files_are_large_and_few`.)
+  - **And** given a compacted partition (a manifest naming its one file)
+    that receives a late file, the next pass reads its manifest rather
+    than skipping it. Whether it is then selected is #1026's to decide;
+    until then it is not, as today.
+
+- **RFC0009.11 — planning keeps no state `[§3.6 / multiple compactors]`**
+  - **Given** a store with sealed candidates
+  - **When** candidates are planned, by one planner or by two
+    independent ones over the same store
+  - **Then** no object is written, and both select the same partitions.
+
+- **RFC0009.12 — erasure still reaches a settled partition `[RFC 0047
+  §3.6 / CLAUDE.md §3.7]`**
+  - **Given** a sealed partition with one live file at or above the
+    small-file size, which candidate planning skips, holding rows an
+    erasure request matches
+  - **When** a sweep runs the erasure
+  - **Then** the partition is rewritten without the matching rows, and
+    the other rows are kept.
+
+> **Amendment (2026-10-16, #1033, maintainer-approved) — late writes
+> stay live.** RFC0009.13–.24 cover the §3.4 late-write note and the
+> erasure note after it. RFC0009.13 replaces RFC0009.10's second arm.
+
+- **RFC0009.13 — a late write into a compacted partition is read and
+  compacted `[CLAUDE.md §3.4 / §3.6 / #1026]`**
+  - **Given** a partition with two flush files (templates 1 and 2),
+    compacted so that the manifest names only the output
+  - **When** a third flush file (template 3, below the small-file size)
+    lands in the same hour
+  - **Then** the querier and `visit_partition_rows` return templates 1,
+    2 and 3, and `plan_candidates` selects the partition.
+  - **And** when the partition is compacted again, the output holds all
+    three rows, the late file is consumed, and no row is counted twice.
+  - **And** `gc_orphans` run at any point before that compaction leaves
+    the late file in place.
+
+- **RFC0009.14 — no unconsumed flush file is ever deleted `[CLAUDE.md
+  §3.4 / RFC0009.4]`**
+  - **Given** any interleaving of writer puts, compaction steps 1–4,
+    lost CASes, failed deletes, crashes at each step, and `gc_orphans`
+    passes over one partition
+  - **When** the partition is read after every step
+  - **Then** every row of every completed flush put is read exactly
+    once, and the only flush files ever deleted are ones a won commit's
+    `consumed` names.
+
+- **RFC0009.15 — a flush that lands during a compaction stays live
+  `[RFC0009.3]`**
+  - **Given** a compaction that has listed its inputs and not yet
+    committed
+  - **When** a flush file lands in the partition and the compaction then
+    commits
+  - **Then** the committed manifest does not consume the new file, and
+    reads before and after the commit both include its rows.
+
+- **RFC0009.16 — a lost-CAS leftover never reads as live
+  `[RFC0009.3 / RFC0009.4]`**
+  - **Given** two compactions of one partition at generation *N* on a
+    CAS backend, where the loser's delete of its output fails
+  - **When** the partition is read, and then `gc_orphans` runs
+  - **Then** the read returns the winner's generation only, without the
+    leftover output, and GC deletes the leftover.
+
+- **RFC0009.17 — GC keeps an in-flight output `[RFC0009.4]`**
+  - **Given** a manifest at generation *G* and an unnamed compacted file
+    written for generation *G* + 1
+  - **When** `gc_orphans` runs
+  - **Then** the file is kept. Once a commit reaches *G* + 1 without
+    naming it, the next GC deletes it.
+
+- **RFC0009.18 — reads do not tear between the listing and the manifest
+  `[RFC0009.3]`**
+  - **Given** a reader that has listed a partition and not yet read its
+    manifest
+  - **When** a compaction commits and deletes its inputs in between
+  - **Then** the reader returns every row exactly once.
+  - **And** given a partition with **no** manifest when the store-backed
+    resolver lists it, when that partition's first commit creates the
+    manifest and deletes the inputs before the query opens them, then the
+    query re-resolves on the not-found and returns every row exactly once.
+    It never returns fewer rows.
+  - **And** when the resolution goes stale on all three attempts, or rows
+    have already been sent, the query fails with a storage error naming
+    the key, and does not return a short result.
+
+- **RFC0009.19 — a manifest in the old format is rejected
+  `[CLAUDE.md §3.5]`**
+  - **Given** a partition whose `manifest.json` has no `"format": 2`
+  - **When** the querier, the planner or the compactor reads it
+  - **Then** each fails with a typed error naming the partition, and
+    none of them falls back to globbing or deletes anything.
+
+- **RFC0009.20 — erasure covers a late file that landed before it
+  `[RFC 0047 §3.6]`**
+  - **Given** a compacted partition plus a late flush file holding rows
+    of conversation *c*
+  - **When** an erasure of *c* completes
+  - **Then** no row of *c* is read from the partition, and the late
+    file is consumed.
+
+- **RFC0009.21 — after an erasure, the current hour still takes writes
+  `[CLAUDE.md §3.4]`**
+  - **Given** an erasure that rewrote the tenant's current, unsealed
+    hour partition
+  - **When** a flush file lands in that hour afterwards
+  - **Then** its rows are read.
+
+- **RFC0009.22 — the confirming pass catches what changed during the
+  rows phase `[RFC 0047 §3.6]`**
+  - **Given** an erasure of *c* whose rewrite of a partition has
+    committed at generation *E*, and a flush file with a row of *c* that
+    lands there before the confirming pass
+  - **When** the rows phase finishes
+  - **Then** the marker advances only after a pass finds every
+    partition at its recorded generation with no live flush file, and no
+    row of *c* is read.
+  - **And** given the same late file, when a second compactor's ordinary
+    consolidation commits it into a new compacted file at *E* + 1 before
+    the confirming pass, the pass sees the generation change, rewrites the
+    partition, and no row of *c* is read.
+  - **And** given a partition holding only `*.parquet.tmp` objects (no
+    live input, no manifest), the erasure records checked generation 0.
+    The confirming pass, finding it still at 0 with no live flush file,
+    treats it as settled, and the marker advances to `tuples`.
+  - **And** if partitions keep changing for 8 rounds, the marker stays
+    in `rows` and the sweep reports it.
+  - **And (residual, accepted under D3)** a pre-request row
+    whose flush publishes after the last confirming pass has checked its
+    partition is **not** erased. The marker advances, the row is read,
+    and its tuples are written again. The test pins this behaviour, so
+    the residual cannot quietly change without a scenario change.
+
+- **RFC0009.23 — the rows phase waits for `erasure_settle` `[RFC 0047
+  §3.6]`**
+  - **Given** an erasure marker younger than `erasure_settle`
+  - **When** a sweep runs
+  - **Then** no partition is rewritten for it and the marker stays in
+    `rows`. Once the marker is older, the next sweep runs the rows
+    phase.
+
+- **RFC0009.24 — at most one active compactor through a rollout
+  `[§3.4 local backend / #1034]`**
+  - **Given** the Helm chart with the compactor enabled
+  - **When** its manifests are rendered, for any values
+  - **Then** the compactor Deployment has `replicas: 1` and `strategy:
+    { type: Recreate }`, so an upgrade stops the old pod before it starts
+    the new one, and two compactor pods never share the data volume.
+
+The following scenario is added by the 2026-10-16 orphan-GC amendment
+(§3.6, #1039, maintainer-approved).
+
+- **RFC0009.25 — the orphan GC pass is counted per tenant
+  `[CLAUDE.md §6.3]`**
+  - **Given** two tenants' sealed candidates, one holding two orphan files
+    a crashed compaction left, the other none
+  - **When** a sweep runs
+  - **Then** `ourios.compaction.orphan.reclaimed` gains 2 under the first
+    tenant with no `error.type`, and no point under the second, and
+    `ourios.compaction.orphan.files` is unchanged.
+  - **And** when the orphan's delete fails, the counter gains 1 under the
+    tenant with `error.type = io`, the file is still listed, and the next
+    sweep that deletes it adds 1 with no `error.type`.
+  - **And** every partition's GC runs after the sweep's last
+    consolidation commit, and RFC0009.17's sweep test still reclaims the
+    crashed output once.
+
+- **RFC0009.26 — an orphan a stopped sweep left is reclaimed by the next
+  `[RFC0009.4]`**
+  - **Given** a partition whose compaction committed and whose process
+    stopped before the GC pass, leaving one live compacted file beside a
+    dead output (or a stray `*.parquet.tmp` in a sealed hour)
+  - **When** a later sweep runs
+  - **Then** the partition is not a candidate and is not rewritten, its
+    GC runs and deletes the dead object, and every row is read once.
+  - **And** planning it costs no request beyond the listing and the one
+    manifest read the candidate test already makes, and once reclaimed the
+    partition is settled and costs no manifest read.
+  - **And** a `*.parquet.tmp` in an unsealed hour is never planned for GC.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -453,6 +1270,107 @@ Mapped to `CLAUDE.md` §6.2:
   throughput) + D3 (file count under load); re-run the RFC 0007 §6 B2
   latency bench post-compaction to show the per-file footer-read
   residual (§2.1) shrinks.
+
+> **Amendment (2026-10-16, #1027, maintainer-approved) — test map for
+> RFC0009.8–.12.** RFC0009.8–.11 are
+> in `ourios-parquet`'s compaction suite, against a local store seen
+> through a request-counting `ObjectStore` wrapper. On the local backend
+> one logical listing is one `list` call on the wrapper, so the wrapper
+> counts logical listings, not the S3 pages behind them.
+>
+> | Scenario | Test | Kind |
+> |---|---|---|
+> | RFC0009.8 | `rfc0009_8_settled_partitions_cost_no_request_of_their_own` — 48 settled partitions (half with a manifest): no `GET`, exactly one logical listing, the same as a 1-partition tenant | integration |
+> | RFC0009.9 | `rfc0009_9_listing_plan_selects_what_per_partition_reads_select` — proptest over partitions × files × sizes × manifest subsets × orphans/tmp; the oracle is the pre-amendment per-partition predicate, kept in the test module (the late-write amendment changes the oracle's live-set rule and fixtures to format 2; see the note under RFC0009.9) | property |
+> | RFC0009.9 | `rfc0009_9_a_manifest_decides_when_two_files_are_listed` — two listed files, a manifest naming one: not selected, one `GET` (under the late-write amendment, the two files are a named compacted file and an orphan compacted file) | unit |
+> | RFC0009.10 | `rfc0009_10_a_late_write_into_a_settled_partition_is_replanned` — one file above the small-file size, planned (skipped, no `GET`); a late file below the small-file size lands; planned again (selected) | integration |
+> | RFC0009.10 | `rfc0009_10_a_late_write_into_a_compacted_partition_is_read` — compacted partition plus a late file: one `GET` of its manifest, not selected (pins today's #1026 behaviour; that fix updates this assertion) | integration |
+> | RFC0009.11 | `rfc0009_11_planning_writes_nothing_and_two_planners_agree` — store listing unchanged after planning; two `Store` handles plan the same list | integration |
+> | RFC0009.12 | `rfc0009_12_erasure_rewrites_a_settled_partition_the_planner_skips` (in `ourios-ingester`'s compactor suite, next to the erasure tests) — one file above the small-file size, confirmed skipped by `plan_candidates`; an erasure sweep rewrites it, drops the matching row, keeps the other | integration |
+>
+> The existing `plan_*` tests stay as they are; they pin the predicate
+> the amendment keeps.
+
+> **Amendment (2026-10-16, #1033, maintainer-approved) — test map for RFC0009.13–.24.**
+> `ourios-parquet`'s compaction suite holds the storage scenarios, the
+> `ourios-querier` file-set tests hold the reader ones, and
+> `ourios-ingester`'s compactor suite holds the erasure ones. Crash
+> points are driven through a fault-injecting `Store` wrapper that fails
+> or stops before a named step, the same way the RFC0009.4 tests stop
+> before and after the swap.
+>
+> | Scenario | Test | Kind |
+> |---|---|---|
+> | RFC0009.13 | `rfc0009_13_a_late_write_into_a_compacted_partition_is_read_and_compacted`: the #1026 repro as written in the issue (`write_file` ×2, `compact_partition`, late `write_file`), then `visit_partition_rows` returns templates [1, 2, 3], `plan_candidates` selects the partition, `gc_orphans` keeps the late file, and a second `compact_partition` consumes it | integration |
+> | RFC0009.13 | `rfc0009_10_a_late_write_into_a_compacted_partition_is_read` (RFC0009.10's second arm) changes its expectation from "not selected" to "selected"; it is a contract change that this amendment approves | integration |
+> | RFC0009.13 | `rfc0009_13_querier_reads_a_late_file_beside_a_compacted_one`: through both `resolve_live_files` (local) and `resolve_live_keys` (store) | integration |
+> | RFC0009.14 | `rfc0009_14_no_unconsumed_flush_file_is_deleted`: proptest over interleaved operations (flush put, compaction steps 1–4 with a crash at any step, lost CAS, failed delete, GC). The oracle is the multiset of rows from completed flush puts, compared after every step | property |
+> | RFC0009.15 | `rfc0009_15_a_flush_between_listing_and_commit_stays_live`: a hook between step 1 and step 3 writes a flush file | integration |
+> | RFC0009.16 | `rfc0009_16_a_lost_cas_leftover_is_never_live`: a CAS-simulating store, with the loser's delete failing | integration |
+> | RFC0009.17 | `rfc0009_17_gc_keeps_an_output_for_a_future_generation` | unit |
+> | RFC0009.9 | `rfc0009_9_*` (above): the oracle and generators move to the format-2 live-set rule, and the two-file non-candidate case uses an orphan compacted file. This is a contract change to RFC0009.9's test, approved with this amendment | property, unit |
+> | RFC0009.18 | `rfc0009_18_list_then_manifest_does_not_tear`: commit and input deletes injected between the resolver's listing and its manifest read | integration |
+> | RFC0009.18 | `rfc0009_18_first_manifest_after_listing_re_resolves`: a partition with no manifest is listed; its first commit and the input deletes are injected before execution; the query re-resolves and returns every row once, through `resolve_live_keys` | integration |
+> | RFC0009.18 | `rfc0009_18_stale_three_times_is_a_storage_error`: a not-found injected on every attempt gives a storage error naming the key, and no partial result | integration |
+> | RFC0009.19 | `rfc0009_19_an_old_format_manifest_is_rejected`: querier, planner and `compact_partition`, with the store unchanged afterwards | unit |
+> | RFC0009.20 | `rfc0009_20_erasure_rewrites_a_late_file_that_predates_it` | integration |
+> | RFC0009.21 | `rfc0009_21_a_flush_after_an_erasure_rewrite_is_read`: the current-hour case | integration |
+> | RFC0009.22 | `rfc0009_22_confirming_pass_rewrites_a_flush_during_the_rows_phase` and `rfc0009_22_rows_phase_stays_open_while_flushes_keep_arriving` | integration |
+> | RFC0009.22 | `rfc0009_22_confirming_pass_catches_a_consolidation_since_the_erasure`: a second `Sweep` handle consolidates the late file between the erasure rewrite and the confirming pass | integration |
+> | RFC0009.22 | `rfc0009_22_a_tmp_only_partition_does_not_block_the_marker`: a partition with only a `*.parquet.tmp` object; the erasure finishes its rows phase and advances | integration |
+> | RFC0009.22 | `rfc0009_22_residual_a_publish_after_the_last_pass_is_not_erased`: a flush is injected after the final confirming listing and before the marker advances; the row stays readable (pins D3's residual) | integration |
+> | RFC0009.23 | `rfc0009_23_rows_phase_waits_for_erasure_settle`: an injected clock against the marker's `LastModified` | unit |
+> | RFC0009.24 | a `deploy/helm/render-tests.sh` assertion (run by `deploy-test.yml`): the rendered compactor Deployment carries `strategy.type: Recreate` and `replicas: 1`, with defaults and with the per-role overrides set. The chart change is part of the implementation: `strategy: { type: Recreate }` in `deploy/helm/ourios/templates/compactor-deployment.yaml` | chart render |
+>
+> The existing `rfc0009_4_*` GC tests keep their assertions, with one
+> exception below. Their fixtures are rebuilt in the new layout (outputs
+> named `….g<N>.parquet`, superseded inputs listed in `consumed`), which
+> the layout break requires.
+>
+> **Test-contract change, pending separate maintainer approval.**
+> `rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable`
+> (`crates/ourios-parquet/src/compaction/tests/mod.rs`) cannot keep its
+> immediate-reclaim assertion. It models a compactor that crashed before
+> its commit: the manifest is at generation 1 and the consolidated output
+> is present but unnamed. Under RFC0009.17 that output is written for
+> generation 2, so it is an in-flight output, and GC at generation 1 must
+> keep it. Renaming the fixtures cannot preserve both the crash scenario
+> and the assertion. The proposed test, renamed
+> `rfc0009_4_pre_commit_orphan_consolidated_is_reclaimed_once_generation_passes`:
+>
+> 1. **Kept unchanged:** two flush inputs, then a manifest at generation
+>    1. The output is written and not named, and it is now named
+>    `….g2.parquet`. The reader sees only the inputs (`read_partition_rows
+>    == originals`).
+> 2. **Changed:** `gc_orphans` at generation 1 returns `OrphanGc {
+>    reclaimed: 0, failures: 0 }`, and the `….g2.parquet` output is still
+>    listed. Today the assertion is `reclaimed: 1`.
+> 3. **Kept unchanged:** the inputs stay live (`live_keys(..).len() ==
+>    inputs.len()`) and are intact (`read_partition_rows == originals`).
+> 4. **Added:** another commit reaches generation 2 without naming that
+>    output, for example a `compact_partition` of the same inputs, which
+>    writes and names its own `….g2.parquet`. A subsequent `gc_orphans`
+>    then returns `reclaimed: 1` for the crashed output. The rows read
+>    after it equal `originals`, each exactly once.
+>
+> The reclaim is not dropped, only delayed until the generation passes,
+> which is exactly what RFC0009.17 requires. No other assertion is
+> removed. Under `CLAUDE.md` §6.2 this is a contract change: approving
+> the amendment does not approve it. The implementation PR changes this
+> test only after the maintainer has approved this wording.
+
+> **Amendment (2026-10-16, #1039, maintainer-approved) — test map for
+> RFC0009.25–.26.** In `ourios-ingester`, beside the existing compaction metric
+> tests, over an in-memory metric reader.
+>
+> | Scenario | Test | Kind |
+> |---|---|---|
+> | RFC0009.25 | `rfc0009_25_reclaimed_orphans_are_counted_per_tenant`: two tenants, one with two orphans; the counter's points per tenant, and `orphan.files` unchanged | integration |
+> | RFC0009.25 | `rfc0009_25_a_failed_orphan_delete_carries_error_type`: an orphan in a partition directory made read-only; `error.type = io`, the file still listed; after the directory is restored, the next sweep counts it without `error.type` | integration |
+> | RFC0009.25 | `rfc0009_17_sweeps_reclaim_an_output_a_crashed_compaction_left` (existing, unchanged): the crashed output is reclaimed once under the moved pass | integration |
+> | RFC0009.26 | `rfc0009_26_a_later_sweep_reclaims_what_an_interrupted_one_left` (`ourios-ingester`): `compact_partition` commits over a crashed output and stops; a sweep compacts nothing and reclaims the output; rows read once | integration |
+> | RFC0009.26 | `rfc0009_26_a_settled_partition_with_a_dead_output_is_reclaimable` (`ourios-parquet` planner): planned for GC with one manifest read; after the GC, settled with none | unit |
+> | RFC0009.26 | `rfc0009_26_a_stray_tmp_makes_only_a_sealed_partition_reclaimable` (`ourios-parquet` planner): no manifest read; unsealed never planned | unit |
 
 ## 7. Open questions
 
@@ -505,6 +1423,146 @@ history is legible):
   check (OTel assistant / `weaver` / rego policy packages) and fix any
   divergence before instrumentation lands.
 
+> **Amendment (2026-10-16, #1027, maintainer-approved) — planning cost
+> (#1019 item 2).**
+
+**Alternatives considered for the planning cost.** The recommended
+design is the one-listing planner in the §3.3 note. Each alternative
+below was weighed against the same constraint: never skip a partition
+that the §3.3 candidate predicate selects, meaning at least two live
+files and either more than `compaction_min_files` of them or one below
+the small-file size. (Wording narrowed by the late-write amendment: a
+partition with two large live files is not selected, as RFC0009.10
+states.)
+
+- **A per-tenant "settled-through" watermark in object storage.** The
+  compactor records "every partition up to hour *H* was settled when I
+  looked", and the planner skips them. Rejected: a late write lands in
+  any old hour at any time (the partition comes from the record's own
+  timestamp, and the receiver has no admission window), and the writer
+  runs in the receiver, a different process from the compactor (§3.2,
+  the chart's separate `compactor` Deployment). Lowering the watermark
+  safely needs the writer to record a dirty mark *before* its put, and
+  the compactor to consume marks only once their puts must have landed.
+  That puts a new object-store write on the flush path, adds a second
+  artefact to RFC 0005 with its own migration story, and still rests on
+  an assumption about how long a put can take. The one-listing planner
+  needs none of it.
+- **An in-memory cache of settled partitions, invalidated by writes.**
+  Rejected: the compactor does not see the receiver's writes (separate
+  processes), so nothing would invalidate it. A cache with a periodic
+  full re-check bounds the delay but breaks the constraint above in
+  between.
+- **A manifest cache keyed by `ETag`.** Keep each partition's parsed
+  manifest in memory and re-read it only when the listing shows a new
+  `ETag`. Not needed: after the §3.3 note, only partitions with two or
+  more listed files read a manifest, and those are the candidates and
+  the #1026 case. It also needs the listing to carry `ETag`s, which the
+  store seam does not expose today. Revisit if those reads show up.
+- **One recursive listing per day prefix instead of per tenant.** Bounds
+  memory to one day of keys, at about 24× the requests of the tenant
+  listing (still about 50× fewer than today). Kept as the fallback if a
+  tenant's listing ever gets too large to hold (see below).
+- **Keep the per-partition reads but drop the manifest `GET` when the
+  partition listing shows one file.** Halves the cost and stays
+  O(history). Subsumed by the recommended design.
+
+**Open (amendment):**
+
+- [ ] **Late writes into a compacted partition (#1026).** The manifest
+  hides them from readers and the planner, and `gc_orphans` would delete
+  them. The fix changes the §3.4 manifest contract (the writer appends
+  to the manifest, or a file newer than the manifest's commit counts as
+  live). Its own amendment; RFC0009.10's second arm is updated with it.
+- [ ] **Listing size.** The tenant listing is materialised while the
+  tenant is planned (§3.3 note). Stream it, or fall back to per-day
+  listings, if a tenant's key count ever makes that matter. At the H4
+  steady state it is a few MB per year of history.
+- [ ] **A sealed non-candidate with two or more listed files** (two
+  large files, or one live file plus an orphan that `gc_orphans` never
+  reaches because the partition is never a candidate) reads its
+  manifest every sweep. Bounded by the number of such partitions, not
+  by history. Running `gc_orphans` on them would clear the orphan case.
+
+> **Amendment (2026-10-16, #1033, maintainer-approved) — late writes.**
+> The first open item above (#1026) and the original "late-arriving data"
+> item are answered by the §3.4 late-write note.
+
+**Decided (late-write amendment, maintainer approval 2026-10-16):** the
+maintainer took the recommended option for each decision.
+
+- [x] **D1. Design: the consumed-set manifest** (§3.4 note, §4 option
+  4). Flush and compacted files are told apart by name, the manifest
+  names live compacted files and consumed flush files, and every other
+  flush file is live. The runner-up, the writer CAS-append (§4 option
+  1), is rejected: it puts a CAS on the flush path, has no local-backend
+  primitive, and needs a GC age gate.
+- [x] **D2. Layout break: old manifests are rejected, and stores start
+  from an empty `data/` prefix** (§3.4 note), per the pre-production
+  policy. There is no dual-read and no one-shot conversion. The
+  implementation PR carries a `!` and a `BREAKING CHANGE` footer.
+- [x] **D3. Erasure scope: the narrower guarantee, with its residual
+  tested.** `erasure_settle` plus the generation-keyed confirming pass
+  cover every row **published** before the last confirming pass checks
+  its partition, including rows that a second compactor folds in
+  meanwhile. The accepted residual is that **a pre-request row whose
+  flush publishes after that pass is not erased**. That covers a flush
+  still pending when the last pass checks its partition, a long flush
+  backlog, and a WAL replay after an outage longer than `erasure_settle`
+  (§3.4 erasure note, case 3). RFC0009.22's residual arm pins it. The
+  fences that would close it are recorded for a later RFC, each a design
+  of its own:
+  - a per-receiver publication frontier exported to the store, which the
+    rows phase waits on. It builds on RFC 0055's `PUBLISHED`, which is
+    node-local and `drafted`;
+  - receivers that drop a marked conversation's rows at publish, plus a
+    receiver membership list, so the compactor knows that every receiver
+    has seen the marker;
+  - a completed marker kept as a tombstone for a retention window, with
+    the drop filter applied, ahead of `observe`, in every compaction of
+    the tenant during it. This catches late publishes at the next
+    compaction, but the rows are readable until then and new rows of
+    the same id are erased too.
+- [x] **D4. Compacted-file name: `<uuidv7>.g<N>.parquet`**, where *N* is
+  the generation the compaction commits at. A flush name can never take
+  this form.
+
+**Known residual, separate from D3 and pre-existing (#1034):** sweep A
+buffers the tuples its `observe` hook derives during the blocking pass
+and writes them in its graph phase afterwards (`compactor/daemon.rs`
+`sweep_deriving`, `compactor/graph_phase.rs`). With more than one
+compactor, sweep B can erase a conversation in between, and A then
+creates the deleted tuples again. Only the grant comes back, not the
+rows. Neither the generation-keyed confirming pass nor the erasure
+rewrite's missing `observe` hook prevents it. This amendment neither
+causes nor fixes it. #1034 tracks it as an RFC 0047 question, and the
+`Recreate` rollout strategy (RFC0009.24) narrows it to deployments that
+deliberately run more than one compactor.
+
+**Pending separate approval:** the
+`rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable` test-contract
+change (§6 late-write test map).
+
+**Open (late-write amendment):**
+
+- [ ] **Trimming `consumed`.** It is append-only (§3.4 note). A trim is
+  safe only for a name that has been deleted and can no longer reappear
+  through a retried put, and only for readers that list first. Revisit if
+  manifest size shows up, which needs a high flush rate and many late
+  files per partition.
+- [ ] **A second local-backend compactor.** It is unsafe today and stays
+  unsafe, because `LocalFileSystem` has no conditional update. The chart
+  pins one replica and, with this amendment, uses the `Recreate` strategy
+  (RFC0009.24), so a rollout never overlaps two pods. A deployment outside
+  the chart must provide the same exclusivity itself. A lock file would be
+  the fix if a local multi-compactor deployment is ever wanted.
+- [ ] **`erasure_settle` default.** Twice the receiver's maximum flush
+  interval plus `compaction_grace`. Where it lives depends on the RFC
+  0004 configuration surface.
+- [ ] **WAL replay duplicates.** Unchanged by this amendment: a replayed
+  batch is a new flush file under a new name. Whether replay can
+  duplicate an already published batch is RFC 0008/0052's question.
+
 ## 8. References
 
 - `docs/hazards.md` H4 (small-file problem) — the hazard this
@@ -523,3 +1581,45 @@ history is legible):
   (small-file count under sustained load).
 - Apache Iceberg / Delta Lake atomic metadata-swap commit — design
   inspiration for §3.4 (the idea, not the machinery).
+
+## 9. Amendment history
+
+- **2026-10-16 — planning reads a tenant once (#1027,
+  maintainer-approved).** Candidate planning lists each tenant's data
+  prefix once and reads a partition's manifest only when two or more
+  committed files are listed there, so a settled partition costs no
+  request of its own (§3.3 note). The candidate predicate is unchanged
+  and no state is kept. Erasure (RFC 0047 §3.6) and the graph backfill
+  (RFC 0048) keep walking every hour partition (RFC0009.12). New
+  scenarios RFC0009.8–.12 (§5) and their test map (§6); alternatives and open questions in §7. Records the late-write
+  gap #1026 (§3.3 note, §7). Refs #1019.
+- **2026-10-16 — late writes stay live (#1033, maintainer-approved
+  with D1–D4 as recommended).** The manifest names live compacted files and consumed
+  flush files, and every other flush file is live. A late write into a
+  compacted partition, a flush during a compaction, and a flush into an
+  hour an erasure already rewrote are all read and later compacted, and
+  never deleted as orphans. Compaction output is named
+  `<uuidv7>.g<N>.parquet`, so GC tells a lost-CAS leftover or an
+  in-flight output apart from a late file without comparing clocks. The
+  RFC 0047 §3.6 erasure covers late files through the live set, a
+  generation-keyed confirming pass and an `erasure_settle` delay. A
+  pre-request row published after the last confirming pass is a recorded
+  residual (D3). A query whose resolution goes stale (a first manifest,
+  or deletes, after its listing) re-resolves on the not-found. RFC0009.9's
+  oracle moves to the format-2 rule. Old manifests are rejected
+  (breaking, no dual-read). Local commits need one active compactor, so
+  the chart's compactor Deployment uses `strategy: Recreate`
+  (RFC0009.24). §3.3 and §3.4 notes, §4 options, RFC0009.13–.24, test map,
+  decisions D1–D4 in §7. The
+  `rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable` test-contract
+  change (§6) awaits separate approval. Refs #1026.
+- **2026-10-16 — orphan GC is observable (#1039, maintainer-approved).**
+  Adds `ourios.compaction.orphan.reclaimed`, a per-tenant counter of the
+  files the orphan GC deleted or failed to delete (`error.type` on a
+  failure; the count is of successful delete responses), and moves the GC
+  into one pass after the consolidation pass so it can carry RFC 0038's
+  `reclaim orphans` phase span. The pass visits the candidates and every
+  sealed partition whose listing shows an orphan, so a sweep stopped
+  before the pass loses nothing. The GC rule and RFC0009.17 are unchanged,
+  and `ourios.compaction.orphan.files` keeps its meaning. §3.6 note,
+  RFC0009.25–.26, test map. The new names go to the ourios-semconv registry.

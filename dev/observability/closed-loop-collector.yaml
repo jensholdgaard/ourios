@@ -1,0 +1,120 @@
+# OTel Collector config for the local closed loop (`just closed-loop-collector`).
+# Local development only — never a deployment artefact (that's `deploy/`).
+# Runs as a native `otelcol-contrib` binary; no container runtime.
+#
+# Logs go to the local Ourios unless they come from Ourios itself or this
+# Collector, so Claude Code's logs never leave the machine. Traces and
+# metrics (Claude Code's and Ourios's own) go to your own OTLP/HTTP backend,
+# tagged deployment.environment.name=development. The backend is local
+# configuration, read from the environment (`.env`, gitignored):
+#   CLOSED_LOOP_OTLP_ENDPOINT       base URL, e.g. https://otlp.example.com
+#   CLOSED_LOOP_OTLP_AUTHORIZATION  Authorization header value, if it needs one
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+      http:
+        endpoint: 127.0.0.1:4318
+
+processors:
+  batch:
+  # Claude Code puts the content its OTEL_LOG_USER_PROMPTS / OTEL_LOG_TOOL_DETAILS
+  # gates unlock on its spans and metrics as well as its logs. The logs stay local; spans go
+  # to the remote backend, so strip that content from claude-code spans and drop
+  # their span-event attributes (tool output) before export. These are the
+  # gated span attributes Claude Code documents; review the list when updating it.
+  transform/scrub_claude_code_spans:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        conditions:
+          - resource.attributes["service.name"] == "claude-code"
+        statements:
+          - delete_matching_keys(attributes, "^(prompt|prompt_text|user_prompt|new_context|system_reminders|system_prompt_preview|user_system_prompt|response\\.model_output|full_command|bash_command|file_path|diff|content|tool_input|tool_parameters|hook_definitions|workflow\\.name|skill_name|subagent_type|error)$")
+      - context: spanevent
+        conditions:
+          - resource.attributes["service.name"] == "claude-code"
+        statements:
+          - delete_matching_keys(attributes, ".*")
+    # With OTEL_LOG_TOOL_DETAILS=1 Claude Code puts real agent, skill, plugin
+    # and MCP server/tool names on its cost and token metrics. Replace each with
+    # its SHA-256 rather than deleting it: deleting would merge distinct series
+    # into one stream with conflicting values, while a hash keeps every series
+    # (and its totals) separate without exposing the name.
+    metric_statements:
+      - context: datapoint
+        conditions:
+          - resource.attributes["service.name"] == "claude-code"
+        statements:
+          - set(attributes["agent.name"], SHA256(attributes["agent.name"])) where attributes["agent.name"] != nil
+          - set(attributes["skill.name"], SHA256(attributes["skill.name"])) where attributes["skill.name"] != nil
+          - set(attributes["plugin.name"], SHA256(attributes["plugin.name"])) where attributes["plugin.name"] != nil
+          - set(attributes["mcp_server.name"], SHA256(attributes["mcp_server.name"])) where attributes["mcp_server.name"] != nil
+          - set(attributes["mcp_tool.name"], SHA256(attributes["mcp_tool.name"])) where attributes["mcp_tool.name"] != nil
+  resource/environment:
+    attributes:
+      - key: deployment.environment.name
+        value: development
+        action: upsert
+
+connectors:
+  # Route on the resource's service.name, failing closed: only the named
+  # self-telemetry services reach the backend and every other log stays in the local
+  # Ourios. Claude Code's logs therefore stay local unless its service.name is
+  # set to one of those two names.
+  routing/logs:
+    default_pipelines: [logs/ourios]
+    table:
+      - context: resource
+        condition: attributes["service.name"] == "ourios-server" or attributes["service.name"] == "otelcol-contrib"
+        pipelines: [logs/backend]
+
+exporters:
+  otlp_http/ourios:
+    endpoint: http://127.0.0.1:24318
+    # RFC 0046: the tenant is named out of band on every export.
+    headers:
+      x-ourios-tenant: claude-code
+  otlp_http/backend:
+    endpoint: ${env:CLOSED_LOOP_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:CLOSED_LOOP_OTLP_AUTHORIZATION}
+
+service:
+  # The Collector's own metrics, pushed over OTLP straight to the backend instead of
+  # the default Prometheus pull endpoint on :8888.
+  telemetry:
+    resource:
+      deployment.environment.name: development
+    metrics:
+      readers:
+        - periodic:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: ${env:CLOSED_LOOP_OTLP_ENDPOINT}/v1/metrics
+                headers:
+                  - name: Authorization
+                    value: ${env:CLOSED_LOOP_OTLP_AUTHORIZATION}
+  pipelines:
+    logs/in:
+      receivers: [otlp]
+      processors: [resource/environment]
+      exporters: [routing/logs]
+    logs/ourios:
+      receivers: [routing/logs]
+      processors: [batch]
+      exporters: [otlp_http/ourios]
+    logs/backend:
+      receivers: [routing/logs]
+      processors: [batch]
+      exporters: [otlp_http/backend]
+    traces:
+      receivers: [otlp]
+      processors: [resource/environment, transform/scrub_claude_code_spans, batch]
+      exporters: [otlp_http/backend]
+    metrics:
+      receivers: [otlp]
+      processors: [resource/environment, transform/scrub_claude_code_spans, batch]
+      exporters: [otlp_http/backend]

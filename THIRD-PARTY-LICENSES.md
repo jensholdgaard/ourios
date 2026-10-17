@@ -19,7 +19,7 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 359 |
+| `Apache-2.0` | 360 |
 | `MIT` | 73 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 13 |
@@ -4977,7 +4977,7 @@ Used by:
 - `rustc_version` 0.4.1 — <https://github.com/djc/rustc-version-rs>
 - `rustix` 1.1.5 — <https://github.com/bytecodealliance/rustix>
 - `rustls-native-certs` 0.8.4 — <https://github.com/rustls/rustls-native-certs>
-- `rustls` 0.23.45 — <https://github.com/rustls/rustls>
+- `rustls` 0.23.46 — <https://github.com/rustls/rustls>
 - `rusty-fork` 0.3.1 — <https://github.com/altsysrq/rusty-fork>
 - `scopeguard` 1.2.0 — <https://github.com/bluss/scopeguard>
 - `security-framework-sys` 2.17.0 — <https://github.com/kornelski/rust-security-framework>
@@ -6973,20 +6973,20 @@ limitations under the License.
 
 Used by:
 
-- `ourios-bench` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-config` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-core` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-df-otel` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-ingester` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-miner` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-parquet` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-querier` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-semconv` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-server` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-serving` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-telemetry` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-testgen` 0.13.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-wal` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-bench` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-config` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-core` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-df-otel` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-ingester` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-miner` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-parquet` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-querier` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-semconv` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-server` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-serving` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-telemetry` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-testgen` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-wal` 0.14.0-rc.1 — <https://github.com/jensholdgaard/ourios>
 - `allocator-api2` 0.2.21 — <https://github.com/zakarumych/allocator-api2>
 - `android_system_properties` 0.1.5 — <https://github.com/nical/android_system_properties>
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>
@@ -7012,6 +7012,7 @@ Used by:
 - `miniz_oxide` 0.9.1 — <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide>
 - `num-conv` 0.2.2 — <https://github.com/jhpratt/num-conv>
 - `opentelemetry-appender-tracing` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-appender-tracing>
+- `opentelemetry-http` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http>
 - `opentelemetry-otlp` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp>
 - `opentelemetry` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry>
 - `opentelemetry_sdk` 0.32.1 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk>

@@ -139,7 +139,8 @@ impl GraphEmitter {
             )?,
             tuples: ourios_core::telemetry::meter("ourios.graph")
                 .u64_counter(semconv::OURIOS_GRAPH_TUPLES)
-                .with_unit("{tuple}")
+                .with_description(semconv::OURIOS_GRAPH_TUPLES_DESCRIPTION)
+                .with_unit(semconv::OURIOS_GRAPH_TUPLES_UNIT)
                 .build(),
         }))
     }

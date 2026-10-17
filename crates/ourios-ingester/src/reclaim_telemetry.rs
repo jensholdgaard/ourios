@@ -247,39 +247,64 @@ type Shared = Weak<Mutex<Observed>>;
 type StateRead = fn(&ReclaimState) -> u64;
 type BacklogRead = fn(&HousekeepingProgress) -> usize;
 
-const STATE_SUMS: [(&str, &str, StateRead); 7] = [
-    (semconv::OURIOS_WAL_SIZE, "By", |s| s.disk_bytes),
-    (semconv::OURIOS_WAL_UNFLUSHED_SIZE, "By", |s| {
-        s.unflushed_bytes
-    }),
-    (semconv::OURIOS_WAL_SEGMENT_COUNT, "{segment}", |s| {
-        u64::from(s.segment_count)
-    }),
-    (semconv::OURIOS_WAL_UNRECLAIMED_SIZE, "By", |s| {
-        s.unreclaimed_bytes
-    }),
+const STATE_SUMS: [(&str, &str, &str, StateRead); 7] = [
+    (
+        semconv::OURIOS_WAL_SIZE,
+        semconv::OURIOS_WAL_SIZE_DESCRIPTION,
+        semconv::OURIOS_WAL_SIZE_UNIT,
+        |s| s.disk_bytes,
+    ),
+    (
+        semconv::OURIOS_WAL_UNFLUSHED_SIZE,
+        semconv::OURIOS_WAL_UNFLUSHED_SIZE_DESCRIPTION,
+        semconv::OURIOS_WAL_UNFLUSHED_SIZE_UNIT,
+        |s| s.unflushed_bytes,
+    ),
+    (
+        semconv::OURIOS_WAL_SEGMENT_COUNT,
+        semconv::OURIOS_WAL_SEGMENT_COUNT_DESCRIPTION,
+        semconv::OURIOS_WAL_SEGMENT_COUNT_UNIT,
+        |s| u64::from(s.segment_count),
+    ),
+    (
+        semconv::OURIOS_WAL_UNRECLAIMED_SIZE,
+        semconv::OURIOS_WAL_UNRECLAIMED_SIZE_DESCRIPTION,
+        semconv::OURIOS_WAL_UNRECLAIMED_SIZE_UNIT,
+        |s| s.unreclaimed_bytes,
+    ),
     (
         semconv::OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT,
-        "{tenant}",
+        semconv::OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT_DESCRIPTION,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT_UNIT,
         |s| to_u64(s.floor.pinned_tenants()),
     ),
-    (semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE, "By", |s| {
-        s.lag_bytes
-    }),
+    (
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE_DESCRIPTION,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE_UNIT,
+        |s| s.lag_bytes,
+    ),
     (
         semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT,
-        "{segment}",
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT_DESCRIPTION,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT_UNIT,
         |s| to_u64(s.lag_segments),
     ),
 ];
 
-const BACKLOG: [(&str, BacklogRead); 2] = [
-    (semconv::OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING, |p| {
-        p.horizon_remaining
-    }),
-    (semconv::OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING, |p| {
-        p.unlink_remaining
-    }),
+const BACKLOG: [(&str, &str, &str, BacklogRead); 2] = [
+    (
+        semconv::OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING,
+        semconv::OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING_DESCRIPTION,
+        semconv::OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING_UNIT,
+        |p| p.horizon_remaining,
+    ),
+    (
+        semconv::OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING,
+        semconv::OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_DESCRIPTION,
+        semconv::OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_UNIT,
+        |p| p.unlink_remaining,
+    ),
 ];
 
 impl Instruments {
@@ -287,10 +312,11 @@ impl Instruments {
         let meter = ourios_core::telemetry::meter("ourios.wal");
         let mut updown: Vec<_> = STATE_SUMS
             .into_iter()
-            .map(|(name, unit, read)| {
+            .map(|(name, description, unit, read)| {
                 let observed = Weak::clone(observed);
                 meter
                     .i64_observable_up_down_counter(name)
+                    .with_description(description)
                     .with_unit(unit)
                     .with_callback(move |observer| {
                         if let Some(value) = with(&observed, |o| o.state.as_ref().map(read)) {
@@ -310,7 +336,8 @@ impl Instruments {
         let mut gauges = vec![
             meter
                 .u64_observable_gauge(semconv::OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES)
-                .with_unit("{failure}")
+                .with_description(semconv::OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES_DESCRIPTION)
+                .with_unit(semconv::OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES_UNIT)
                 .with_callback(move |observer| {
                     if let Some((_, attempts)) = rotation.read() {
                         observer.observe(u64::from(attempts), &[]);
@@ -318,11 +345,12 @@ impl Instruments {
                 })
                 .build(),
         ];
-        gauges.extend(BACKLOG.into_iter().map(|(name, read)| {
+        gauges.extend(BACKLOG.into_iter().map(|(name, description, unit, read)| {
             let observed = Weak::clone(observed);
             meter
                 .u64_observable_gauge(name)
-                .with_unit("{segment}")
+                .with_description(description)
+                .with_unit(unit)
                 .with_callback(move |observer| {
                     if let Some(value) = with(&observed, |o| o.progress.as_ref().map(read)) {
                         observer.observe(to_u64(value), &[]);
@@ -361,7 +389,8 @@ fn floor_status(meter: &Meter, observed: &Shared) -> ObservableUpDownCounter<i64
     let observed = Weak::clone(observed);
     meter
         .i64_observable_up_down_counter(semconv::OURIOS_WAL_RETAIN_FLOOR_STATUS)
-        .with_unit("1")
+        .with_description(semconv::OURIOS_WAL_RETAIN_FLOOR_STATUS_DESCRIPTION)
+        .with_unit(semconv::OURIOS_WAL_RETAIN_FLOOR_STATUS_UNIT)
         .with_callback(move |observer| {
             let Some(current) = with(&observed, |o| {
                 o.state.as_ref().map(|s| floor_state(s.floor))
@@ -384,7 +413,8 @@ fn rotation_status(meter: &Meter, rotation: &Arc<RotationReading>) -> Observable
     let rotation = Arc::clone(rotation);
     meter
         .i64_observable_up_down_counter(semconv::OURIOS_WAL_ROTATION_STATUS)
-        .with_unit("1")
+        .with_description(semconv::OURIOS_WAL_ROTATION_STATUS_DESCRIPTION)
+        .with_unit(semconv::OURIOS_WAL_ROTATION_STATUS_UNIT)
         .with_callback(move |observer| {
             let Some((current, _)) = rotation.read() else {
                 return;
@@ -409,7 +439,8 @@ fn unreclaimed_age(meter: &Meter, observed: &Shared) -> ObservableGauge<f64> {
     let observed = Weak::clone(observed);
     meter
         .f64_observable_gauge(semconv::OURIOS_WAL_UNRECLAIMED_AGE)
-        .with_unit("s")
+        .with_description(semconv::OURIOS_WAL_UNRECLAIMED_AGE_DESCRIPTION)
+        .with_unit(semconv::OURIOS_WAL_UNRECLAIMED_AGE_UNIT)
         .with_callback(move |observer| {
             if let Some(oldest) = with(&observed, |o| o.state.as_ref()?.oldest_unreclaimed) {
                 let age = SystemTime::now()

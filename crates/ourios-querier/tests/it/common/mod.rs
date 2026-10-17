@@ -139,6 +139,11 @@ pub fn write_all(bucket: &Path, recs: &[MinedRecord]) {
 /// implicit `service.name`.
 pub fn write_all_with_promoted(bucket: &Path, recs: &[MinedRecord], promoted: &PromotedAttributes) {
     let store = Store::local(bucket).expect("local store");
+    write_all_in(&store, recs, promoted);
+}
+
+/// [`write_all_with_promoted`] into any [`Store`], the S3 backend included.
+pub fn write_all_in(store: &Store, recs: &[MinedRecord], promoted: &PromotedAttributes) {
     let mut by_part: HashMap<PartitionKey, Vec<MinedRecord>> = HashMap::new();
     for r in recs {
         by_part
@@ -148,7 +153,7 @@ pub fn write_all_with_promoted(bucket: &Path, recs: &[MinedRecord], promoted: &P
     }
     for (part, rs) in by_part {
         let mut w =
-            Writer::open_in_with_promoted(&store, part, DEFAULT_ZSTD_LEVEL, promoted.clone())
+            Writer::open_in_with_promoted(store, part, DEFAULT_ZSTD_LEVEL, promoted.clone())
                 .expect("open writer");
         w.append_records(&rs).expect("append");
         w.close().expect("close");
@@ -325,6 +330,22 @@ pub async fn localstack_s3(
     >,
     ourios_parquet::Store,
 ) {
+    let (container, config) = localstack_s3_config(bucket).await;
+    let store = ourios_parquet::Store::s3(config).expect("build s3 store");
+    (container, store)
+}
+
+/// [`localstack_s3`]'s container and the `S3Config` addressing its bucket,
+/// for a caller that builds its own store from it (a querier through
+/// `StoreConfig::S3`).
+pub async fn localstack_s3_config(
+    bucket: &str,
+) -> (
+    testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::localstack::LocalStack,
+    >,
+    ourios_parquet::S3Config,
+) {
     use testcontainers_modules::localstack::LocalStack;
     use testcontainers_modules::testcontainers::ImageExt;
     use testcontainers_modules::testcontainers::core::ExecCommand;
@@ -361,11 +382,37 @@ pub async fn localstack_s3(
         Some(0),
         "awslocal s3 mb failed (code {code:?}): stdout={stdout:?} stderr={stderr:?}",
     );
-    let store = ourios_parquet::Store::s3(
-        ourios_parquet::S3Config::new(bucket)
-            .with_endpoint(format!("http://{host}:{port}"))
-            .with_region("us-east-1"),
-    )
-    .expect("build s3 store");
-    (container, store)
+    let config = ourios_parquet::S3Config::new(bucket)
+        .with_endpoint(format!("http://{host}:{port}"))
+        .with_region("us-east-1");
+    (container, config)
+}
+
+/// Install a process-wide default subscriber once. Without one, a callsite
+/// first reached by a test running with no subscriber can cache a `never`
+/// interest while another test's scoped subscriber is being registered,
+/// and that scoped subscriber then misses the span. A default subscriber
+/// that is interested in everything keeps every callsite enabled, so each
+/// test's scoped subscriber decides what it records.
+pub fn global_subscriber() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // Another test binary component may already have set one; either
+        // way a default now exists.
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
+/// Install `provider` as the process-global tracer provider, which the
+/// store's `CLIENT` spans go to, for as long as the returned guard lives.
+/// Every test in this binary that reads spans through the global provider
+/// holds it for its whole tracing lifetime, so two of them never swap the
+/// provider under each other when they share a process (`cargo test`).
+pub async fn global_tracer_provider(
+    provider: &opentelemetry_sdk::trace::SdkTracerProvider,
+) -> tokio::sync::MutexGuard<'static, ()> {
+    static GLOBAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let guard = GLOBAL.lock().await;
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    guard
 }

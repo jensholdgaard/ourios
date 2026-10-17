@@ -20,6 +20,7 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::TryStreamExt;
 use object_store::local::LocalFileSystem;
@@ -61,13 +62,24 @@ fn is_plain_opaque_tag(tag: &str) -> bool {
 /// backend doesn't expose one.
 pub type EtaggedBytes = (Vec<u8>, Option<String>);
 
+/// One object of a recursive listing, as returned by
+/// [`Store::list_objects_blocking`]: its store-relative key, its size, and
+/// the `ETag` the backend listed for it (`None` when it lists none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedObject {
+    pub key: String,
+    pub size: u64,
+    pub e_tag: Option<String>,
+}
+
 /// One `/`-delimited level of a listing, as returned by
 /// [`Store::list_delimited_blocking`]: store-relative keys, each list sorted
 /// and unique.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DelimitedListing {
-    /// Objects directly under the listed prefix (not in a child "directory").
-    pub objects: Vec<String>,
+    /// Objects directly under the listed prefix (not in a child "directory"),
+    /// as `(key, size)` pairs.
+    pub objects: Vec<(String, u64)>,
     /// The immediate child common-prefixes ("directories"), without a
     /// trailing `/`.
     pub common_prefixes: Vec<String>,
@@ -127,6 +139,10 @@ pub struct Store {
     /// The directory a local backend writes under, for
     /// [`Self::sync_local_blocking`]; `None` on every other backend.
     local_root: Option<std::path::PathBuf>,
+    /// Whether the last [`Self::put_if_match`] that needed its fallback won
+    /// with the unquoted `ETag`, so later swaps lead with that spelling.
+    /// Shared by every handle on the backend.
+    if_match_unquoted: Arc<AtomicBool>,
 }
 
 /// Addressing for the S3 / S3-compatible backend (RFC0013.7) — bucket,
@@ -689,6 +705,16 @@ impl Store {
     /// per-object `head`. Same tenant-isolation gating and key normalisation as
     /// [`Self::list`].
     async fn list_entries(&self, prefix: Option<&str>) -> Result<Vec<(String, u64)>, StoreError> {
+        Ok(self
+            .list_objects(prefix)
+            .await?
+            .into_iter()
+            .map(|object| (object.key, object.size))
+            .collect())
+    }
+
+    /// [`Self::list_entries`] with each object's listed `ETag`.
+    async fn list_objects(&self, prefix: Option<&str>) -> Result<Vec<ListedObject>, StoreError> {
         let scoped = match prefix {
             Some(p) => self.resolve(p)?,
             None => self.prefix.clone(),
@@ -700,7 +726,7 @@ impl Store {
             .await
             .map_err(StoreError::Backend)?;
         let root = &self.prefix;
-        let mut entries: Vec<(String, u64)> = metas
+        let mut entries: Vec<ListedObject> = metas
             .into_iter()
             .filter_map(|m| {
                 // The backend's `list` does **string**-prefix matching, so S3
@@ -720,10 +746,14 @@ impl Store {
                     .map(|p| p.as_ref().to_owned())
                     .collect::<Vec<_>>()
                     .join("/");
-                Some((key, m.size))
+                Some(ListedObject {
+                    key,
+                    size: m.size,
+                    e_tag: m.e_tag,
+                })
             })
             .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(entries)
     }
 
@@ -756,6 +786,24 @@ impl Store {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
         self.bridge(Operation::List, async move {
             store.list_entries(prefix.as_deref()).await
+        })
+    }
+
+    /// Blocking [`ListedObject`] listing for the **sync** storage call sites:
+    /// [`Self::list_with_sizes_blocking`] plus each object's listed `ETag`, so
+    /// a caller can tell an object unchanged without reading it. Same order +
+    /// isolation contract as [`Self::list_blocking`].
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// [`StoreError::Backend`] on a listing failure.
+    pub fn list_objects_blocking(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ListedObject>, StoreError> {
+        let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
+        self.bridge(Operation::List, async move {
+            store.list_objects(prefix.as_deref()).await
         })
     }
 
@@ -806,15 +854,15 @@ impl Store {
                     .join("/"),
             )
         };
-        let mut objects: Vec<String> = result
+        let mut objects: Vec<(String, u64)> = result
             .objects
             .iter()
-            .filter_map(|m| relative(&m.location))
+            .filter_map(|m| Some((relative(&m.location)?, m.size)))
             .collect();
         let mut common_prefixes: Vec<String> =
             result.common_prefixes.iter().filter_map(relative).collect();
         objects.sort();
-        objects.dedup();
+        objects.dedup_by(|a, b| a.0 == b.0);
         common_prefixes.sort();
         common_prefixes.dedup();
         Ok(DelimitedListing {
@@ -945,13 +993,15 @@ impl Store {
     /// supports conditional update — S3-compatible stores do;
     /// `LocalFileSystem` does not.
     ///
-    /// A `412` against a quoted `ETag` is retried once with the quotes
-    /// stripped: some S3-compatible stores (Ceph RGW-based ones) return the
+    /// A `412` against a quoted `ETag` is retried once in the other
+    /// spelling: some S3-compatible stores (Ceph RGW-based ones) return the
     /// quoted form from `GET` but honour `If-Match` only unquoted, so every
-    /// swap would otherwise lose. The retry cannot weaken the swap — it
-    /// still succeeds only if the object is unchanged — because it is sent
-    /// only for a plain opaque tag (letters, digits and hyphens), whose
-    /// unquoted spelling cannot become a wildcard or a list.
+    /// swap would otherwise lose. The spelling that won a retry leads the
+    /// next swap, so such a store costs one request per swap, not a `412`
+    /// and a second `PUT`. The retry cannot weaken the swap — it still
+    /// succeeds only if the object is unchanged — because it is sent only
+    /// for a plain opaque tag (letters, digits and hyphens), whose unquoted
+    /// spelling cannot become a wildcard or a list.
     ///
     /// # Errors
     /// [`StoreError::Backend`] whose [`StoreError::is_precondition`] is true if
@@ -976,12 +1026,65 @@ impl Store {
             .strip_prefix('"')
             .and_then(|rest| rest.strip_suffix('"'))
             .filter(|tag| is_plain_opaque_tag(tag));
-        match (put(e_tag).await, unquoted) {
+        let lead_unquoted = self.if_match_unquoted.load(Ordering::Relaxed);
+        let (first, fallback) = match unquoted {
+            Some(unquoted) if lead_unquoted => (unquoted, Some(e_tag)),
+            Some(unquoted) => (e_tag, Some(unquoted)),
+            None => (e_tag, None),
+        };
+        match (put(first).await, fallback) {
             (Ok(_), _) => Ok(()),
-            (Err(object_store::Error::Precondition { .. }), Some(unquoted)) => {
-                put(unquoted).await.map(|_| ()).map_err(StoreError::Backend)
+            (Err(object_store::Error::Precondition { .. }), Some(fallback)) => {
+                put(fallback).await.map_err(StoreError::Backend)?;
+                self.if_match_unquoted
+                    .store(!lead_unquoted, Ordering::Relaxed);
+                Ok(())
             }
             (Err(e), _) => Err(StoreError::Backend(e)),
+        }
+    }
+
+    /// Read the object at `key` together with when the store last modified
+    /// it, by the store's own clock (Unix nanoseconds; `0` for an instant
+    /// before the epoch or past the nanosecond range), both from the one
+    /// `GET`, so they always describe the same version of the object.
+    ///
+    /// # Errors
+    /// As [`Self::get`].
+    pub async fn get_with_modified(&self, key: &str) -> Result<(Vec<u8>, u64), StoreError> {
+        let got = self
+            .inner
+            .get(&self.resolve(key)?)
+            .await
+            .map_err(StoreError::Backend)?;
+        let last_modified = got
+            .meta
+            .last_modified
+            .timestamp_nanos_opt()
+            .and_then(|nanos| u64::try_from(nanos).ok())
+            .unwrap_or(0);
+        let bytes = got.bytes().await.map_err(StoreError::Backend)?;
+        Ok((bytes.to_vec(), last_modified))
+    }
+
+    /// Blocking [`Self::get_with_modified`], mapping a missing object to
+    /// `None`.
+    ///
+    /// # Errors
+    /// As [`Self::get_with_modified`], except a not-found object yields
+    /// `Ok(None)`; plus [`StoreError::Runtime`] if the bridge runtime can't be
+    /// built.
+    pub fn get_with_modified_blocking_opt(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
+        let (store, key) = (self.clone(), key.to_owned());
+        match self.bridge(Operation::Get, async move {
+            store.get_with_modified(&key).await
+        }) {
+            Ok(got) => Ok(Some(got)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -1421,7 +1524,7 @@ mod tests {
         assert_eq!(
             level,
             super::DelimitedListing {
-                objects: vec!["data/tenant_id=a/stray.parquet".to_string()],
+                objects: vec![("data/tenant_id=a/stray.parquet".to_string(), 1)],
                 common_prefixes: vec![
                     "data/tenant_id=a/year=2025".to_string(),
                     "data/tenant_id=a/year=2026".to_string(),

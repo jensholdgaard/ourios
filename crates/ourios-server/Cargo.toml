@@ -32,8 +32,10 @@ ourios-parquet = { path = "../ourios-parquet" }
 # RFC 3339 parsing for the `graph backfill --from` boundary (RFC 0048
 # §3.4); already in the Arrow dep tree via ourios-parquet.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-# OTel SDK + OTLP push MeterProvider bootstrap (RFC 0001 §6.8).
-ourios-telemetry = { path = "../ourios-telemetry" }
+# OTel SDK + OTLP push MeterProvider bootstrap (RFC 0001 §6.8). `http-proto`
+# honours `OTEL_EXPORTER_OTLP[_<SIGNAL>]_PROTOCOL=http/protobuf`; gRPC stays
+# the default when no protocol is set.
+ourios-telemetry = { path = "../ourios-telemetry", features = ["http-proto"] }
 # OTel meter API for the querier role's metrics (RFC 0016 §3.6); the SDK
 # lives in ourios-telemetry, library code resolves against the global meter.
 # `trace` is the API half only — `Context` + `FutureExt::with_context` for
@@ -98,6 +100,9 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # no new crate (§3.1).
 rmcp = { version = "2.1.0", default-features = false, features = ["macros", "server", "transport-streamable-http-server"] }
 schemars = { version = "1.2.1", default-features = false, features = ["derive"] }
+# The `/mcp` response body wrapper that keeps the SERVER span open while
+# rmcp streams the tool result (RFC0039.6). Already in the tree via axum.
+http-body = { version = "1", default-features = false }
 
 [dev-dependencies]
 # RFC 0030 test CAs / leaf certs, minted at test time — no committed

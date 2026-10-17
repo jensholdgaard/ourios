@@ -102,6 +102,10 @@ struct Fold {
     objects: Arc<[(String, u64)]>,
     fetch: Fetch,
     span: tracing::Span,
+    /// The registering caller's `OTel` context. Entering `span` on a worker
+    /// does not restore it, and the store bridge reads the query-phase
+    /// marker from it to open the GETs' `CLIENT` spans (RFC 0038 §3.7.4).
+    cx: opentelemetry::Context,
     /// The next object index to dispatch; every index below it is
     /// dispatched, so the consumer's next object always is.
     next: usize,
@@ -123,6 +127,7 @@ struct Job {
     key: String,
     fetch: Fetch,
     span: tracing::Span,
+    cx: opentelemetry::Context,
 }
 
 impl PoolState {
@@ -148,6 +153,7 @@ impl PoolState {
                 key: key.clone(),
                 fetch: Arc::clone(&fold.fetch),
                 span: fold.span.clone(),
+                cx: fold.cx.clone(),
             };
             fold.next += 1;
             fold.reserved = fold.reserved.saturating_add(*size);
@@ -252,6 +258,7 @@ impl FetchPool {
                 objects,
                 fetch,
                 span: tracing::Span::current(),
+                cx: opentelemetry::Context::current(),
                 next: 0,
                 reserved: 0,
                 in_flight: 0,
@@ -282,9 +289,12 @@ impl FetchPool {
         loop {
             if let Some(job) = state.claim(self.limits.bytes) {
                 drop(state);
-                let outcome = job
-                    .span
-                    .in_scope(|| catch_unwind(AssertUnwindSafe(|| (job.fetch)(&job.key))));
+                // Attached after entering: entering the span activates its
+                // own context, which would replace the caller's.
+                let outcome = job.span.in_scope(|| {
+                    let _cx = job.cx.clone().attach();
+                    catch_unwind(AssertUnwindSafe(|| (job.fetch)(&job.key)))
+                });
                 state = self.lock();
                 state.publish(&job, outcome);
                 self.changed.notify_all();
@@ -487,6 +497,43 @@ mod tests {
         .expect("fetch");
 
         assert_eq!(seen, (0..objects.len()).collect::<Vec<_>>());
+    }
+
+    /// A worker GETs under the registering caller's `OTel` context, so a
+    /// fetch made inside a query phase still carries the `QueryPhase`
+    /// marker the store bridge opens `CLIENT` spans from.
+    #[test]
+    fn workers_fetch_under_the_callers_otel_context() {
+        use ourios_parquet::QueryPhase;
+
+        let objects = objects(&[10; 8]);
+        let _phase = opentelemetry::Context::current()
+            .with_value(QueryPhase)
+            .attach();
+
+        fetch_in_order(
+            &pool(4, u64::MAX),
+            objects,
+            fetcher(|key| {
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some("ourios-audit-fetch"),
+                    "the GET runs on a pool worker",
+                );
+                if opentelemetry::Context::current()
+                    .get::<QueryPhase>()
+                    .is_some()
+                {
+                    Ok(body(key))
+                } else {
+                    Err(QueryError::Storage {
+                        detail: format!("{key} fetched without the caller's context"),
+                    })
+                }
+            }),
+            |_, _| Ok(()),
+        )
+        .expect("every GET sees the caller's context");
     }
 
     #[test]

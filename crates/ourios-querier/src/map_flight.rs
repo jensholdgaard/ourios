@@ -17,6 +17,7 @@
 //! removed when it completes — successfully, with an error, or by a panic.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -25,18 +26,26 @@ use ourios_core::tenant::TenantId;
 use tokio::sync::watch;
 use tracing::Instrument as _;
 
-use crate::template_map::{self, TemplateMap};
+use crate::audit_scan::{AuditListing, ObjectTag};
+use crate::template_map::{self, AcquireTrigger, Persisted, TEMPLATE_MAP_FILENAME, TemplateMap};
 use crate::{Backend, QueryError, StoreRef, audit_scan, phase};
 
 /// One acquisition's answer: the map plus its template-map acquisition
 /// bytes ([`crate::QueryResult::registry_bytes_read`]).
+#[cfg(test)]
 pub(crate) type Acquired = Result<(Arc<TemplateMap>, u64), QueryError>;
+
+/// One acquisition's answer as its flight publishes it: the map, its
+/// acquisition bytes, and what it left in the store.
+type Shared = Result<(Arc<TemplateMap>, u64, Persisted), QueryError>;
 
 /// A successful acquisition as one query saw it. A query acquires at most
 /// once (RFC 0033): at compile time when the DSL uses `resolves_to` (the
 /// alias fold), otherwise lazily while rendering rows, so the alias map and
 /// the registry can never come from different frontiers within one query
-/// (§3.1's one-artifact rationale).
+/// (§3.1's one-artifact rationale). Cloning shares the map; a query's
+/// retries reuse its one acquisition rather than acquiring again.
+#[derive(Clone)]
 pub(crate) struct MapAcquisition {
     pub(crate) map: Arc<TemplateMap>,
     /// The acquisition's bytes ([`crate::QueryResult::registry_bytes_read`]),
@@ -45,6 +54,19 @@ pub(crate) struct MapAcquisition {
     /// The bytes this query fetched itself: `bytes` for the acquirer, `0`
     /// for a joiner, so a shared fold is counted once across its queries.
     pub(crate) fetched: u64,
+    /// What the acquisition left in the store, the same for every joiner.
+    pub(crate) persisted: Persisted,
+}
+
+impl MapAcquisition {
+    fn new((map, bytes, persisted): (Arc<TemplateMap>, u64, Persisted), fetched: u64) -> Self {
+        Self {
+            map,
+            bytes,
+            fetched,
+            persisted,
+        }
+    }
 }
 
 /// The in-flight acquisitions, by tenant. Shared by every clone of a
@@ -64,18 +86,115 @@ impl fmt::Debug for TemplateMapFlights {
     }
 }
 
-/// An acquisition in progress: the frontier it was listed at and where its
-/// result will be published.
+/// An acquisition in progress: the frontier it was listed at, who started
+/// it, and where its result will be published.
 struct Flight {
     frontier: Vec<String>,
-    done: watch::Receiver<Option<Acquired>>,
+    trigger: AcquireTrigger,
+    done: watch::Receiver<Option<Shared>>,
 }
 
-enum Step {
-    Done(Acquired),
+enum Step<U> {
+    Done {
+        acquired: Shared,
+        verified: Option<Verified>,
+    },
     Wait {
-        done: watch::Receiver<Option<Acquired>>,
+        done: watch::Receiver<Option<Shared>>,
         same_frontier: bool,
+        trigger: AcquireTrigger,
+    },
+    /// The listing proved the acquisition unnecessary (RFC 0060 §3.7).
+    Unchanged(U),
+}
+
+/// How an acquisition ended: with a map, or, for a refresh pass, at a
+/// listing that proved it unnecessary.
+enum Settled<U> {
+    Acquired {
+        acquisition: MapAcquisition,
+        /// The verified listing this acquisition's own hit established.
+        verified: Option<Verified>,
+    },
+    Unchanged(U),
+}
+
+/// Who acquires: the tenant whose map is wanted, what initiated the
+/// acquisition (RFC 0060 §3.5), and what it knows before listing.
+#[derive(Clone)]
+struct Acquirer<P> {
+    tenant: TenantId,
+    trigger: AcquireTrigger,
+    prior: P,
+}
+
+/// What an acquisition knows before it lists (RFC 0060 §3.7). A query knows
+/// nothing and so always acquires; a refresh pass may hold the tenant's
+/// verified listing.
+trait Prior: Clone + Send + 'static {
+    /// Proof that the listing needs no acquisition.
+    type Unchanged: Send + 'static;
+    /// Whether a hit should establish a verified listing.
+    const LEARNS: bool;
+
+    fn unchanged(&self, listing: &AuditListing<'_>) -> Option<Self::Unchanged>;
+}
+
+impl Prior for () {
+    type Unchanged = Infallible;
+    const LEARNS: bool = false;
+
+    fn unchanged(&self, _listing: &AuditListing<'_>) -> Option<Infallible> {
+        None
+    }
+}
+
+impl Prior for Option<Arc<Verified>> {
+    type Unchanged = ();
+    const LEARNS: bool = true;
+
+    fn unchanged(&self, listing: &AuditListing<'_>) -> Option<()> {
+        self.as_deref()
+            .is_some_and(|verified| verified.matches(listing))
+            .then_some(())
+    }
+}
+
+/// A tenant's last verified hit (RFC 0060 §3.7): the frontier it was at, and
+/// the artifact tag both its listing and its read saw. A later listing
+/// equal to both proves a read would be the same hit.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Verified {
+    frontier: Vec<String>,
+    tag: ObjectTag,
+}
+
+impl Verified {
+    /// The verified listing a hit establishes, only when the read's tag is the
+    /// listed one: otherwise the artifact changed between the two.
+    fn of_hit(
+        frontier: Vec<String>,
+        listed: Option<ObjectTag>,
+        read: Option<&ObjectTag>,
+    ) -> Option<Self> {
+        let tag = listed?;
+        (read == Some(&tag)).then_some(Self { frontier, tag })
+    }
+
+    fn matches(&self, listing: &AuditListing<'_>) -> bool {
+        listing.artifact.as_ref() == Some(&self.tag) && listing.set.frontier() == self.frontier
+    }
+}
+
+/// How a refresh pass's acquisition of one tenant ended (RFC 0060 §3.7).
+pub(crate) enum Refreshed {
+    /// The listing matched the tenant's verified listing: nothing was read.
+    Unchanged,
+    Acquired {
+        persisted: Persisted,
+        /// The verified listing to remember, when the acquisition was a hit
+        /// whose read tag matched its listing.
+        verified: Option<Verified>,
     },
 }
 
@@ -95,7 +214,7 @@ impl TemplateMapFlights {
         backend: &Backend,
         tenant: &TenantId,
     ) -> Acquired {
-        self.acquire_fetched(backend, tenant)
+        self.acquire_fetched(backend, tenant, AcquireTrigger::Query)
             .await
             .map(|acquired| (acquired.map, acquired.bytes))
     }
@@ -106,6 +225,8 @@ impl TemplateMapFlights {
     ///
     /// RFC 0038 §3.7.2: the acquisition is the query's `load template_map`
     /// span, a query phase whose object-store requests open `CLIENT` spans.
+    /// `trigger` says who asks (RFC 0060 §3.5); an acquisition it starts
+    /// records it, and one it joins records the starter's.
     ///
     /// # Errors
     ///
@@ -114,111 +235,206 @@ impl TemplateMapFlights {
         self: &Arc<Self>,
         backend: &Backend,
         tenant: &TenantId,
+        trigger: AcquireTrigger,
     ) -> Result<MapAcquisition, QueryError> {
+        let request = Acquirer {
+            tenant: tenant.clone(),
+            trigger,
+            prior: (),
+        };
+        match self.acquire_in_phase(backend, request).await? {
+            Settled::Acquired { acquisition, .. } => Ok(acquisition),
+            Settled::Unchanged(never) => match never {},
+        }
+    }
+
+    /// A refresh pass's acquisition of `tenant` (RFC 0060 §3.7): as
+    /// [`Self::acquire_fetched`] with [`AcquireTrigger::Refresh`], except that
+    /// a listing matching `verified` ends it before the artifact is read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::acquire`].
+    pub(crate) async fn refresh(
+        self: &Arc<Self>,
+        backend: &Backend,
+        tenant: &TenantId,
+        verified: Option<Arc<Verified>>,
+    ) -> Result<Refreshed, QueryError> {
+        let request = Acquirer {
+            tenant: tenant.clone(),
+            trigger: AcquireTrigger::Refresh,
+            prior: verified,
+        };
+        Ok(match self.acquire_in_phase(backend, request).await? {
+            Settled::Acquired {
+                acquisition,
+                verified,
+            } => Refreshed::Acquired {
+                persisted: acquisition.persisted,
+                verified,
+            },
+            Settled::Unchanged(()) => Refreshed::Unchanged,
+        })
+    }
+
+    /// [`Self::acquire_shared`] inside its `load template_map` phase span,
+    /// which records an error the acquisition ends with.
+    async fn acquire_in_phase<P: Prior>(
+        self: &Arc<Self>,
+        backend: &Backend,
+        request: Acquirer<P>,
+    ) -> Result<Settled<P::Unchanged>, QueryError> {
         let phase = tracing::info_span!(
             "load template_map",
             otel.kind = "internal",
-            ourios.tenant = tenant.as_str(),
+            ourios.tenant = request.tenant.as_str(),
             ourios.template_map.lookup.outcome = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
             error.type = tracing::field::Empty,
         );
-        let acquired = self
-            .acquire_shared(backend, tenant, &phase)
+        let settled = self
+            .acquire_shared(backend, request, &phase)
             .instrument(phase.clone())
             .await;
-        if let Err(e) = &acquired {
+        if let Err(e) = &settled {
             ourios_core::telemetry::record_span_error(&phase, template_map::error_type(e));
         }
-        acquired
+        settled
     }
 
     /// [`Self::acquire_fetched`]'s single-flight loop, inside `phase`.
-    async fn acquire_shared(
+    async fn acquire_shared<P: Prior>(
         self: &Arc<Self>,
         backend: &Backend,
-        tenant: &TenantId,
+        request: Acquirer<P>,
         phase: &tracing::Span,
-    ) -> Result<MapAcquisition, QueryError> {
+    ) -> Result<Settled<P::Unchanged>, QueryError> {
         let mut waited = Duration::ZERO;
         loop {
-            // The phase span itself, never `Span::current()`: when the
-            // subscriber filters the phase out, the current span is the
-            // query, which must not become the phase (`crate::phase`).
-            let span = phase.clone();
-            // The caller's subscriber too, not just its span: the fold opens
-            // its own `derive template_map` span on the blocking thread,
-            // which otherwise resolves only the global default.
-            let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            let flights = Arc::clone(self);
-            let backend = backend
-                .clone()
-                .with_caller(ourios_parquet::Caller::TemplateMap);
-            let owned = tenant.clone();
-            let step = tokio::task::spawn_blocking(move || {
-                tracing::dispatcher::with_default(&dispatch, || {
-                    phase::in_phase(&span, || flights.step(backend.store_ref(), &owned))
-                })
-            })
-            .await
-            .map_err(|e| QueryError::Storage {
-                detail: format!("blocking storage task: {e}"),
-            })??;
-            match step {
-                Step::Done(acquired) => {
-                    return acquired.map(|(map, bytes)| MapAcquisition {
-                        map,
-                        bytes,
-                        fetched: bytes,
+            match self.blocking_step(backend, &request, phase).await? {
+                Step::Done { acquired, verified } => {
+                    return acquired.map(|shared| {
+                        let bytes = shared.1;
+                        Settled::Acquired {
+                            acquisition: MapAcquisition::new(shared, bytes),
+                            verified,
+                        }
                     });
                 }
+                Step::Unchanged(unchanged) => return Ok(Settled::Unchanged(unchanged)),
                 Step::Wait {
-                    mut done,
+                    done,
                     same_frontier,
+                    trigger,
                 } => {
-                    let started = Instant::now();
-                    // The flight's guard always publishes before dropping its
-                    // sender, so a closed channel without a value is
-                    // unreachable; it is still an error, never a hang.
-                    let outcome = async {
-                        match done.wait_for(Option::is_some).await {
-                            Ok(value) => (*value).clone(),
-                            Err(_) => None,
-                        }
+                    let outcome = Self::wait(done, &mut waited).await;
+                    if !same_frontier {
+                        continue;
                     }
-                    .instrument(tracing::info_span!(
-                        "wait template_map",
-                        otel.kind = "internal"
-                    ))
-                    .await;
-                    waited += started.elapsed();
-                    if same_frontier {
-                        let acquired = outcome.unwrap_or_else(|| Err(abandoned()));
-                        // A joiner's wait is recorded whatever the shared
-                        // acquisition returned. The lookup outcome is not:
-                        // the acquiring query recorded its own, and a failed
-                        // acquisition records none for anyone.
-                        template_map::record_acquire_wait(waited);
-                        if acquired.is_ok() {
-                            template_map::record_joined_lookup();
-                            #[cfg(any(test, feature = "testing"))]
-                            self.hooks.joined();
-                        }
-                        return acquired.map(|(map, bytes)| MapAcquisition {
-                            map,
-                            bytes,
-                            fetched: 0,
-                        });
-                    }
+                    let joined = Self::join(outcome, waited, trigger);
+                    #[cfg(any(test, feature = "testing"))]
+                    self.hooks.joined(&joined);
+                    return joined.map(|acquisition| Settled::Acquired {
+                        acquisition,
+                        verified: None,
+                    });
                 }
             }
         }
     }
 
-    /// One blocking pass: LIST, then join the running flight or become the
+    /// One [`Self::step`] on the blocking pool, inside `phase`.
+    async fn blocking_step<P: Prior>(
+        self: &Arc<Self>,
+        backend: &Backend,
+        request: &Acquirer<P>,
+        phase: &tracing::Span,
+    ) -> Result<Step<P::Unchanged>, QueryError> {
+        // The phase span itself, never `Span::current()`: when the
+        // subscriber filters the phase out, the current span is the
+        // query, which must not become the phase (`crate::phase`).
+        let span = phase.clone();
+        // The caller's subscriber too, not just its span: the fold opens
+        // its own `derive template_map` span on the blocking thread,
+        // which otherwise resolves only the global default.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let flights = Arc::clone(self);
+        let backend = backend
+            .clone()
+            .with_caller(ourios_parquet::Caller::TemplateMap);
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                phase::in_phase(&span, || flights.step(backend.store_ref(), &request))
+            })
+        })
+        .await
+        .map_err(|e| QueryError::Storage {
+            detail: format!("blocking storage task: {e}"),
+        })?
+    }
+
+    /// Wait for a running flight's result, adding the wait to `waited`.
+    async fn wait(
+        mut done: watch::Receiver<Option<Shared>>,
+        waited: &mut Duration,
+    ) -> Option<Shared> {
+        let started = Instant::now();
+        // The flight's guard always publishes before dropping its sender, so
+        // a closed channel without a value is unreachable; it is still an
+        // error, never a hang.
+        let outcome = async {
+            match done.wait_for(Option::is_some).await {
+                Ok(value) => (*value).clone(),
+                Err(_) => None,
+            }
+        }
+        .instrument(tracing::info_span!(
+            "wait template_map",
+            otel.kind = "internal"
+        ))
+        .await;
+        *waited += started.elapsed();
+        outcome
+    }
+
+    /// A joiner's answer: the shared acquisition's, with none of its bytes.
+    fn join(
+        outcome: Option<Shared>,
+        waited: Duration,
+        trigger: AcquireTrigger,
+    ) -> Result<MapAcquisition, QueryError> {
+        let acquired = outcome.unwrap_or_else(|| Err(abandoned()));
+        // A joiner's wait is recorded whatever the shared acquisition
+        // returned. The lookup outcome is not: the acquiring query recorded
+        // its own, and a failed acquisition records none for anyone.
+        template_map::record_acquire_wait(waited);
+        if acquired.is_ok() {
+            template_map::record_joined_lookup(trigger);
+        }
+        acquired.map(|shared| MapAcquisition::new(shared, 0))
+    }
+
+    /// One blocking pass: LIST, then stop if the listing proves the
+    /// acquisition unnecessary, or join the running flight, or become the
     /// flight and acquire against this listing.
-    fn step(&self, backend: StoreRef<'_>, tenant: &TenantId) -> Result<Step, QueryError> {
-        let resolved = audit_scan::resolve_audit_set(backend, tenant)?;
+    fn step<P: Prior>(
+        &self,
+        backend: StoreRef<'_>,
+        request: &Acquirer<P>,
+    ) -> Result<Step<P::Unchanged>, QueryError> {
+        let tenant = &request.tenant;
+        let listing = audit_scan::list_audit_stream(backend, tenant, TEMPLATE_MAP_FILENAME)?;
+        #[cfg(any(test, feature = "testing"))]
+        self.hooks.after_listing();
+        if let Some(unchanged) = request.prior.unchanged(&listing) {
+            return Ok(Step::Unchanged(unchanged));
+        }
+        let AuditListing {
+            set: resolved,
+            artifact,
+        } = listing;
         let guard = {
             let mut flights = self.lock();
             if let Some(flight) = flights.get(tenant) {
@@ -227,6 +443,7 @@ impl TemplateMapFlights {
                 return Ok(Step::Wait {
                     done: flight.done.clone(),
                     same_frontier: flight.frontier == resolved.frontier(),
+                    trigger: flight.trigger,
                 });
             }
             let (tx, done) = watch::channel(None);
@@ -234,6 +451,7 @@ impl TemplateMapFlights {
                 tenant.clone(),
                 Flight {
                     frontier: resolved.frontier().to_vec(),
+                    trigger: request.trigger,
                     done,
                 },
             );
@@ -244,11 +462,22 @@ impl TemplateMapFlights {
             }
         };
         #[cfg(any(test, feature = "testing"))]
-        self.hooks.before_acquire();
-        let acquired = template_map::load_or_derive_resolved(backend, tenant, resolved)
-            .map(|(map, bytes, _)| (Arc::new(map), bytes));
+        {
+            let in_flight = self.lock().len();
+            self.hooks.before_acquire(tenant, in_flight);
+        }
+        let frontier = P::LEARNS.then(|| resolved.frontier().to_vec());
+        let loaded =
+            template_map::load_or_derive_resolved(backend, tenant, resolved, request.trigger);
+        let verified = match (&loaded, frontier) {
+            (Ok(loaded), Some(frontier)) => {
+                Verified::of_hit(frontier, artifact, loaded.hit_tag.as_ref())
+            }
+            _ => None,
+        };
+        let acquired = loaded.map(|loaded| (Arc::new(loaded.map), loaded.bytes, loaded.persisted));
         guard.finish(acquired.clone());
-        Ok(Step::Done(acquired))
+        Ok(Step::Done { acquired, verified })
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<TenantId, Flight>> {
@@ -268,15 +497,15 @@ fn abandoned() -> QueryError {
 struct FlightGuard<'a> {
     flights: &'a TemplateMapFlights,
     tenant: &'a TenantId,
-    tx: Option<watch::Sender<Option<Acquired>>>,
+    tx: Option<watch::Sender<Option<Shared>>>,
 }
 
 impl FlightGuard<'_> {
-    fn finish(mut self, acquired: Acquired) {
+    fn finish(mut self, acquired: Shared) {
         self.complete(acquired);
     }
 
-    fn complete(&mut self, acquired: Acquired) {
+    fn complete(&mut self, acquired: Shared) {
         let Some(tx) = self.tx.take() else {
             return;
         };
@@ -292,22 +521,27 @@ impl Drop for FlightGuard<'_> {
 }
 
 /// Test seams (unit tests, and integration tests through the `testing`
-/// feature): acquisitions started, acquisitions that waited on a flight,
-/// `joined` lookups recorded, and a gate the acquiring thread runs just
-/// before it acquires.
+/// feature): acquisitions started, the tenants they were for and how many
+/// flights were in flight as each started, acquisitions that waited on a
+/// flight, `joined` lookups recorded, and a gate the acquiring thread runs
+/// just before it acquires.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) mod hooks {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
+
+    use ourios_core::tenant::TenantId;
 
     pub(crate) type Hook = Arc<dyn Fn() + Send + Sync>;
 
     #[derive(Default)]
     pub(crate) struct Hooks {
         pub(crate) acquisitions: AtomicUsize,
+        pub(crate) started: Mutex<Vec<(TenantId, usize)>>,
         pub(crate) waits: AtomicUsize,
         pub(crate) joins: AtomicUsize,
         pub(crate) before_acquire: Mutex<Option<Hook>>,
+        pub(crate) after_listing: Mutex<Option<Hook>>,
     }
 
     impl Hooks {
@@ -315,11 +549,29 @@ pub(crate) mod hooks {
             self.waits.fetch_add(1, Ordering::SeqCst);
         }
 
-        pub(crate) fn joined(&self) {
-            self.joins.fetch_add(1, Ordering::SeqCst);
+        /// Count a join that answered; a failed shared acquisition is none.
+        pub(crate) fn joined<T, E>(&self, joined: &Result<T, E>) {
+            if joined.is_ok() {
+                self.joins.fetch_add(1, Ordering::SeqCst);
+            }
         }
 
-        pub(crate) fn before_acquire(&self) {
+        pub(crate) fn after_listing(&self) {
+            let hook = self
+                .after_listing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
+        pub(crate) fn before_acquire(&self, tenant: &TenantId, in_flight: usize) {
+            self.started
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((tenant.clone(), in_flight));
             self.acquisitions.fetch_add(1, Ordering::SeqCst);
             let hook = self
                 .before_acquire

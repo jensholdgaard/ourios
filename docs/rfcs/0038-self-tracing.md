@@ -22,6 +22,50 @@ superseded-by: —
 > new scenarios are `drafted` until review confirms they are testable, then
 > move through `specified`, `red` and `green` on their own. Refs #853.
 
+> **Status update (2026-10-13, #985, maintainer-approved) — RFC0038.1's
+> query arm is `red`.** The `resolve files` span is implemented with
+> `ourios.tenant` and `ourios.file_set.live_files`, and
+> `rfc0038_1_query_emits_the_server_span_and_its_resolve_phase` replaces the
+> superseded one-span test, as §6 directs. The arm stays `red` until the
+> other three `ourios.file_set.*` counts and the S3 variant land (#986).
+> RFC0038.8–.11 stay `drafted`.
+
+> **Status update (2026-10-16, maintainer-approved) — RFC0038.1's query arm
+> is `green`.** `resolve files` now carries all four `ourios.file_set.*`
+> counts, asserted by `resolution_spans_the_file_set_under_the_query` and
+> `a_narrow_window_counts_only_the_partitions_it_reaches`. The S3 variant,
+> `s3_resolution_requests_nest_under_the_phase`, passes in the
+> `s3-integration` CI job. `infer schema` is covered by
+> `schema_inference_spans_the_gap_between_resolution_and_the_scan` and
+> `a_failed_inference_marks_its_phase_as_an_error`. All are in
+> `crates/ourios-querier/tests/it/rfc0038_file_set_span.rs` (#986).
+> RFC0038.8–.11 stay `drafted`.
+
+> **Amendment (2026-10-16, #1025, maintainer-approved) — the sweep's
+> planning phase gets a span.** Adds one `INTERNAL` child of
+> `sweep partitions`, `plan partitions`, around the sweep's up-front
+> planning of every tenant, carrying the `ourios.file_set.*` listing and
+> manifest-read counts (§3.8). Amends RFC0038.1's sweep arm and adds
+> RFC0038.17 (§5). No new attribute names. The sweep still emits no
+> `CLIENT` spans, so the §7 question about them stays open. Refs #1019.
+
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — the planning counts.** RFC 0009's
+> amended planner (#1027, implemented in #1030) plans each tenant from one
+> recursive listing and reads a manifest only where it can change the
+> decision. §3.8's count definitions, its reuse paragraph, RFC0038.17's
+> expected counts and the §6 test map are corrected in place to match. The
+> span, its attributes and its names are unchanged.
+
+> **Amendment (2026-10-16, #1039, maintainer-approved) — the sweep's
+> orphan-reclaim phase gets a span.** RFC 0009's orphan-GC amendment moves
+> the GC of every candidate into one pass after the consolidation pass.
+> That pass gets one `INTERNAL` child of `sweep partitions`,
+> `reclaim orphans`, carrying the files it deleted and the deletes that
+> failed, and marked `Error` when any partition's GC failed (§3.9). Amends
+> RFC0038.1's sweep arm (exactly two children) and adds RFC0038.18 (§5).
+> Two new attribute names go to the ourios-semconv registry. GC of one
+> partition still gets no span.
+
 > **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
 > the completed-backlog batch flip. Where a thesis-gate applies it
 > stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
@@ -138,6 +182,19 @@ measure" — minimal new code.
 > the "never gets a span" table: none of the new spans is per record. The
 > discipline is the same one §2 draws. A phase gets a span because it has
 > duration and crosses the process boundary, not because it is a step.
+
+> **Amendment (2026-10-16, #1025, maintainer-approved) — the sweep span
+> gets one phase child (§3.8).** The sweep row now reads: one `INTERNAL` `sweep partitions`
+> span, plus one `INTERNAL` `plan partitions` child: a single aggregate
+> span over the planning of all tenants. Planning one tenant or one
+> partition gets no span of its own, and neither does consolidating a
+> partition.
+
+> **Amendment (2026-10-16, #1039, maintainer-approved) — and a second
+> phase child (§3.9).** The sweep row now reads: one `INTERNAL`
+> `sweep partitions` span, plus two `INTERNAL` children, `plan partitions`
+> and then `reclaim orphans`, each a single aggregate span over all
+> tenants. Reclaiming one partition's orphans gets no span of its own.
 
 ### 3.2 The tracer, in the bootstrap
 
@@ -280,6 +337,28 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 > | The RFC 0033 fold behind a `miss`, `stale`, `torn` or `unknown_version` lookup (not `hit`, not `joined`) | `derive template_map` | `INTERNAL` (child of `load template_map`) |
 > | Waiting on another query's in-flight acquisition, of the same frontier or another; one per single-flight loop iteration that finds one | `wait template_map` | `INTERNAL` (child of `load template_map`) |
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — the schema inference gets a span (§3.7.2).**
+> The table gains this row. It follows the `{action} {target}` rule.
+>
+> | Operation | Span name | Kind |
+> |---|---|---|
+> | Union-schema inference over the resolved files' footers | `infer schema` | `INTERNAL` (child of `POST /v1/query`) |
+
+> **Amendment (2026-10-16, #1025, maintainer-approved) — the sweep's planning phase (§3.8).**
+> The table gains this row. It follows the `{action} {target}` rule.
+>
+> | Operation | Span name | Kind |
+> |---|---|---|
+> | Planning every tenant's consolidation candidates, once per sweep | `plan partitions` | `INTERNAL` (child of `sweep partitions`) |
+
+> **Amendment (2026-10-16, #1039, maintainer-approved) — the sweep's
+> orphan-reclaim phase (§3.9).** The table gains this row. It follows the
+> `{action} {target}` rule.
+>
+> | Operation | Span name | Kind |
+> |---|---|---|
+> | Reclaiming orphan files from every partition the plan marks for GC, once per sweep after consolidation | `reclaim orphans` | `INTERNAL` (child of `sweep partitions`) |
+
 ### 3.6 GenAI/MCP semantic-convention attributes on the tool spans
 
 The MCP tool spans are Ourios's agent-observability surface: an agent driving
@@ -390,6 +469,51 @@ flowchart TD
 >
 > The audit listing, the artifact `GET` and the write-through `PUT` stay
 > directly under `load template_map`.
+
+> **Amendment (2026-10-15, #1014, maintainer-approved) — `infer schema`.** The tree gains a
+> third phase under the query's root, between `resolve files` and the
+> first RFC 0040 operator tree:
+
+```mermaid
+flowchart TD
+    Q["POST /v1/query<br/>SERVER (root)"]
+    R["resolve files<br/>INTERNAL"]
+    I["infer schema<br/>INTERNAL<br/>(at most one: when a live file exists)"]
+    O["RFC 0040 operator trees"]
+    IH["S3.HeadObject × n<br/>CLIENT"]
+    IG["S3.GetObject × m<br/>CLIENT (footers)"]
+    Q --> R
+    Q --> I
+    Q --> O
+    I --> IH
+    I --> IG
+```
+
+> Before the scan can be planned, the querier builds one table schema from
+> every resolved file's footer (`SchemaMode::Union`: RFC 0005 §3.9's union, which
+> RFC 0022's predicate compilation relies on). DataFusion does that per file with a `HEAD` and a
+> footer read, `meta_fetch_concurrency` files at a time. The phase was
+> missing from the list above. It is neither in-process work nor an
+> operator span's I/O, so the "what does not get a span" reasoning never
+> covered it, and the closing claim of this section did not hold for it.
+> On v0.13.2 it was about 3 s of a 16.2 s `nocturnal` query with no span
+> over it at all (trace `36049ab82fd1dc1212e6e3f6cd08c34e`, 2026-10-15),
+> where an inference regression and a slow scan look the same.
+>
+> `infer schema` appears **at most once** per query: exactly once when
+> `resolve files` found at least one live file, and none when it found
+> none (that query runs no scan, as above). It is opened by the caller,
+> which knows the tenant. The listing-table helper stays tenant-free by
+> design. A query whose filter turns out provably empty after inference
+> still has the span, because the footers were read.
+>
+> Where the text below says "both `INTERNAL` spans", it now means all
+> three phase spans. `infer schema` is emitted on both backends, for the
+> same reason: on the local backend its reads are `std::fs` and open no
+> `CLIENT` span. The closing paragraph's pre-scan gap is now attributed
+> to `resolve files` and `infer schema` together. The §3.7.2 heading
+> "The two `INTERNAL` spans" keeps naming the two in its table.
+> `infer schema` has its own table there.
 
 A query run through MCP never passes through the HTTP handler. Its root is
 the `execute_tool query_logs` span (§3.5), which is itself the child of
@@ -502,6 +626,23 @@ normal.
 > write-through `PUT` stay under `load template_map`. No new attribute
 > names.
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — `infer schema`.**
+>
+> | | `infer schema` |
+> |---|---|
+> | Kind | `INTERNAL` |
+> | Parent | the query's root, as for `resolve files` |
+> | Opens / ends | around registering the scan's listing table: from before the first footer read, through the merge, to the registered table (the build after the merge is in-process) |
+> | Status | `Error` iff the inference or the merge fails (the query then fails with it), `error.type` = the error's class as on `resolve files`; `Unset` otherwise |
+> | Required attributes | `ourios.tenant` |
+>
+> It carries no count. The number of files it reads is the sibling `resolve
+> files` span's `ourios.file_set.live_files`, since it reads each of those
+> files once. On the S3 backend, its `CLIENT` children show how many
+> requests it made. A second attribute with the same value would add a
+> name and say nothing new. It installs the query-phase marker (§3.7.3),
+> so its object-store requests open `CLIENT` spans beneath it.
+
 #### 3.7.3 Object-store `CLIENT` spans (S3 backend)
 
 These follow the upstream object-store conventions
@@ -603,9 +744,24 @@ OTel `Context` they attach. With no marker there is no span. So:
 - DataFusion's scan reads carry no marker and no parent, so they emit
   none (§3.7.1).
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — a third phase installs the marker.**
+> `infer schema` installs it too. The inference runs on the calling task
+> rather than the blocking pool, so the marked `Context` is attached to
+> the inference future itself, not entered in a closure. Its `HEAD` and
+> footer reads are DataFusion requests, like the scan's, and they are
+> scoped by the same rule: under a phase span they get `CLIENT` spans,
+> and the scan's reads, under no phase, still get none. Their number is
+> bounded by the query's live files, as `resolve files`' manifest reads
+> are bounded by its partitions.
+
 Extending `CLIENT` spans to the sweep is left open (§7): a sweep over a
 large backlog can make thousands of requests, and that trade-off deserves
 its own look.
+
+> **Amendment (2026-10-16, #1025, maintainer-approved) — still open.** `plan partitions`
+> (§3.8) does **not** install the query-phase marker, so the sweep's
+> requests still open no `CLIENT` span. The planning phase's request count
+> is summarised as attributes on that span instead.
 
 **Always on, not opt-in or separately sampled.** Under that scope the
 spans follow the trace's own sampling decision and have no switch of their
@@ -691,6 +847,12 @@ Two existing Ourios attributes are reused: `ourios.tenant` and
 > `ourios.template_map.derive.reason` attribute. RFC0038.11's
 > no-violation list covers `http.*` as well.
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — no new names.** `infer schema` is a
+> span name, fixed in §3.5 like the others. It carries only `ourios.tenant`
+> and, on failure, `error.type`. Its `CLIENT` children use the §3.7.3
+> upstream set (`S3.HeadObject` is already a §3.7.3 name). No registry
+> change and no `REGISTRY_REF` bump.
+
 **New names, added to the ourios-semconv registry** (a registry change in
 that repo, a `semconv/REGISTRY_REF` bump here, and regenerated
 `ourios-semconv` constants; no name written inline in code):
@@ -757,6 +919,206 @@ implementation, not a reason to invent a local name.
   change here. Whatever RFC 0058 adds to its own error type and signal is
   its own.
 
+### 3.8 The sweep's planning phase (Amendment 2026-10-16)
+
+> This section is new in the 2026-10-16 amendment (#1025,
+> maintainer-approved). It amends §3.1 and §3.5 as the in-place notes
+> there say, and RFC0038.1's sweep arm as the note in §5 says.
+
+**Why.** Issue #1019: on v0.13.1–v0.13.3 every `sweep partitions` span
+took 300–390 s, however little the sweep compacted, and the span had no
+children, so the trace could not say where the time went. The answer came
+from a metrics query instead: about 3,000 listings and 3,000 manifest
+reads per sweep, at about 55 ms each, all of it the planning of every
+tenant's hour partitions (`plan_candidates`). #1020 made the sweep plan
+each tenant once, up front, so planning is now one contiguous phase
+before any partition is consolidated. Planning reads every sealed
+partition's manifest, so its cost grows with retained history rather than
+with the compaction work there is, and it is the part of the sweep most
+likely to regress again. It has duration and makes network calls on the
+S3 backend, which is the §3.7 rule for a phase span.
+
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner).** The
+> per-partition reads described above are what #1019 measured. Under the
+> RFC 0009 planner, a tenant's planning is one recursive listing plus one
+> manifest read per sealed partition whose listing shows two or more
+> committed files and a manifest. Its cost grows with the tenant's object
+> count rather than with its retained hours, and the phase span stays the
+> place a regression would show.
+
+**The span.**
+
+| | `plan partitions` |
+|---|---|
+| Kind | `INTERNAL` |
+| Parent | `sweep partitions` |
+| Opens / ends | around planning every tenant (`plan_tenants`): from before the first tenant's partition listing to the last tenant's finished candidate list. The tenant enumeration before it stays directly under `sweep partitions`. |
+| Cardinality | **exactly one** per sweep whose tenant enumeration succeeds, also when the store has no tenant (the counts are then zero); **none** when the enumeration fails, since the sweep then ends before planning |
+| Status | `Error` iff planning at least one tenant failed, with `error.type` = the first such failure's class (the classes `sweep partitions` already uses: `read`, `write`, `manifest`, `io`, `_OTHER`); `Unset` otherwise. The sweep skips that tenant and goes on, so `sweep partitions` stays `Unset` (its existing rule) |
+| Required attributes | `ourios.file_set.list_request_count`, `ourios.file_set.listed_objects`, `ourios.file_set.manifest_read_count` (§3.7.5), summed over every tenant planned |
+
+It carries no `ourios.tenant`: it covers every tenant. It carries no
+`ourios.file_set.live_files`, since planning hands nothing to a scan; the
+candidates it selects are the existing `ourios.compaction.*` metrics'
+concern.
+
+**The counts.** They are set when the phase ends, on both backends,
+including for a tenant whose planning failed (the work up to the
+failure). They follow §3.7.2's rules:
+
+- `list_request_count` counts each store listing call: the delimited
+  roll-up at each Hive level (`year=`, `month=`, `day=`, `hour=`), and the
+  one recursive listing of each sealed partition whose manifest read
+  succeeded. A call returning an error still counts. HTTP pages are not
+  counted.
+- `listed_objects` counts the objects those calls return, before the
+  seal, manifest and file-type filters. A delimited roll-up returns only
+  common prefixes, which are not objects.
+- `manifest_read_count` counts each manifest read issued: one per sealed
+  partition examined, whether the manifest is present, absent or fails to
+  read. The querier's S3 resolution only reads manifests its listing shows,
+  so it never issues a read for an absent one; planning reads before it
+  lists, so it does. Both count the reads they issue. On a planning pass
+  this count is therefore also the number of sealed partitions examined,
+  so no separate partition count is defined.
+
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — the counts
+> under the one-listing planner.** The three bullets above describe the
+> per-partition planner and no longer hold. Read instead:
+>
+> - `list_request_count` counts one logical recursive listing of each
+>   tenant's `data/` prefix, failed ones included. HTTP pages are still not
+>   counted. There are no delimited roll-ups and no per-partition listings.
+> - `listed_objects` counts every key that listing returns, before any
+>   filter: keys in unsealed hours, `manifest.json`, `*.tmp` files and
+>   anything outside a canonical hour partition included.
+> - `manifest_read_count` counts the manifest reads actually issued:
+>   one per sealed partition whose listing shows two or more committed
+>   `*.parquet` files **and** a `manifest.json`, whether that read
+>   succeeds or fails. Planning now lists before it reads, so it never
+>   issues a read for an absent manifest, which is the querier's S3
+>   resolution's rule too. The count is **not** the number of partitions
+>   examined: a settled or single-file partition, and a partition without
+>   a manifest, cost no read.
+
+> **Amendment (2026-10-17, #1055, maintainer-approved via the registry
+> decision) — the unsealed count.** `plan partitions` also requires
+> `ourios.compaction.partition.unsealed_count` (int, ourios-semconv
+> v0.3.22): the listed partitions planning skipped because their hour
+> plus `compaction_grace` had not yet passed (RFC 0009 §3.3), summed over
+> every tenant planned.
+> - It is set when the phase ends, with the other counts, and is `0` when
+>   the store has no tenant.
+> - A sweep that ends `ourios.compaction.result=noop` while this count is
+>   above zero is waiting for the seal; it is not stalled.
+> - It is a new name rather than a reuse, because no `ourios.file_set.*`
+>   attribute counts what a resolution leaves out.
+> - Tested by `compactor::tests::the_planning_span_counts_unsealed_partitions`.
+
+**Reusing the `ourios.file_set.*` names.** Planning a tenant is a
+file-set resolution in the registry's sense: for each sealed partition it
+reads the manifest and lists the prefix to resolve the live files and
+their sizes, which is the per-partition work `resolve files` does for a
+query. The registry defines these three attributes for "one file-set
+resolution" and does not tie them to queries. OpenTelemetry's guidance is
+to reuse registered attributes across operations and to tailor the brief
+to each use
+([attribute registry](https://opentelemetry.io/docs/specs/semconv/registry/attributes/),
+[defining attributes](https://opentelemetry.io/docs/specs/semconv/how-to-write-conventions/#defining-attributes)),
+so this amendment reuses them, with the brief on `plan partitions` being
+"summed over every tenant's planning". Reusing them also lets one query
+over `ourios.file_set.manifest_read_count` show both the read path's and
+the sweep's manifest load. Whether the registry briefs should say so is an
+open question (§7).
+
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — the reuse
+> still holds, on a different footing.** Planning no longer reads each
+> sealed partition's manifest and lists its prefix. It lists the tenant's
+> data prefix once and reads only the manifests the listing shows where
+> they can change the decision. That is how the querier's S3 resolution
+> counts: one count per listing call, every object the listing returns
+> before filtering, and one read per manifest the listing showed and the
+> resolution fetched. So the three names still mean the same work on both
+> sides, and the names stay as approved.
+
+**What does not get a span.** Planning one tenant, examining one
+partition, and consolidating one partition are per-item loops, which §3.1
+keeps span-free. A tenant whose planning dominates shows up only in the
+phase's total. Nothing else attributes planning cost to a tenant either:
+`ourios.storage.operation.duration` carries only the operation, the
+caller (`compaction`) and `error.type`, never the tenant. So this
+amendment leaves per-tenant planning cost unattributed. Whether that
+matters is a §7 question. The consolidation pass after
+planning gets no phase span here: its work is already counted by the
+existing `ourios.compaction.*` metrics. The time under
+`sweep partitions` that `plan partitions` does not cover is the one
+tenant listing before it, and the consolidation and RFC 0047 erasure
+passes after it.
+
+> **Amendment (2026-10-16, #1039, maintainer-approved).** The orphan
+> GC that ran inside the consolidation loop now runs as its own pass after
+> it, under `reclaim orphans` (§3.9). The consolidation pass itself still
+> gets no span.
+
+### 3.9 The sweep's orphan-reclaim phase (Amendment 2026-10-16)
+
+> This section is new in the 2026-10-16 orphan-GC amendment (#1039,
+> maintainer-approved). It amends §3.1 and §3.5 as the in-place notes
+> there say, and RFC0038.1's sweep arm as the note in §5 says.
+
+**Why.** The sweep's orphan GC (`gc_orphans`, RFC 0009 RFC0009.4)
+deletes files from object storage, and nothing in a trace showed it:
+not its duration, not what it deleted, not a delete that failed. It ran
+inside the per-partition consolidation loop, which §3.1 keeps span-free,
+so it could not get a span there. RFC 0009's orphan-GC amendment moves it
+into one pass after the consolidation pass. That pass has duration and,
+on the S3 backend, makes one listing, one manifest read and one `DELETE`
+per orphan for each partition it visits, which is the §3.7 rule for a phase span.
+
+**The span.**
+
+| | `reclaim orphans` |
+|---|---|
+| Kind | `INTERNAL` |
+| Parent | `sweep partitions` |
+| Opens / ends | around the GC of every partition the plan marks for GC, for every tenant whose planning succeeded: the candidates, then the sealed non-candidates whose listing shows an orphan (RFC 0009 §3.6, "Which partitions"). It opens after the consolidation pass's last rewrite and before the RFC 0047 erasure pass, and starts after `plan partitions` ends. |
+| Cardinality | **exactly one** per sweep whose tenant enumeration succeeds, also when there is nothing to reclaim; **none** when the enumeration fails, since the sweep then ends before planning. A sweep with no candidate still reclaims from the sealed partitions whose listing shows an orphan (RFC 0009 §3.6, RFC0009.26) and reports them in `reclaimed_count`; the counts are zero only when no partition the plan marks for GC holds an orphan (for example an empty store) |
+| Status | `Error` iff the GC of at least one partition failed, either its scan (an unreadable manifest or a failed listing) or the delete of at least one orphan. `error.type` is the first such failure's class, in pass order: a scan failure takes the class `sweep partitions` already uses (`read`, `write`, `manifest`, `io`, `_OTHER`), and a failed delete is `io`. `Unset` otherwise. The sweep goes on either way, so `sweep partitions` stays `Unset` (its existing rule). |
+| Required attributes | `ourios.compaction.orphan.reclaimed_count`, `ourios.compaction.orphan.failed_count`, summed over every partition GC'd |
+
+It carries no `ourios.tenant`: it covers every tenant. The per-tenant
+split is `ourios.compaction.orphan.reclaimed` (RFC 0009 §3.6).
+
+**The counts.** Set when the phase ends, including when some partition's
+GC failed (the counts up to and after it, since the pass goes on).
+
+- `reclaimed_count` counts the successful delete responses for orphan
+  files. Only an explicit not-found result is excluded. S3 answers a
+  `DELETE` of an absent key with success, so a file another actor removed
+  after the listing is still counted there (RFC 0009 §3.6).
+- `failed_count` counts the orphan files whose delete failed. A partition
+  whose scan failed deletes nothing and adds to neither count; it shows as
+  the span's `Error`.
+
+The two counts equal the sweep's points on
+`ourios.compaction.orphan.reclaimed` without and with `error.type`,
+summed over tenants.
+
+**The names.** Two new attributes, `ourios.compaction.orphan.reclaimed_count`
+and `ourios.compaction.orphan.failed_count` (int), in the
+`ourios.compaction.orphan` namespace beside the two orphan counters. The
+`_count` suffix follows the registry's existing span counts
+(`ourios.file_set.list_request_count`) and keeps the attribute names
+distinct from the metric name `ourios.compaction.orphan.reclaimed`.
+Neither existing registered name fits: the `ourios.file_set.*` counts
+describe a resolution's listings and reads, not deletions.
+
+**What does not get a span.** Reclaiming one partition, and deleting one
+file, are per-item loops, which §3.1 keeps span-free. The pass's listings
+and manifest reads are not counted on the span; the
+`ourios.storage.operation.*` metrics already count them under the
+`compaction` caller.
+
 ## 4. Alternatives considered
 
 **Correlation-only (a tracer that generates ids but exports no spans).** The
@@ -816,6 +1178,27 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > sweep arms, and without a parent the record-sink flush would mint root
 > spans. §7 keeps compaction open.
 
+> **Amendment (2026-10-16, #1025, maintainer-approved) — alternatives for the planning phase (§3.8).**
+>
+> **Counts on `sweep partitions` itself, no child span.** It costs no
+> span name, and the counts alone would have pointed #1019 at planning.
+> But the trace would still not show how much of the sweep's duration
+> planning took, or that it all came before the first partition was
+> rewritten, and a duration attribute is the alternative the 2026-09-28
+> amendment already rejected for the query phases. Rejected; the counts
+> are kept, on the phase span.
+>
+> **One planning span per tenant.** It would attribute the cost to a
+> tenant, but it is a per-item loop, and the span count would grow with
+> the tenant count. Rejected under §3.1. That leaves per-tenant planning
+> cost unattributed: no existing signal carries it, since the storage
+> metric has no tenant dimension (§3.8, §7).
+>
+> **New `ourios.compaction.plan.*` attribute names.** Names scoped to
+> compaction would avoid stretching "one file-set resolution" over many
+> tenants. They would add three registry entries meaning the same work as
+> three that exist. Not chosen; §7 keeps it as the fallback.
+
 ## 5. Acceptance criteria
 
 > **Scenario RFC0038.1 — request-scoped operations open exactly one span, and
@@ -864,6 +1247,29 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > On the S3 backend, the fold's object-store requests' `CLIENT` spans are
 > children of `derive template_map`, not of `load template_map`. "No other
 > span is produced" now applies to this extended set.
+
+> **Amendment (2026-10-15, #1014, maintainer-approved) — RFC0038.1's query arm gains `infer
+> schema`.** The span set above also contains, under the query's root,
+> **at most one** `infer schema`: exactly one iff `resolve files` found at
+> least one live file. On the S3 backend, its `CLIENT` children are its
+> `HEAD` and footer reads. "No other span is produced" now applies to this
+> extended set.
+
+> **Amendment (2026-10-16, #1025, maintainer-approved) — RFC0038.1's sweep arm (§3.8).** For
+> the compaction sweep, "one internal span for the sweep" now reads: one
+> `INTERNAL` `sweep partitions` span, the sweep's root, with **exactly
+> one** `INTERNAL` `plan partitions` child when the tenant enumeration
+> succeeds and **none** when it fails. No other span is produced. The
+> query, MCP and ingest arms and the log-correlation clause are unchanged.
+> RFC0038.10's "the sweep produces exactly the spans RFC0038.1 fixes"
+> follows this arm.
+
+> **Amendment (2026-10-16, #1039, maintainer-approved) — RFC0038.1's
+> sweep arm, again (§3.9).** "Exactly one `INTERNAL` `plan partitions`
+> child" now reads: **exactly two** `INTERNAL` children when the tenant
+> enumeration succeeds, `plan partitions` and `reclaim orphans`, the
+> second starting after the first ends, and **none** when it fails. No
+> other span is produced. The other arms are unchanged.
 
 > **Scenario RFC0038.2 — the ingest hot path mints no per-record spans.**
 > **Given** traces enabled and an always-on sampler,
@@ -972,6 +1378,18 @@ are `drafted`.
 > span carries `ourios.template_map.derive.reason` and lies within its
 > parent's interval.
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — RFC0038.8 and `infer schema`.** The
+> zero-row and row-returning traces each have exactly one `infer schema`
+> child of the root, carrying `ourios.tenant`. The no-file trace has none.
+> `infer schema` starts after `resolve files` ends and ends before the
+> first RFC 0040 operator span starts, which replaces "`resolve files`
+> ends before the first RFC 0040 operator span starts". "Every `CLIENT`
+> span is a child of …" gains `infer schema`. The `CLIENT` spans under it
+> are `S3.HeadObject` and `S3.GetObject` only, with `aws.s3.key` equal to
+> one of the resolved files' keys. Their number is not fixed, since
+> DataFusion decides how it reads a footer. "No `CLIENT` span exists for
+> the scan's own reads" stands.
+
 > **Scenario RFC0038.9 — the span harness sees spans opened off the calling
 > thread.**
 > **Given** the harness used by RFC0038.1's query arm and RFC0038.8,
@@ -1075,6 +1493,62 @@ maintainer-approved).
 > `Unset`, since the wait itself completed. Its `load template_map` is
 > `Error`, with an `error.type` equal to the shared failure's class
 > (`storage`).
+
+The following scenario is added by the 2026-10-16 amendment (§3.8, #1025,
+maintainer-approved).
+
+> **Scenario RFC0038.17 — the sweep's planning phase is a span that
+> counts its listings and manifest reads.**
+> **Given** traces enabled with an always-on sampler, and a store with two
+> tenants, one holding a sealed hour partition with two files and a
+> manifest-less sealed partition, the other an unsealed partition,
+> **When** a compaction sweep runs,
+> **Then** `sweep partitions` has exactly one `plan partitions` child, of
+> kind `INTERNAL`, that lies within its parent's interval and ends before
+> the sweep reports its first committed partition,
+> **And** its `ourios.file_set.list_request_count`,
+> `ourios.file_set.listed_objects` and
+> `ourios.file_set.manifest_read_count` equal the counts the fixture
+> implies under §3.8's rules (one manifest read per sealed partition, none
+> for the unsealed one), and its status is `Unset`,
+> **And** when one tenant's planning fails (an unreadable tenant
+> directory), `plan partitions` has status `Error` with that failure's
+> `error.type`, still carries the counts up to the failure, and the sweep
+> goes on to plan and compact the other tenant with `sweep partitions`
+> `Unset`.
+
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — RFC0038.17's
+> counts.** "One manifest read per sealed partition, none for the unsealed
+> one" now reads: one listing per tenant; every key those listings return,
+> the unsealed partition's included; and one manifest read per sealed
+> partition listed with two or more committed files and a manifest, so
+> **none** for the scenario's fixture, whose files have no manifest. The
+> failure clause is unchanged: the failing tenant's one listing still
+> counts.
+
+The following scenario is added by the 2026-10-16 orphan-GC amendment
+(§3.9, #1039, maintainer-approved).
+
+> **Scenario RFC0038.18 — the sweep's orphan-reclaim phase is a span that
+> counts what it deleted.**
+> **Given** traces enabled with an always-on sampler, and a store with a
+> sealed candidate partition holding two orphan files a crashed
+> compaction left,
+> **When** a compaction sweep runs,
+> **Then** `sweep partitions` has exactly one `reclaim orphans` child, of
+> kind `INTERNAL`, that starts after `plan partitions` ends and after the
+> sweep's last consolidation commit (an RFC 0047 erasure rewrite, which
+> runs after it, is not one), and lies within its parent's interval,
+> **And** its `ourios.compaction.orphan.reclaimed_count` is 2, its
+> `ourios.compaction.orphan.failed_count` is 0, and its status is `Unset`,
+> **And** on a store with no orphan (a candidate without one, or an empty
+> store), the span is still there with both counts 0,
+> **And** a sweep with no candidate that finds an orphan beside a settled
+> partition reports it in `reclaimed_count` (RFC0009.26),
+> **And** when an orphan's delete fails (its partition directory is
+> read-only), `reclaim orphans` has status `Error` with
+> `error.type = io` and `failed_count` 1, and `sweep partitions` stays
+> `Unset`.
 
 ## 6. Testing strategy
 
@@ -1188,6 +1662,135 @@ Mapped to `CLAUDE.md` §6.2:
 >   returns no rows and so acquires no template map, so neither exercises
 >   the new children.
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — testing `infer schema`.**
+>
+> - **RFC0038.1 (query arm), local backend** — in
+>   `crates/ourios-querier/tests/it/rfc0038_file_set_span.rs`, next to the
+>   `resolve files` tests and under the same scoped harness:
+>   - a query over live files has exactly one `infer schema` under the
+>     query's span, carrying `ourios.tenant`, starting after `resolve
+>     files` ends and ending before the render pass's `load template_map`
+>     starts. The operator spans go to the global tracer provider, which
+>     this scoped harness does not install, so the ordering against them
+>     is RFC0038.8's to assert;
+>   - `an_empty_file_set_still_spans_the_resolution` also asserts that no
+>     `infer schema` span exists. That adds an assertion and weakens
+>     nothing;
+>   - a data file whose footer does not parse fails the query and marks
+>     `infer schema` `Error` with `error.type`, while `resolve files`
+>     stays `Unset`.
+> - **The marker on a future** — a unit test in
+>   `crates/ourios-querier/src/phase.rs`, beside
+>   `only_an_enabled_phase_span_attaches_the_marker`. It asserts that a
+>   future run as a phase sees the marker and the phase span's context
+>   while it is polled, and that a disabled phase span attaches no
+>   marker.
+> - **RFC0038.8, S3 backend** — the `CLIENT` parentage under `infer
+>   schema` joins the RFC0038.8 localstack test, which is still to be
+>   written (#986). Until then the local tests and the phase unit test
+>   above cover the span, and the `ourios-parquet` client-span tests
+>   cover the connector's behaviour under a marked context.
+> - The existing exact-count tests (`rfc0038_1_query_emits_one_server_span`,
+>   `rfc0038_1_mcp_tool_emits_one_internal_span`) are unchanged. An empty
+>   tenant has no live file, so it opens no `infer schema`.
+
+> **Amendment (2026-10-16, #1025, maintainer-approved) — testing `plan partitions` (§3.8).**
+>
+> - **RFC0038.1 (sweep arm)** — `crates/ourios-ingester/src/compactor/tests.rs`.
+>   The existing `rfc0038_1_sweep_emits_one_internal_span` asserts the
+>   superseded one-span contract (`spans.len() == 1`). Changing it is the
+>   contract change this amendment approves (maintainer, 2026-10-16)
+>   (`CLAUDE.md` §6.2). It is replaced, in the change that adds the span
+>   and never weakened first, by
+>   `rfc0038_1_sweep_emits_its_span_and_one_plan_phase`, which asserts
+>   exactly two spans: `sweep partitions` (`INTERNAL`, a root) and
+>   `plan partitions` (`INTERNAL`, its child, in the same trace). The
+>   replacement asserts more than the original: the same name and kind on
+>   the sweep span, plus the child's name, kind and parentage.
+> - **RFC0038.1 (sweep arm, failed enumeration)** — the existing
+>   `a_failed_sweep_marks_its_span_error` is unchanged. It already asserts
+>   exactly one span (`let [span] = …`), which is the arm's "none when the
+>   enumeration fails".
+> - **RFC0038.3** — `rfc0038_3_span_context_survives_spawn_boundaries`
+>   counts `sweep partitions` spans by name and is unchanged. It gains an
+>   assertion that the one `plan partitions` span is that sweep span's
+>   child across `spawn_blocking`.
+> - **RFC0038.17** — in the same file, under the same scoped harness:
+>   - `the_plan_phase_counts_its_listings_and_manifest_reads` drives the
+>     two-tenant fixture through `run_sweep_committing`, asserts the three
+>     counts, `Unset`, the interval within the parent, and that the phase
+>     ends before the first commit callback;
+>   - `a_failed_tenant_plan_marks_the_plan_phase_error` makes one tenant's
+>     directory unreadable, and asserts `Error` with `error.type = "io"` on
+>     `plan partitions`, the counts up to the failure, `Unset` on
+>     `sweep partitions`, and the other tenant still compacted;
+>   - `an_empty_store_still_spans_its_planning` asserts the phase and
+>     zero counts on a store with no tenant.
+> - **The counting itself** — unit tests beside `plan_candidates` in
+>   `crates/ourios-parquet/src/compaction/tests/`, over local fixtures:
+>   the counts for sealed, unsealed and manifest-less partitions, and the
+>   counts kept on the error path. `plan_candidates`' existing tests are
+>   unchanged; the counted form returns the same candidates.
+> - **RFC0038.10** — the sweep clause reuses RFC0038.1's sweep test, as
+>   before; it now expects the two spans above and no `CLIENT` span.
+> - No `criterion` guard: one span per sweep, never per tenant or per
+>   partition (RFC0038.2's invariant), and the counting is integer
+>   increments beside store calls that each take milliseconds.
+
+> **Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner) — the
+> expected counts in the tests above.** #1030 changes the planner's I/O, not
+> the counting rules, so the tests keep their names and their assertions
+> other than these counts `(list_request_count, listed_objects,
+> manifest_read_count)`:
+>
+> | Test | Before | After |
+> |---|---|---|
+> | `planning_counts_its_listings_and_manifest_reads` (`ourios-parquet`) | 5, 2, 1 | 1, 3, 0 |
+> | `planning_keeps_its_counts_on_the_error_path` (`ourios-parquet`) | 4, 0, 1 | 1, 3, 1 |
+> | `the_plan_phase_counts_its_listings_and_manifest_reads` (`ourios-ingester`) | 9, 2, 1 | 2, 3, 0 |
+> | `a_failed_tenant_plan_marks_the_plan_phase_error` (`ourios-ingester`) | 6, 2, 1 | 2, 2, 0 |
+> | `planning_a_tenant_with_no_data_makes_one_listing`, `an_empty_store_still_spans_its_planning` | unchanged | unchanged |
+>
+> `list_request_count` and `manifest_read_count` only fall. `listed_objects`
+> rises where the tenant listing returns keys the per-partition listings
+> never fetched (an unsealed hour's file) or fetched only after the manifest
+> read (the error-path fixture's three keys). The error-path test still
+> counts its failing manifest read, because that partition lists two
+> files and a manifest.
+
+> **Amendment (2026-10-16, #1039, maintainer-approved) — testing
+> `reclaim orphans` (§3.9).**
+>
+> - **RFC0038.1 (sweep arm)** — `crates/ourios-ingester/src/compactor/tests.rs`.
+>   `rfc0038_1_sweep_emits_its_span_and_one_plan_phase` asserts exactly two
+>   spans. Changing that to three is the contract change this amendment
+>   approves (maintainer, 2026-10-16) (`CLAUDE.md` §6.2). The test becomes
+>   `rfc0038_1_sweep_emits_its_span_and_two_phases` in the change that adds
+>   the span. It keeps every other assertion (the sweep's name, kind and
+>   root parentage; `plan partitions`' name, kind, parentage and trace) and
+>   adds the same for `reclaim orphans`, plus that it starts after
+>   `plan partitions` ends.
+> - **RFC0038.1 (sweep arm, failed enumeration)** —
+>   `a_failed_sweep_marks_its_span_error` is unchanged: exactly one span.
+> - **RFC0038.3** — `rfc0038_3_span_context_survives_spawn_boundaries`
+>   gains an assertion that the one `reclaim orphans` span is the sweep
+>   span's child across `spawn_blocking`.
+> - **RFC0038.17** — unchanged. Its tests find `plan partitions` by name.
+> - **RFC0038.18** — in the same file, under the same scoped harness:
+>   - `the_reclaim_phase_counts_the_orphans_it_deleted`: two orphans, the
+>     two counts, `Unset`, the interval after `plan partitions` and after
+>     the last consolidation commit callback (the fixture has no erasure);
+>   - `an_idle_reclaim_phase_still_spans_with_zero_counts`: no orphan
+>     anywhere, as a candidate without one and as an empty store;
+>   - `rfc0009_26_a_later_sweep_reclaims_what_an_interrupted_one_left`
+>     (RFC 0009's test, also asserting this span): no candidate,
+>     `reclaimed_count` 1;
+>   - `a_failed_orphan_delete_marks_the_reclaim_phase_error`: a read-only
+>     partition directory holding an orphan; `Error`, `error.type = io`,
+>     `failed_count` 1, and `sweep partitions` `Unset`.
+> - No `criterion` guard: one span per sweep, and the counts are integer
+>   increments beside store calls.
+
 ## 7. Open questions
 
 - [ ] Should the per-Export-batch span live on `ingest_bound` (single choke
@@ -1243,6 +1846,39 @@ Mapped to `CLAUDE.md` §6.2:
       Should it still get a one-line in-place note pointing at the phase
       siblings?
 
+**Open questions added by the 2026-10-16 amendment (§3.8).**
+
+- [x] **Reuse of `ourios.file_set.*` on `plan partitions`.** §3.8 reads
+      planning as a file-set resolution and sums the counts over tenants.
+      The fallback was three new registry entries
+      (`ourios.compaction.plan.list_request_count`,
+      `ourios.compaction.plan.listed_objects`,
+      `ourios.compaction.plan.manifest_read_count`). **Decided: reuse**,
+      by the maintainer on 2026-10-16. No registry entries are added.
+- [ ] **Registry briefs.** Should the briefs of the reused names say they
+      apply to the sweep's planning too? That is a wording change in
+      ourios-semconv, not a new name.
+- [x] **Replacing the one-span sweep test.** §6 replaces
+      `rfc0038_1_sweep_emits_one_internal_span`, whose one-span assertion
+      the amended sweep arm contradicts, with
+      `rfc0038_1_sweep_emits_its_span_and_one_plan_phase`. **Decided:
+      replace**, by the maintainer on 2026-10-16 (`CLAUDE.md` §6.2).
+- [ ] **A partition count.** §3.8 defines none, since
+      `manifest_read_count` equals the sealed partitions examined, and the
+      unsealed ones cost only their share of the `hour=` roll-ups. A count
+      of all partitions walked would need a new name. Add it only if a
+      trace is found that needs it.
+      *Amendment (2026-10-16, #1027, follows the approved RFC 0009 planner):* the premise
+      no longer holds. `manifest_read_count` now counts only the manifests
+      read, not the sealed partitions examined, so the trace has no count of
+      partitions planned. The question stays open on that basis.
+- [ ] **Per-tenant planning cost.** With one aggregate span and no
+      tenant on `ourios.storage.operation.duration`, nothing says which
+      tenant's history dominates planning. Does that matter? If it does,
+      the candidates are a per-tenant count on a metric (a new name, or
+      `ourios.tenant` on an existing compaction metric), not a span per
+      tenant, which §3.1 rules out.
+
 **Future work (out of scope here).** A reusable **DataFusion → OTel
 instrumentation** — per-operator / per-`ExecutionPlan`-node sub-spans, bridging
 DataFusion's existing per-operator `MetricsSet` into the trace — would deepen
@@ -1297,6 +1933,13 @@ scope, not ingest) already covers it.
   [recording errors](https://opentelemetry.io/docs/specs/semconv/general/recording-errors/);
   [attribute naming](https://opentelemetry.io/docs/specs/semconv/general/naming/);
   `db.response.returned_rows` (`Development`, opt-in; not reused, §3.7.5).
+- Amendment 2026-10-16 (§3.8): issue #1019 (the 300–390 s sweeps with no
+  children), PR #1020 (plan each tenant once per sweep);
+  `crates/ourios-ingester/src/compactor/mod.rs` (`plan_tenants`),
+  `crates/ourios-parquet/src/compaction/plan.rs` (`plan_candidates`);
+  OpenTelemetry [attribute registry](https://opentelemetry.io/docs/specs/semconv/registry/attributes/)
+  and [defining attributes](https://opentelemetry.io/docs/specs/semconv/how-to-write-conventions/#defining-attributes)
+  (reuse registered attributes across conventions, tailoring the brief).
 
 ## 9. Amendment history
 
@@ -1318,3 +1961,34 @@ scope, not ingest) already covers it.
   attributes they carry (§3.7.3). Amends RFC0038.1's query arm and
   RFC0038.8's parentage, adds RFC0038.12–.16 and maps them to #965's
   tests (§5, §6). No new attribute names. Matches #965.
+- **2026-10-15 — `infer schema` (#1014, maintainer-approved).** Adds `infer schema` as an
+  `INTERNAL` child of the query's root around the union-schema footer
+  inference, which no span covered, and lets it install the query-phase
+  marker so its `HEAD` and footer reads get `CLIENT` spans (§3.5,
+  §3.7.1–§3.7.3, §3.7.5). Amends RFC0038.1's query arm and RFC0038.8, and
+  maps the tests (§5, §6). No new attribute names.
+- **2026-10-16 — the sweep's planning phase (#1025,
+  maintainer-approved).** Adds §3.8: `plan partitions` as the one
+  `INTERNAL` child of `sweep partitions`, around #1020's up-front planning
+  of every tenant, carrying the three `ourios.file_set.*` work counts
+  summed over tenants. In-place notes in §3.1, §3.5, §3.7.3, §4, §5
+  (RFC0038.1's sweep arm) and §6, which names the one-span sweep test the
+  change replaces. New scenario RFC0038.17 and two open questions in §7.
+  No new attribute names; the sweep still emits no `CLIENT` spans.
+  Motivated by #1019.
+- **2026-10-16 — the planning counts under RFC 0009's one-listing
+  planner (#1027, implemented in #1030).** In-place notes correct §3.8's
+  count definitions and its reuse argument, RFC0038.17's expected counts,
+  the §6 test map's counts and the §7 partition-count question. The span,
+  its attributes and the approved reuse of the `ourios.file_set.*` names
+  are unchanged.
+- **2026-10-16 — the sweep's orphan-reclaim phase (#1039,
+  maintainer-approved).** Adds §3.9: `reclaim orphans` as the second
+  `INTERNAL` child of `sweep partitions`, around the orphan GC pass that
+  RFC 0009's orphan-GC amendment moves after consolidation. It carries
+  `ourios.compaction.orphan.reclaimed_count` and
+  `ourios.compaction.orphan.failed_count` (new registry names) and is
+  `Error` with `error.type` when a partition's GC failed. In-place notes in
+  §3.1, §3.5, §3.8, §5 (RFC0038.1's sweep arm: exactly two children) and
+  §6, which names the two-span test that becomes a three-span test. New
+  scenario RFC0038.18.

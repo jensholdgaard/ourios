@@ -34,6 +34,10 @@ const HOUR_NS: u64 = 3_600_000_000_000;
 /// so only the `template_id` predicate — not time — drives pruning.
 const HUGE_WINDOW: u64 = 100 * 365 * 24 * 60 * 60 * 1_000_000_000;
 
+/// Each test installs its own process-global `MeterProvider`; an in-process
+/// `cargo test` runs them on threads of one process, so they take turns.
+static GLOBAL_METER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn mined_at(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
     MinedRecord {
         tenant_id: TenantId::new(tenant),
@@ -125,6 +129,7 @@ async fn rfc0016_6_pruning_is_observable() {
     // instruments resolve against it. A multi-hour corpus where each file holds
     // a distinct `template_id` (distinct hour ⇒ distinct partition ⇒ distinct
     // file/row group), so a `template_id` predicate prunes the others.
+    let _global_meter = GLOBAL_METER.lock().await;
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
     let bucket = tempfile::tempdir().unwrap();
     let recs: Vec<MinedRecord> = (0..4)
@@ -191,9 +196,111 @@ async fn rfc0016_6_pruning_is_observable() {
     assert_query_reads(&rms, bucket.path(), &json);
 }
 
+/// A `400` before kind dispatch — a missing or off-grammar tenant, or a body
+/// that does not parse — is recorded on `ourios.query.duration` as kind
+/// `rejected`, with the response's error kind as `error.type`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_400_before_kind_dispatch_records_its_error_type() {
+    let _global_meter = GLOBAL_METER.lock().await;
+    let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
+    let bucket = tempfile::tempdir().unwrap();
+    let app = router(bucket.path().to_path_buf(), HUGE_WINDOW);
+    let off_grammar = "x".repeat(129);
+    let cases = [
+        (None, "template_id == 1", "missing_tenant"),
+        (
+            Some(off_grammar.as_str()),
+            "template_id == 1",
+            "invalid_tenant",
+        ),
+        (Some("acme"), "template_id ==", "invalid_query"),
+    ];
+
+    for (tenant, query, kind) in cases {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/query")
+            .header(header::CONTENT_TYPE, "text/plain");
+        if let Some(tenant) = tenant {
+            request = request.header("X-Ourios-Tenant", tenant);
+        }
+        let request = request.body(Body::from(query)).expect("build request");
+        let response = app.clone().oneshot(request).await.expect("oneshot");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{kind}: {json}"
+        );
+        assert_eq!(json["error"]["kind"], kind, "{json}");
+    }
+
+    guard.force_flush().expect("force_flush");
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let AggregatedMetrics::F64(MetricData::Histogram(hist)) =
+        metric_data(&rms, semconv::OURIOS_QUERY_DURATION)
+    else {
+        panic!("query.duration should be an f64 histogram");
+    };
+    let mut recorded: Vec<(String, u64)> = hist
+        .data_points()
+        .map(|dp| {
+            let attr = |key: &str| {
+                dp.attributes()
+                    .find(|kv| kv.key.as_str() == key)
+                    .map(|kv| kv.value.as_str().into_owned())
+            };
+            assert_eq!(
+                attr(semconv::OURIOS_QUERY_KIND).as_deref(),
+                Some("rejected"),
+            );
+            (attr("error.type").expect("error.type is set"), dp.count())
+        })
+        .collect();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        [
+            ("invalid_query".to_owned(), 1),
+            ("invalid_tenant".to_owned(), 1),
+            ("missing_tenant".to_owned(), 1),
+        ],
+    );
+}
+
+/// The query instruments, each exported with the registry description and
+/// unit.
+const REGISTERED: [ourios_telemetry::metadata_guard::Registered; 4] = [
+    (
+        semconv::OURIOS_QUERY_DURATION,
+        semconv::OURIOS_QUERY_DURATION_DESCRIPTION,
+        semconv::OURIOS_QUERY_DURATION_UNIT,
+    ),
+    (
+        semconv::OURIOS_QUERY_ROW_GROUPS,
+        semconv::OURIOS_QUERY_ROW_GROUPS_DESCRIPTION,
+        semconv::OURIOS_QUERY_ROW_GROUPS_UNIT,
+    ),
+    (
+        semconv::OURIOS_QUERY_FILES,
+        semconv::OURIOS_QUERY_FILES_DESCRIPTION,
+        semconv::OURIOS_QUERY_FILES_UNIT,
+    ),
+    (
+        semconv::OURIOS_QUERY_READ_SIZE,
+        semconv::OURIOS_QUERY_READ_SIZE_DESCRIPTION,
+        semconv::OURIOS_QUERY_READ_SIZE_UNIT,
+    ),
+];
+
 /// The query duration and row-group instruments are in the exported stream,
-/// and (#949) no histogram the query path exported uses the SDK's
-/// millisecond buckets.
+/// (#949) no histogram the query path exported uses the SDK's millisecond
+/// buckets, and every exported `ourios.*` metric carries its registry
+/// description and unit.
 fn assert_query_instruments_exported(rms: &[ResourceMetrics]) {
     let names = metric_names(rms);
     for expected in [
@@ -213,6 +320,7 @@ fn assert_query_instruments_exported(rms: &[ResourceMetrics]) {
             semconv::OURIOS_QUERY_READ_SIZE,
         ],
     );
+    ourios_telemetry::metadata_guard::assert_registry_metadata(rms, &REGISTERED);
 }
 
 /// #924 — what the query read. Every live data file of the fixture was

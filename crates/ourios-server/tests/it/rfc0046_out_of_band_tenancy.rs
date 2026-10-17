@@ -98,7 +98,7 @@ async fn start(tmp: &Path, auth_yaml: &str) -> Server {
     );
     let path = tmp.join(format!("config-{}.yaml", now_ns()));
     std::fs::write(&path, config).expect("write config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .arg("--config")
         .arg(&path)
         .env("RFC0046_TOKEN", "tok-acme")

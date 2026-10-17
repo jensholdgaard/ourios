@@ -8,28 +8,51 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// The manifest a commit replaces.
+#[derive(Clone, Copy)]
+pub(super) enum Base<'e> {
+    /// None yet: the commit creates the first one.
+    Absent,
+    /// The manifest read before the rewrite, with its `ETag` (`None` if the
+    /// backend exposes none).
+    Current(Option<&'e str>),
+}
+
 /// Commit `manifest` to `key` in `store` with the backend-appropriate atomic
 /// swap (CLAUDE.md §3.5 / RFC0009.3 — no torn read either way):
 ///
+/// - **First commit (any backend):** a create-if-absent conditional PUT
+///   ([`Manifest::publish_cas`] with no `ETag`); a peer that created the
+///   manifest first makes it [`Published::Lost`] (RFC 0009 §3.4).
 /// - **CAS-capable backend (S3, RFC0019.4):** an `If-Match` conditional PUT
-///   ([`Manifest::publish_cas`]) against `expected`; a lost race returns
-///   [`Published::Lost`].
-/// - **Local backend (RFC0019.7 — byte-for-byte unchanged):** `LocalFileSystem`
-///   rejects `PutMode::Update`, so commit with an atomic overwrite (it stages to
+///   against the base's `ETag`; a lost race returns [`Published::Lost`].
+/// - **Local backend (RFC0019.7):** `LocalFileSystem` rejects
+///   `PutMode::Update`, so a later commit is an atomic overwrite (it stages to
 ///   a temp object and renames it into place — the same swap
-///   [`Manifest::write_atomic`] performed pre-RFC-0019). Last-writer-wins; there
-///   is no S3-style CAS race to lose on a single local host, so it always wins.
+///   [`Manifest::write_atomic`] performed pre-RFC-0019). Last-writer-wins; one
+///   compactor per local store (RFC0009.24), so it always wins.
 pub(super) fn commit_manifest(
     store: &Store,
     key: &str,
     manifest: &Manifest,
-    expected: Option<&str>,
+    base: Base<'_>,
 ) -> Result<Published, CompactionError> {
-    if store.supports_conditional_update() {
-        return manifest
-            .publish_cas(store, key, expected)
-            .map_err(CompactionError::Manifest);
-    }
+    let expected = match base {
+        Base::Absent => None,
+        Base::Current(etag) if store.supports_conditional_update() => etag,
+        Base::Current(_) => return overwrite_manifest(store, key, manifest),
+    };
+    manifest
+        .publish_cas(store, key, expected)
+        .map_err(CompactionError::Manifest)
+}
+
+/// The local backend's last-writer-wins commit over an existing manifest.
+fn overwrite_manifest(
+    store: &Store,
+    key: &str,
+    manifest: &Manifest,
+) -> Result<Published, CompactionError> {
     manifest.validate().map_err(CompactionError::Manifest)?;
     let bytes = manifest
         .to_json()
@@ -54,12 +77,14 @@ pub struct OrphanGc {
 /// crashed before its in-process GC finished (RFC0009.4). The commit point is
 /// the atomic manifest swap (§3.4), so a crash always freezes a partition at a
 /// clean generation; what it can leave behind is dead files the manifest does
-/// not name. When a `manifest.json` is present it is authoritative (RFC0009.3):
-/// every `*.parquet` object **not** named by it is provably dead — a pre-commit
-/// consolidated file, or a superseded input the post-commit GC never reached —
-/// and any `*.parquet.tmp` is an interrupted publish (absent on S3). Both are
-/// safe to unlink. With **no** manifest the glob is the live set, so no
-/// `*.parquet` is an orphan and only stray `*.parquet.tmp` are reclaimed.
+/// not name. Under the RFC 0009 §3.4 live-set rule ([`LiveSet::is_orphan`])
+/// the dead files are: a flush file the manifest lists as consumed (an input
+/// the post-commit GC never reached), a compaction output
+/// (`<uuid>.g<N>.parquet`) whose generation *N* the manifest has reached
+/// without naming it, and any `*.parquet.tmp` (an interrupted publish, absent
+/// on S3). An unconsumed flush file is never an orphan — a late write is live
+/// — and an output for a generation past the manifest's is kept, since its
+/// compaction may still commit it (RFC0009.17).
 ///
 /// Idempotent, never touches a live file, and safe to run on any sealed
 /// partition at any time — so orphans left by a crash are *reclaimable*
@@ -73,32 +98,39 @@ pub struct OrphanGc {
 /// surfaced — an orphan that outlives one pass is reclaimed by the next.
 pub fn gc_orphans(store: &Store, partition: &PartitionKey) -> Result<OrphanGc, CompactionError> {
     let prefix = partition_data_prefix(partition);
-    let live: Option<HashSet<String>> =
-        read_manifest(store, partition)?.map(|m| m.files.into_iter().collect());
+    let manifest = read_manifest(store, partition)?;
     let keys = store
         .list_blocking(Some(&prefix))
         .map_err(|e| store_io("list", &prefix, e))?;
+    let live = LiveSet::new(manifest.as_ref());
     let mut gc = OrphanGc::default();
-    for object in keys {
-        let name = basename(&object);
-        // `.parquet.tmp` is always a dead interrupted publish. A `.parquet` is
-        // an orphan only when a manifest names a set that excludes it (no
-        // manifest ⇒ glob ⇒ every `.parquet` is live). Anything else
-        // (`manifest.json`, a future sidecar) is not ours.
-        let orphan = if name.ends_with(".parquet.tmp") {
-            true
-        } else if name.ends_with(".parquet") {
-            live.as_ref().is_some_and(|l| !l.contains(name))
-        } else {
-            false
-        };
-        if orphan {
-            match store.delete_blocking(&object) {
-                Ok(()) => gc.reclaimed += 1,
-                Err(e) if e.is_not_found() => {}
-                Err(_) => gc.failures += 1,
-            }
+    let orphans = keys
+        .iter()
+        .filter(|object| live.is_orphan(basename(object)));
+    for object in orphans {
+        match unlink(store, object) {
+            Unlink::Removed => gc.reclaimed += 1,
+            Unlink::AlreadyGone => {}
+            Unlink::Failed => gc.failures += 1,
         }
     }
     Ok(gc)
+}
+
+/// What deleting one orphan did.
+enum Unlink {
+    Removed,
+    /// Not found: already reclaimed (S3 `DELETE` is idempotent; the local
+    /// backend reports not-found).
+    AlreadyGone,
+    /// Left for a later pass.
+    Failed,
+}
+
+fn unlink(store: &Store, object: &str) -> Unlink {
+    match store.delete_blocking(object) {
+        Ok(()) => Unlink::Removed,
+        Err(e) if e.is_not_found() => Unlink::AlreadyGone,
+        Err(_) => Unlink::Failed,
+    }
 }

@@ -262,6 +262,19 @@ of wrapping it in chart-specific keys. The authoritative lists:
   — `OTEL_EXPORTER_OTLP_PROTOCOL`, per-signal `_ENDPOINT` overrides,
   `_HEADERS`, `_TIMEOUT`, `_COMPRESSION`, …
 
+The transport is `grpc` unless `OTEL_EXPORTER_OTLP_PROTOCOL` (or a per-signal
+`OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_PROTOCOL`, which wins) is
+`http/protobuf`. Ourios keeps gRPC as its default where the OTLP spec defaults
+to `http/protobuf`, so existing deployments pointed at a `:4317` endpoint keep
+working. `http/json` and unknown values are not supported: the signal falls
+back to gRPC, and start-up logs one `ourios.server.telemetry.protocol_unsupported`
+warning per affected signal naming the requested value
+(`ourios.server.telemetry.requested_protocol`) and the exporter actually built
+(`otel.component.type`, e.g. `otlp_grpc_log_exporter`). Over
+`http/protobuf`, `otel.exporterEndpoint` is the base URL (e.g.
+`http://collector:4318`) and the SDK appends `/v1/traces`, `/v1/metrics` and
+`/v1/logs`; TLS verifies against the system CA store.
+
 Two things worth setting deliberately before running this in anger:
 
 - **Sampling.** The SDK default is `parentbased_always_on`, so *every* request
@@ -672,10 +685,12 @@ pod sweeping, the receiver and querier disable compaction in their config file
 (`compaction.enabled: false`), so a **single dedicated `compactor` Deployment
 (1 replica)** is the only sweeper.
 
-Scaling that compactor `Deployment` past 1 replica is **safe but unnecessary**:
-the manifest publish-CAS commit (RFC 0009 §3.2 / RFC0013.3–.4) makes concurrent
-sweeps correct — a losing sweeper's consolidated file is just an orphan a later
-sweep reclaims — but it duplicates the per-interval object listing for no gain.
+Keep it at **1 replica**. The Deployment uses the `Recreate` strategy, so an
+upgrade stops the old compactor pod before it starts the new one (RFC0009.24).
+On the local (PVC) backend the manifest commit is last-writer-wins, so two
+compactors running at once can lose rows. On S3 the publish-CAS commit
+(RFC0013.3–.4) keeps concurrent sweeps correct for the data, but a second
+sweeper can still recreate graph tuples that an erasure deleted (#1034).
 A `replicas: 1` Deployment self-heals (k8s reschedules a dead pod; a brief gap
 in this background maintenance is harmless), so leader election isn't needed and
 is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.

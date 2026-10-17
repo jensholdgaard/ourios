@@ -58,11 +58,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{KeyValue, global};
 
+use ourios_core::audit::{EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED};
 use ourios_core::otlp::{KeyValue as OtlpKeyValue, any_value};
 use ourios_core::tenant::TenantId;
 use ourios_semconv as semconv;
 
 mod gauges;
+#[cfg(test)]
+mod zero_points_tests;
 
 use gauges::{Binding, GaugeRegistry, GlobalProvider};
 
@@ -84,8 +87,30 @@ const RESERVOIR_CAP: usize = 1024;
 
 /// Bucket boundaries for `ourios.miner.confidence` (`similarity /
 /// threshold`), exactly as RFC 0001 §6.8 fixes them: straddling the §6.3
-/// decision boundary at 1.0, with `+Inf` implicit.
-const CONFIDENCE_BUCKETS: [f64; 11] = [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0];
+/// decision boundary at 1.0, with `+Inf` implicit. Buckets are
+/// upper-inclusive; `0.99` and `0.999` resolve the values just under 1.0.
+const CONFIDENCE_BUCKETS: [f64; 13] = [
+    0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99, 0.999, 1.0, 1.05, 1.2, 1.5, 2.0,
+];
+
+/// The `ourios.miner.template_change` registry enum: a tenant's
+/// `ourios.miner.merges` zero points (RFC 0001 §6.8).
+const TEMPLATE_CHANGES: [&str; 2] = [
+    EVENT_TYPE_TEMPLATE_WIDENED,
+    EVENT_TYPE_TEMPLATE_TYPE_EXPANDED,
+];
+
+/// The `ourios.miner.parse_failure.reason` registry enum: a tenant's
+/// `ourios.miner.parse_failures` zero points (RFC 0001 §6.8).
+const PARSE_FAILURE_REASONS: [&str; 7] = [
+    "below_floor",
+    "empty_line",
+    "tokenizer_failure",
+    "degenerate_widening",
+    "line_too_long",
+    "template_ceiling",
+    "id_reservation_failed",
+];
 
 /// Bucket boundaries (seconds) for `ourios.miner.duration`, one line's
 /// mining time: microseconds normally, milliseconds when a tree search runs
@@ -394,37 +419,45 @@ impl MinerMetrics {
 
         let merges_total = meter
             .u64_counter(semconv::OURIOS_MINER_MERGES)
-            .with_unit("{merge}")
+            .with_description(semconv::OURIOS_MINER_MERGES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_MERGES_UNIT)
             .build();
         let parse_failures_total = meter
             .u64_counter(semconv::OURIOS_MINER_PARSE_FAILURES)
-            .with_unit("{failure}")
+            .with_description(semconv::OURIOS_MINER_PARSE_FAILURES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_PARSE_FAILURES_UNIT)
             .build();
         let upstream_template_processed = meter
             .u64_counter(semconv::OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED)
-            .with_unit("{log_record}")
+            .with_description(semconv::OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED_UNIT)
             .build();
         let params_overflow_total = meter
             .u64_counter(semconv::OURIOS_MINER_PARAMS_OVERFLOW)
-            .with_unit("{overflow}")
+            .with_description(semconv::OURIOS_MINER_PARAMS_OVERFLOW_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_PARAMS_OVERFLOW_UNIT)
             .build();
         let template_version_changes_total = meter
             .u64_counter(semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES)
-            .with_unit("{change}")
+            .with_description(semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES_UNIT)
             .build();
         let confidence = meter
             .f64_histogram(semconv::OURIOS_MINER_CONFIDENCE)
-            .with_unit("1")
+            .with_description(semconv::OURIOS_MINER_CONFIDENCE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_CONFIDENCE_UNIT)
             .with_boundaries(CONFIDENCE_BUCKETS.to_vec())
             .build();
         let miner_duration = meter
             .f64_histogram(semconv::OURIOS_MINER_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_MINER_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_DURATION_UNIT)
             .with_boundaries(LINE_DURATION_BUCKETS_S.to_vec())
             .build();
         let structured_body_size = meter
             .u64_histogram(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE_UNIT)
             .with_boundaries(STRUCTURED_BODY_SIZE_BUCKETS.to_vec())
             .build();
 
@@ -454,9 +487,46 @@ impl MinerMetrics {
     /// observe `numerator > denominator` (utilization > 1) for a line
     /// in flight.
     pub(crate) fn record_line_denominator(&self, tenant: &TenantId, service: Option<&str>) {
-        let mut st = lock_recovering(&self.state);
-        bump_tenant(&mut st.body_lines, tenant);
-        tally_mut(&mut st.by_service, tenant, service).lines += 1;
+        let first_sight = {
+            let mut st = lock_recovering(&self.state);
+            let first_sight = !st.body_lines.contains_key(tenant);
+            bump_tenant(&mut st.body_lines, tenant);
+            tally_mut(&mut st.by_service, tenant, service).lines += 1;
+            first_sight
+        };
+        if first_sight {
+            self.record_zero_points(tenant);
+        }
+    }
+
+    /// RFC 0001 §6.8's per-tenant zero points: `0` on each lazily-created
+    /// counter, so a tenant with no merges, parse failures or overflows
+    /// exports zero rather than nothing. `ourios.service` has no natural
+    /// first value and is omitted; a required enum attribute gets one
+    /// point per registry member.
+    fn record_zero_points(&self, tenant: &TenantId) {
+        let tenant = KeyValue::new(semconv::OURIOS_TENANT, tenant.as_str().to_owned());
+        for change in TEMPLATE_CHANGES {
+            self.merges_total.add(
+                0,
+                &[
+                    tenant.clone(),
+                    KeyValue::new(semconv::OURIOS_MINER_TEMPLATE_CHANGE, change),
+                ],
+            );
+        }
+        for reason in PARSE_FAILURE_REASONS {
+            self.parse_failures_total.add(
+                0,
+                &[
+                    tenant.clone(),
+                    KeyValue::new(semconv::OURIOS_MINER_PARSE_FAILURE_REASON, reason),
+                ],
+            );
+        }
+        let tenant_only = std::slice::from_ref(&tenant);
+        self.params_overflow_total.add(0, tenant_only);
+        self.template_version_changes_total.add(0, tenant_only);
     }
 
     /// Observe one ingested line's `confidence` on both the §6.8
@@ -522,6 +592,10 @@ impl MinerMetrics {
         service: Option<&str>,
         reason: &'static str,
     ) {
+        debug_assert!(
+            PARSE_FAILURE_REASONS.contains(&reason),
+            "{reason} is not an ourios.miner.parse_failure.reason member"
+        );
         // RFC 0023 §3.4 — the cause dimension rides the one counter
         // as an attribute (the OTel error.type convention), never
         // per-cause counters. Values are the
@@ -586,6 +660,10 @@ impl MinerMetrics {
     /// `ourios.miner.template.version_changes` bump (every merge
     /// advances `template_version` per §6.7 / H5).
     pub(crate) fn record_merge(&self, tenant: &TenantId, event_type: &str) {
+        debug_assert!(
+            TEMPLATE_CHANGES.contains(&event_type),
+            "{event_type} is not an ourios.miner.template_change member"
+        );
         self.merges_total.add(
             1,
             &[
@@ -663,7 +741,9 @@ mod tests {
     fn confidence_buckets_are_the_rfc_0001_6_8_boundaries() {
         assert_eq!(
             super::CONFIDENCE_BUCKETS,
-            [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0],
+            [
+                0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99, 0.999, 1.0, 1.05, 1.2, 1.5, 2.0
+            ],
         );
     }
 

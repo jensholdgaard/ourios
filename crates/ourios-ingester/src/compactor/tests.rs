@@ -12,7 +12,7 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{PartitionKey, Store, Writer};
+use ourios_parquet::{PartitionKey, Store, Writer, plan_candidates};
 
 use super::*;
 
@@ -26,7 +26,7 @@ pub(super) fn store_at(bucket: &Path) -> Store {
 pub(super) const TS0: u64 = 1_775_127_480_000_000_000;
 pub(super) const HOUR: u64 = 3_600_000_000_000;
 /// Well past hour 10's end + grace.
-const NOW_SEALED: u64 = TS0 + 2 * HOUR;
+pub(super) const NOW_SEALED: u64 = TS0 + 2 * HOUR;
 
 pub(super) fn rec(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
     MinedRecord {
@@ -62,7 +62,7 @@ pub(super) fn rec(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
 }
 
 /// Write one committed file for `tenant` at `ts_ns` through the store seam.
-fn write_file(store: &Store, tenant: &str, template_id: u64, ts_ns: u64) {
+pub(super) fn write_file(store: &Store, tenant: &str, template_id: u64, ts_ns: u64) {
     let record = rec(tenant, template_id, ts_ns);
     let mut w = Writer::open_in(store, PartitionKey::derive(&record).expect("derive"))
         .expect("open writer");
@@ -76,19 +76,11 @@ pub(super) fn write_sealed_candidate(store: &Store, tenant: &str) {
     write_file(store, tenant, 2, TS0 + 1_000_000);
 }
 
-/// RFC0038.1 — one `sweep partitions` INTERNAL span per sweep.
-/// `run_sweep` is the sync body `spawn_blocking`ed in production; a scoped
-/// `with_default` subscriber captures the span it opens internally (the
-/// per-tenant / per-file loops below it stay span-free — RFC0038.2).
-#[test]
-fn rfc0038_1_sweep_emits_one_internal_span() {
-    use opentelemetry::trace::SpanKind;
+/// The spans `run` emits under a scoped subscriber over an in-memory
+/// exporter, with what `run` returned.
+pub(super) fn traced<T>(run: impl FnOnce() -> T) -> (T, Vec<opentelemetry_sdk::trace::SpanData>) {
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use tracing_subscriber::prelude::*;
-
-    let bucket = tempfile::tempdir().expect("temp");
-    let store = store_at(bucket.path());
-    write_sealed_candidate(&store, "a");
 
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
@@ -96,23 +88,238 @@ fn rfc0038_1_sweep_emits_one_internal_span() {
         .build();
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
-
-    tracing::subscriber::with_default(subscriber, || {
-        run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
-    });
+    let out = tracing::subscriber::with_default(subscriber, run);
     provider.force_flush().expect("spans flush");
+    (out, exporter.get_finished_spans().expect("spans exported"))
+}
 
-    let spans = exporter.get_finished_spans().expect("spans exported");
+/// The one span named `name`.
+pub(super) fn only_span<'s>(
+    spans: &'s [opentelemetry_sdk::trace::SpanData],
+    name: &str,
+) -> &'s opentelemetry_sdk::trace::SpanData {
+    let [span] = spans
+        .iter()
+        .filter(|s| s.name.as_ref() == name)
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("one `{name}` span, got {spans:?}");
+    };
+    span
+}
+
+pub(super) fn attr(
+    span: &opentelemetry_sdk::trace::SpanData,
+    key: &str,
+) -> Option<opentelemetry::Value> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.clone())
+}
+
+/// The `ourios.file_set.*` counts `plan partitions` carries, in order:
+/// list requests, listed objects, manifest reads.
+fn plan_counts(span: &opentelemetry_sdk::trace::SpanData) -> [Option<opentelemetry::Value>; 3] {
+    [
+        ourios_semconv::OURIOS_FILE_SET_LIST_REQUEST_COUNT,
+        ourios_semconv::OURIOS_FILE_SET_LISTED_OBJECTS,
+        ourios_semconv::OURIOS_FILE_SET_MANIFEST_READ_COUNT,
+    ]
+    .map(|key| attr(span, key))
+}
+
+fn counts(
+    list_requests: i64,
+    listed_objects: i64,
+    manifest_reads: i64,
+) -> [Option<opentelemetry::Value>; 3] {
+    [list_requests, listed_objects, manifest_reads].map(|n| Some(opentelemetry::Value::I64(n)))
+}
+
+/// RFC0038.1 (sweep arm, as amended for RFC 0038 §3.8 and §3.9) — one
+/// `sweep partitions` INTERNAL root per sweep, with exactly two INTERNAL
+/// children, `plan partitions` and then `reclaim orphans`. `run_sweep` is
+/// the sync body `spawn_blocking`ed in production; a scoped `with_default`
+/// subscriber captures the spans it opens (the per-tenant / per-file loops
+/// below them stay span-free — RFC0038.2). Replaces the one-span and then
+/// the two-span test the amendments supersede.
+#[test]
+fn rfc0038_1_sweep_emits_its_span_and_two_phases() {
+    use opentelemetry::trace::{SpanId, SpanKind};
+
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+
+    let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
+    result.expect("sweep");
+
     // The sweep path is our code only (filesystem + Parquet, no async
-    // runtime / DataFusion), so the whole sweep emits exactly this one
-    // span — asserting the total count catches any accidental extra
-    // instrumentation (the "one span per sweep" contract, RFC0038.2).
-    assert_eq!(spans.len(), 1, "exactly one span total, got {spans:?}");
-    assert_eq!(spans[0].name.as_ref(), "sweep partitions");
+    // runtime / DataFusion), so asserting the total count catches any
+    // accidental extra instrumentation.
+    assert_eq!(spans.len(), 3, "exactly three spans total, got {spans:?}");
+    let sweep = only_span(&spans, "sweep partitions");
+    let plan = only_span(&spans, "plan partitions");
+    let reclaim = only_span(&spans, "reclaim orphans");
     assert_eq!(
-        spans[0].span_kind,
-        SpanKind::Internal,
-        "sweep partitions is an INTERNAL span",
+        (&sweep.span_kind, &plan.span_kind),
+        (&SpanKind::Internal, &SpanKind::Internal),
+        "both spans are INTERNAL",
+    );
+    assert_eq!(
+        (
+            sweep.parent_span_id,
+            plan.parent_span_id,
+            plan.span_context.trace_id(),
+        ),
+        (
+            SpanId::INVALID,
+            sweep.span_context.span_id(),
+            sweep.span_context.trace_id(),
+        ),
+        "the sweep is a root, and the plan phase its child in the same trace",
+    );
+    assert_eq!(
+        (
+            &reclaim.span_kind,
+            reclaim.parent_span_id,
+            reclaim.span_context.trace_id(),
+        ),
+        (
+            &SpanKind::Internal,
+            sweep.span_context.span_id(),
+            sweep.span_context.trace_id(),
+        ),
+        "the reclaim phase is an INTERNAL child of the sweep in the same trace",
+    );
+    assert!(
+        plan.end_time <= reclaim.start_time,
+        "reclaiming starts after planning ends"
+    );
+}
+
+/// RFC0038.17 — `plan partitions` counts the planning's listings and
+/// manifest reads over every tenant, lies within the sweep, and ends
+/// before the first partition commits.
+#[test]
+fn the_plan_phase_counts_its_listings_and_manifest_reads() {
+    use opentelemetry::trace::Status;
+
+    // Arrange — `a`: a sealed hour-10 partition with two files and no
+    // manifest. `b`: one file in hour 12, still open at `NOW_SEALED`.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    write_file(&store, "b", 1, NOW_SEALED);
+    let mut first_commit = None;
+
+    // Act
+    let (result, spans) = traced(|| {
+        run_sweep_committing(
+            &store,
+            SweepClock::sealed_at(NOW_SEALED),
+            &CompactionPolicy::default(),
+            &PromotedAttributes::default(),
+            &mut SweepHooks::default(),
+            &mut |_| {
+                first_commit.get_or_insert_with(SystemTime::now);
+            },
+        )
+    });
+
+    // Assert — one recursive listing per tenant, returning `a`'s two files
+    // and `b`'s one; `a`'s partition lists no manifest, so none is read
+    // (RFC 0009 §3.3, 2026-10-16 amendment).
+    assert_eq!(result.expect("sweep").partitions_compacted, 1);
+    let sweep = only_span(&spans, "sweep partitions");
+    let plan = only_span(&spans, "plan partitions");
+    assert_eq!(
+        (plan_counts(plan), &plan.status),
+        (counts(2, 3, 0), &Status::Unset)
+    );
+    assert!(sweep.start_time <= plan.start_time && plan.end_time <= sweep.end_time);
+    let first_commit = first_commit.expect("a partition committed");
+    assert!(
+        plan.end_time <= first_commit,
+        "planning ends before the first commit"
+    );
+}
+
+/// RFC0038.17 — a tenant whose planning fails marks `plan partitions`
+/// `Error`, keeps the counts up to the failure, and the sweep goes on.
+#[cfg(unix)]
+#[test]
+fn a_failed_tenant_plan_marks_the_plan_phase_error() {
+    use opentelemetry::trace::Status;
+
+    // Arrange — `a` plans and compacts; `b`'s directory can't be listed.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    write_file(&store, "b", 1, TS0);
+    let unlistable = Unreadable::new(bucket.path().join("data/tenant_id=b"));
+
+    // Act
+    let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
+    drop(unlistable);
+
+    // Assert — `a`'s one listing of its two objects, no manifest read
+    // (none is listed), plus `b`'s one failed listing.
+    let report = result.expect("a failed tenant does not fail the sweep");
+    assert_eq!(report.partitions_compacted, 1, "{report:?}");
+    let plan = only_span(&spans, "plan partitions");
+    assert!(
+        matches!(plan.status, Status::Error { .. }),
+        "{:?}",
+        plan.status
+    );
+    assert_eq!(
+        (
+            attr(plan, "error.type"),
+            plan_counts(plan),
+            &only_span(&spans, "sweep partitions").status,
+        ),
+        (Some("io".into()), counts(2, 2, 0), &Status::Unset),
+    );
+}
+
+/// RFC0038.17 — a store with no tenant still has its (empty) planning
+/// phase.
+#[test]
+fn an_empty_store_still_spans_its_planning() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+
+    let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
+
+    result.expect("sweep");
+    assert_eq!(
+        plan_counts(only_span(&spans, "plan partitions")),
+        counts(0, 0, 0)
+    );
+}
+
+/// The planning span says how many listed partitions it skipped as not yet
+/// sealed, so a no-op sweep over the open hour reads as such.
+#[test]
+fn the_planning_span_counts_unsealed_partitions() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    write_file(&store, "a", 7, NOW_SEALED);
+    write_file(&store, "b", 7, NOW_SEALED);
+
+    let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
+
+    result.expect("sweep");
+    assert_eq!(
+        attr(
+            only_span(&spans, "plan partitions"),
+            ourios_semconv::OURIOS_COMPACTION_PARTITION_UNSEALED_COUNT
+        ),
+        Some(opentelemetry::Value::I64(2)),
+        "one open hour per tenant"
     );
 }
 
@@ -159,13 +366,14 @@ fn a_failed_sweep_marks_its_span_error() {
     assert_eq!(error_type.as_deref(), Some("io"));
 }
 
-/// A candidate whose manifest bootstrap loses to another compactor wrote
-/// nothing and belongs to the winner, so the sweep stays a clean no-op. The
-/// bootstrap is made to lose by occupying the manifest key with a
-/// directory: it reads as absent, so the create-if-absent runs, and is
+/// A peer creates the partition's first manifest while this compaction
+/// rewrites it: this compaction's create-if-absent commit is lost, its
+/// output is cleaned up, and the sweep reports the loss so it is retried.
+/// The peer is modelled by occupying the manifest key with a directory: it
+/// reads as absent, so the rewrite runs, and the create-if-absent is
 /// refused as already existing.
 #[test]
-fn sweep_leaves_a_candidate_whose_bootstrap_lost_as_a_no_op() {
+fn sweep_cleans_up_a_candidate_whose_first_commit_lost() {
     // Arrange
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
@@ -188,9 +396,16 @@ fn sweep_leaves_a_candidate_whose_bootstrap_lost_as_a_no_op() {
         .collect();
     assert_eq!(
         (report.partitions_compacted, found, report.errors.len()),
-        (0, vec![1], 0),
+        (0, vec![1], 1),
         "{report:?}"
     );
+    let parquet: Vec<_> = store
+        .list_blocking(Some("data/"))
+        .expect("list")
+        .into_iter()
+        .filter(|k| k.ends_with(".parquet"))
+        .collect();
+    assert_eq!(parquet.len(), 2, "only the inputs remain: {parquet:?}");
 }
 
 fn outcome(files_before: usize, commit_lost: bool) -> CompactionOutcome {
@@ -225,19 +440,18 @@ fn a_lost_final_swap_is_a_sweep_error() {
     );
 }
 
-/// A lost bootstrap is benign for a consolidation but not for an erasure,
-/// whose rows are still on disk; a partition with nothing to rewrite is a
-/// no-op for both.
+/// An erasure whose first commit is lost is an error, since its rows are
+/// still on disk; a partition with nothing to rewrite is a no-op for both
+/// an erasure and a consolidation.
 #[test]
-fn a_lost_bootstrap_is_an_error_only_for_an_erasure() {
+fn an_erasure_whose_first_commit_is_lost_is_an_error() {
     let verdicts = [
-        check_committed(outcome(2, false), false).is_err(),
-        check_committed(outcome(2, false), true).is_err(),
+        check_committed(outcome(2, true), true).is_err(),
         check_committed(outcome(0, false), false).is_err(),
         check_committed(outcome(0, false), true).is_err(),
     ];
 
-    assert_eq!(verdicts, [false, true, false, false]);
+    assert_eq!(verdicts, [true, false, false]);
 }
 
 /// A lost swap whose discarded rewrite could not be deleted keeps that
@@ -307,6 +521,135 @@ fn erasure_keeps_the_rows_phase_when_its_manifest_swap_lost() {
         .map(|r| r.phase)
         .collect();
     assert_eq!(pending, vec![ErasurePhase::Rows]);
+}
+
+/// RFC0009.12 — an erasure still rewrites a settled partition: one live
+/// file at or above the small-file size, which candidate planning skips
+/// without reading it. Erasure walks every hour partition itself.
+#[test]
+fn rfc0009_12_erasure_rewrites_a_settled_partition_the_planner_skips() {
+    // Arrange — one file holding a row to erase (template 1) and one to keep.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    let records = [rec("a", 1, TS0), rec("a", 2, TS0 + 1_000_000)];
+    let partition = PartitionKey::derive(&records[0]).expect("derive");
+    let mut w = Writer::open_in(&store, partition.clone()).expect("open writer");
+    w.append_records(&records).expect("append");
+    w.close().expect("close");
+    let policy = CompactionPolicy {
+        small_file_bytes: 1,
+        ..CompactionPolicy::default()
+    };
+    assert!(
+        plan_candidates(&store, "a", NOW_SEALED, &policy)
+            .expect("plan")
+            .is_empty(),
+        "the partition is settled: the planner skips it",
+    );
+    request_erasure(&store, "a", "c-1").expect("request");
+    let erase_template_1 = |record: &MinedRecord, _: &str| record.template_id == 1;
+    let mut hooks = SweepHooks {
+        observe: None,
+        erasure_match: Some(&erase_template_1),
+        gauges: None,
+    };
+
+    // Act
+    let report = run_sweep_hooked(
+        &store,
+        NOW_SEALED,
+        &policy,
+        &PromotedAttributes::default(),
+        &mut hooks,
+    )
+    .expect("sweep");
+
+    // Assert
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let candidates: Vec<_> = report
+        .per_tenant
+        .iter()
+        .map(|t| t.candidates_found)
+        .collect();
+    assert_eq!(candidates, vec![0], "no consolidation candidate");
+    let outcomes: Vec<_> = report
+        .erasures
+        .iter()
+        .map(|o| (o.partitions_rewritten, o.rows_dropped))
+        .collect();
+    assert_eq!(outcomes, vec![(1, 1)], "{report:?}");
+    let mut kept = Vec::new();
+    ourios_parquet::compaction::visit_partition_rows(&store, &partition, |batch| {
+        kept.extend(batch.iter().map(|r| r.template_id));
+    })
+    .expect("read");
+    assert_eq!(kept, vec![2], "the erased row is gone, the other kept");
+}
+
+/// Write `records` as one committed file in their partition; its key.
+fn write_records(store: &Store, records: &[MinedRecord]) -> String {
+    let partition = PartitionKey::derive(&records[0]).expect("derive");
+    let mut w = Writer::open_in(store, partition).expect("open writer");
+    w.append_records(records).expect("append");
+    w.close().expect("close").key
+}
+
+/// Lay down what a compactor killed before its commit leaves: the two
+/// inputs under a manifest at generation 1 that consumes nothing (so the
+/// inputs stay live), and their consolidated rows under an unnamed output
+/// for generation 2. Returns that output's key.
+pub(super) fn crash_before_commit(store: &Store, records: &[MinedRecord; 2]) -> String {
+    write_records(store, &records[..1]);
+    write_records(store, &records[1..]);
+    let staged = write_records(store, records);
+    let (prefix, _) = staged.rsplit_once('/').expect("partition prefix");
+    let manifest = ourios_parquet::Manifest::new(1, Vec::new(), Vec::new());
+    store
+        .put_blocking(
+            &format!("{prefix}/{}", ourios_parquet::MANIFEST_FILENAME),
+            manifest.to_json().expect("json"),
+        )
+        .expect("manifest");
+    let output = format!(
+        "{}.g2.parquet",
+        staged.strip_suffix(".parquet").expect("suffix")
+    );
+    let bytes = store.get_blocking(&staged).expect("staged bytes");
+    store.put_blocking(&output, bytes).expect("output");
+    store.delete_blocking(&staged).expect("unstage");
+    output
+}
+
+/// RFC0009.17 through production sweeps: an output a crashed compaction
+/// wrote for generation 2 survives GC while the manifest is at 1, and the
+/// sweep that commits generation 2 reclaims it. The partition then has one
+/// live file and is never a candidate again, so a GC that ran only before
+/// the rewrite would leave the output forever.
+#[test]
+fn rfc0009_17_sweeps_reclaim_an_output_a_crashed_compaction_left() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    let records = [rec("a", 1, TS0), rec("a", 2, TS0 + 1_000_000)];
+    let partition = PartitionKey::derive(&records[0]).expect("derive");
+    let crashed = crash_before_commit(&store, &records);
+
+    let reports: Vec<_> = (0..2)
+        .map(|_| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep"))
+        .collect();
+
+    let compacted: Vec<_> = reports.iter().map(|r| r.partitions_compacted).collect();
+    assert_eq!(compacted, [1, 0], "compacted once, then settled");
+    let reclaimed: u64 = reports.iter().map(|r| r.orphans_reclaimed).sum();
+    assert_eq!(reclaimed, 1, "the crashed output is reclaimed");
+    let listed = store.list_blocking(Some("data/")).expect("list");
+    assert!(!listed.contains(&crashed), "{listed:?}");
+    let mut rows = Vec::new();
+    ourios_parquet::compaction::visit_partition_rows(&store, &partition, |batch| {
+        rows.extend(batch.iter().map(|r| r.template_id));
+    })
+    .expect("read");
+    rows.sort_unstable();
+    assert_eq!(rows, [1, 2], "every row read exactly once");
 }
 
 #[test]
@@ -388,7 +731,10 @@ fn sweep_emits_a_compaction_audit_event() {
         output_file.ends_with(".parquet") && !input_files.contains(output_file),
         "output is the new consolidated file, distinct from the inputs",
     );
-    assert_eq!(*generation, 2, "bootstrap gen 1, commit gen 2");
+    assert_eq!(
+        *generation, 1,
+        "the first commit creates the manifest at gen 1"
+    );
     assert_eq!(*rows, 2);
 }
 
@@ -430,11 +776,13 @@ fn sweep_scans_every_tenant() {
 #[test]
 fn sweep_isolates_a_failing_tenant() {
     // Arrange — tenant "a" is a healthy sealed candidate; tenant
-    // "b" has a malformed manifest.json, so planning it errors.
+    // "b" has a malformed manifest.json, so planning it errors. b holds two
+    // files: planning reads a manifest only where two or more are listed
+    // (RFC 0009 §3.3, 2026-10-16 amendment).
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
     write_sealed_candidate(&store, "a");
-    write_file(&store, "b", 1, TS0);
+    write_sealed_candidate(&store, "b");
     // Corrupt b's manifest on the local store (its partition dir exists
     // after the write above); planning b then fails to parse it.
     let b_dir = PartitionKey::derive(&rec("b", 1, TS0))

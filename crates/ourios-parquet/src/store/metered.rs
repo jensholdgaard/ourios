@@ -46,6 +46,7 @@ impl Store {
             prefix,
             conditional_update,
             local_root,
+            if_match_unquoted: Arc::default(),
         }
         .metered()
     }

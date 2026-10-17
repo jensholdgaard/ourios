@@ -25,8 +25,9 @@
 //! lives in its own integration binary (its own process) — the
 //! `rfc0016_6_query_metrics` precedent, applied at the querier-library
 //! surface where the RFC 0033 instruments live — and is one of this
-//! crate's two RFC0028.2 process-isolation exemptions (the other,
-//! `rfc0033_bounded_fold.rs`, installs a global allocator).
+//! crate's RFC0028.2 process-isolation exemptions (with
+//! `rfc0060_refresh_observability.rs`, the same shape, and
+//! `rfc0033_bounded_fold.rs`, which installs a global allocator).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -300,16 +301,39 @@ fn metric_data<'a>(rms: &'a [ResourceMetrics], name: &str) -> &'a AggregatedMetr
         .data()
 }
 
+/// The `ourios.template_map.acquire.trigger` every lookup and derive sample
+/// in this file carries (RFC 0060 §3.5): each acquisition here is a query's.
+const QUERY_TRIGGER: (&str, &str) = (semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_TRIGGER, "query");
+
 /// The counter `metric`'s data points as `attr_key value → count` — one
 /// entry per exported attribute set, so extras (a stray outcome, an
-/// attribute-free point) fail the map equality below.
-fn outcome_counts(rms: &[ResourceMetrics], metric: &str, attr_key: &str) -> BTreeMap<String, u64> {
+/// attribute-free point) fail the map equality below. Every point must also
+/// carry exactly the `fixed` attributes, and nothing else.
+fn outcome_counts(
+    rms: &[ResourceMetrics],
+    metric: &str,
+    attr_key: &str,
+    fixed: &[(&str, &str)],
+) -> BTreeMap<String, u64> {
     let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric_data(rms, metric) else {
         panic!("{metric} should be a u64 sum (counter)");
     };
     let mut counts = BTreeMap::new();
     for dp in sum.data_points() {
-        let attrs: Vec<_> = dp.attributes().collect();
+        let (fixed_attrs, attrs): (Vec<_>, Vec<_>) = dp
+            .attributes()
+            .partition(|kv| fixed.iter().any(|(key, _)| kv.key.as_str() == *key));
+        let mut carried: Vec<(String, String)> = fixed_attrs
+            .iter()
+            .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
+            .collect();
+        carried.sort();
+        let mut expected: Vec<(String, String)> = fixed
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(carried, expected, "{metric} data point's fixed attributes");
         let [kv] = attrs.as_slice() else {
             panic!(
                 "{metric} data point must carry exactly the {attr_key} attribute, \
@@ -393,9 +417,12 @@ fn fallback(r: &str) -> String {
     )
 }
 
-/// A [`histogram_points`] key: `entries` sorted.
+/// A derive [`histogram_points`] key: `entries` and the query trigger,
+/// sorted.
 fn key(entries: &[String]) -> Vec<String> {
+    let (trigger, value) = QUERY_TRIGGER;
     let mut key = entries.to_vec();
+    key.push(format!("{trigger}={value}"));
     key.sort();
     key
 }
@@ -684,6 +711,109 @@ fn binding_conflict_act(
         expected,
         "the folding miss carries the anomaly; the hit after it does not",
     );
+
+    announced_once_act(guard, exporter, capture, bucket.path());
+}
+
+/// Scenario RFC0033.8, amendment 2026-10-13 (#987): a refresh of the
+/// artifact the conflicting miss published re-announces nothing for the
+/// known key, though its lookup still carries the anomaly; a second key
+/// coming into conflict is announced once, alone; and a `files_removed`
+/// full-fold fallback re-announces neither known key.
+fn announced_once_act(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+    capture: &live_check::EventCapture,
+    bucket: &Path,
+) {
+    let conflict_events = || conflict_events(capture);
+    capture.reset();
+
+    let before_fresh = audit_parquet_files(bucket);
+    write_audit(bucket, &[created(5, "fresh <*>", TS0 + 5)]);
+    let fresh: Vec<_> = audit_parquet_files(bucket)
+        .difference(&before_fresh)
+        .cloned()
+        .collect();
+    assert_eq!(body_query(bucket).rows, 1);
+    let events = conflict_events();
+    assert!(
+        events.is_empty(),
+        "a refresh re-announces no known key: {events:#?}"
+    );
+
+    write_audit(
+        bucket,
+        &[
+            created(3, "left <*>", TS0 + 6),
+            created(3, "right <*>", TS0 + 7),
+        ],
+    );
+    assert_eq!(body_query(bucket).rows, 1);
+    let events = conflict_events();
+    let [event] = events.as_slice() else {
+        panic!("only the new key is announced: {events:#?}");
+    };
+    assert_eq!(
+        event
+            .attributes
+            .get(semconv::OURIOS_TEMPLATE_ID)
+            .map(String::as_str),
+        Some("3")
+    );
+
+    capture.reset();
+    assert!(!fresh.is_empty(), "the fresh audit file was written");
+    for file in &fresh {
+        std::fs::remove_file(file).expect("remove a folded audit file");
+    }
+    assert_eq!(body_query(bucket).rows, 1);
+    let events = conflict_events();
+    assert!(
+        events.is_empty(),
+        "a files_removed full fold re-announces no known key: {events:#?}"
+    );
+
+    assert_refresh_anomalies(guard, exporter);
+}
+
+/// The binding-conflict events captured since the last reset.
+fn conflict_events(capture: &live_check::EventCapture) -> Vec<live_check::Event> {
+    capture
+        .events()
+        .into_iter()
+        .filter(|e| e.name == BINDING_CONFLICTED.name)
+        .collect()
+}
+
+/// The audit Parquet objects under `bucket`.
+fn audit_parquet_files(bucket: &Path) -> std::collections::BTreeSet<PathBuf> {
+    walk_files(&bucket.join("audit"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .collect()
+}
+
+/// `announced_once_act`'s lookups: the conflicting miss and its three
+/// stale refreshes each carry the anomaly.
+fn assert_refresh_anomalies(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) {
+    guard.force_flush().expect("force_flush");
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let rms = std::slice::from_ref(rms.last().expect("a collection"));
+    let expected: BTreeMap<(String, String), u64> = [
+        (("miss".to_string(), "binding_conflict".to_string()), 1),
+        (("stale".to_string(), "binding_conflict".to_string()), 3),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        anomaly_counts(rms),
+        expected,
+        "every refresh of a conflicted map still carries the anomaly",
+    );
 }
 
 /// The publish-size histogram recorded each published artifact's byte
@@ -705,6 +835,72 @@ fn assert_artifact_sizes(rms: &[ResourceMetrics], published: [u64; 3]) {
         "each sample is the published artifact's byte size",
     );
 }
+
+/// RFC0033.7's counted outcomes: one lookup per answered outcome, each
+/// `query`-triggered, and one publish per write-through that published.
+fn assert_lookups_and_publishes(rms: &[ResourceMetrics]) {
+    let lookups = outcome_counts(
+        rms,
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS,
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
+        &[QUERY_TRIGGER],
+    );
+    let expected: BTreeMap<String, u64> = EXPECTED_LOOKUPS
+        .iter()
+        .map(|(outcome, n)| ((*outcome).to_string(), *n))
+        .collect();
+    assert_eq!(
+        lookups, expected,
+        "one lookup per answered outcome, no extras — act 5's failed fold \
+         counted nothing"
+    );
+
+    // The three publishing lookups (miss, stale, torn) each published;
+    // no lost race or error occurred, so no other series exists.
+    let publishes = outcome_counts(
+        rms,
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES,
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISH_OUTCOME,
+        &[],
+    );
+    let expected: BTreeMap<String, u64> = [("published".to_string(), 3)].into_iter().collect();
+    assert_eq!(publishes, expected, "three write-through publishes");
+}
+
+/// The template-map instruments the acts drive, each exported with the
+/// registry's description and unit.
+const REGISTERED: &[ourios_telemetry::metadata_guard::Registered] = &[
+    (
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS,
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES,
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE,
+        semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_UNIT,
+    ),
+];
 
 /// Scenario RFC0033.7 — observable outcomes.
 /// Scenario RFC0033.9 — derive cost is observable (`assert_derive_metrics`).
@@ -763,31 +959,7 @@ fn rfc0033_7_observable_outcomes() {
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
 
-    let lookups = outcome_counts(
-        &rms,
-        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS,
-        semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
-    );
-    let expected: BTreeMap<String, u64> = EXPECTED_LOOKUPS
-        .iter()
-        .map(|(outcome, n)| ((*outcome).to_string(), *n))
-        .collect();
-    assert_eq!(
-        lookups, expected,
-        "one lookup per answered outcome, no extras — act 5's failed fold \
-         counted nothing"
-    );
-
-    // The three publishing lookups (miss, stale, torn) each published;
-    // no lost race or error occurred, so no other series exists.
-    let publishes = outcome_counts(
-        &rms,
-        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES,
-        semconv::OURIOS_TEMPLATE_MAP_PUBLISH_OUTCOME,
-    );
-    let expected: BTreeMap<String, u64> = [("published".to_string(), 3)].into_iter().collect();
-    assert_eq!(publishes, expected, "three write-through publishes");
-
+    assert_lookups_and_publishes(&rms);
     assert_artifact_sizes(&rms, [size_after_miss, size_after_stale, size_after_torn]);
     assert_derive_metrics(&rms, cold_audit_set);
     // #949 — no template-map histogram uses the SDK's millisecond buckets.
@@ -800,6 +972,7 @@ fn rfc0033_7_observable_outcomes() {
             semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE,
         ],
     );
+    ourios_telemetry::metadata_guard::assert_registry_metadata(&rms, REGISTERED);
     binding_conflict_act(&guard, &exporter, &rms);
     unknown_version_act(&guard, &exporter);
     derive_mode_act(&guard, &exporter);

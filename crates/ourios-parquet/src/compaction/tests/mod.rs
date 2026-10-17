@@ -7,8 +7,12 @@ use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 
 use super::*;
+use crate::writer::DEFAULT_ZSTD_LEVEL;
 
 mod bounded_sort;
+mod late_writes;
+mod plan_cost;
+mod plan_reclaim;
 
 /// 2026-04-02T10:58:00 UTC — offsets stay within hour 10, so
 /// every record shares one partition.
@@ -463,10 +467,10 @@ proptest::proptest! {
     }
 }
 
-/// RFC0009.3 — atomic publish / no torn read. A compaction first
-/// bootstraps a manifest naming the *inputs*, then writes the
-/// consolidated file, then atomically swaps the manifest to name only
-/// that file. This models the two states a crash could freeze and
+/// RFC0009.3 — atomic publish / no torn read. Over an existing manifest
+/// that consumes nothing, a compaction writes the consolidated file, then
+/// atomically swaps the manifest to name only that file and consume the
+/// inputs. This models the two states a crash could freeze and
 /// asserts a reader is never torn: pre-commit it sees exactly the
 /// inputs (the stored consolidated file is invisible — no double
 /// count), post-commit exactly the consolidated rows (no loss).
@@ -483,23 +487,13 @@ fn atomic_publish_is_never_torn_across_the_swap() {
     let originals = read_partition_rows(&store);
     assert_eq!(originals.len(), 3, "three input rows");
 
-    // Mid-compaction, in compact_partition's order: bootstrap the
-    // manifest naming the inputs *first* (so the reader is
-    // manifest-authoritative before any new file appears)...
-    seed_manifest(
-        &store,
-        &part,
-        &Manifest {
-            generation: 1,
-            files: input_names,
-        },
-    );
+    // Mid-compaction: a manifest from an earlier generation that consumes
+    // nothing, so the inputs stay live...
+    seed_manifest(&store, &part, &Manifest::new(1, Vec::new(), Vec::new()));
     // ...then write the consolidated file. It now exists in the store but
-    // the manifest still names only the inputs.
-    let mut w = Writer::open_in(&store, part.clone()).expect("writer");
-    w.append_records(&originals).expect("append");
-    let consolidated = w.close().expect("close");
-    let consolidated_name = basename(&consolidated.key).to_owned();
+    // the manifest does not name it.
+    let consolidated = write_uncommitted_output(&store, &originals, 2);
+    let consolidated_name = basename(&consolidated).to_owned();
 
     // All three files are physically present...
     assert_eq!(
@@ -512,14 +506,12 @@ fn atomic_publish_is_never_torn_across_the_swap() {
     let pre = read_partition_rows(&store);
     assert_eq!(pre, originals, "pre-commit reader sees only the inputs");
 
-    // Commit: atomic swap to name only the consolidated file.
+    // Commit: atomic swap to name only the consolidated file and consume
+    // the inputs.
     seed_manifest(
         &store,
         &part,
-        &Manifest {
-            generation: 2,
-            files: vec![consolidated_name],
-        },
+        &Manifest::new(2, vec![consolidated_name], input_names),
     );
 
     // Post-commit: exactly the consolidated rows — no loss, no dup.
@@ -549,18 +541,14 @@ fn rfc0009_4_post_commit_orphan_inputs_are_reclaimable() {
     let part = partition();
     write_file(&store, &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
     write_file(&store, &[rec(2, TS0 + 2_000_000)]);
+    let input_names = basenames(&live_keys(&store, &part));
     let originals = read_partition_rows(&store);
-    let mut w = Writer::open_in(&store, part.clone()).expect("writer");
-    w.append_records(&originals).expect("append");
-    let consolidated = w.close().expect("close");
-    let consolidated_name = basename(&consolidated.key).to_owned();
+    let consolidated = write_uncommitted_output(&store, &originals, 2);
+    let consolidated_name = basename(&consolidated).to_owned();
     seed_manifest(
         &store,
         &part,
-        &Manifest {
-            generation: 2,
-            files: vec![consolidated_name],
-        },
+        &Manifest::new(2, vec![consolidated_name], input_names),
     );
     // Reader is already at the clean post generation despite orphans.
     assert_eq!(
@@ -590,12 +578,77 @@ fn rfc0009_4_post_commit_orphan_inputs_are_reclaimable() {
     );
 }
 
+/// Whether `key` is an object in [`partition`]'s prefix.
+fn is_listed(store: &Store, key: &str) -> bool {
+    store
+        .list_blocking(Some(&partition_data_prefix(&partition())))
+        .expect("list")
+        .iter()
+        .any(|k| k == key)
+}
+
+/// Write `rows` as an unnamed compaction output for `generation`, as a
+/// compactor that died before its commit leaves it.
+fn write_uncommitted_output(store: &Store, rows: &[MinedRecord], generation: u64) -> String {
+    let promoted = PromotedAttributes::default();
+    let output = CompactedOutput {
+        keys: ClusterKeys::for_promoted(&promoted),
+        flush_override: None,
+        estimated_output_bytes: 0,
+        generation,
+    };
+    let mut w = Writer::open_in_compacted(store, partition(), promoted, output).expect("writer");
+    w.append_records(rows).expect("append");
+    w.close().expect("close").key
+}
+
+/// Seed [`partition`]'s manifest at `generation`, consuming nothing, so its
+/// flush files stay live.
+fn seed_generation(store: &Store, generation: u64) {
+    seed_manifest(
+        store,
+        &partition(),
+        &Manifest::new(generation, Vec::new(), Vec::new()),
+    );
+}
+
+/// Run `gc_orphans` on [`partition`] and assert it reclaimed exactly
+/// `reclaimed` objects with no failed unlink.
+fn assert_gc_reclaims(store: &Store, reclaimed: u64, why: &str) {
+    let gc = gc_orphans(store, &partition()).expect("gc");
+    assert_eq!(
+        gc,
+        OrphanGc {
+            reclaimed,
+            failures: 0
+        },
+        "{why}"
+    );
+}
+
+/// Assert whether `key` is still listed, and that the partition reads
+/// exactly `rows`, each once.
+fn assert_object_and_rows(store: &Store, key: &str, listed: bool, rows: &[MinedRecord]) {
+    assert_eq!(is_listed(store, key), listed, "{key} listed");
+    assert_eq!(read_partition_rows(store), rows, "live rows");
+}
+
+/// Compact [`partition`] and return its won commit.
+fn commit_compaction(store: &Store) -> Committed {
+    compact_partition(store, &partition())
+        .expect("compact")
+        .committed
+        .expect("committed")
+}
+
 /// RFC0009.4 — crash BEFORE the commit swap: the manifest still names
-/// the inputs; the freshly written consolidated file is a dead orphan
-/// (the pre-commit generation). See the post-commit test for the
-/// shared crash-safety note.
+/// the inputs, and the freshly written consolidated file, written for
+/// generation 2, is not named. GC at generation 1 keeps it, because its
+/// compaction may still be about to commit (RFC0009.17); once another
+/// commit reaches generation 2 without naming it, it is dead and GC
+/// reclaims it. See the post-commit test for the shared crash-safety note.
 #[test]
-fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable() {
+fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimed_once_generation_passes() {
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
     let part = partition();
@@ -603,37 +656,93 @@ fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable() {
     write_file(&store, &[rec(8, TS0 + 2_000_000)]);
     let inputs = live_keys(&store, &part);
     let originals = read_partition_rows(&store);
-    seed_manifest(
-        &store,
-        &part,
-        &Manifest {
-            generation: 1,
-            files: basenames(&inputs),
-        },
-    );
-    let mut w = Writer::open_in(&store, part.clone()).expect("writer");
-    w.append_records(&originals).expect("append");
-    w.close().expect("close"); // consolidated present, NOT in manifest
+    seed_generation(&store, 1);
+    let crashed = write_uncommitted_output(&store, &originals, 2);
+    assert!(crashed.ends_with(".g2.parquet"), "{crashed}");
     assert_eq!(
         read_partition_rows(&store),
         originals,
         "pre-commit reader sees only the inputs (consolidated invisible)",
     );
-    let gc = gc_orphans(&store, &part).expect("gc");
-    assert_eq!(
-        gc,
-        OrphanGc {
-            reclaimed: 1,
-            failures: 0
-        },
-        "orphan consolidated reclaimed"
+
+    assert_gc_reclaims(
+        &store,
+        0,
+        "the generation-2 output is in flight at generation 1",
     );
+    assert_object_and_rows(&store, &crashed, true, &originals);
     assert_eq!(
         live_keys(&store, &part).len(),
         inputs.len(),
         "inputs stay live"
     );
-    assert_eq!(read_partition_rows(&store), originals, "inputs intact");
+
+    let committed = commit_compaction(&store);
+    assert_eq!(committed.generation, 2);
+    assert_ne!(committed.file, basename(&crashed));
+    assert_gc_reclaims(
+        &store,
+        1,
+        "the crashed output is dead once generation 2 is committed without it",
+    );
+    assert_object_and_rows(&store, &crashed, false, &originals);
+}
+
+/// RFC0009.17 — GC keeps a compaction output written for a generation the
+/// manifest has not reached, and reclaims it once a commit reaches that
+/// generation without naming it.
+#[test]
+fn rfc0009_17_gc_keeps_an_output_for_a_future_generation() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_file(&store, &[rec(1, TS0)]);
+    let rows = read_partition_rows(&store);
+    seed_generation(&store, 3);
+    let in_flight = write_uncommitted_output(&store, &rows, 4);
+
+    assert_gc_reclaims(
+        &store,
+        0,
+        "an output for generation 4 survives GC at generation 3",
+    );
+    assert_object_and_rows(&store, &in_flight, true, &rows);
+
+    seed_generation(&store, 4);
+    assert_gc_reclaims(&store, 1, "generation 4 committed without it: dead");
+    assert_object_and_rows(&store, &in_flight, false, &rows);
+}
+
+/// RFC0009.16 — a lost-CAS leftover (an unnamed output for a generation
+/// the winner already committed) is never read and GC reclaims it.
+#[test]
+fn rfc0009_16_a_lost_cas_leftover_is_never_live() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_file(&store, &[rec(1, TS0)]);
+    write_file(&store, &[rec(2, TS0 + 1_000_000)]);
+    let originals = read_partition_rows(&store);
+    let winner = commit_compaction(&store);
+    let leftover = write_uncommitted_output(&store, &originals, winner.generation);
+
+    assert_object_and_rows(&store, &leftover, true, &originals);
+    assert_gc_reclaims(&store, 1, "the leftover's generation is already committed");
+    assert_object_and_rows(&store, &leftover, false, &originals);
+}
+
+#[test]
+fn compaction_names_its_output_for_the_committed_generation() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_file(&store, &[rec(1, TS0)]);
+    write_file(&store, &[rec(2, TS0 + 1_000_000)]);
+    let committed = compact_partition(&store, &partition())
+        .expect("compact")
+        .committed
+        .expect("committed");
+    assert_eq!(
+        crate::manifest::compacted_generation(&committed.file),
+        Some(committed.generation)
+    );
 }
 
 /// RFC0009.4 — a stray `*.parquet.tmp` with NO manifest (glob live
@@ -948,15 +1057,7 @@ fn bumps_generation_from_an_existing_manifest() {
     let part = partition();
     write_file(&store, &[rec(1, TS0)]);
     write_file(&store, &[rec(2, TS0 + 1_000_000)]);
-    let names = basenames(&live_keys(&store, &part));
-    seed_manifest(
-        &store,
-        &part,
-        &Manifest {
-            generation: 5,
-            files: names,
-        },
-    );
+    seed_manifest(&store, &part, &Manifest::new(5, Vec::new(), Vec::new()));
 
     // Act
     let outcome = compact_partition(&store, &part).expect("compact");
@@ -1068,6 +1169,7 @@ fn plan_selects_a_sealed_many_file_partition_via_count() {
         min_files: 4,
         small_file_bytes: 1,
         grace_nanos: CompactionPolicy::default().grace_nanos,
+        ..CompactionPolicy::default()
     };
 
     // Act
@@ -1094,6 +1196,7 @@ fn plan_skips_when_files_are_large_and_few() {
         min_files: 4,
         small_file_bytes: 1,
         grace_nanos: CompactionPolicy::default().grace_nanos,
+        ..CompactionPolicy::default()
     };
 
     // Act
@@ -1140,4 +1243,88 @@ fn plan_for_a_tenant_with_no_data_is_empty() {
 
     // Assert
     assert!(selected.is_empty());
+}
+
+/// Put `names` as raw objects under tenant `a`'s 2026-04-02 hour `hour`.
+fn put_in_hour(store: &Store, hour: u32, names: &[&str]) {
+    for name in names {
+        store
+            .put_blocking(
+                &format!("data/tenant_id=a/year=2026/month=04/day=02/hour={hour:02}/{name}"),
+                b"x".to_vec(),
+            )
+            .expect("put");
+    }
+}
+
+#[test]
+fn planning_counts_its_listings_and_manifest_reads() {
+    // Arrange — hour 10 sealed with two files and no manifest; hour 12
+    // still open at `NOW_SEALED` (12:58).
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    put_in_hour(&store, 10, &["x.parquet", "y.parquet"]);
+    put_in_hour(&store, 12, &["z.parquet"]);
+
+    // Act
+    let (selected, counts) =
+        plan_candidates_counted(&store, "a", NOW_SEALED, &CompactionPolicy::default());
+
+    // Assert — one recursive listing of the tenant, returning all three
+    // objects (the open hour's too); no manifest is listed, so none is read
+    // (RFC 0009 §3.3, 2026-10-16 amendment).
+    assert_eq!(selected.expect("plan"), vec![partition()]);
+    assert_eq!(
+        counts,
+        PlanCounts {
+            list_requests: 1,
+            listed_objects: 3,
+            manifest_reads: 0,
+            unsealed_partitions: 1,
+        }
+    );
+}
+
+#[test]
+fn planning_keeps_its_counts_on_the_error_path() {
+    // Arrange — a sealed partition whose manifest does not parse.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    put_in_hour(&store, 10, &["x.parquet", "y.parquet"]);
+    put_in_hour(&store, 10, &[MANIFEST_FILENAME]);
+
+    // Act
+    let (selected, counts) =
+        plan_candidates_counted(&store, "a", NOW_SEALED, &CompactionPolicy::default());
+
+    // Assert — the tenant listing ran first and returned the partition's
+    // three objects; the failed manifest read after it still counts.
+    assert!(selected.is_err(), "an unparseable manifest fails planning");
+    assert_eq!(
+        counts,
+        PlanCounts {
+            list_requests: 1,
+            listed_objects: 3,
+            manifest_reads: 1,
+            unsealed_partitions: 0,
+        }
+    );
+}
+
+#[test]
+fn planning_a_tenant_with_no_data_makes_one_listing() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+
+    let (selected, counts) =
+        plan_candidates_counted(&store, "ghost", NOW_SEALED, &CompactionPolicy::default());
+
+    assert!(selected.expect("plan").is_empty());
+    assert_eq!(
+        counts,
+        PlanCounts {
+            list_requests: 1,
+            ..PlanCounts::default()
+        }
+    );
 }

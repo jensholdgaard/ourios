@@ -34,6 +34,7 @@ pub(super) fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
             .worker_threads(workers)
             .thread_name("ourios-store-bridge")
             .on_thread_start(metrics::bridge_thread_started)
+            .thread_keep_alive(BLOCKING_THREAD_KEEP_ALIVE)
             // `enable_all` so the runtime carries the IO + time drivers the
             // `AmazonS3` backend's HTTP client (reqwest/hyper) needs; the local
             // backend ignores them.
@@ -52,6 +53,14 @@ pub(super) fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
 
 /// Upper bound on the bridge runtime's worker threads.
 pub(super) const MAX_BRIDGE_WORKERS: usize = 4;
+
+/// How long an idle blocking-pool thread of the bridge runtime lives. The
+/// local backend's file I/O and the S3 client's DNS lookups run on that pool,
+/// and tokio's ten-second default retired a thread between any two calls
+/// further apart than that, so a lightly loaded store started a thread per
+/// call. Idle threads hold only their stacks, and the pool never exceeds its
+/// peak concurrency.
+const BLOCKING_THREAD_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Drive `fut` to completion synchronously — the bridge from the **sync**
 /// storage API (`Writer`, `Reader`, `compaction`, the manifest) to async

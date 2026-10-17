@@ -12,9 +12,12 @@
 //! spans with no phase span between.
 
 use opentelemetry::Context;
+use opentelemetry::context::FutureExt as _;
 use ourios_parquet::QueryPhase;
-use tracing::Span;
+use tracing::{Instrument as _, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+use crate::QueryError;
 
 /// `work`, run inside `span` as a query phase.
 pub(crate) fn in_phase<T>(span: &Span, work: impl FnOnce() -> T) -> T {
@@ -24,6 +27,34 @@ pub(crate) fn in_phase<T>(span: &Span, work: impl FnOnce() -> T) -> T {
         let _phase = (!span.is_disabled()).then(|| span.context().with_value(QueryPhase).attach());
         work()
     })
+}
+
+/// `work`, a future polled on the calling task, run as the query phase
+/// `span`. The marked context is attached inside the entered span on every
+/// poll, for the reason [`in_phase`] gives.
+pub(crate) async fn in_phase_async<F: Future>(span: &Span, work: F) -> F::Output {
+    if span.is_disabled() {
+        return work.instrument(span.clone()).await;
+    }
+    let cx = span.context().with_value(QueryPhase);
+    work.with_context(cx).instrument(span.clone()).await
+}
+
+/// `work` on the blocking pool as the query phase `span` ([`in_phase`]), so
+/// the store requests it makes open `CLIENT` spans beneath the phase
+/// (RFC 0038 §3.7.3). The span is taken explicitly: `Span::current()` could
+/// be an ancestor, which would parent those spans with no phase between.
+pub(crate) async fn spawn_blocking<T, F>(span: &Span, work: F) -> Result<T, QueryError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, QueryError> + Send + 'static,
+{
+    let span = span.clone();
+    tokio::task::spawn_blocking(move || in_phase(&span, work))
+        .await
+        .map_err(|e| QueryError::Storage {
+            detail: format!("blocking storage task: {e}"),
+        })?
 }
 
 /// `work`, run inside `span`, and still a query phase when the work around
@@ -53,7 +84,7 @@ mod tests {
     use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::prelude::*;
 
-    use super::{in_phase, nested_in};
+    use super::{in_phase, in_phase_async, nested_in};
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
     /// Whether the work runs in a query phase under a valid parent span.
@@ -96,5 +127,43 @@ mod tests {
                 });
             });
         });
+    }
+
+    /// A future run as a phase sees the marker under the phase span while
+    /// it is polled, across an await point; a filtered-out phase span
+    /// attaches none.
+    #[tokio::test]
+    async fn a_phase_future_carries_the_marker_while_polled() {
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(ourios_telemetry::test_tracer(&provider)),
+            )
+            .with(filter_fn(|meta| meta.name() != "filtered phase"));
+        let _default = tracing::subscriber::set_default(subscriber);
+        let query = tracing::info_span!("POST /v1/query");
+        let _query = query.enter();
+
+        let filtered = tracing::info_span!("filtered phase");
+        let seen = in_phase_async(&filtered, async { traced_phase() }).await;
+        assert!(!seen, "no phase on the query");
+
+        let infer = tracing::info_span!("infer schema");
+        let id = infer.context().span().span_context().span_id();
+        let (before, after, parent) = in_phase_async(&infer, async {
+            let before = traced_phase();
+            tokio::task::yield_now().await;
+            let after = traced_phase();
+            (
+                before,
+                after,
+                Context::current().span().span_context().span_id(),
+            )
+        })
+        .await;
+        assert!(before && after, "the phase, on both sides of the await");
+        assert_eq!(parent, id);
+        assert!(!traced_phase(), "detached once the future completes");
     }
 }

@@ -219,22 +219,7 @@ async fn assert_operator_span_tree() {
         }
     }
 
-    // RFC0040.3 — attribute shape for a scan-shaped node (pruning counts)
-    // and a non-scan node (rows/bytes/elapsed_compute only), each an actual
-    // `Value::I64`, not merely present under the right key.
-    let scan = operator_spans
-        .iter()
-        .find(|s| has_attr(s, "datafusion.operator.row_groups_matched"))
-        .unwrap_or_else(|| panic!("expected a scan node reporting pruning counts among {names:?}"));
-    assert_i64_attr(scan, "datafusion.operator.row_groups_matched");
-    assert_i64_attr(scan, "datafusion.operator.row_groups_pruned");
-    let non_scan = operator_spans
-        .iter()
-        .find(|s| {
-            !has_attr(s, "datafusion.operator.row_groups_matched") && !s.attributes.is_empty()
-        })
-        .unwrap_or_else(|| panic!("expected a non-scan node with attributes among {names:?}"));
-    assert_i64_attr(non_scan, "datafusion.operator.output_rows");
+    assert_plan_node_attributes(&operator_spans, &names);
 
     // RFC0040.2 — real wall-clock bounds, never inverted.
     for op in &operator_spans {
@@ -244,6 +229,34 @@ async fn assert_operator_span_tree() {
             op.name
         );
     }
+}
+
+/// RFC0040.3 — attribute shape for a scan-shaped node (pruning counts) and a
+/// non-scan node (rows, bytes and `elapsed_compute` only), each an actual
+/// `Value::I64`, not merely present under the right key. Chosen among the
+/// plan's operator nodes: the RFC 0038 §3.7 phase spans (`resolve files`,
+/// `load template_map`) also nest under the query and carry attributes.
+fn assert_plan_node_attributes(
+    operator_spans: &[&opentelemetry_sdk::trace::SpanData],
+    names: &[String],
+) {
+    let plan_nodes: Vec<_> = operator_spans
+        .iter()
+        .filter(|s| s.name.ends_with("Exec"))
+        .collect();
+    let scan = plan_nodes
+        .iter()
+        .find(|s| has_attr(s, "datafusion.operator.row_groups_matched"))
+        .unwrap_or_else(|| panic!("expected a scan node reporting pruning counts among {names:?}"));
+    assert_i64_attr(scan, "datafusion.operator.row_groups_matched");
+    assert_i64_attr(scan, "datafusion.operator.row_groups_pruned");
+    let non_scan = plan_nodes
+        .iter()
+        .find(|s| {
+            !has_attr(s, "datafusion.operator.row_groups_matched") && !s.attributes.is_empty()
+        })
+        .unwrap_or_else(|| panic!("expected a non-scan node with attributes among {names:?}"));
+    assert_i64_attr(non_scan, "datafusion.operator.output_rows");
 }
 
 /// RFC0040.5 — span count is bounded by plan node count, independent of the

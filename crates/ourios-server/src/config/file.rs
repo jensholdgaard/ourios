@@ -491,6 +491,30 @@ pub struct QuerierSection {
     pub default_window_secs: Option<String>,
     /// The RFC 0027 MCP surface (`querier.mcp.*`).
     pub mcp: McpSection,
+    /// The cached template map (`querier.template_map.*`, RFC 0060).
+    pub template_map: TemplateMapSection,
+}
+
+/// `querier.template_map.*`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct TemplateMapSection {
+    /// The background refresh task (`querier.template_map.refresh.*`).
+    pub refresh: RefreshSection,
+}
+
+/// `querier.template_map.refresh.*` — the RFC 0060 §3.4 background
+/// refresh task (default on, interval `5m`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct RefreshSection {
+    #[serde(deserialize_with = "scalar_opt")]
+    pub enabled: Option<String>,
+    /// Idle time between passes, `<integer><unit>` with `ms`/`s`/`m`/`h`.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub interval: Option<String>,
 }
 
 /// `querier.mcp.*` — the RFC 0027 MCP surface (§3.1; default off).
@@ -973,7 +997,18 @@ impl QuerierSection {
         substitute(&mut self.http_addr, lookup)?;
         self.http_tls.substitute(lookup)?;
         substitute(&mut self.default_window_secs, lookup)?;
-        substitute(&mut self.mcp.enabled, lookup)
+        substitute(&mut self.mcp.enabled, lookup)?;
+        self.template_map.refresh.substitute(lookup)
+    }
+}
+
+impl RefreshSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.enabled, lookup)?;
+        substitute(&mut self.interval, lookup)
     }
 }
 
@@ -1831,12 +1866,8 @@ auth:
         }
     }
 
-    // The length is the maximal YAML document itself — one line per
-    // config leaf is the census.
-    #[allow(clippy::too_many_lines)]
-    #[test]
-    fn every_scalar_leaf_resolves_env_references() {
-        let yaml = r"
+    /// The maximal YAML document: one line per config leaf is the census.
+    const MAXIMAL_YAML: &str = r"
 storage:
   backend: ${env:L01}
   s3:
@@ -1886,6 +1917,10 @@ querier:
   default_window_secs: ${env:L36}
   mcp:
     enabled: ${env:L37}
+  template_map:
+    refresh:
+      enabled: ${env:L70}
+      interval: ${env:L71}
 compaction:
   enabled: ${env:L38}
   interval_secs: ${env:L39}
@@ -1932,6 +1967,10 @@ auth:
       max_objects: ${env:L68}
       list_timeout_ms: ${env:L69}
 ";
+
+    #[test]
+    fn every_scalar_leaf_resolves_env_references() {
+        let yaml = MAXIMAL_YAML;
         let refs_in_yaml = yaml.matches("${env:").count();
         let config = parse(yaml, &|name| Some(format!("resolved+{name}")))
             .expect("the maximal config parses");

@@ -59,9 +59,10 @@ exceptions = [
     # (attribution-free redistribution); scoped to this one crate rather than
     # allowed globally.
     { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
-    # The same Mozilla CA-certificate data, packaged as DER certificates for
-    # rustls-platform-verifier (reqwest 0.13, via object_store 0.14's `aws`
-    # feature). Same permissive data license, same per-crate scoping.
+    # The same Mozilla CA data as webpki-roots, in DER form. It reaches the
+    # server through rustls-platform-verifier (reqwest 0.13, the OTLP/HTTP
+    # self-telemetry exporter), which depends on it only on wasm32; Linux
+    # builds verify against the system store via rustls-native-certs.
     { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
 ]
 # The allow-list is a stable permissive baseline; the set of licenses actually

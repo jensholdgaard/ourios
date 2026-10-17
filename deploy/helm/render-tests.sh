@@ -494,6 +494,21 @@ check "helm test: an authenticated querier is probed over TCP, not an anonymous 
   "$(helm template t "$CHART" --show-only templates/tests/test-connection.yaml "${secure_args[@]}" \
       | grep -o 'nc -z -w5 t-ourios-querier 4319')"
 
+# --- RFC0009.24: at most one active compactor through a rollout --------------
+
+compactor_rollout() {
+  helm template t "$CHART" --show-only templates/compactor-deployment.yaml "$@" \
+    | sed -n -e 's/^  replicas: \([0-9]*\)$/replicas=\1/p' \
+             -e '/^  strategy:$/{n;s/^    type: \([A-Za-z]*\)$/strategy=\1/p;}'
+}
+check "RFC0009.24: compactor is one replica with the Recreate strategy" \
+  "$(printf 'replicas=1\nstrategy=Recreate')" "$(compactor_rollout)"
+check "RFC0009.24: role overrides keep one replica and Recreate" \
+  "$(printf 'replicas=1\nstrategy=Recreate')" \
+  "$(compactor_rollout --set compactor.intervalSecs=60 \
+      --set 'compactor.extraEnv[0].name=X' --set 'compactor.extraEnv[0].value=y' \
+      --set 'compactor.podLabels.a=b')"
+
 if ((failures)); then
   printf '\n%d assertion(s) failed\n' "$failures" >&2
   exit 1

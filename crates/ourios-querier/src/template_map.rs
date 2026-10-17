@@ -48,6 +48,7 @@ use ourios_semconv as semconv;
 use serde::{Deserialize, Serialize};
 
 use crate::alias_store::AliasFold;
+use crate::audit_scan::ObjectTag;
 use crate::fold_state::{FoldState, FoldStateJson, HighWater};
 use crate::template_registry::{BindingConflicts, RegistryFold, TemplateRegistry};
 use crate::{QueryError, StoreRef, audit_scan, local_publish};
@@ -146,6 +147,9 @@ const ERROR_TYPE: &str = "error.type";
 const PUBLISH_OUTCOME_PUBLISHED: &str = "published";
 const PUBLISH_OUTCOME_LOST_RACE: &str = "lost_race";
 const PUBLISH_OUTCOME_ERROR: &str = "error";
+/// `ourios.template_map.acquire.trigger` values (RFC 0060 §3.5).
+const ACQUIRE_TRIGGER_QUERY: &str = "query";
+const ACQUIRE_TRIGGER_REFRESH: &str = "refresh";
 
 /// Bucket boundaries (seconds) for the derive and acquire-wait durations.
 /// The SDK defaults are millisecond-shaped; a cold derive over a large
@@ -183,6 +187,7 @@ struct TemplateMapMetrics {
     derive_audit_files: Histogram<u64>,
     derive_audit_size: Histogram<u64>,
     acquire_wait: Histogram<f64>,
+    refresh_duration: Histogram<f64>,
 }
 
 /// Resolved once, on the first lookup or publish, through the
@@ -198,70 +203,75 @@ static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
     TemplateMapMetrics {
         lookups: meter
             .u64_counter(semconv::OURIOS_TEMPLATE_MAP_LOOKUPS)
-            .with_unit("{lookup}")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_LOOKUPS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_LOOKUPS_UNIT)
             .build(),
         publishes: meter
             .u64_counter(semconv::OURIOS_TEMPLATE_MAP_PUBLISHES)
-            .with_unit("{publish}")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_PUBLISHES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_PUBLISHES_UNIT)
             .build(),
         artifact_size: meter
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_UNIT)
             .with_boundaries(ARTIFACT_SIZE_BUCKETS.to_vec())
             .build(),
         derive_duration: meter
             .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION_UNIT)
             .with_boundaries(DURATION_BUCKETS_S.to_vec())
             .build(),
         derive_audit_files: meter
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES)
-            .with_unit("{file}")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_UNIT)
             .with_boundaries(histogram_buckets::COUNT_DECADES.to_vec())
             .build(),
         derive_audit_size: meter
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_UNIT)
             .with_boundaries(histogram_buckets::SIZE_BYTES.to_vec())
             .build(),
         acquire_wait: meter
             .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION_UNIT)
+            .with_boundaries(DURATION_BUCKETS_S.to_vec())
+            .build(),
+        refresh_duration: meter
+            .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_REFRESH_DURATION)
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_REFRESH_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_REFRESH_DURATION_UNIT)
             .with_boundaries(DURATION_BUCKETS_S.to_vec())
             .build(),
     }
 });
 
 impl TemplateMapMetrics {
-    fn record_lookup(&self, outcome: CacheOutcome, binding_conflict: bool) {
+    fn record_lookup(
+        &self,
+        outcome: CacheOutcome,
+        binding_conflict: bool,
+        trigger: AcquireTrigger,
+    ) {
         let value = lookup_outcome(outcome);
         record_outcome_on_span(value);
-        let outcome = KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
+        let mut attrs = lookup_attributes(value, trigger);
         if binding_conflict {
-            self.lookups.add(
-                1,
-                &[
-                    outcome,
-                    KeyValue::new(
-                        semconv::OURIOS_TEMPLATE_MAP_LOOKUP_ANOMALY,
-                        LOOKUP_ANOMALY_BINDING_CONFLICT,
-                    ),
-                ],
-            );
-        } else {
-            self.lookups.add(1, &[outcome]);
+            attrs.push(KeyValue::new(
+                semconv::OURIOS_TEMPLATE_MAP_LOOKUP_ANOMALY,
+                LOOKUP_ANOMALY_BINDING_CONFLICT,
+            ));
         }
+        self.lookups.add(1, &attrs);
     }
 
-    fn record_lookup_value(&self, value: &'static str) {
+    fn record_lookup_value(&self, value: &'static str, trigger: AcquireTrigger) {
         record_outcome_on_span(value);
-        self.lookups.add(
-            1,
-            &[KeyValue::new(
-                semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
-                value,
-            )],
-        );
+        self.lookups.add(1, &lookup_attributes(value, trigger));
     }
 
     /// One fold's cost: its duration always (with `error.type` when it
@@ -297,6 +307,14 @@ impl TemplateMapMetrics {
     }
 }
 
+/// A lookup sample's outcome and the trigger of the acquisition behind it.
+fn lookup_attributes(outcome: &'static str, trigger: AcquireTrigger) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, outcome),
+        trigger.attribute(),
+    ]
+}
+
 /// The `ourios.template_map.lookup.outcome` value of `outcome`.
 fn lookup_outcome(outcome: CacheOutcome) -> &'static str {
     match outcome {
@@ -320,12 +338,19 @@ fn record_outcome_on_span(value: &'static str) {
     tracing::Span::current().record(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
 }
 
-/// Name every binding conflict a fold found, once per acquisition. The
-/// event carries the key, never the template texts — they can hold user
-/// data. Rendering for the key stays last-wins; the event is the signal
-/// that rows carrying it may render against the wrong template.
-fn announce_binding_conflicts(tenant: &TenantId, conflicts: &[(u64, u32)]) {
-    for &(template_id, version) in conflicts {
+/// Name each binding conflict a fold found that `known` (the conflict set
+/// of the artifact this acquisition replaces, ascending) lacks, so a key
+/// is announced once per artifact that records it, not on every derive:
+/// until a write-through lands, the next acquisition announces it again
+/// (RFC0033.8). The event
+/// carries the key, never the template texts — they can hold user data.
+/// Rendering for the key stays last-wins; the event is the signal that
+/// rows carrying it may render against the wrong template.
+fn announce_binding_conflicts(tenant: &TenantId, conflicts: &[(u64, u32)], known: &[(u64, u32)]) {
+    let new = conflicts
+        .iter()
+        .filter(|key| known.binary_search(key).is_err());
+    for &(template_id, version) in new {
         tracing::warn!(
             name: semconv::EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED,
             {
@@ -341,11 +366,24 @@ fn announce_binding_conflicts(tenant: &TenantId, conflicts: &[(u64, u32)]) {
     }
 }
 
-/// Record a `joined` lookup: this query was served the map another query
-/// acquired at the same frontier. Only for a successful shared acquisition —
-/// the acquirer records its own outcome, and a failure records nothing.
-pub(crate) fn record_joined_lookup() {
-    METRICS.record_lookup_value(LOOKUP_OUTCOME_JOINED);
+/// Record a `joined` lookup: this query was served the map another
+/// acquisition, started by `trigger`, took at the same frontier. Only for a
+/// successful shared acquisition — the acquirer records its own outcome, and
+/// a failure records nothing.
+pub(crate) fn record_joined_lookup(trigger: AcquireTrigger) {
+    METRICS.record_lookup_value(LOOKUP_OUTCOME_JOINED, trigger);
+}
+
+/// Record one background refresh pass (RFC 0060 §3.5): its duration, with
+/// `error.type` when the pass ended early.
+pub(crate) fn record_refresh_pass(elapsed: Duration, error_type: Option<&'static str>) {
+    let attrs: Vec<KeyValue> = error_type
+        .map(|e| KeyValue::new(ERROR_TYPE, e))
+        .into_iter()
+        .collect();
+    METRICS
+        .refresh_duration
+        .record(elapsed.as_secs_f64(), &attrs);
 }
 
 /// Record how long a query waited on another query's acquisition of the
@@ -354,13 +392,17 @@ pub(crate) fn record_acquire_wait(waited: Duration) {
     METRICS.acquire_wait.record(waited.as_secs_f64(), &[]);
 }
 
-/// A derive sample's attributes: its `reason`, plus the mode and
-/// fallback reason of `path` once the path was decided.
-fn derive_attributes(reason: &'static str, path: Option<DerivePath>) -> Vec<KeyValue> {
-    let mut attrs = vec![KeyValue::new(
-        semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON,
-        reason,
-    )];
+/// A derive sample's attributes: its `reason` and `trigger`, plus the mode
+/// and fallback reason of `path` once the path was decided.
+fn derive_attributes(
+    reason: &'static str,
+    trigger: AcquireTrigger,
+    path: Option<DerivePath>,
+) -> Vec<KeyValue> {
+    let mut attrs = vec![
+        KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON, reason),
+        trigger.attribute(),
+    ];
     attrs.extend(path.map_or_else(Vec::new, path_attributes));
     attrs
 }
@@ -418,6 +460,46 @@ pub(crate) fn error_type(error: &QueryError) -> &'static str {
         QueryError::InvalidQuery { .. } => "invalid_query",
         QueryError::Forbidden { .. } => "permission_denied",
     }
+}
+
+/// Who started an acquisition (`ourios.template_map.acquire.trigger`,
+/// RFC 0060 §3.5). A query that joins an acquisition records the trigger of
+/// the one that started it, not its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcquireTrigger {
+    Query,
+    Refresh,
+}
+
+impl AcquireTrigger {
+    fn attribute(self) -> KeyValue {
+        let value = match self {
+            Self::Query => ACQUIRE_TRIGGER_QUERY,
+            Self::Refresh => ACQUIRE_TRIGGER_REFRESH,
+        };
+        KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_TRIGGER, value)
+    }
+}
+
+/// What an acquisition left in the store for the next one at its frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Persisted {
+    /// A current artifact: a hit, this acquisition's publish, or a
+    /// concurrent writer's (a lost race).
+    Current,
+    /// Nothing: the write-through abstained or failed.
+    Nothing,
+}
+
+/// One acquisition's answer (`load_or_derive_resolved`).
+pub(crate) struct Loaded {
+    pub(crate) map: TemplateMap,
+    pub(crate) bytes: u64,
+    pub(crate) outcome: CacheOutcome,
+    pub(crate) persisted: Persisted,
+    /// On a hit, the tag of the artifact bytes it read (RFC 0060 §3.7);
+    /// `None` on every other outcome.
+    pub(crate) hit_tag: Option<ObjectTag>,
 }
 
 /// The per-tenant cached fold of the audit stream (RFC 0033 §3.2):
@@ -578,28 +660,38 @@ pub fn load_or_derive(
         backend,
         tenant,
         audit_scan::resolve_audit_set(backend, tenant)?,
+        AcquireTrigger::Query,
     )
+    .map(|loaded| (loaded.map, loaded.bytes, loaded.outcome))
 }
 
 /// [`load_or_derive`] against a listing the caller already took — the
 /// querier's per-tenant single-flight (`map_flight`) lists once, keys the
 /// flight by that listing's frontier, and acquires against the same
 /// listing, so the §3.3 one-listing rule holds. No map is retained once
-/// the acquisition completes.
+/// the acquisition completes. Its lookup and derive samples carry
+/// `trigger`; the answer also says what the acquisition left in the store.
 pub(crate) fn load_or_derive_resolved(
     backend: StoreRef<'_>,
     tenant: &TenantId,
     resolved: audit_scan::ResolvedAuditSet<'_>,
-) -> Result<(TemplateMap, u64, CacheOutcome), QueryError> {
+    trigger: AcquireTrigger,
+) -> Result<Loaded, QueryError> {
     let (fetched_bytes, expected, outcome, stale) = match fetch_artifact(backend, tenant) {
         FetchedArtifact::Absent => (0, None, miss(MissReason::Absent), None),
         FetchedArtifact::Unreadable => (0, None, miss(MissReason::Torn), None),
-        FetchedArtifact::Present { bytes, e_tag } => {
+        FetchedArtifact::Present { bytes, e_tag, tag } => {
             let len = bytes.len() as u64;
             match TemplateMap::from_artifact_bytes(&bytes, tenant)? {
                 ArtifactRead::Valid(map) if map.folded_files() == resolved.frontier() => {
-                    METRICS.record_lookup(CacheOutcome::Hit, false);
-                    return Ok((map, len, CacheOutcome::Hit));
+                    METRICS.record_lookup(CacheOutcome::Hit, false, trigger);
+                    return Ok(Loaded {
+                        map,
+                        bytes: len,
+                        outcome: CacheOutcome::Hit,
+                        persisted: Persisted::Current,
+                        hit_tag: tag,
+                    });
                 }
                 ArtifactRead::Valid(map) => (len, e_tag, CacheOutcome::StaleRefreshed, Some(map)),
                 ArtifactRead::Torn { .. } => (len, e_tag, miss(MissReason::Torn), None),
@@ -609,19 +701,38 @@ pub(crate) fn load_or_derive_resolved(
             }
         }
     };
+    let known = stale
+        .as_ref()
+        .and_then(TemplateMap::fold_state)
+        .map(|state| state.binding_conflicts().to_vec())
+        .unwrap_or_default();
     // On the span before the fold, so a failed fold's span still says why
     // it folded; the metric keeps counting only lookups that answered.
     record_outcome_on_span(lookup_outcome(outcome));
-    let derived = measured_fold(resolved, tenant, outcome, stale)?;
+    let derived = measured_fold(resolved, tenant, stale, FoldCause { outcome, trigger })?;
     let acquisition_bytes = add_bytes(derived.fetched_bytes, fetched_bytes)?;
     // Recorded only after every fallible step — a counted outcome is
     // always one that answered, mirroring the hit arm's record-at-return.
-    announce_binding_conflicts(tenant, &derived.conflicts);
-    METRICS.record_lookup(outcome, !derived.conflicts.is_empty());
-    derived
+    announce_binding_conflicts(tenant, &derived.conflicts, &known);
+    METRICS.record_lookup(outcome, !derived.conflicts.is_empty(), trigger);
+    let persisted = derived
         .map
         .write_through(backend, expected.as_deref(), acquisition_bytes);
-    Ok((derived.map, acquisition_bytes, outcome))
+    Ok(Loaded {
+        map: derived.map,
+        bytes: acquisition_bytes,
+        outcome,
+        persisted,
+        hit_tag: None,
+    })
+}
+
+/// The lookup outcome that sent an acquisition to the fold, and who started
+/// the acquisition: what its derive sample is keyed by.
+#[derive(Clone, Copy)]
+struct FoldCause {
+    outcome: CacheOutcome,
+    trigger: AcquireTrigger,
 }
 
 fn miss(reason: MissReason) -> CacheOutcome {
@@ -699,10 +810,10 @@ impl DeriveError {
 fn measured_fold(
     resolved: audit_scan::ResolvedAuditSet<'_>,
     tenant: &TenantId,
-    outcome: CacheOutcome,
     stale: Option<TemplateMap>,
+    cause: FoldCause,
 ) -> Result<Derived, QueryError> {
-    let Some(reason) = derive_reason(outcome) else {
+    let Some(reason) = derive_reason(cause.outcome) else {
         return derive(resolved, tenant, stale).map_err(|e| e.error);
     };
     let started = Instant::now();
@@ -711,7 +822,11 @@ fn measured_fold(
         Ok(d) => (Some(d.path), Ok((d.fetched_files, d.fetched_bytes))),
         Err(e) => (e.path, Err(error_type(&e.error))),
     };
-    METRICS.record_derive(derive_attributes(reason, path), started.elapsed(), cost);
+    METRICS.record_derive(
+        derive_attributes(reason, cause.trigger, path),
+        started.elapsed(),
+        cost,
+    );
     derived.map_err(|e| e.error)
 }
 
@@ -727,6 +842,7 @@ fn traced_derive(
     let span = tracing::info_span!(
         "derive template_map",
         otel.kind = "internal",
+        ourios.tenant = tenant.as_str(),
         ourios.template_map.derive.reason = reason,
         otel.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,
@@ -781,6 +897,9 @@ enum FetchedArtifact {
         /// write-through publish carries. `None` on the local backend
         /// (its publish is last-writer-wins, §3.4).
         e_tag: Option<String>,
+        /// What identifies the bytes read (RFC 0060 §3.7): the `ETag`, or
+        /// locally the open file's metadata.
+        tag: Option<ObjectTag>,
     },
 }
 
@@ -792,8 +911,12 @@ fn fetch_artifact(backend: StoreRef<'_>, tenant: &TenantId) -> FetchedArtifact {
                 .join("audit")
                 .join(format!("tenant_id={enc}"))
                 .join(TEMPLATE_MAP_FILENAME);
-            match std::fs::read(&path) {
-                Ok(bytes) => FetchedArtifact::Present { bytes, e_tag: None },
+            match read_local_artifact(&path) {
+                Ok((bytes, tag)) => FetchedArtifact::Present {
+                    bytes,
+                    e_tag: None,
+                    tag,
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => FetchedArtifact::Absent,
                 Err(_) => FetchedArtifact::Unreadable,
             }
@@ -801,12 +924,27 @@ fn fetch_artifact(backend: StoreRef<'_>, tenant: &TenantId) -> FetchedArtifact {
         StoreRef::Remote(store) => {
             let key = format!("audit/tenant_id={enc}/{TEMPLATE_MAP_FILENAME}");
             match store.get_with_etag_blocking_opt(&key) {
-                Ok(Some((bytes, e_tag))) => FetchedArtifact::Present { bytes, e_tag },
+                Ok(Some((bytes, e_tag))) => FetchedArtifact::Present {
+                    bytes,
+                    tag: e_tag.as_deref().map(ObjectTag::from_e_tag),
+                    e_tag,
+                },
                 Ok(None) => FetchedArtifact::Absent,
                 Err(_) => FetchedArtifact::Unreadable,
             }
         }
     }
+}
+
+/// The local artifact's bytes, tagged from the handle they were read
+/// through: a publish renames a new file into place, so the tag names
+/// exactly these bytes even when a publish lands meanwhile.
+fn read_local_artifact(path: &Path) -> std::io::Result<(Vec<u8>, Option<ObjectTag>)> {
+    let mut file = std::fs::File::open(path)?;
+    let tag = ObjectTag::from_metadata(&file.metadata()?);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok((bytes, tag))
 }
 
 /// Fold `tenant`'s [`TemplateMap`] from its audit stream — **one**
@@ -1223,18 +1361,26 @@ impl TemplateMap {
     /// records no publish outcome — §3.7 pins the values to
     /// `published` / `lost_race` / `error`, and a publish that never
     /// starts is none of them.
-    fn write_through(&self, backend: StoreRef<'_>, expected: Option<&str>, acquisition_bytes: u64) {
+    fn write_through(
+        &self,
+        backend: StoreRef<'_>,
+        expected: Option<&str>,
+        acquisition_bytes: u64,
+    ) -> Persisted {
         let Ok(bytes) = self.to_artifact_bytes() else {
             METRICS.record_publish(PUBLISH_OUTCOME_ERROR);
-            return;
+            return Persisted::Nothing;
         };
         if abstains(bytes.len() as u64, acquisition_bytes) {
-            return;
+            return Persisted::Nothing;
         }
-        // Best-effort by contract: Published and LostRace are both fine,
-        // and an error must not fail the query answered from the fold in
-        // hand (publish_bytes already recorded it).
-        let _ = self.publish_bytes(backend, expected, bytes);
+        // Best-effort by contract: Published and LostRace both leave a
+        // current artifact, and an error must not fail the query answered
+        // from the fold in hand (publish_bytes already recorded it).
+        match self.publish_bytes(backend, expected, bytes) {
+            Ok(PublishOutcome::Published | PublishOutcome::LostRace) => Persisted::Current,
+            Err(_) => Persisted::Nothing,
+        }
     }
 
     /// Commit `bytes` per the §3.4 backend ladder, recording the §3.7

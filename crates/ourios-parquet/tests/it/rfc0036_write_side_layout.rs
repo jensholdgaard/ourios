@@ -636,29 +636,31 @@ fn rfc0036_4_rebuild_byte_identity() {
     }
     let part = PartitionKey::derive(&files[0][0]).expect("derive partition");
 
-    // Same bytes, same names: write into store A, mirror byte-for-byte
-    // into store B.
+    // Same bytes, same names: write into store A, then lay each input down
+    // in both stores as a generation-1 compacted file, which the manifest
+    // names (RFC 0009 §3.4 late-write note).
+    let prefix = partition_prefix(&part);
     let mut names: Vec<String> = Vec::new();
     for recs in &files {
         let (name, key) = write_input(&store_a, &part, recs);
         let bytes = store_a.get_blocking(&key).expect("get input");
+        store_a.delete_blocking(&key).expect("unstage input");
+        let name = name.replace(".parquet", ".g1.parquet");
+        let key = format!("{prefix}/{name}");
+        store_a.put_blocking(&key, bytes.clone()).expect("input a");
         store_b.put_blocking(&key, bytes).expect("mirror input");
         names.push(name);
     }
 
-    // The compactor resolves its listing through the manifest when one
-    // exists, so a shuffled manifest IS a store returning listings in a
+    // The compactor takes the named compacted files in the manifest's
+    // order, so a shuffled manifest IS a store returning listings in a
     // different order: seed A sorted, B reversed.
     let mut sorted = names.clone();
     sorted.sort();
     let mut reversed = sorted.clone();
     reversed.reverse();
-    let prefix = partition_prefix(&part);
     for (store, listing) in [(&store_a, sorted), (&store_b, reversed)] {
-        let manifest = Manifest {
-            generation: 1,
-            files: listing,
-        };
+        let manifest = Manifest::new(1, listing, Vec::new());
         store
             .put_blocking(
                 &format!("{prefix}/{MANIFEST_FILENAME}"),

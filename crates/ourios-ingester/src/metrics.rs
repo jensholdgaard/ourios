@@ -18,6 +18,7 @@ use opentelemetry::metrics::{
     Counter, Histogram, ObservableGauge, ObservableUpDownCounter, UpDownCounter,
 };
 use ourios_core::histogram_buckets;
+use ourios_core::tenant::TenantId;
 use ourios_semconv as semconv;
 
 use crate::cadence::BarrierEpochs;
@@ -30,13 +31,30 @@ pub use compaction::CompactionMetrics;
 /// Ingest-path instruments (RFC 0014 §6.3 / `CLAUDE.md` §3.4): throughput
 /// plus the WAL-before-ack durability latency. Built once per pipeline on
 /// the global `ourios.ingest` meter; recording is a no-op when no provider
-/// is installed (RFC 0001 §6.8 API/SDK split). System-aggregate (no
-/// tenant/service attributes) so a performance run reads throughput directly.
+/// is installed (RFC 0001 §6.8 API/SDK split). The counters carry the
+/// accepted batch's tenant, never the source service; summing over
+/// `ourios.tenant` reads system throughput.
 #[derive(Debug)]
 pub struct IngestMetrics {
     records: Counter<u64>,
     batches: Counter<u64>,
     append_duration: Histogram<f64>,
+}
+
+/// One durably-acknowledged batch, as [`IngestMetrics::record_batch`]
+/// records it.
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptedBatch<'a> {
+    /// The tenant the batch was accepted for (one per batch, RFC 0046).
+    pub tenant: &'a TenantId,
+    /// Log records made durable.
+    pub record_count: usize,
+    /// Of those, the records whose `SeverityNumber` is outside `0..=24`.
+    pub severity_out_of_range: usize,
+    /// Whether the OTLP/JSON payload only parsed via the lenient retry.
+    pub lenient_json: bool,
+    /// The append + fsync (WAL-before-ack) latency.
+    pub elapsed: Duration,
 }
 
 impl IngestMetrics {
@@ -46,15 +64,18 @@ impl IngestMetrics {
         let meter = ourios_core::telemetry::meter("ourios.ingest");
         let records = meter
             .u64_counter(semconv::OURIOS_INGEST_RECORDS)
-            .with_unit("{record}")
+            .with_description(semconv::OURIOS_INGEST_RECORDS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_INGEST_RECORDS_UNIT)
             .build();
         let batches = meter
             .u64_counter(semconv::OURIOS_INGEST_BATCHES)
-            .with_unit("{batch}")
+            .with_description(semconv::OURIOS_INGEST_BATCHES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_INGEST_BATCHES_UNIT)
             .build();
         let append_duration = meter
             .f64_histogram(semconv::OURIOS_WAL_APPEND_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_WAL_APPEND_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_WAL_APPEND_DURATION_UNIT)
             .with_boundaries(histogram_buckets::FAST_DURATION_S.to_vec())
             .build();
         // Seed the attribute-free counters so they are visible before the
@@ -69,10 +90,8 @@ impl IngestMetrics {
         }
     }
 
-    /// Record one durably-acknowledged batch: `record_count` log records
-    /// made durable in `elapsed` (the append + fsync / WAL-before-ack
-    /// latency), of which `severity_out_of_range` carried an out-of-`0..=24`
-    /// `SeverityNumber`. Call only on a successful, acked commit.
+    /// Record one durably-acknowledged batch (see [`AcceptedBatch`]). Call
+    /// only on a successful, acked commit.
     ///
     /// Per the OpenTelemetry "recording errors on metrics" convention, the
     /// `ourios.ingest.records` counter carries the standard `error.type`
@@ -86,32 +105,34 @@ impl IngestMetrics {
     /// batches counter — the same one-instrument-plus-attribute shape as
     /// `error.type`, and the operator/dormancy signal for the interim
     /// upstream workaround.
-    pub fn record_batch(
-        &self,
-        record_count: usize,
-        severity_out_of_range: usize,
-        lenient_json: bool,
-        elapsed: Duration,
-    ) {
-        if lenient_json {
+    pub fn record_batch(&self, batch: &AcceptedBatch<'_>) {
+        let tenant = KeyValue::new(semconv::OURIOS_TENANT, batch.tenant.as_str().to_owned());
+        if batch.lenient_json {
             self.batches.add(
                 1,
-                &[KeyValue::new(semconv::OURIOS_INGEST_JSON_LENIENT, true)],
+                &[
+                    tenant.clone(),
+                    KeyValue::new(semconv::OURIOS_INGEST_JSON_LENIENT, true),
+                ],
             );
         } else {
-            self.batches.add(1, &[]);
+            self.batches.add(1, std::slice::from_ref(&tenant));
         }
-        let in_range = record_count.saturating_sub(severity_out_of_range);
+        let in_range = batch
+            .record_count
+            .saturating_sub(batch.severity_out_of_range);
         if in_range > 0 {
-            self.records.add(to_u64(in_range), &[]);
+            self.records
+                .add(to_u64(in_range), std::slice::from_ref(&tenant));
         }
-        if severity_out_of_range > 0 {
+        if batch.severity_out_of_range > 0 {
             self.records.add(
-                to_u64(severity_out_of_range),
-                &[KeyValue::new(ERROR_TYPE, SEVERITY_OUT_OF_RANGE)],
+                to_u64(batch.severity_out_of_range),
+                &[tenant, KeyValue::new(ERROR_TYPE, SEVERITY_OUT_OF_RANGE)],
             );
         }
-        self.append_duration.record(elapsed.as_secs_f64(), &[]);
+        self.append_duration
+            .record(batch.elapsed.as_secs_f64(), &[]);
     }
 
     /// Record one rejected request on the existing `ourios.ingest.batches`
@@ -244,19 +265,23 @@ impl BarrierMetrics {
         let meter = ourios_core::telemetry::meter("ourios.ingest");
         let cuts = meter
             .u64_counter(semconv::OURIOS_INGEST_BARRIER_CUTS)
-            .with_unit("{cut}")
+            .with_description(semconv::OURIOS_INGEST_BARRIER_CUTS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_INGEST_BARRIER_CUTS_UNIT)
             .build();
         let captures = meter
             .u64_counter(semconv::OURIOS_INGEST_BARRIER_CAPTURES)
-            .with_unit("{capture}")
+            .with_description(semconv::OURIOS_INGEST_BARRIER_CAPTURES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_INGEST_BARRIER_CAPTURES_UNIT)
             .build();
         let checkpoint_writes = meter
             .u64_counter(semconv::OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES)
-            .with_unit("{write}")
+            .with_description(semconv::OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES_UNIT)
             .build();
         let snapshot_writes = meter
             .u64_counter(semconv::OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES)
-            .with_unit("{write}")
+            .with_description(semconv::OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES_UNIT)
             .build();
         // Weak, so a barrier that is gone stops reporting rather than
         // being kept alive by the meter provider. One paired reading per
@@ -278,7 +303,8 @@ impl BarrierMetrics {
         let (paired, fresh) = (Arc::clone(&reading), read.clone());
         let epoch = meter
             .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_EPOCH)
-            .with_unit("{epoch}")
+            .with_description(semconv::OURIOS_INGEST_BARRIER_EPOCH_DESCRIPTION)
+            .with_unit(semconv::OURIOS_INGEST_BARRIER_EPOCH_UNIT)
             .with_callback(move |observer| {
                 if let Some((_, current)) = paired.read(&fresh) {
                     observer.observe(current, &[]);
@@ -287,7 +313,8 @@ impl BarrierMetrics {
             .build();
         let failed_epoch = meter
             .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH)
-            .with_unit("{epoch}")
+            .with_description(semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH_DESCRIPTION)
+            .with_unit(semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH_UNIT)
             .with_callback(move |observer| {
                 if let Some((Some(failed), _)) = reading.read(&read) {
                     observer.observe(failed, &[]);
@@ -363,7 +390,8 @@ impl EncodePoolMetrics {
         let meter = ourios_core::telemetry::meter("ourios.ingest");
         let queue_depth = meter
             .i64_up_down_counter(semconv::OURIOS_INGEST_ENCODE_QUEUE_DEPTH)
-            .with_unit("{batch}")
+            .with_description(semconv::OURIOS_INGEST_ENCODE_QUEUE_DEPTH_DESCRIPTION)
+            .with_unit(semconv::OURIOS_INGEST_ENCODE_QUEUE_DEPTH_UNIT)
             .build();
         // Seed so the gauge is visible before the first submitted batch
         // (collect-on-read).
@@ -408,24 +436,29 @@ impl SinkMetrics {
         let meter = ourios_core::telemetry::meter("ourios.sink");
         let flush_duration = meter
             .f64_histogram(semconv::OURIOS_SINK_FLUSH_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_SINK_FLUSH_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_SINK_FLUSH_DURATION_UNIT)
             .with_boundaries(histogram_buckets::DURATION_S.to_vec())
             .build();
         let flush_records = meter
             .u64_counter(semconv::OURIOS_SINK_FLUSH_RECORDS)
-            .with_unit("{record}")
+            .with_description(semconv::OURIOS_SINK_FLUSH_RECORDS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_SINK_FLUSH_RECORDS_UNIT)
             .build();
         let flush_errors = meter
             .u64_counter(semconv::OURIOS_SINK_FLUSH_ERRORS)
-            .with_unit("{error}")
+            .with_description(semconv::OURIOS_SINK_FLUSH_ERRORS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_SINK_FLUSH_ERRORS_UNIT)
             .build();
         let derive_errors = meter
             .u64_counter(semconv::OURIOS_SINK_DERIVE_ERRORS)
-            .with_unit("{error}")
+            .with_description(semconv::OURIOS_SINK_DERIVE_ERRORS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_SINK_DERIVE_ERRORS_UNIT)
             .build();
         let buffer_usage = meter
             .i64_up_down_counter(semconv::OURIOS_SINK_BUFFER_USAGE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_SINK_BUFFER_USAGE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_SINK_BUFFER_USAGE_UNIT)
             .build();
         // Seed the attribute-free instruments so they're visible before the
         // first flush; `flush_duration` / `flush_records` carry the required
@@ -516,19 +549,23 @@ impl AuditSinkMetrics {
         let meter = ourios_core::telemetry::meter("ourios.audit_sink");
         let flushes = meter
             .u64_counter(semconv::OURIOS_AUDIT_SINK_FLUSHES)
-            .with_unit("{flush}")
+            .with_description(semconv::OURIOS_AUDIT_SINK_FLUSHES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_AUDIT_SINK_FLUSHES_UNIT)
             .build();
         let flush_events = meter
             .u64_counter(semconv::OURIOS_AUDIT_SINK_FLUSH_EVENTS)
-            .with_unit("{event}")
+            .with_description(semconv::OURIOS_AUDIT_SINK_FLUSH_EVENTS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_AUDIT_SINK_FLUSH_EVENTS_UNIT)
             .build();
         let flush_errors = meter
             .u64_counter(semconv::OURIOS_AUDIT_SINK_FLUSH_ERRORS)
-            .with_unit("{error}")
+            .with_description(semconv::OURIOS_AUDIT_SINK_FLUSH_ERRORS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_AUDIT_SINK_FLUSH_ERRORS_UNIT)
             .build();
         let derive_errors = meter
             .u64_counter(semconv::OURIOS_AUDIT_SINK_DERIVE_ERRORS)
-            .with_unit("{error}")
+            .with_description(semconv::OURIOS_AUDIT_SINK_DERIVE_ERRORS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_AUDIT_SINK_DERIVE_ERRORS_UNIT)
             .build();
 
         // `buffer.usage` is an **observable** UpDownCounter reporting the
@@ -537,7 +574,8 @@ impl AuditSinkMetrics {
         let callback_state = Arc::clone(&buffered_state);
         let buffer_usage = meter
             .i64_observable_up_down_counter(semconv::OURIOS_AUDIT_SINK_BUFFER_USAGE)
-            .with_unit("{event}")
+            .with_description(semconv::OURIOS_AUDIT_SINK_BUFFER_USAGE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_AUDIT_SINK_BUFFER_USAGE_UNIT)
             .with_callback(move |observer| {
                 observer.observe(callback_state.load(Ordering::Relaxed), &[]);
             })

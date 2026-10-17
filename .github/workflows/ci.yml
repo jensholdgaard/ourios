@@ -209,12 +209,28 @@ jobs:
       # RFC 0033 §3.4 S3 publish arm: the template-map artifact's
       # conditional-put ladder (create / lost create / If-Match swap /
       # lost swap), and the RFC0033.12 incremental publish under CAS,
-      # against the same LocalStack.
-      - run: >
-          cargo test -p ourios-querier --test it --
-          --ignored --exact
-          rfc0033_cached_template_map::template_map_publish_cas_on_s3
-          rfc0033_incremental_fold::rfc0033_12_incremental_publish_resolves_by_cas_on_s3
+      # against the same LocalStack. Plus the RFC 0038 §3.7.3 check that the
+      # file-set resolution's S3 requests are CLIENT spans under its phase,
+      # and the RFC0060.15 refresh pass that reads no artifact its listing
+      # proves unchanged. `testing` compiles the RFC 0060 module. libtest
+      # passes a filter that matches nothing, so the step first lists the
+      # tests and fails unless every name exists.
+      - env:
+          S3_TESTS: >-
+            rfc0033_cached_template_map::template_map_publish_cas_on_s3
+            rfc0033_incremental_fold::rfc0033_12_incremental_publish_resolves_by_cas_on_s3
+            rfc0038_file_set_span::s3_resolution_requests_nest_under_the_phase
+            rfc0060_refresh::rfc0060_15_the_skip_on_s3_reads_no_artifact
+        run: |
+          read -ra tests <<< "$S3_TESTS"
+          listed=$(cargo test -p ourios-querier --features testing --test it -- \
+            --ignored --exact --list "${tests[@]}" | grep -c ': test$' || true)
+          if [ "$listed" -ne "${#tests[@]}" ]; then
+            echo "::error::$listed of ${#tests[@]} S3 tests exist"
+            exit 1
+          fi
+          cargo test -p ourios-querier --features testing --test it -- \
+            --ignored --exact "${tests[@]}"
       # RFC 0019 server-level §5 scenarios (.2/.3/.4/.5): spawn the
       # `ourios-server` binary configured for the S3 backend against the same
       # LocalStack, driven over HTTP. `--exact` (RFC0019.1/.6/.7 are non-ignored
@@ -633,6 +649,19 @@ jobs:
           if [ "$mcp_seen" -eq 0 ]; then
             echo "::warning::MCP execute_tool span not observed in live-check — the gen_ai.*/mcp.* attribute + exemption path was not exercised this run (the best-effort MCP handshake likely failed)"
           fi
+          # The probe query above is mandatory, so its `POST /v1/query` server
+          # span must carry the caller attributes (#1005); curl sends a
+          # User-Agent by default.
+          missing_client=""
+          for attr in client.address client.port user_agent.original; do
+            seen="$(jq --arg a "$attr" '[.. | objects | select(.name? == $a)] | length' "$report")"
+            if [ "$seen" -eq 0 ]; then
+              missing_client="$missing_client $attr"
+            fi
+          done
+          if [ -n "$missing_client" ]; then
+            echo "::error::the query server span reached weaver without:$missing_client"
+          fi
           unexpected="$(jq '[.. | objects
             | select(.type? == "PolicyFinding" and .level? == "violation")
             | select(( (.id == "deprecated")
@@ -655,7 +684,7 @@ jobs:
           if [ "$server_status" -ne 0 ]; then
             echo "::error::ourios-server exited with status $server_status"
           fi
-          [ "$unexpected" -eq 0 ] && [ "$server_status" -eq 0 ]
+          [ "$unexpected" -eq 0 ] && [ "$server_status" -eq 0 ] && [ -z "$missing_client" ]
       # The WAL's rotation, floor and latch events (RFC0052.7) and the
       # listener events (#873) fire only when a disk fails, a tenant pins
       # the floor, an accept fails or a certificate goes bad, which the
@@ -836,10 +865,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov,cargo-nextest
       # Collect once (runs the test suite under instrumentation), then
       # render each format from the same profile data — no double run.
-      - run: cargo llvm-cov --workspace --all-features --no-report
+      # Through nextest, as the `test` job runs: under plain `cargo test`
+      # the tests that capture spans or events with a scoped subscriber
+      # share one process and flake (#981).
+      - run: cargo llvm-cov nextest --workspace --all-features --no-report
       - run: cargo llvm-cov report --summary-only
       - run: cargo llvm-cov report --lcov --output-path lcov.info
       - run: cargo llvm-cov report --html --output-dir coverage-html

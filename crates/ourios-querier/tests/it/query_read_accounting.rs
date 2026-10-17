@@ -167,27 +167,23 @@ async fn a_drift_query_reports_both_scans_reads() {
     );
 }
 
-/// Write a manifest naming every committed file into each data partition,
-/// returning the manifests' total bytes.
+/// Write a manifest that consumes nothing (so every committed file stays
+/// live) into each data partition, returning the manifests' total bytes.
 fn write_manifests(bucket: &std::path::Path) -> u64 {
     let mut stack = vec![bucket.join("data")];
     let mut written = 0;
     while let Some(dir) = stack.pop() {
-        let mut files = Vec::new();
+        let mut has_data = false;
         for entry in std::fs::read_dir(&dir).expect("list data dir") {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().is_some_and(|e| e == "parquet") {
-                let name = path.file_name().expect("file name").to_string_lossy();
-                files.push(name.into_owned());
+                has_data = true;
             }
         }
-        if !files.is_empty() {
-            let manifest = ourios_parquet::Manifest {
-                generation: 1,
-                files,
-            };
+        if has_data {
+            let manifest = ourios_parquet::Manifest::new(1, Vec::new(), Vec::new());
             manifest.write_atomic(&dir).expect("write manifest");
             let path = dir.join(ourios_parquet::MANIFEST_FILENAME);
             written += std::fs::metadata(path).expect("stat manifest").len();

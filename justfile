@@ -396,6 +396,120 @@ jaeger-env:
     # trace context between the two processes, just the same backend).
     ENV
 
+# Download the pinned `otelcol-contrib` release into scratch/bin/ and verify it
+# against the release's published checksums. Homebrew does not package the
+# contrib distribution.
+closed-loop-install version="0.157.0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -s)-$(uname -m)" in
+      Darwin-arm64) target=darwin_arm64 ;;
+      Darwin-x86_64) target=darwin_amd64 ;;
+      Linux-x86_64) target=linux_amd64 ;;
+      Linux-aarch64) target=linux_arm64 ;;
+      *) echo "unsupported platform: $(uname -s)-$(uname -m)"; exit 1 ;;
+    esac
+    version="$1"
+    tarball="otelcol-contrib_${version}_${target}.tar.gz"
+    base="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${version}"
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+    curl -fsSL -o "$work/$tarball" "$base/$tarball"
+    curl -fsSL -o "$work/sums.txt" "$base/opentelemetry-collector-releases_otelcol-contrib_checksums.txt"
+    (cd "$work" && grep " $tarball\$" sums.txt | shasum -a 256 -c -)
+    mkdir -p scratch/bin
+    tar -xzf "$work/$tarball" -C scratch/bin otelcol-contrib
+    scratch/bin/otelcol-contrib --version
+
+# Run the local closed-loop Collector (`dev/observability/closed-loop-collector.yaml`)
+# as a native binary on 127.0.0.1:4317/4318: Claude Code's logs go to
+# `dogfood-server` only; Claude Code's traces and metrics and Ourios's own
+# telemetry go to your own OTLP/HTTP backend. Needs `otelcol-contrib` on PATH or
+# in scratch/bin/ (`just closed-loop-install`), and in .env (gitignored)
+# CLOSED_LOOP_OTLP_ENDPOINT plus, if the backend wants one,
+# CLOSED_LOOP_OTLP_AUTHORIZATION (the Authorization header value). Start `closed-loop-ourios`
+# too, and run `just closed-loop-env` for the Claude Code settings.
+closed-loop-collector:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin="$(command -v otelcol-contrib || echo scratch/bin/otelcol-contrib)"
+    [ -x "$bin" ] || { echo "otelcol-contrib not found (PATH or scratch/bin/)"; exit 1; }
+    set -a; [ -f .env ] && . ./.env; set +a
+    : "${CLOSED_LOOP_OTLP_ENDPOINT:?set CLOSED_LOOP_OTLP_ENDPOINT (your OTLP/HTTP backend) in .env}"
+    export CLOSED_LOOP_OTLP_AUTHORIZATION="${CLOSED_LOOP_OTLP_AUTHORIZATION:-}"
+    exec "$bin" --config dev/observability/closed-loop-collector.yaml
+
+# `dogfood-server` with its own logs, traces and metrics exported through the
+# closed-loop Collector (and so to your backend), tagged as a development deployment.
+# gRPC on 4317: the server binary is built without `ourios-telemetry`'s
+# `http-proto` feature, so it exports over gRPC whatever the protocol says.
+# Every exporter setting is set here, per signal included, so a shell still
+# carrying `dogfood-env`'s block can't redirect or disable a signal.
+closed-loop-ourios:
+    OTEL_LOGS_EXPORTER=otlp OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_SERVICE_NAME=ourios-server \
+    OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=development \
+    just dogfood-server
+
+# Start the whole closed loop in the background: the Collector and the local
+# Ourios run detached, so they outlive the terminal and a Claude Code restart.
+# Ourios is built first, each service must be listening before the next
+# starts, and state and logs go to scratch/closed-loop/. Idempotent.
+closed-loop-up:
+    dev/observability/closed-loop.sh up
+
+# Stop what `closed-loop-up` started, Ourios first so its last telemetry still
+# reaches the Collector. A recorded PID is only signalled while it is still the
+# process that was launched (PID plus start time).
+closed-loop-down:
+    dev/observability/closed-loop.sh down
+
+# Print the `env` block for ~/.claude/settings.json that points Claude Code at
+# the closed-loop Collector. Claude Code ignores OTEL_* exporter variables in a
+# repository's .claude/settings*.json, so this must go in the user settings
+# (or the launching shell), and Claude Code must be restarted to pick it up.
+# Run `just closed-loop-up` before restarting Claude Code with this block: it
+# restarts a Collector whose config changed, so the span scrubber is in place
+# before any captured content arrives.
+# Every signal's endpoint and protocol is pinned to the local Collector, so an
+# inherited per-signal OTEL_EXPORTER_OTLP_* setting can't send captured content
+# straight to a remote backend. Prompts and tool details are captured: they land in Claude Code's logs, which
+# only reach the local Ourios, and the Collector strips the same content from
+# Claude Code's spans before they go to the remote backend. Tool content,
+# assistant responses and raw API bodies stay off.
+closed-loop-env:
+    #!/usr/bin/env bash
+    cat <<'JSON'
+    "env": {
+      "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+      "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+      "OTEL_METRICS_EXPORTER": "otlp",
+      "OTEL_LOGS_EXPORTER": "otlp",
+      "OTEL_TRACES_EXPORTER": "otlp",
+      "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+      "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+      "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://127.0.0.1:4318/v1/logs",
+      "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/protobuf",
+      "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://127.0.0.1:4318/v1/traces",
+      "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+      "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://127.0.0.1:4318/v1/metrics",
+      "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
+      "OTEL_SERVICE_NAME": "claude-code",
+      "OTEL_LOG_USER_PROMPTS": "1",
+      "OTEL_LOG_TOOL_DETAILS": "1",
+      "OTEL_LOG_TOOL_CONTENT": "0",
+      "OTEL_LOG_ASSISTANT_RESPONSES": "0",
+      "OTEL_LOG_RAW_API_BODIES": "0",
+      "ENABLE_BETA_TRACING_DETAILED": "0",
+      "BETA_TRACING_ENDPOINT": "http://127.0.0.1:4318",
+      "OTEL_RESOURCE_ATTRIBUTES": "deployment.environment.name=development"
+    }
+    JSON
+
 # Clean build artefacts (cargo target + mdBook output).
 clean:
     cargo clean || true

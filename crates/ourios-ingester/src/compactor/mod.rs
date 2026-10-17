@@ -20,9 +20,10 @@ use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    Committed, CompactionError, CompactionOutcome, CompactionPolicy, CompactionStats, PartitionKey,
-    PromotedAttributes, RowFilter, RowHooks, RowObserver, Store, compact_partition_hooked,
-    gc_orphans, hour_partitions, percent_decode_tenant, percent_encode_tenant, plan_candidates,
+    Committed, CompactionError, CompactionOutcome, CompactionPlan, CompactionPolicy,
+    CompactionStats, PartitionKey, PlanCounts, PromotedAttributes, RowFilter, RowHooks,
+    RowObserver, Store, compact_partition_hooked, hour_partitions, percent_decode_tenant,
+    percent_encode_tenant, plan_compaction_counted,
 };
 
 #[cfg(feature = "openfga")]
@@ -77,12 +78,21 @@ impl IngestError {
     #[must_use]
     pub fn error_type(&self) -> &'static str {
         match self {
-            Self::Compaction(CompactionError::Read(_)) => "read",
-            Self::Compaction(CompactionError::Write(_)) => "write",
-            Self::Compaction(CompactionError::Manifest(_)) => "manifest",
-            Self::Compaction(CompactionError::Io { .. }) | Self::Io { .. } => "io",
-            Self::Compaction(_) => "_OTHER",
+            Self::Compaction(e) => compaction_error_type(e),
+            Self::Io { .. } => "io",
         }
+    }
+}
+
+/// The `error.type` of a compaction failure, shared by the sweep and its
+/// planning phase.
+fn compaction_error_type(error: &CompactionError) -> &'static str {
+    match error {
+        CompactionError::Read(_) => "read",
+        CompactionError::Write(_) => "write",
+        CompactionError::Manifest(_) => "manifest",
+        CompactionError::Io { .. } => "io",
+        _ => "_OTHER",
     }
 }
 
@@ -112,8 +122,13 @@ pub struct SweepReport {
     /// Orphan files (dead inputs / consolidated / `*.tmp` left by a
     /// crashed prior compaction) reclaimed this sweep by `gc_orphans`
     /// (RFC0009.4 — crash safety: orphans are reclaimable on a later
-    /// sweep). Counts only candidate partitions visited this sweep.
+    /// sweep). Counts the partitions the plan marked for GC: the candidates
+    /// and the sealed non-candidates whose listing shows an orphan.
     pub orphans_reclaimed: u64,
+    /// One entry per successfully planned tenant: what its orphan GC
+    /// deleted and failed to delete, for `ourios.compaction.orphan.reclaimed`
+    /// (RFC 0009 §3.6).
+    pub orphan_gc: Vec<TenantOrphanGc>,
     /// Erasure markers skipped this sweep because their tenant holds a
     /// backfill lock (RFC 0048 §3.4 — the fence; retried next sweep).
     pub erasures_deferred: Vec<String>,
@@ -155,12 +170,19 @@ pub struct SweepReport {
 mod backfill;
 mod daemon;
 mod erasure;
+#[cfg(test)]
+mod erasure_late_tests;
 #[cfg(feature = "openfga")]
 mod graph_phase;
 #[cfg(all(test, feature = "openfga"))]
 mod graph_tests;
+mod reclaim;
+#[cfg(test)]
+mod reclaim_tests;
 #[cfg(test)]
 mod sweep_progress_tests;
+#[cfg(test)]
+mod tenant_metrics_tests;
 #[cfg(test)]
 mod tests;
 
@@ -175,6 +197,8 @@ pub use daemon::*;
 pub use erasure::*;
 #[cfg(feature = "openfga")]
 use graph_phase::GraphPhase;
+pub(crate) use reclaim::DELETE_FAILED;
+pub use reclaim::TenantOrphanGc;
 
 fn store_error(op: &'static str, key: &str, e: &ourios_parquet::StoreError) -> IngestError {
     IngestError::Io {
@@ -191,7 +215,7 @@ fn store_error(op: &'static str, key: &str, e: &ourios_parquet::StoreError) -> I
 pub struct TenantSweep {
     /// Tenant the counts are for.
     pub tenant: String,
-    /// Sealed candidate partitions [`plan_candidates`] selected.
+    /// Sealed candidate partitions [`plan_candidates`](ourios_parquet::plan_candidates) selected.
     pub candidates_found: usize,
     /// How many of those actually consolidated (committed) this sweep.
     pub partitions_compacted: usize,
@@ -210,7 +234,7 @@ pub struct CompactedFile {
 
 /// Run one compaction sweep over `store`, as of wall-clock
 /// `now_unix_nanos`: for each tenant, select its sealed candidate
-/// partitions ([`plan_candidates`]) and consolidate each
+/// partitions ([`plan_candidates`](ourios_parquet::plan_candidates)) and consolidate each
 /// ([`compact_partition_hooked`]), accumulating a [`SweepReport`].
 ///
 /// Resilient: a tenant whose planning fails, or a partition whose
@@ -256,10 +280,8 @@ pub struct SweepHooks<'a> {
 #[derive(Debug, Default)]
 pub struct SweepGauges {
     /// Consolidation candidates the running sweep has not yet processed;
-    /// zero between sweeps. It never rises during a sweep: candidates that
-    /// became eligible after the sweep counted them still compact but are
-    /// not counted, so it can reach zero slightly before the sweep ends
-    /// ([`Countdown`]).
+    /// zero between sweeps. Set from the sweep's one planning pass, so it
+    /// never rises during a sweep ([`Countdown`]).
     remaining: AtomicU64,
     /// Every rewrite's memory, budgets and spills.
     compaction: CompactionStats,
@@ -281,45 +303,17 @@ impl SweepGauges {
 
 /// Counts a sweep's consolidation candidates down as they are processed,
 /// and back to zero when dropped, however the pass ends.
-///
-/// The total comes from a counting pass that keeps one number per tenant,
-/// never the candidates themselves: each tenant's candidate list is held
-/// only while that tenant compacts. The count only ever falls during a
-/// sweep: a tenant planned with fewer candidates than counted gives up the
-/// difference, but one planned with more is not raised. Candidates that
-/// became eligible after the counting pass are still compacted in this
-/// sweep, uncounted, so the count can reach zero slightly before the sweep
-/// ends; the next sweep's count includes whatever they left behind.
 struct Countdown<'a> {
     remaining: Option<&'a AtomicU64>,
-    counted: std::vec::IntoIter<usize>,
 }
 
 impl<'a> Countdown<'a> {
-    /// Without `gauges` nothing is counted, so a sweep nobody measures
-    /// lists each tenant once, as before.
-    fn start(gauges: Option<&'a SweepGauges>, count: impl FnOnce() -> Vec<usize>) -> Self {
+    fn start(gauges: Option<&'a SweepGauges>, planned: usize) -> Self {
         let remaining = gauges.map(|gauges| &gauges.remaining);
-        let counted = if remaining.is_some() {
-            count()
-        } else {
-            Vec::new()
-        };
         if let Some(remaining) = remaining {
-            remaining.store(to_u64(counted.iter().sum()), Ordering::Relaxed);
+            remaining.store(to_u64(planned), Ordering::Relaxed);
         }
-        Self {
-            remaining,
-            counted: counted.into_iter(),
-        }
-    }
-
-    /// The next tenant planned `planned` candidates: drop the ones it was
-    /// counted with but no longer has.
-    fn begin_tenant(&mut self, planned: usize) {
-        let counted = self.counted.next().unwrap_or(0);
-        let vanished = to_u64(counted.saturating_sub(planned));
-        self.store(|left| left.saturating_sub(vanished));
+        Self { remaining }
     }
 
     fn tick(&self) {
@@ -340,19 +334,76 @@ impl Drop for Countdown<'_> {
     }
 }
 
-/// How many candidates each of `tenants` has, keeping only the counts; a
-/// tenant whose planning fails counts none (its error is recorded when it
-/// is planned again to compact).
-fn count_candidates(
+/// One tenant's sealed consolidation candidates, or why planning them
+/// failed.
+type TenantPlan<'t> = (&'t str, Result<CompactionPlan, CompactionError>);
+
+/// Plan every tenant once, up front. Planning lists each tenant's objects
+/// and reads the manifest of every sealed partition holding two or more
+/// files, so it is the sweep's dominant request cost on a store with a long
+/// history; the plans both set the countdown and drive the consolidation. A
+/// partition that becomes a candidate during the sweep (a late write into a
+/// sealed hour) is planned by the next one. The plans
+/// hold one key, the tenant plus four integers, per *candidate*: they grow
+/// with the compaction backlog, not with the retained history.
+///
+/// The whole pass is the RFC 0038 §3.8 `plan partitions` phase, carrying its
+/// store work summed over the tenants.
+fn plan_tenants<'t>(
     store: &Store,
-    tenants: &[String],
+    tenants: &'t [String],
     sealed_at: u64,
     policy: &CompactionPolicy,
-) -> Vec<usize> {
-    tenants
+) -> Vec<TenantPlan<'t>> {
+    let span = tracing::info_span!(
+        "plan partitions",
+        otel.kind = "internal",
+        ourios.file_set.list_request_count = tracing::field::Empty,
+        ourios.file_set.listed_objects = tracing::field::Empty,
+        ourios.file_set.manifest_read_count = tracing::field::Empty,
+        ourios.compaction.partition.unsealed_count = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    );
+    let _phase = span.enter();
+    let mut counts = PlanCounts::default();
+    let plans: Vec<TenantPlan<'t>> = tenants
         .iter()
-        .map(|tenant| plan_candidates(store, tenant, sealed_at, policy).map_or(0, |c| c.len()))
-        .collect()
+        .map(|tenant| {
+            let (planned, tenant_counts) =
+                plan_compaction_counted(store, tenant, sealed_at, policy);
+            counts += tenant_counts;
+            (tenant.as_str(), planned)
+        })
+        .collect();
+    record_plan(&span, counts, &plans);
+    plans
+}
+
+/// Set the planning phase's counts, and mark it `Error` with the first
+/// failed tenant's class: the sweep skips that tenant and goes on.
+fn record_plan(span: &tracing::Span, counts: PlanCounts, plans: &[TenantPlan<'_>]) {
+    // `i64`: tracing-opentelemetry renders a `u64` field as a string.
+    let as_count = |count: usize| i64::try_from(count).unwrap_or(i64::MAX);
+    span.record(
+        ourios_semconv::OURIOS_FILE_SET_LIST_REQUEST_COUNT,
+        as_count(counts.list_requests),
+    );
+    span.record(
+        ourios_semconv::OURIOS_FILE_SET_LISTED_OBJECTS,
+        as_count(counts.listed_objects),
+    );
+    span.record(
+        ourios_semconv::OURIOS_FILE_SET_MANIFEST_READ_COUNT,
+        as_count(counts.manifest_reads),
+    );
+    span.record(
+        ourios_semconv::OURIOS_COMPACTION_PARTITION_UNSEALED_COUNT,
+        as_count(counts.unsealed_partitions),
+    );
+    if let Some(error) = plans.iter().find_map(|(_, planned)| planned.as_ref().err()) {
+        ourios_core::telemetry::record_span_error(span, compaction_error_type(error));
+    }
 }
 
 /// A [`SweepHooks::observe`] callback.
@@ -517,7 +568,7 @@ fn sweep_committing(
         stats: hooks.gauges.map(SweepGauges::compaction),
     };
     sweep.consolidate_all(&tenants, policy, hooks);
-    match erase_pending(&mut sweep, hooks.erasure_match) {
+    match erase_pending(&mut sweep, hooks.erasure_match, policy.erasure_settle_nanos) {
         Ok(()) => Ok(sweep.report),
         Err(error) => Err(FailedSweep {
             error,
@@ -545,36 +596,39 @@ struct Target<'p> {
 }
 
 impl Sweep<'_, '_> {
-    /// The consolidation pass over every tenant, one tenant planned at a
-    /// time, counting its candidates down ([`Countdown`]).
+    /// The consolidation pass over every tenant, planned once
+    /// ([`plan_tenants`]), counting the candidates down ([`Countdown`]),
+    /// then the orphan-reclaim pass over the same candidates.
     fn consolidate_all(
         &mut self,
         tenants: &[String],
         policy: &CompactionPolicy,
         hooks: &mut SweepHooks<'_>,
     ) {
-        let sealed_at = self.clock.sealed_at;
-        let mut countdown = Countdown::start(hooks.gauges, || {
-            count_candidates(self.store, tenants, sealed_at, policy)
-        });
-        for tenant in tenants {
+        let plans = plan_tenants(self.store, tenants, self.clock.sealed_at, policy);
+        let planned = plans
+            .iter()
+            .map(|(_, planned)| planned.as_ref().map_or(0, |plan| plan.candidates.len()))
+            .sum();
+        let countdown = Countdown::start(hooks.gauges, planned);
+        for (tenant, planned) in &plans {
             let observe = hooks.observe.as_deref_mut();
-            self.tenant(tenant, policy, observe, &mut countdown);
+            let candidates = planned.as_ref().map(|plan| plan.candidates.as_slice());
+            self.tenant(tenant, candidates, observe, &countdown);
         }
+        self.reclaim_all(&plans);
     }
 
-    /// Plan and consolidate `tenant`'s sealed candidates, counting each
-    /// down. A planning failure is recorded and the tenant skipped.
+    /// Consolidate `tenant`'s planned candidates, counting each down. A
+    /// planning failure is recorded and the tenant skipped.
     fn tenant(
         &mut self,
         tenant: &str,
-        policy: &CompactionPolicy,
+        planned: Result<&[PartitionKey], &CompactionError>,
         mut observe: Option<&mut SweepObserver<'_>>,
-        countdown: &mut Countdown<'_>,
+        countdown: &Countdown<'_>,
     ) {
         self.report.tenants_scanned += 1;
-        let planned = plan_candidates(self.store, tenant, self.clock.sealed_at, policy);
-        countdown.begin_tenant(planned.as_ref().map_or(0, Vec::len));
         let candidates = match planned {
             Ok(candidates) => candidates,
             Err(e) => {
@@ -585,7 +639,7 @@ impl Sweep<'_, '_> {
             }
         };
         let mut compacted_here = 0usize;
-        for partition in &candidates {
+        for partition in candidates {
             let target = Target { tenant, partition };
             if self.consolidate(target, observe.as_deref_mut()) {
                 compacted_here += 1;
@@ -599,20 +653,9 @@ impl Sweep<'_, '_> {
         });
     }
 
-    /// Reclaim the partition's orphans, then consolidate it; whether it
-    /// committed.
+    /// Consolidate the partition; whether it committed.
     fn consolidate(&mut self, target: Target<'_>, observe: Option<&mut SweepObserver<'_>>) -> bool {
         let Target { tenant, partition } = target;
-        // Reclaim orphans a prior crashed compaction of this partition
-        // left (RFC0009.4). Manifest-authoritative, so it never touches
-        // a live file; a scan error is recorded, not fatal.
-        match gc_orphans(self.store, partition) {
-            Ok(gc) => self.report.orphans_reclaimed += gc.reclaimed,
-            Err(e) => self.report.errors.push(format!(
-                "gc-orphans {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
-                partition.year, partition.month, partition.day, partition.hour,
-            )),
-        }
         let mut observe = observe.map(|observe| move |rows: &[MinedRecord]| observe(tenant, rows));
         let observe = observe
             .as_mut()
@@ -749,10 +792,8 @@ fn compact_candidate(
 }
 
 /// `outcome`, or the sweep error it must be rather than a no-op. A lost
-/// final swap always is. An erasure is too whenever it left live rows
-/// unrewritten, even after losing only the bootstrap, because its marker
-/// must not advance past rows still on disk. A consolidation that lost the
-/// bootstrap wrote nothing and left the partition to the winner.
+/// manifest commit always is. An erasure is too whenever it left live rows
+/// unrewritten, because its marker must not advance past rows still on disk.
 fn check_committed(
     outcome: CompactionOutcome,
     erasing: bool,

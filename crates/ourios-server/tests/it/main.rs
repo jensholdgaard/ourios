@@ -16,6 +16,7 @@
 //! same span joining the caller's trace under a `/mcp` SERVER span).
 
 mod collector_interop;
+mod otlp_http_self_telemetry;
 mod raw_http;
 mod rfc0003_16_served_binary;
 mod rfc0008_10_recovery_driver;
@@ -44,3 +45,5 @@ mod rfc0048_grammar;
 mod rfc0050_3_served_mixed_stream;
 mod rfc0051_layering;
 mod rfc0059_6_bootstrap_sigterm;
+mod rfc0060_refresh_config;
+mod server_bin;

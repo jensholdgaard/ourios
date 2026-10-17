@@ -7,6 +7,7 @@
 // import surface so every referenced name resolves unchanged.
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use futures::{StreamExt, TryStreamExt};
 use ourios_parquet::PromotedAttributes;
 
 /// How [`register_listing_table`] derives the table schema.
@@ -18,10 +19,9 @@ pub(crate) enum SchemaMode<'a> {
     /// the promoted-column arms on the post-union schema). A bare
     /// `ListingTableConfig::infer_schema` infers from the *first*
     /// table path only — with per-file URLs that is one arbitrary
-    /// file, not the union — so this arm infers per file and merges.
-    /// The extra footer reads are already paid: the Parquet format
-    /// fetches every listed file's footer for statistics at plan
-    /// time. RFC 0042 §3.3: a declared promoted key's class fixes
+    /// file, not the union — so this arm infers per file and merges,
+    /// reading up to `execution.meta_fetch_concurrency` footers at
+    /// once. RFC 0042 §3.3: a declared promoted key's class fixes
     /// its union-schema type; an undeclared promoted-column conflict
     /// resolves to Utf8; the per-file expression adapter reads a
     /// type-mismatched promoted column as absent (typed NULL) —
@@ -106,14 +106,29 @@ pub(crate) async fn register_listing_table(
         ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
     let config = match mode {
         SchemaMode::Union(promoted) => {
-            let mut schemas = Vec::with_capacity(urls.len());
-            for url in &urls {
-                let schema = options
-                    .infer_schema(&ctx.state(), url)
-                    .await
-                    .map_err(storage_err)?;
-                schemas.push(schema.as_ref().clone());
-            }
+            // A footer read per file, so one at a time a many-file query
+            // waits out the sum of the round trips. `buffered` keeps the
+            // results in `urls` order: the merge sees what the serial loop
+            // fed it.
+            let state = ctx.state();
+            let concurrency = state
+                .config_options()
+                .execution
+                .meta_fetch_concurrency
+                .get();
+            // Collected before streaming: a `map` closure over borrowed
+            // URLs makes the future fail the `Send` bound a spawned query
+            // needs ("FnOnce is not general enough").
+            let reads: Vec<_> = urls
+                .iter()
+                .map(|url| options.infer_schema(&state, url))
+                .collect();
+            let schemas: Vec<datafusion::arrow::datatypes::Schema> = futures::stream::iter(reads)
+                .buffered(concurrency)
+                .map_ok(|schema| schema.as_ref().clone())
+                .try_collect()
+                .await
+                .map_err(storage_err)?;
             let file_schema = schema_adapt::merge_scanned_schemas(schemas, promoted)
                 .map_err(|detail| QueryError::Storage { detail })?;
             ListingTableConfig::new_with_multi_paths(urls)
@@ -131,6 +146,38 @@ pub(crate) async fn register_listing_table(
     ctx.register_table(name, Arc::new(table))
         .map_err(storage_err)?;
     ctx.table(name).await.map_err(storage_err)
+}
+
+/// The data path's [`register_listing_table`] (union schema), as the
+/// RFC 0038 §3.7.2 `infer schema` phase: every resolved file's `HEAD` and
+/// footer read happen here, before the scan, and would otherwise sit under
+/// the query's root with no span.
+pub(crate) async fn register_logs_table(
+    ctx: &SessionContext,
+    urls: Vec<ListingTableUrl>,
+    promoted: &PromotedAttributes,
+    tenant: &TenantId,
+) -> Result<datafusion::dataframe::DataFrame, QueryError> {
+    let span = tracing::info_span!(
+        "infer schema",
+        otel.kind = "internal",
+        ourios.tenant = tenant.as_str(),
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    );
+    // Boxed: the phase wrappers inline the whole inference into every
+    // query future that awaits it.
+    let registered = Box::pin(register_listing_table(
+        ctx,
+        "logs",
+        urls,
+        SchemaMode::Union(promoted),
+    ));
+    crate::phase::in_phase_async(&span, registered)
+        .await
+        .inspect_err(|e| {
+            ourios_core::telemetry::record_span_error(&span, crate::template_map::error_type(e));
+        })
 }
 
 /// The one execution path: physical-plan the frame, collect it, and
@@ -260,6 +307,64 @@ mod tests {
         assert!(
             names.contains(&"only_a".to_string()) && !names.contains(&"only_b".to_string()),
             "infer is first-file-only by contract: {names:?}",
+        );
+    }
+
+    /// `Union` reads the files' footers concurrently, yet merges them in
+    /// URL order: with later files answering first, the union's field
+    /// order is still first appearance in `urls`.
+    #[tokio::test]
+    async fn union_reads_footers_concurrently_and_merges_in_url_order() {
+        const FILES: usize = 8;
+        // A later file answers sooner, so completion order is reversed.
+        fn reversed(key: &str) -> std::time::Duration {
+            let index = key
+                .trim_end_matches(".parquet")
+                .rsplit('f')
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            std::time::Duration::from_millis((8 - index) * 15)
+        }
+
+        let dir = tempfile::tempdir().expect("tmp");
+        for i in 0..FILES {
+            write_file(
+                &dir.path().join(format!("f{i}.parquet")),
+                vec![Field::new(format!("only_{i}"), DataType::Int64, false)],
+                vec![Arc::new(Int64Array::from(vec![1_i64]))],
+            );
+        }
+        let local = Arc::new(
+            datafusion::object_store::local::LocalFileSystem::new_with_prefix(dir.path())
+                .expect("local store"),
+        );
+        let slow = crate::test_support::SlowStore::new(local, reversed, None);
+        let ctx = SessionContext::new();
+        let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse("slow://bucket")
+            .expect("store url");
+        ctx.register_object_store(store_url.as_ref(), Arc::new(slow.clone()));
+        let urls = (0..FILES)
+            .map(|i| ListingTableUrl::parse(format!("slow://bucket/f{i}.parquet")).expect("url"))
+            .collect();
+
+        let promoted = PromotedAttributes::default();
+        let df = register_listing_table(&ctx, "t", urls, SchemaMode::Union(&promoted))
+            .await
+            .expect("registers");
+
+        let names: Vec<_> = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let expected: Vec<_> = (0..FILES).map(|i| format!("only_{i}")).collect();
+        assert_eq!(names, expected, "the union keeps URL order");
+        assert!(
+            slow.max_in_flight() > 1,
+            "footer reads overlap, got {} in flight at most",
+            slow.max_in_flight(),
         );
     }
 

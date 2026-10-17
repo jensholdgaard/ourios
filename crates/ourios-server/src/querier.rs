@@ -34,10 +34,10 @@ use opentelemetry::KeyValue;
 use opentelemetry::context::FutureExt as _;
 use opentelemetry::metrics::{Counter, Histogram};
 use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
-use ourios_serving::extract_context;
 use ourios_serving::serve::{PlainListener, serve_http};
 use ourios_serving::tls::{ALPN_HTTP, TlsSettings};
 use ourios_serving::tls_serve::{LISTENER_QUERIER, TlsListener, reloading_acceptor};
+use ourios_serving::{HttpClient, extract_context};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -102,6 +102,9 @@ pub struct QuerierConfig {
     /// server-supplied default window the DSL compiler expects (RFC 0002 §4 P5;
     /// RFC 0016 §7).
     pub default_window_nanos: u64,
+    /// The idle time between background template-map refresh passes
+    /// (RFC 0060); `None` runs no refresh task.
+    pub template_map_refresh: Option<Duration>,
 }
 
 /// A running querier role: the resolved bound address plus the handle to shut
@@ -110,21 +113,32 @@ pub struct QuerierHandle {
     pub http_addr: SocketAddr,
     shutdown: watch::Sender<()>,
     http: JoinHandle<()>,
+    refresh: Option<JoinHandle<()>>,
 }
 
 impl QuerierHandle {
-    /// Signal the listener to stop and await its graceful drain. A send error
-    /// just means the listener already stopped.
+    /// Signal the listener and the refresh task to stop and await both. A
+    /// send error just means they already stopped. The refresh task exits
+    /// at once: it abandons an acquisition in flight rather than waiting
+    /// for it (RFC 0060 §3.1).
     ///
     /// # Errors
     ///
-    /// The listener task's join error, as a `String` (no engine type
-    /// crosses the boundary).
+    /// A task's join error, as a `String` (no engine type crosses the
+    /// boundary).
     pub async fn shutdown(self) -> Result<(), String> {
         let _ = self.shutdown.send(());
-        self.http
+        let http = self
+            .http
             .await
-            .map_err(|e| format!("HTTP listener task: {e}"))
+            .map_err(|e| format!("HTTP listener task: {e}"));
+        let refresh = match self.refresh {
+            Some(task) => task
+                .await
+                .map_err(|e| format!("template-map refresh task: {e}")),
+            None => Ok(()),
+        };
+        http.and(refresh)
     }
 }
 
@@ -132,8 +146,9 @@ impl QuerierHandle {
 pub(crate) const QUERY_KIND_LOGS: &str = "logs";
 pub(crate) const QUERY_KIND_DRIFT: &str = "drift";
 /// The `ourios.query.kind` value for a request rejected before kind
-/// dispatch (RFC 0026 §3.4) — authn/authz answer before the body parse,
-/// so neither `logs` nor `drift` applies.
+/// dispatch (RFC 0026 §3.4) — authn/authz, the tenant header and the body
+/// parse all answer before the statement is known, so neither `logs` nor
+/// `drift` applies.
 const QUERY_KIND_REJECTED: &str = "rejected";
 /// `ourios.query.row_group.state` attribute values.
 const ROW_GROUP_SCANNED: &str = "scanned";
@@ -163,21 +178,25 @@ impl QuerierMetrics {
         let meter = ourios_core::telemetry::meter("ourios.query");
         let duration = meter
             .f64_histogram(semconv::OURIOS_QUERY_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_QUERY_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_DURATION_UNIT)
             .with_boundaries(histogram_buckets::LONG_DURATION_S.to_vec())
             .build();
         let row_groups = meter
             .u64_counter(semconv::OURIOS_QUERY_ROW_GROUPS)
-            .with_unit("{row_group}")
+            .with_description(semconv::OURIOS_QUERY_ROW_GROUPS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_ROW_GROUPS_UNIT)
             .build();
         let files = meter
             .u64_histogram(semconv::OURIOS_QUERY_FILES)
-            .with_unit("{file}")
+            .with_description(semconv::OURIOS_QUERY_FILES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_FILES_UNIT)
             .with_boundaries(histogram_buckets::FILE_COUNT.to_vec())
             .build();
         let read_size = meter
             .u64_histogram(semconv::OURIOS_QUERY_READ_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_QUERY_READ_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_READ_SIZE_UNIT)
             .with_boundaries(histogram_buckets::SIZE_BYTES.to_vec())
             .build();
         // Seed each pruning state with a zero so both series are visible before
@@ -188,7 +207,8 @@ impl QuerierMetrics {
         row_groups.add(0, &Self::state_attrs(ROW_GROUP_PRUNED));
         let visibility = meter
             .u64_counter(semconv::OURIOS_QUERY_VISIBILITY)
-            .with_unit("{query}")
+            .with_description(semconv::OURIOS_QUERY_VISIBILITY_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_VISIBILITY_UNIT)
             .build();
         for branch in [
             crate::visibility::BRANCH_TENANT_WIDE,
@@ -438,6 +458,14 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         None => None,
     };
 
+    let (shutdown, mut shutdown_rx) = watch::channel(());
+    let refresh = config.template_map_refresh.map(|interval| {
+        let refresher = querier.template_map_refresher();
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(refresher.run(interval, async move {
+            let _ = shutdown_rx.changed().await;
+        }))
+    });
     let app = router_from_querier(
         querier,
         config.default_window_nanos,
@@ -445,7 +473,6 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         config.mcp_enabled,
         &config.promoted,
     );
-    let (shutdown, mut shutdown_rx) = watch::channel(());
     let http = tokio::spawn(async move {
         let shutdown = async move {
             let _ = shutdown_rx.changed().await;
@@ -474,6 +501,7 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         http_addr,
         shutdown,
         http,
+        refresh,
     })
 }
 
@@ -486,11 +514,12 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
 /// already-entered span fails with `AlreadyStarted` (§3.3).
 async fn handle_query(
     State(state): State<QuerierState>,
+    client: HttpClient,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let parent = extract_context(&headers);
-    handle_query_traced(state, headers, body)
+    handle_query_traced(state, &client, headers, body)
         .with_context(parent)
         .await
 }
@@ -504,6 +533,11 @@ async fn handle_query(
         otel.kind = "server",
         http.request.method = "POST",
         http.route = "/v1/query",
+        client.address = client.address().map(tracing::field::display),
+        client.port = client.port(),
+        network.peer.address = client.address().map(tracing::field::display),
+        network.peer.port = client.port(),
+        user_agent.original = client.user_agent(),
         ourios.tenant = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
         ourios.query.visibility.branch = tracing::field::Empty,
@@ -511,7 +545,12 @@ async fn handle_query(
         error.type = tracing::field::Empty,
     )
 )]
-async fn handle_query_traced(state: QuerierState, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle_query_traced(
+    state: QuerierState,
+    client: &HttpClient,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     // Record the outgoing status across every early-return path at the one
     // exit; the RFC 0016 flow lives in the inner fn, which runs inside this
     // span so its `ourios.tenant` record lands on it.
@@ -538,26 +577,9 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
     // (RFC 0016 §3.3): a missing/empty header is a `400` that never scans data.
     let tenant = match tenant_from_headers(&headers) {
         Ok(tenant) => tenant,
-        Err(TenantHeaderError::Missing) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing_tenant",
-                "the X-Ourios-Tenant header is required and must be non-empty",
-            );
-        }
-        Err(TenantHeaderError::NotText) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_tenant",
-                "the X-Ourios-Tenant value must be visible ASCII text (RFC 0048 §3.1)",
-            );
-        }
-        Err(TenantHeaderError::Invalid(e)) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_tenant",
-                &format!("the X-Ourios-Tenant value is invalid: {e} (RFC 0048 §3.1)"),
-            );
+        Err(e) => {
+            let (kind, message) = e.rejection();
+            return reject_bad_request(&state, gate_started, kind, &message);
         }
     };
     tracing::Span::current().record("ourios.tenant", tenant.as_str());
@@ -582,7 +604,9 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
 
     let statement = match parse_body(&headers, &body) {
         Ok(statement) => statement,
-        Err(message) => return error_response(StatusCode::BAD_REQUEST, "invalid_query", &message),
+        Err(message) => {
+            return reject_bad_request(&state, gate_started, "invalid_query", &message);
+        }
     };
 
     // RFC 0047 §3.4: the two-step decides which rows this principal may see
@@ -610,20 +634,34 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
             if let Some(rejection) = crate::visibility::require_tenant_wide(visibility.as_ref()) {
                 return reject_visibility(&state, gate_started, &rejection);
             }
-            let result = state.querier.run_drift(&query, &tenant, now).await;
-            let elapsed = started.elapsed();
-            match result {
-                Ok(result) => {
-                    state.metrics.record_drift(elapsed, &result);
-                    json_ok(&DriftResponse::from(&result))
-                }
-                Err(e) => {
-                    state
-                        .metrics
-                        .record_err(QUERY_KIND_DRIFT, elapsed, query_error_type(&e));
-                    query_error_response(&e)
-                }
-            }
+            run_drift_query(&state, &query, &tenant, now, started).await
+        }
+    }
+}
+
+/// The drift arm of the query endpoint: run, record, encode.
+async fn run_drift_query(
+    state: &QuerierState,
+    query: &ourios_querier::dsl::DriftQuery,
+    tenant: &TenantId,
+    now: u64,
+    started: Instant,
+) -> Response {
+    let result = state.querier.run_drift(query, tenant, now).await;
+    let elapsed = started.elapsed();
+    match result {
+        Ok(result) => served(
+            state,
+            QUERY_KIND_DRIFT,
+            elapsed,
+            &DriftResponse::from(&result),
+            || state.metrics.record_drift(elapsed, &result),
+        ),
+        Err(e) => {
+            state
+                .metrics
+                .record_err(QUERY_KIND_DRIFT, elapsed, query_error_type(&e));
+            query_error_response(&e)
         }
     }
 }
@@ -667,6 +705,26 @@ enum TenantHeaderError {
     Missing,
     NotText,
     Invalid(ourios_core::tenant::TenantIdError),
+}
+
+impl TenantHeaderError {
+    /// The `400`'s error kind and message.
+    fn rejection(&self) -> (&'static str, String) {
+        match self {
+            Self::Missing => (
+                "missing_tenant",
+                "the X-Ourios-Tenant header is required and must be non-empty".to_owned(),
+            ),
+            Self::NotText => (
+                "invalid_tenant",
+                "the X-Ourios-Tenant value must be visible ASCII text (RFC 0048 §3.1)".to_owned(),
+            ),
+            Self::Invalid(e) => (
+                "invalid_tenant",
+                format!("the X-Ourios-Tenant value is invalid: {e} (RFC 0048 §3.1)"),
+            ),
+        }
+    }
 }
 
 /// Parse the body into a [`Statement`] by `Content-Type` (RFC 0016 §3.3):
@@ -1035,23 +1093,56 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// `200` with a JSON body. A serialisation failure (should not happen for these
-/// owned DTOs) degrades to a `500` rather than a `200` with an empty body.
-fn json_ok<T: Serialize>(value: &T) -> Response {
-    match serde_json::to_vec(value) {
-        Ok(body) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            body,
-        )
-            .into_response(),
-        Err(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            "failed to encode the query result",
-        ),
+/// Encode a query's `response` and record the query: `record_served` only
+/// once the body encodes, otherwise a failure of `kind` and the logged `500`.
+fn served<T: Serialize>(
+    state: &QuerierState,
+    kind: &'static str,
+    elapsed: Duration,
+    response: &T,
+    record_served: impl FnOnce(),
+) -> Response {
+    match serde_json::to_vec(response) {
+        Ok(body) => {
+            record_served();
+            json_ok(body)
+        }
+        Err(e) => {
+            state.metrics.record_err(kind, elapsed, ENCODE_ERROR_TYPE);
+            encode_failure(&e)
+        }
     }
 }
+
+/// `200` with an encoded JSON body.
+fn json_ok(body: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+/// A result that failed to encode (should not happen for these owned DTOs):
+/// a logged `500` rather than a `200` with an empty body. The caller records
+/// the query as failed, not as served.
+fn encode_failure(error: &serde_json::Error) -> Response {
+    log_exception(
+        std::any::type_name::<serde_json::Error>(),
+        ENCODE_ERROR_TYPE,
+        &error.to_string(),
+    );
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "failed to encode the query result",
+    )
+}
+
+/// OpenTelemetry's fallback `error.type`: an encoding failure has no class
+/// of its own among the query errors.
+const ENCODE_ERROR_TYPE: &str = "_OTHER";
 
 /// A `status` JSON error body `{ "error": { "kind", "message" } }` (RFC 0016
 /// §3.5). `message` is Ourios-owned text — never engine internals.
@@ -1094,10 +1185,13 @@ async fn run_logs_query(
         .await;
     let elapsed = started.elapsed();
     match result {
-        Ok(result) => {
-            state.metrics.record_logs(elapsed, &result);
-            json_ok(&LogQueryResponse::from(&result))
-        }
+        Ok(result) => served(
+            state,
+            QUERY_KIND_LOGS,
+            elapsed,
+            &LogQueryResponse::from(&result),
+            || state.metrics.record_logs(elapsed, &result),
+        ),
         Err(e) => {
             state
                 .metrics
@@ -1108,6 +1202,21 @@ async fn run_logs_query(
 }
 
 /// An RFC 0047 §3.4 refusal, recorded like every pre-dispatch rejection.
+/// A `400` before kind dispatch, recorded on `ourios.query.duration` (kind
+/// `rejected`) with the response's error kind as `error.type`. The server
+/// span stays unset: semconv leaves a server span's `4xx` to the client.
+fn reject_bad_request(
+    state: &QuerierState,
+    gate_started: Instant,
+    kind: &'static str,
+    message: &str,
+) -> Response {
+    state
+        .metrics
+        .record_err(QUERY_KIND_REJECTED, gate_started.elapsed(), kind);
+    error_response(StatusCode::BAD_REQUEST, kind, message)
+}
+
 fn reject_visibility(
     state: &QuerierState,
     gate_started: Instant,
@@ -1201,12 +1310,46 @@ fn query_error_response(error: &ourios_querier::QueryError) -> Response {
         // `Storage` and any future `#[non_exhaustive]` variant → a scrubbed
         // 500. `QueryError::Display` is the H6-safe surface (it withholds the
         // engine detail), so this never leaks DataFusion/SQL text.
-        _ => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            &error.to_string(),
-        ),
+        _ => {
+            log_server_exception(error);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &error.to_string(),
+            )
+        }
     }
+}
+
+/// Semconv `http.server.request.exception`: one `ERROR` log per `5xx` the
+/// server itself caused, in the request span, carrying the detail the
+/// scrubbed response withholds. Without it a failed query leaves nothing to
+/// debug but `error.type`.
+fn log_server_exception(error: &ourios_querier::QueryError) {
+    let message = match error {
+        ourios_querier::QueryError::Storage { detail } => detail.clone(),
+        other => other.to_string(),
+    };
+    log_exception(
+        std::any::type_name::<ourios_querier::QueryError>(),
+        query_error_type(error),
+        &message,
+    );
+}
+
+/// `exception.type` is the Rust error type, per semconv; `error.type` is
+/// the class the query metrics record, so the log joins them.
+fn log_exception(exception_type: &str, error_type: &str, message: &str) {
+    use ourios_core::telemetry;
+    tracing::error!(
+        name: telemetry::EVENT_HTTP_SERVER_REQUEST_EXCEPTION,
+        {
+            { telemetry::EXCEPTION_TYPE } = exception_type,
+            { telemetry::ERROR_TYPE } = error_type,
+            { telemetry::EXCEPTION_MESSAGE } = message,
+        },
+        "query failed",
+    );
 }
 
 /// The `{"query": "<dsl text>"}` JSON wrapper (RFC 0016 §3.3). `deny_unknown_fields`
@@ -1228,8 +1371,135 @@ mod tests {
 
     use super::{
         DEFAULT_LIMIT, LogRowDto, MAX_LIMIT, Stage, Statement, TenantHeaderError, apply_limit,
-        parse_body, tenant_from_headers,
+        parse_body, query_error_response, tenant_from_headers,
     };
+
+    /// An event's name, level and fields.
+    type Seen = (String, tracing::Level, Vec<(String, String)>);
+
+    /// The events a scope saw.
+    #[derive(Clone, Default)]
+    struct Events(std::sync::Arc<std::sync::Mutex<Vec<Seen>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(Vec<(String, String)>);
+            impl tracing::field::Visit for Fields {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push((field.name().to_owned(), value.to_owned()));
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push((field.name().to_owned(), format!("{value:?}")));
+                }
+            }
+            let mut fields = Fields(Vec::new());
+            event.record(&mut fields);
+            let meta = event.metadata();
+            self.0
+                .lock()
+                .unwrap()
+                .push((meta.name().to_owned(), *meta.level(), fields.0));
+        }
+    }
+
+    fn events_of(f: impl FnOnce()) -> Vec<Seen> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let events = Events::default();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(events.clone()), f);
+        events.0.lock().unwrap().clone()
+    }
+
+    /// A `500` logs one `http.server.request.exception` at `ERROR` with the
+    /// storage detail the response body withholds.
+    #[test]
+    fn a_storage_500_logs_the_withheld_detail() {
+        let error = ourios_querier::QueryError::Storage {
+            detail: "list data prefix data/tenant_id=acme/: timed out".to_owned(),
+        };
+        let events = events_of(|| {
+            let response = query_error_response(&error);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        });
+        let [(name, level, fields)] = &events[..] else {
+            panic!("one event: {events:?}");
+        };
+        assert_eq!(name, "http.server.request.exception");
+        assert_eq!(*level, tracing::Level::ERROR);
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            field("exception.type"),
+            Some(std::any::type_name::<ourios_querier::QueryError>()),
+        );
+        assert_eq!(field("error.type"), Some("storage"));
+        assert_eq!(
+            field("exception.message"),
+            Some("list data prefix data/tenant_id=acme/: timed out"),
+        );
+    }
+
+    /// A result that fails to encode is a server `500`: logged the same way.
+    #[test]
+    fn an_encoding_500_logs_the_serializer_error() {
+        struct Unencodable;
+        impl serde::Serialize for Unencodable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("not encodable"))
+            }
+        }
+        let events = events_of(|| {
+            let error = serde_json::to_vec(&Unencodable).expect_err("unencodable");
+            let response = super::encode_failure(&error);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        });
+        let [(name, level, fields)] = &events[..] else {
+            panic!("one event: {events:?}");
+        };
+        assert_eq!(name, "http.server.request.exception");
+        assert_eq!(*level, tracing::Level::ERROR);
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            field("exception.type"),
+            Some(std::any::type_name::<serde_json::Error>()),
+        );
+        assert_eq!(field("exception.message"), Some("not encodable"));
+    }
+
+    /// A `4xx` is the client's error: no exception log.
+    #[test]
+    fn a_4xx_logs_no_exception() {
+        let error = ourios_querier::QueryError::InvalidQuery {
+            detail: "unexpected token".to_owned(),
+        };
+        let events = events_of(|| {
+            let response = query_error_response(&error);
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        });
+        assert!(events.is_empty(), "{events:?}");
+    }
 
     fn headers(content_type: Option<&str>, tenant: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();

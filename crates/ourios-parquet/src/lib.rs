@@ -51,14 +51,18 @@ pub use audit_record_batch::{AuditBatchError, audit_events_to_batch};
 pub use audit_sink::ParquetAuditSink;
 pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile, derive_audit_partition};
 pub use compaction::{
-    CommitHook, Committed, CompactionError, CompactionOutcome, CompactionPolicy, CompactionStats,
-    MemoryPhase, OrphanGc, RowFilter, RowHooks, RowObserver, compact_partition,
-    compact_partition_hooked, compact_partition_with_flush_threshold,
-    compact_partition_with_promoted, compact_partition_with_sort_budget, gc_orphans,
-    hour_partitions, plan_candidates,
+    CommitHook, Committed, CompactionError, CompactionOutcome, CompactionPlan, CompactionPolicy,
+    CompactionStats, MemoryPhase, OrphanGc, PartitionSnapshot, PlanCounts, RowFilter, RowHooks,
+    RowObserver, compact_partition, compact_partition_hooked,
+    compact_partition_with_flush_threshold, compact_partition_with_promoted,
+    compact_partition_with_sort_budget, gc_orphans, hour_partitions, partition_snapshot,
+    plan_candidates, plan_candidates_counted, plan_compaction_counted,
 };
 pub use id_max::{FooterMax, IdColumns, IdMaxError, decoded_max, footer_max, object_max_id};
-pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
+pub use manifest::{
+    LiveSet, MANIFEST_FILENAME, MANIFEST_FORMAT, Manifest, ManifestError, Published,
+    compacted_generation,
+};
 pub use partition::{
     PartitionKey, TimestampOverflowError, effective_time_unix_nano, hour_partition_in_window,
     percent_decode_tenant, percent_encode_tenant,
@@ -67,7 +71,8 @@ pub use promoted::{PromotedAttributes, PromotedClass, PromotedKey, SERVICE_NAME_
 pub use reader::{Reader, ReaderError, ShapeValidation, batch_to_mined_records};
 pub use record_batch::{BatchError, mined_records_to_batch, mined_records_to_batch_with_promoted};
 pub use store::{
-    Caller, DelimitedListing, QueryPhase, S3Config, Store, StoreConfig, StoreError, Suffix,
+    Caller, DelimitedListing, ListedObject, QueryPhase, S3Config, Store, StoreConfig, StoreError,
+    Suffix,
 };
 pub use writer::{
     COMPACTED_RG_BYTES_ENV, DEFAULT_ZSTD_LEVEL, MAX_COMPACTED_RG_BYTES, MIN_COMPACTED_RG_BYTES,

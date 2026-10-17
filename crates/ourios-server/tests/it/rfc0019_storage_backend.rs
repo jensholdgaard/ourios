@@ -197,7 +197,7 @@ async fn localstack_s3(bucket: &str) -> (ContainerAsync<LocalStack>, String, Sto
 /// `endpoint`/`bucket`. Credentials are *not* set here — the child inherits the
 /// `AWS_*` env the CI job provides (RFC 0019 §3.4).
 fn s3_server(endpoint: &str, bucket: &str) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ourios-server"));
+    let mut cmd = crate::server_bin::command();
     cmd.env("OURIOS_STORAGE_BACKEND", "s3")
         .env("OURIOS_S3_BUCKET", bucket)
         .env("OURIOS_S3_ENDPOINT", endpoint)
@@ -619,8 +619,8 @@ async fn rfc0019_4_compaction_operates_on_s3() {
         "compaction consolidated the partition to a single live file",
     );
     assert!(
-        consolidated.generation >= 2,
-        "the manifest was swapped via the conditional-PUT CAS (bootstrap gen 1 → commit gen ≥ 2), got {}",
+        consolidated.generation >= 1,
+        "the manifest was committed via the conditional PUT (first commit creates gen 1), got {}",
         consolidated.generation,
     );
 

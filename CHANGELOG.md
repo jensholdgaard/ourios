@@ -2,6 +2,146 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.14.0-rc.1] - 2026-10-17
+
+### Added
+
+- Finer confidence buckets near 1.0 and per-tenant zero points (#1058) (0eea0fb)
+- Count the batch on the ingest span and tenant the ingest counters (#1053) (3d4d59f)
+- Warn at start-up when an otlp protocol falls back to grpc (#1054) (0056f40)
+- Count unsealed partitions on the plan partitions span (#1055) (34611e8)
+- Confirm an erasure by partition generation and wait for erasure_settle (#1043) (0dcb0e8)
+- Span and count the orphan gc pass (#1041) (1129b89)
+- **BREAKING** Record consumed flush files in the manifest so a late write stays live (#1038) (a710c68)
+- Name each output for its generation and keep in-flight outputs from gc (#1037) (a37492b)
+
+### Changed
+
+- Drop the bootstrap manifest; the first commit creates it (#1040) (b43c251)
+
+### Chore
+
+- Capture Claude Code prompts and tool details locally and strip them from spans (#1057) (ebb5a75)
+- Run the closed loop in the background and make its OTLP backend configurable (#1046) (2168833)
+- Add a local closed loop that sends Claude Code and Ourios telemetry to Dash0 (#1044) (59305a1)
+
+### Documentation
+
+- Require the unsealed count on the plan partitions span (#1056) (18f59e4)
+- Amend §6.8 for finer confidence buckets and per-tenant zero points (#1052) (e1fc508)
+- Amend for an observable orphan gc pass (#1039) (a003c85)
+
+### Fixed
+
+- Keep the /mcp server span open until the tool result streams (#1048) (bacffc8)
+- Keep the store bridge's idle blocking threads for ten minutes (#1047) (f454954)
+- Record ourios.tenant on execute_tool spans (#1050) (df2ee76)
+- Export self-telemetry over otlp/http when the protocol env selects http/protobuf (#1045) (4614a73)
+- Resolve again when a scan fails over a file set a commit replaced (#1042) (7249af2)
+- Roll the compactor with the recreate strategy so two never run at once (#1036) (ec87bed)
+
+### Tests
+
+- Spawn every served-binary test without the ambient otel env (#1049) (4379f7a)
+
+## [0.13.5] - 2026-10-16
+
+### Added
+
+- Skip the artifact read a refresh pass's listing proves unchanged (#1031) (4dd80d7)
+- Span the sweep's planning phase as plan partitions (#1029) (a34132a)
+
+### Documentation
+
+- Draft the late-write amendment so a late file stays live (#1033) (89db4cf)
+- Correct the plan partitions counts for the one-listing planner (#1035) (3737f9f)
+- Skip the artifact read a pass's listing proves unchanged (#1028) (bce1571)
+- Plan each tenant from one listing, not a read per partition (#1027) (04c1b74)
+- Draft a plan partitions span under the compaction sweep (#1025) (3a919ec)
+
+### Performance
+
+- Plan each tenant from one listing, skip settled partitions (#1030) (8e682da)
+
+## [0.13.4] - 2026-10-16
+
+### Added
+
+- Record the file-set listing and manifest counts on resolve files (#1023) (f265be6)
+- Record ourios.tenant on the per-partition compaction metrics (#1022) (92600e7)
+- Record client.address, client.port and user_agent.original on http server spans (#1021) (df13f95)
+- Span the union-schema footer inference as infer schema (#1018) (21c2115)
+
+### Documentation
+
+- Mark rfc0038.1's query arm green (#1024) (b72dc47)
+- Amend §3.7 with an infer schema phase span (#1017) (427ff72)
+
+### Performance
+
+- Plan each tenant once per sweep (#1020) (14abb6c)
+
+## [0.13.3] - 2026-10-15
+
+### Added
+
+- Record ourios.tenant on the ingest logs and derive template_map spans (#1015) (70150a9)
+
+### CI
+
+- Collect coverage through nextest, as the test job runs (#1012) (cfcb58e)
+
+### Fixed
+
+- Record the query endpoint's 400s on query.duration with error.type (#1013) (bbd3d0f)
+
+## [0.13.2] - 2026-10-14
+
+### Added
+
+- Registry description and unit at every ourios.* instrument (#1003) (ce2e366)
+
+### Chore
+
+- Pin ourios-semconv v0.3.18 for metric description and unit constants (#1002) (f25c365)
+
+### Fixed
+
+- Bump rustls to 0.23.46 for RUSTSEC-2026-0346/0347/0348 (#1010) (86904d6)
+
+### Performance
+
+- Read partition manifests concurrently in resolve files (#1011) (fdcad8c)
+- Read the union schema's footers concurrently (#1009) (a38ce58)
+
+## [0.13.1] - 2026-10-13
+
+### Added
+
+- Run the template-map refresh task in the served role (rfc 0060 stage 2) (#1000) (29c0c4d)
+- Background template-map refresh task (rfc 0060 stage 1) (#997) (cc197c1)
+- Span file-set resolution as a query phase (#985) (bbeb537)
+
+### Chore
+
+- Pin ourios-semconv v0.3.17 for the template-map refresh names (#996) (d9d2449)
+
+### Documentation
+
+- Rfc 0060 background template-map refresh (specified) (#994) (1e7cde1)
+- Rfc 0033 amendment to announce a binding conflict once (#992) (0475a08)
+
+### Fixed
+
+- Log the withheld detail of a query 5xx as an exception event (#995) (a042b2c)
+- Announce a template binding conflict once, not every derive (#993) (ef7ab83)
+- Lead put_if_match with the etag spelling that last won (#991) (17cd1a4)
+
+### Tests
+
+- Red, the §5 stubs land, status specified→red (#999) (3b3b55f)
+- Land the audit file before the frontier-moved flag (#998) (96c6093)
+
 ## [0.13.0] - 2026-10-12
 
 ### Added

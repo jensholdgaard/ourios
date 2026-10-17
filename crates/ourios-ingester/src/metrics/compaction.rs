@@ -35,7 +35,7 @@ use ourios_parquet::MemoryPhase;
 use ourios_semconv as semconv;
 
 use crate::compactor::{
-    FailedSweep, IngestError, PartitionCommitted, SweepGauges, SweepReport, to_u64,
+    DELETE_FAILED, FailedSweep, IngestError, PartitionCommitted, SweepGauges, SweepReport, to_u64,
 };
 
 /// Per-tenant current backlog (sealed-but-uncompacted partition count)
@@ -54,6 +54,9 @@ pub struct CompactionMetrics {
     files: Counter<u64>,
     rows: Counter<u64>,
     orphan_files: Counter<u64>,
+    /// `ourios.compaction.orphan.reclaimed`, per tenant, `error.type` on a
+    /// failed delete.
+    orphan_reclaimed: Counter<u64>,
     duration: Histogram<f64>,
     io: Counter<u64>,
     file_size: Histogram<u64>,
@@ -94,19 +97,22 @@ impl LiveInstruments {
         let read = Arc::clone(gauges);
         let spill_runs = meter
             .u64_observable_counter(semconv::OURIOS_COMPACTION_SPILL_RUNS)
-            .with_unit("{run}")
+            .with_description(semconv::OURIOS_COMPACTION_SPILL_RUNS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_SPILL_RUNS_UNIT)
             .with_callback(move |observer| observer.observe(read.compaction().spill_runs(), &[]))
             .build();
         let read = Arc::clone(gauges);
         let spill_size = meter
             .u64_observable_counter(semconv::OURIOS_COMPACTION_SPILL_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_COMPACTION_SPILL_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_SPILL_SIZE_UNIT)
             .with_callback(move |observer| observer.observe(read.compaction().spill_bytes(), &[]))
             .build();
         let read = Arc::clone(gauges);
         let memory_usage = meter
             .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_MEMORY_USAGE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_COMPACTION_MEMORY_USAGE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_MEMORY_USAGE_UNIT)
             .with_callback(move |observer| {
                 for phase in MemoryPhase::ALL {
                     let usage = read.compaction().usage(phase);
@@ -117,7 +123,8 @@ impl LiveInstruments {
         let read = Arc::clone(gauges);
         let memory_limit = meter
             .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_MEMORY_LIMIT)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_COMPACTION_MEMORY_LIMIT_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_MEMORY_LIMIT_UNIT)
             .with_callback(move |observer| {
                 for phase in MemoryPhase::ALL {
                     if let Some(limit) = read.compaction().limit(phase) {
@@ -129,7 +136,8 @@ impl LiveInstruments {
         let read = Arc::clone(gauges);
         let sweep_remaining = meter
             .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_SWEEP_REMAINING)
-            .with_unit("{partition}")
+            .with_description(semconv::OURIOS_COMPACTION_SWEEP_REMAINING_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_SWEEP_REMAINING_UNIT)
             .with_callback(move |observer| observer.observe(saturating_i64(read.remaining()), &[]))
             .build();
         Self {
@@ -162,20 +170,78 @@ const FILE_SIZE_BUCKETS: [f64; 12] = [
     4_294_967_296.0, // 4 GiB
 ];
 
-/// A `u64` counter named `name` in `unit`.
-fn counter(meter: &Meter, name: &'static str, unit: &'static str) -> Counter<u64> {
-    meter.u64_counter(name).with_unit(unit).build()
+/// A registry metric's `(name, description, unit)` constants.
+type MetricDef = (&'static str, &'static str, &'static str);
+
+const COMPACTION_PARTITIONS: MetricDef = (
+    semconv::OURIOS_COMPACTION_PARTITIONS,
+    semconv::OURIOS_COMPACTION_PARTITIONS_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_PARTITIONS_UNIT,
+);
+const COMPACTION_FILES: MetricDef = (
+    semconv::OURIOS_COMPACTION_FILES,
+    semconv::OURIOS_COMPACTION_FILES_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_FILES_UNIT,
+);
+const COMPACTION_ROWS: MetricDef = (
+    semconv::OURIOS_COMPACTION_ROWS,
+    semconv::OURIOS_COMPACTION_ROWS_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_ROWS_UNIT,
+);
+const COMPACTION_ORPHAN_FILES: MetricDef = (
+    semconv::OURIOS_COMPACTION_ORPHAN_FILES,
+    semconv::OURIOS_COMPACTION_ORPHAN_FILES_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_ORPHAN_FILES_UNIT,
+);
+const COMPACTION_ORPHAN_RECLAIMED: MetricDef = (
+    semconv::OURIOS_COMPACTION_ORPHAN_RECLAIMED,
+    semconv::OURIOS_COMPACTION_ORPHAN_RECLAIMED_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_ORPHAN_RECLAIMED_UNIT,
+);
+const COMPACTION_SWEEPS: MetricDef = (
+    semconv::OURIOS_COMPACTION_SWEEPS,
+    semconv::OURIOS_COMPACTION_SWEEPS_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_SWEEPS_UNIT,
+);
+const COMPACTION_IO: MetricDef = (
+    semconv::OURIOS_COMPACTION_IO,
+    semconv::OURIOS_COMPACTION_IO_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_IO_UNIT,
+);
+const STORAGE_PARQUET_FILE_SIZE: MetricDef = (
+    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
+    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_DESCRIPTION,
+    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_UNIT,
+);
+const COMPACTION_PARTITION_INPUT_FILES: MetricDef = (
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES_UNIT,
+);
+const COMPACTION_PARTITION_INPUT_SIZE: MetricDef = (
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE_UNIT,
+);
+
+/// A `u64` counter for `def`.
+fn counter(meter: &Meter, (name, description, unit): MetricDef) -> Counter<u64> {
+    meter
+        .u64_counter(name)
+        .with_description(description)
+        .with_unit(unit)
+        .build()
 }
 
-/// A `u64` histogram named `name` in `unit`, bucketed at `boundaries`.
+/// A `u64` histogram for `def`, bucketed at `boundaries`.
 fn histogram(
     meter: &Meter,
-    name: &'static str,
-    unit: &'static str,
+    (name, description, unit): MetricDef,
     boundaries: &[f64],
 ) -> Histogram<u64> {
     meter
         .u64_histogram(name)
+        .with_description(description)
         .with_unit(unit)
         .with_boundaries(boundaries.to_vec())
         .build()
@@ -192,7 +258,8 @@ fn backlog(meter: &Meter) -> (BacklogState, ObservableUpDownCounter<i64>) {
     let callback_state = Arc::clone(&backlog_state);
     let backlog = meter
         .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_BACKLOG)
-        .with_unit("{partition}")
+        .with_description(semconv::OURIOS_COMPACTION_BACKLOG_DESCRIPTION)
+        .with_unit(semconv::OURIOS_COMPACTION_BACKLOG_UNIT)
         .with_callback(move |observer| {
             // Recover a poisoned lock rather than panic — a metrics
             // collection callback must never bring the process down.
@@ -226,7 +293,9 @@ impl CompactionMetrics {
     /// UCUM units the registry (`metrics.yaml` in the shared `ourios-semconv` repo)
     /// declares for each.
     ///
-    /// The attribute-free counters are seeded with a zero measurement so
+    /// The counters with no required attribute are seeded with an untagged
+    /// zero measurement (their `ourios.tenant` is conditional on a committed
+    /// partition, #1016) so
     /// they are visible to the exporter before the first sweep records
     /// anything (RFC 0001 §6.8 collect-on-read). `sweeps` and `duration`
     /// are **not** seeded: their `ourios.compaction.result` attribute is
@@ -240,10 +309,10 @@ impl CompactionMetrics {
 
     /// [`Self::new`] on `meter` rather than the global one.
     pub(crate) fn from_meter(meter: &Meter) -> Self {
-        let partitions = counter(meter, semconv::OURIOS_COMPACTION_PARTITIONS, "{partition}");
-        let files = counter(meter, semconv::OURIOS_COMPACTION_FILES, "{file}");
-        let rows = counter(meter, semconv::OURIOS_COMPACTION_ROWS, "{row}");
-        let orphan_files = counter(meter, semconv::OURIOS_COMPACTION_ORPHAN_FILES, "{file}");
+        let partitions = counter(meter, COMPACTION_PARTITIONS);
+        let files = counter(meter, COMPACTION_FILES);
+        let rows = counter(meter, COMPACTION_ROWS);
+        let orphan_files = counter(meter, COMPACTION_ORPHAN_FILES);
         // Only the attribute-free counters; `sweeps` and `io` carry
         // required attributes (`result` / `io.direction`) and `duration`
         // / `file_size` are histograms, so none are zero-seeded here —
@@ -257,35 +326,30 @@ impl CompactionMetrics {
         let live = LiveInstruments::register(meter, &gauges);
 
         Self {
-            sweeps: counter(meter, semconv::OURIOS_COMPACTION_SWEEPS, "{sweep}"),
+            sweeps: counter(meter, COMPACTION_SWEEPS),
             partitions,
             files,
             rows,
             orphan_files,
+            orphan_reclaimed: counter(meter, COMPACTION_ORPHAN_RECLAIMED),
             duration: meter
                 .f64_histogram(semconv::OURIOS_COMPACTION_DURATION)
-                .with_unit("s")
+                .with_description(semconv::OURIOS_COMPACTION_DURATION_DESCRIPTION)
+                .with_unit(semconv::OURIOS_COMPACTION_DURATION_UNIT)
                 .with_boundaries(histogram_buckets::LONG_DURATION_S.to_vec())
                 .build(),
-            io: counter(meter, semconv::OURIOS_COMPACTION_IO, "By"),
-            file_size: histogram(
-                meter,
-                semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
-                "By",
-                &FILE_SIZE_BUCKETS,
-            ),
+            io: counter(meter, COMPACTION_IO),
+            file_size: histogram(meter, STORAGE_PARQUET_FILE_SIZE, &FILE_SIZE_BUCKETS),
             backlog_state,
             backlog,
             input_files: histogram(
                 meter,
-                semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES,
-                "{file}",
+                COMPACTION_PARTITION_INPUT_FILES,
                 &histogram_buckets::FILE_COUNT,
             ),
             input_size: histogram(
                 meter,
-                semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE,
-                "By",
+                COMPACTION_PARTITION_INPUT_SIZE,
                 &histogram_buckets::SIZE_BYTES,
             ),
             gauges,
@@ -301,29 +365,35 @@ impl CompactionMetrics {
 
     /// Record one committed partition rewrite, the moment its manifest
     /// commits: `partitions`, `files`, `rows`, both `io` directions, and
-    /// the H4 `file.size` sample. Recorded per partition, not per sweep, so
-    /// a sweep working through a large backlog shows its progress while it
-    /// runs.
+    /// the H4 `file.size` sample, each attributed to the partition's tenant
+    /// (#1016). Recorded per partition, not per sweep, so a sweep working
+    /// through a large backlog shows its progress while it runs.
     pub fn record_partition(&self, commit: &PartitionCommitted<'_>) {
-        self.partitions.add(1, &[]);
-        self.files.add(commit.files, &[]);
-        self.rows.add(commit.rows, &[]);
-        self.record_io(commit.bytes_read, commit.bytes_written);
+        let tenant = KeyValue::new(semconv::OURIOS_TENANT, commit.tenant.to_owned());
+        let attrs = std::slice::from_ref(&tenant);
+        self.partitions.add(1, attrs);
+        self.files.add(commit.files, attrs);
+        self.rows.add(commit.rows, attrs);
+        self.record_io(commit.bytes_read, commit.bytes_written, attrs);
         self.record_file_size(commit.tenant, commit.bytes_written);
-        self.record_input(commit);
+        self.record_input(commit, &tenant);
     }
 
     /// The partition's input shape: its file count, and its size both as
     /// stored and as the RFC 0036 §3.2 budget estimates it decoded.
-    fn record_input(&self, commit: &PartitionCommitted<'_>) {
-        self.input_files.record(commit.files, &[]);
+    fn record_input(&self, commit: &PartitionCommitted<'_>, tenant: &KeyValue) {
+        self.input_files
+            .record(commit.files, std::slice::from_ref(tenant));
         for (kind, bytes) in [
             ("encoded", commit.bytes_read),
             ("decoded_estimate", commit.decoded_bytes_estimate),
         ] {
             self.input_size.record(
                 bytes,
-                &[KeyValue::new(semconv::OURIOS_COMPACTION_SIZE_KIND, kind)],
+                &[
+                    KeyValue::new(semconv::OURIOS_COMPACTION_SIZE_KIND, kind),
+                    tenant.clone(),
+                ],
             );
         }
     }
@@ -361,7 +431,8 @@ impl CompactionMetrics {
         self.sweeps.add(1, &attrs);
         self.duration.record(elapsed.as_secs_f64(), &attrs);
         // Both directions surface on every sweep, a no-op one included.
-        self.record_io(0, 0);
+        // A sweep has no single tenant, so this observation carries none.
+        self.record_io(0, 0, &[]);
 
         // A sweep that failed before scanning the store yields no
         // per-tenant data, so the backlog map is deliberately left as-is:
@@ -370,7 +441,25 @@ impl CompactionMetrics {
         // the failure itself surfaces via `sweeps{result="error"}`.
         if let Some(report) = report {
             self.orphan_files.add(to_u64(report.gc_failures), &[]);
+            self.record_orphan_gc(report);
             self.record_backlog(report);
+        }
+    }
+
+    /// Each tenant's orphan GC: deleted files without `error.type`, failed
+    /// deletes with it. Zero counts add no point, so a tenant with nothing
+    /// to reclaim emits nothing.
+    fn record_orphan_gc(&self, report: &SweepReport) {
+        for gc in &report.orphan_gc {
+            let tenant = KeyValue::new(semconv::OURIOS_TENANT, gc.tenant.clone());
+            if gc.reclaimed > 0 {
+                self.orphan_reclaimed
+                    .add(gc.reclaimed, std::slice::from_ref(&tenant));
+            }
+            if gc.failed > 0 {
+                let failed = KeyValue::new(super::ERROR_TYPE, DELETE_FAILED);
+                self.orphan_reclaimed.add(gc.failed, &[tenant, failed]);
+            }
         }
     }
 
@@ -413,7 +502,8 @@ impl CompactionMetrics {
                 .compacted_files
                 .iter()
                 .fold(0_u64, |acc, f| acc.saturating_add(f.bytes));
-            self.record_io(report.bytes_read, bytes_written);
+            // A report's totals span every tenant swept: no tenant.
+            self.record_io(report.bytes_read, bytes_written, &[]);
             for file in &report.compacted_files {
                 self.record_file_size(&file.tenant, file.bytes);
             }
@@ -421,14 +511,13 @@ impl CompactionMetrics {
         self.record_end(result.is_err(), result.as_ref().ok(), elapsed);
     }
 
-    /// Bytes moved, split by direction.
-    fn record_io(&self, read: u64, written: u64) {
-        self.io
-            .add(read, &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "read")]);
-        self.io.add(
-            written,
-            &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "write")],
-        );
+    /// Bytes moved, split by direction, with `attrs` on both.
+    fn record_io(&self, read: u64, written: u64, attrs: &[KeyValue]) {
+        for (direction, bytes) in [("read", read), ("write", written)] {
+            let mut all = vec![KeyValue::new(semconv::OURIOS_IO_DIRECTION, direction)];
+            all.extend_from_slice(attrs);
+            self.io.add(bytes, &all);
+        }
     }
 
     /// The H4 detector: one per-tenant sample per consolidated file, so
@@ -617,6 +706,7 @@ mod tests {
             rows_compacted: 100,
             gc_failures: 1,
             orphans_reclaimed: 0,
+            orphan_gc: Vec::new(),
             errors: Vec::new(),
             compaction_events: Vec::new(),
             bytes_read: 4096,
@@ -680,6 +770,15 @@ mod tests {
         }
     }
 
+    /// Compaction instruments exported with the registry description and
+    /// unit, through both the `counter` and `histogram` helpers.
+    const REGISTERED: [ourios_telemetry::metadata_guard::Registered; 4] = [
+        COMPACTION_PARTITIONS,
+        COMPACTION_SWEEPS,
+        COMPACTION_IO,
+        STORAGE_PARQUET_FILE_SIZE,
+    ];
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn record_sweep_exports_the_compaction_metric_set() {
         // Arrange — an in-memory provider, then the instruments (built
@@ -705,6 +804,7 @@ mod tests {
                 semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
             ],
         );
+        ourios_telemetry::metadata_guard::assert_registry_metadata(&rms, &REGISTERED);
 
         assert_sweeps_classified(&rms);
 

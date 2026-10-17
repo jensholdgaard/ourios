@@ -212,11 +212,13 @@ impl AliasMap {
         let meter = crate::telemetry::meter("ourios.miner");
         let assertions_total = meter
             .u64_counter(semconv::OURIOS_MINER_ALIAS_ASSERTIONS)
-            .with_unit("{assertion}")
+            .with_description(semconv::OURIOS_MINER_ALIAS_ASSERTIONS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_ALIAS_ASSERTIONS_UNIT)
             .build();
         let retractions_total = meter
             .u64_counter(semconv::OURIOS_MINER_ALIAS_RETRACTIONS)
-            .with_unit("{retraction}")
+            .with_description(semconv::OURIOS_MINER_ALIAS_RETRACTIONS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_ALIAS_RETRACTIONS_UNIT)
             .build();
         Self {
             classes: HashMap::new(),

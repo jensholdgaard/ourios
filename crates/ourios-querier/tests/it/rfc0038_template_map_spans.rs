@@ -124,6 +124,7 @@ fn text(span: &SpanData, key: &str) -> Option<String> {
 /// A scoped tracing pipeline over its own in-memory span exporter. Keep the
 /// provider alive until the spans are read.
 fn traced() -> (InMemorySpanExporter, SdkTracerProvider, tracing::Dispatch) {
+    crate::common::global_subscriber();
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -174,6 +175,10 @@ async fn a_cold_acquisition_spans_the_load_and_its_derive_under_the_query() {
     assert_eq!(
         text(derive, semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON).as_deref(),
         Some("miss")
+    );
+    assert_eq!(
+        text(derive, semconv::OURIOS_TENANT).as_deref(),
+        Some(TENANT)
     );
     assert!(derive.start_time >= load.start_time && derive.end_time <= load.end_time);
 }
@@ -417,8 +422,11 @@ fn gate_moving_the_frontier(
     let moved = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&moved);
     querier.set_template_map_acquire_gate(Some(Arc::new(move || {
-        if !moved.swap(true, Ordering::SeqCst) {
+        // The file lands before the flag: the second query starts on the
+        // flag, and must list the moved frontier, not join this one.
+        if !moved.load(Ordering::SeqCst) {
             audit_file(&root, 1_775_131_080);
+            moved.store(true, Ordering::SeqCst);
         }
         let deadline = Instant::now() + Duration::from_secs(30);
         while let Some(querier) = weak.upgrade()

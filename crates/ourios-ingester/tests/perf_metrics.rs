@@ -31,35 +31,31 @@ fn data<'a>(rms: &'a [ResourceMetrics], name: &str) -> &'a AggregatedMetrics {
         .data()
 }
 
-/// Sum of a u64 counter's datapoints whose `trigger` attribute equals `want`
+/// Sum of a u64 counter's datapoints carrying the attribute `(key, value)`
 /// (or all datapoints when `want` is `None`).
-fn u64_sum(rms: &[ResourceMetrics], name: &str, want: Option<&str>) -> u64 {
+fn u64_sum(rms: &[ResourceMetrics], name: &str, want: Option<(&str, &str)>) -> u64 {
     let AggregatedMetrics::U64(MetricData::Sum(sum)) = data(rms, name) else {
         panic!("{name} should be a u64 sum");
     };
     sum.data_points()
         .filter(|dp| match want {
             None => true,
-            Some(t) => dp.attributes().any(|kv| {
-                kv.key.as_str() == semconv::OURIOS_SINK_FLUSH_TRIGGER && kv.value.as_str() == t
-            }),
+            Some((key, value)) => dp
+                .attributes()
+                .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value),
         })
         .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
         .sum()
 }
 
-/// Sum of a u64 counter's datapoints whose `ourios.tenant` equals `tenant`.
-fn tenant_sum(rms: &[ResourceMetrics], name: &str, tenant: &str) -> u64 {
-    let AggregatedMetrics::U64(MetricData::Sum(sum)) = data(rms, name) else {
-        panic!("{name} should be a u64 sum");
-    };
-    sum.data_points()
-        .filter(|dp| {
-            dp.attributes()
-                .any(|kv| kv.key.as_str() == semconv::OURIOS_TENANT && kv.value.as_str() == tenant)
-        })
-        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
-        .sum()
+/// The `flush.trigger` attribute filter for [`u64_sum`].
+fn trigger(value: &str) -> (&str, &str) {
+    (semconv::OURIOS_SINK_FLUSH_TRIGGER, value)
+}
+
+/// The `ourios.tenant` attribute filter for [`u64_sum`].
+fn tenant(value: &str) -> (&str, &str) {
+    (semconv::OURIOS_TENANT, value)
 }
 
 /// Every ingest and sink instrument is in the exported stream, and (#949)
@@ -97,11 +93,19 @@ fn assert_ingest_throughput(rms: &[ResourceMetrics]) {
     assert_eq!(u64_sum(rms, semconv::OURIOS_INGEST_BATCHES, None), 1);
     // Both throughput counters attribute the batch to its tenant.
     assert_eq!(
-        tenant_sum(rms, semconv::OURIOS_INGEST_RECORDS, "tenant-a"),
+        u64_sum(
+            rms,
+            semconv::OURIOS_INGEST_RECORDS,
+            Some(tenant("tenant-a"))
+        ),
         10
     );
     assert_eq!(
-        tenant_sum(rms, semconv::OURIOS_INGEST_BATCHES, "tenant-a"),
+        u64_sum(
+            rms,
+            semconv::OURIOS_INGEST_BATCHES,
+            Some(tenant("tenant-a"))
+        ),
         1
     );
 }
@@ -111,17 +115,29 @@ fn assert_ingest_throughput(rms: &[ResourceMetrics]) {
 fn assert_sink_totals(rms: &[ResourceMetrics]) {
     // `flush.records` splits by the required `trigger` dimension.
     assert_eq!(
-        u64_sum(rms, semconv::OURIOS_SINK_FLUSH_RECORDS, Some("size")),
+        u64_sum(
+            rms,
+            semconv::OURIOS_SINK_FLUSH_RECORDS,
+            Some(trigger("size"))
+        ),
         5,
         "size-triggered flush rows",
     );
     assert_eq!(
-        u64_sum(rms, semconv::OURIOS_SINK_FLUSH_RECORDS, Some("rotation")),
+        u64_sum(
+            rms,
+            semconv::OURIOS_SINK_FLUSH_RECORDS,
+            Some(trigger("rotation"))
+        ),
         3,
         "rotation-triggered flush rows",
     );
     assert!(
-        u64_sum(rms, semconv::OURIOS_SINK_FLUSH_RECORDS, Some("age")) == 0,
+        u64_sum(
+            rms,
+            semconv::OURIOS_SINK_FLUSH_RECORDS,
+            Some(trigger("age"))
+        ) == 0,
         "no age-triggered flush was recorded",
     );
 

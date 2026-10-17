@@ -221,5 +221,9 @@ fn the_buckets_resolve_values_just_under_the_decision_boundary() {
         .expect("a 1.0 boundary");
     assert!((bounds[boundary - 1] - 0.999).abs() < f64::EPSILON);
     assert_eq!(counts[boundary], 1, "1.0 in (0.999, 1.0]: {counts:?}");
-    assert_eq!(counts[boundary - 1], 1, "0.995 in (0.99, 0.999]: {counts:?}");
+    assert_eq!(
+        counts[boundary - 1],
+        1,
+        "0.995 in (0.99, 0.999]: {counts:?}"
+    );
 }

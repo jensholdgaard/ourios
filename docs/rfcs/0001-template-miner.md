@@ -487,9 +487,11 @@ direction and the primary obligation lives in those other RFCs.
 > > - **And** no zero point carries `ourios.service`, and every
 > >   `ourios.miner.template_change` / `ourios.miner.parse_failure.reason`
 > >   value on a zero point is a member of that registry enum
-> > - **And** a second line for the same tenant adds no zero point,
-> >   and a real event later counts on the same series its member's
-> >   zero point opened
+> > - **And** a second line for the same tenant adds no zero point
+> > - **And** a later real measurement with the identical attribute set
+> >   (e.g. a merge, which never carries `ourios.service`) counts on the
+> >   series its zero point opened, while a measurement carrying
+> >   `ourios.service` counts on its own `(tenant, service, …)` series
 
 > **Scenario §3.2.1 — Default per-parameter byte limit is 256**
 > - **Given** a tenant configuration with no per-parameter byte
@@ -2232,6 +2234,13 @@ and emits real data under the required attributes.
 >   - `ourios.miner.params.overflow` and
 >     `ourios.miner.template.version_changes` record one point each,
 >     on `ourios.tenant` alone.
+> - **Series.** A zero point opens the tenant-level series for its
+>   attribute set, and only a measurement with the identical set adds to
+>   it. A real parse failure or overflow on a line that carries
+>   `ourios.service` counts on its own `(tenant, service, …)` series,
+>   exactly as before. The zero point marks the tenant-level series live
+>   and is not merged with service series, so summing over
+>   `ourios.service` still gives the tenant total.
 > - **Cost.** The rule adds eleven series per tenant, a number fixed
 >   by the registry enums, not by traffic. The histograms and the
 >   observable gauges are unchanged: they already export on a
@@ -2280,11 +2289,12 @@ boundary at 1.0 (see §6.3): default buckets
 > **Amendment (2026-10-17, #1051, maintainer-approved) — buckets
 > near 1.0.** The default buckets are now
 > `[0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99, 0.999, 1.0, 1.05, 1.2, 1.5,
-> 2.0, +Inf]`. OTel buckets are upper-inclusive, so before this change
-> an exact `1.0` (a line that matched its template exactly) shared
-> `(0.95, 1.0]` with lines just under it. It now lands alone in
-> `(0.999, 1.0]`, so the share of exact matches can be read off the
-> histogram without the in-process gauges.
+> 2.0, +Inf]`. The two new boundaries give finer resolution just under
+> the §6.3 decision boundary at `1.0`, where `(0.95, 1.0]` used to be a
+> single bucket. OTel buckets are upper-inclusive, so `(0.999, 1.0]`
+> still holds every value in that interval, `1.0` included. A value of
+> `1.0` is the decision boundary, not a flag for an exact template
+> match, so the bucket is not read as an exact-match share.
 
 ### 6.9 Persistence and recovery
 
@@ -2742,7 +2752,8 @@ resolves bidirectionally between RFC and tests.
   >   per-tenant zero points of §6.8 (the four counters, their exact
   >   attribute sets, no `ourios.service`, enum members only). A
   >   second line and a second tenant check "once per tenant", and a
-  >   real merge checks that it counts on its member's zero series.
+  >   real merge (whose attribute set equals its zero point's) checks
+  >   that it counts on that zero series.
   > - The unit test pinning `ourios.miner.confidence`'s boundaries
   >   pins the amended list, and a recorded `1.0` lands in the
   >   `(0.999, 1.0]` bucket.

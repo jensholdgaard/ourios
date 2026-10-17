@@ -472,6 +472,9 @@ closed-loop-down:
 # the closed-loop Collector. Claude Code ignores OTEL_* exporter variables in a
 # repository's .claude/settings*.json, so this must go in the user settings
 # (or the launching shell), and Claude Code must be restarted to pick it up.
+# Run `just closed-loop-up` before restarting Claude Code with this block: it
+# restarts a Collector whose config changed, so the span scrubber is in place
+# before any captured content arrives.
 # Every signal's endpoint and protocol is pinned to the local Collector, so an
 # inherited per-signal OTEL_EXPORTER_OTLP_* setting can't send captured content
 # straight to a remote backend. Prompts and tool details are captured: they land in Claude Code's logs, which

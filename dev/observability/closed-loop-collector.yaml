@@ -38,13 +38,20 @@ processors:
         statements:
           - delete_matching_keys(attributes, ".*")
     # With OTEL_LOG_TOOL_DETAILS=1 Claude Code puts real agent, skill, plugin
-    # and MCP server/tool names on its cost and token metrics; drop them too.
+    # and MCP server/tool names on its cost and token metrics. Replace each with
+    # its SHA-256 rather than deleting it: deleting would merge distinct series
+    # into one stream with conflicting values, while a hash keeps every series
+    # (and its totals) separate without exposing the name.
     metric_statements:
       - context: datapoint
         conditions:
           - resource.attributes["service.name"] == "claude-code"
         statements:
-          - delete_matching_keys(attributes, "^(agent|skill|plugin|mcp_server|mcp_tool)\\.name$")
+          - set(attributes["agent.name"], SHA256(attributes["agent.name"])) where attributes["agent.name"] != nil
+          - set(attributes["skill.name"], SHA256(attributes["skill.name"])) where attributes["skill.name"] != nil
+          - set(attributes["plugin.name"], SHA256(attributes["plugin.name"])) where attributes["plugin.name"] != nil
+          - set(attributes["mcp_server.name"], SHA256(attributes["mcp_server.name"])) where attributes["mcp_server.name"] != nil
+          - set(attributes["mcp_tool.name"], SHA256(attributes["mcp_tool.name"])) where attributes["mcp_tool.name"] != nil
   resource/environment:
     attributes:
       - key: deployment.environment.name

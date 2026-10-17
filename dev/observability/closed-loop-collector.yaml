@@ -20,7 +20,7 @@ receivers:
 processors:
   batch:
   # Claude Code puts the content its OTEL_LOG_USER_PROMPTS / OTEL_LOG_TOOL_DETAILS
-  # gates unlock on its spans as well as its logs. The logs stay local; spans go
+  # gates unlock on its spans and metrics as well as its logs. The logs stay local; spans go
   # to the remote backend, so strip that content from claude-code spans and drop
   # their span-event attributes (tool output) before export. These are the
   # gated span attributes Claude Code documents; review the list when updating it.
@@ -31,12 +31,20 @@ processors:
         conditions:
           - resource.attributes["service.name"] == "claude-code"
         statements:
-          - delete_matching_keys(attributes, "^(prompt|prompt_text|user_prompt|new_context|system_reminders|system_prompt_preview|user_system_prompt|response\\.model_output|full_command|file_path|tool_input|tool_parameters|hook_definitions|error)$")
+          - delete_matching_keys(attributes, "^(prompt|prompt_text|user_prompt|new_context|system_reminders|system_prompt_preview|user_system_prompt|response\\.model_output|full_command|bash_command|file_path|diff|content|tool_input|tool_parameters|hook_definitions|workflow\\.name|skill_name|subagent_type|error)$")
       - context: spanevent
         conditions:
           - resource.attributes["service.name"] == "claude-code"
         statements:
           - delete_matching_keys(attributes, ".*")
+    # With OTEL_LOG_TOOL_DETAILS=1 Claude Code puts real agent, skill, plugin
+    # and MCP server/tool names on its cost and token metrics; drop them too.
+    metric_statements:
+      - context: datapoint
+        conditions:
+          - resource.attributes["service.name"] == "claude-code"
+        statements:
+          - delete_matching_keys(attributes, "^(agent|skill|plugin|mcp_server|mcp_tool)\\.name$")
   resource/environment:
     attributes:
       - key: deployment.environment.name
@@ -101,5 +109,5 @@ service:
       exporters: [otlp_http/backend]
     metrics:
       receivers: [otlp]
-      processors: [resource/environment, batch]
+      processors: [resource/environment, transform/scrub_claude_code_spans, batch]
       exporters: [otlp_http/backend]

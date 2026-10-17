@@ -95,10 +95,13 @@ up() {
   if pid="$(live_pid collector)"; then
     echo "collector already running (pid $pid)"
   else
-    nohup "$collector_bin" --config "$collector_config" \
+    # Start from a snapshot, so the recorded digest is of exactly the config
+    # the Collector runs even if the file is edited during startup.
+    cp "$collector_config" "$dir/collector.yaml"
+    nohup "$collector_bin" --config "$dir/collector.yaml" \
       > "$dir/collector.log" 2>&1 < /dev/null &
     pid=$!
-    record collector "$pid" "$(config_digest)"
+    record collector "$pid" "$(shasum -a 256 "$dir/collector.yaml" | cut -d' ' -f1)"
     await_ready collector "$pid" 4318
     echo "collector ready (pid $pid), log $dir/collector.log"
   fi

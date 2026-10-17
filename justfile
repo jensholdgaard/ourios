@@ -504,6 +504,8 @@ closed-loop-env:
       "OTEL_LOG_TOOL_CONTENT": "0",
       "OTEL_LOG_ASSISTANT_RESPONSES": "0",
       "OTEL_LOG_RAW_API_BODIES": "0",
+      "ENABLE_BETA_TRACING_DETAILED": "0",
+      "BETA_TRACING_ENDPOINT": "http://127.0.0.1:4318",
       "OTEL_RESOURCE_ATTRIBUTES": "deployment.environment.name=development"
     }
     JSON

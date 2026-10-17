@@ -472,10 +472,10 @@ closed-loop-down:
 # the closed-loop Collector. Claude Code ignores OTEL_* exporter variables in a
 # repository's .claude/settings*.json, so this must go in the user settings
 # (or the launching shell), and Claude Code must be restarted to pick it up.
-# Prompt, tool-detail, tool-content, response and raw-body capture are set off
-# explicitly so inherited settings can't enable them: the logs only reach the
-# local Ourios, but `OTEL_LOG_TOOL_CONTENT` would put tool output on spans,
-# and spans go to the remote backend.
+# Prompts and tool details are captured: they land in Claude Code's logs, which
+# only reach the local Ourios, and the Collector strips the same content from
+# Claude Code's spans before they go to the remote backend. Tool content,
+# assistant responses and raw API bodies stay off.
 closed-loop-env:
     #!/usr/bin/env bash
     cat <<'JSON'
@@ -488,8 +488,8 @@ closed-loop-env:
       "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
       "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
       "OTEL_SERVICE_NAME": "claude-code",
-      "OTEL_LOG_USER_PROMPTS": "0",
-      "OTEL_LOG_TOOL_DETAILS": "0",
+      "OTEL_LOG_USER_PROMPTS": "1",
+      "OTEL_LOG_TOOL_DETAILS": "1",
       "OTEL_LOG_TOOL_CONTENT": "0",
       "OTEL_LOG_ASSISTANT_RESPONSES": "0",
       "OTEL_LOG_RAW_API_BODIES": "0",

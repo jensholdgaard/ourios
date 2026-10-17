@@ -1001,6 +1001,20 @@ failure). They follow §3.7.2's rules:
 >   examined: a settled or single-file partition, and a partition without
 >   a manifest, cost no read.
 
+> **Amendment (2026-10-17, #1055, maintainer-approved via the registry
+> decision) — the unsealed count.** `plan partitions` also requires
+> `ourios.compaction.partition.unsealed_count` (int, ourios-semconv
+> v0.3.22): the listed partitions planning skipped because their hour
+> plus `compaction_grace` had not yet passed (RFC 0009 §3.3), summed over
+> every tenant planned.
+> - It is set when the phase ends, with the other counts, and is `0` when
+>   the store has no tenant.
+> - A sweep that ends `ourios.compaction.result=noop` while this count is
+>   above zero is waiting for the seal; it is not stalled.
+> - It is a new name rather than a reuse, because no `ourios.file_set.*`
+>   attribute counts what a resolution leaves out.
+> - Tested by `compactor::tests::the_planning_span_counts_unsealed_partitions`.
+
 **Reusing the `ourios.file_set.*` names.** Planning a tenant is a
 file-set resolution in the registry's sense: for each sealed partition it
 reads the manifest and lists the prefix to resolve the live files and

@@ -125,6 +125,41 @@ async fn the_ingest_span_carries_the_batch_tenant() {
     assert_eq!(tenant.as_deref(), Some("checkout"));
 }
 
+fn int_attribute(span: &SpanData, key: &str) -> Option<i64> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| match kv.value {
+            opentelemetry::Value::I64(v) => v,
+            ref other => panic!("{key} should be an int, got {other:?}"),
+        })
+}
+
+/// RFC 0038 §3.5: the batch span carries the batch's record count, and
+/// the byte length of the WAL frame payload it committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn the_ingest_span_carries_the_batch_record_count_and_size() {
+    let spans = ingest_and_collect_spans(3).await;
+    let [batch] = spans_named(&spans, "ingest logs")[..] else {
+        panic!("one ingest-logs span, got {spans:?}");
+    };
+    assert_eq!(
+        int_attribute(batch, ourios_semconv::OURIOS_INGEST_BATCH_RECORD_COUNT),
+        Some(3),
+    );
+
+    let bodies = distinct_bodies(3);
+    let body_refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    let export = request(vec![resource_logs("checkout", &body_refs)]);
+    let payload =
+        ourios_wal::TenantBatch::encode("checkout", &prost::Message::encode_to_vec(&export))
+            .expect("tenant frame");
+    assert_eq!(
+        int_attribute(batch, ourios_semconv::OURIOS_INGEST_BATCH_SIZE),
+        Some(i64::try_from(payload.len()).expect("fits")),
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn rfc0038_2_span_count_is_constant_in_record_count() {
     let one = ingest_and_collect_spans(1).await;

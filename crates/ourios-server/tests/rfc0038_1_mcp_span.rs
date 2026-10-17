@@ -149,6 +149,11 @@ fn assert_successful_tool_span(spans: &[SpanData], session: &str) {
         "mcp.session.id carries the caller's session, correlating its tool calls",
     );
     assert_eq!(
+        attribute(span, "ourios.tenant").as_deref(),
+        Some("acme"),
+        "ourios.tenant names the tenant the tool ran against, as on POST /v1/query",
+    );
+    assert_eq!(
         span.status,
         Status::Unset,
         "a successful call is not an error"
@@ -187,4 +192,9 @@ async fn rfc0038_1_mcp_tool_emits_one_internal_span() {
         failed.status
     );
     assert_eq!(attribute(failed, "error.type").as_deref(), Some("-32602"));
+    assert_eq!(
+        attribute(failed, "ourios.tenant"),
+        None,
+        "an off-grammar tenant argument is never recorded as a tenant id",
+    );
 }

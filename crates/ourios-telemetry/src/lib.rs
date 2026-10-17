@@ -67,6 +67,9 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 /// this one tracer, under the same versioned scope rule.
 const TRACER_SCOPE: &str = "ourios";
 
+/// The upstream `otel.component.type` attribute key.
+const OTEL_COMPONENT_TYPE: &str = "otel.component.type";
+
 /// The scope `name`, versioned with this release. The library crates resolve
 /// theirs through `ourios_core::telemetry`, which this crate does not depend
 /// on.
@@ -398,14 +401,12 @@ pub fn metrics_http_export_configured() -> bool {
     )
 }
 
-#[cfg(feature = "http-proto")]
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
 /// The first of a signal-specific and a general OTLP setting that is set and
 /// not blank: an empty signal-specific value must not shadow the general one.
-#[cfg(feature = "http-proto")]
 fn first_set<'a>(signal: Option<&'a str>, general: Option<&'a str>) -> Option<&'a str> {
     let set = |value: &&str| !value.trim().is_empty();
     signal.filter(set).or(general.filter(set))
@@ -427,6 +428,81 @@ fn http_export_configured(
     protocol: Option<&str>,
 ) -> bool {
     first_set(signal_endpoint, endpoint).is_some() && is_http_protobuf(signal_protocol, protocol)
+}
+
+/// One of the three signals `init` may install, for the start-up check of the
+/// protocol the environment asked it to export with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signal {
+    Logs,
+    Metrics,
+    Traces,
+}
+
+impl Signal {
+    /// The `<SIGNAL>` in `OTEL_EXPORTER_OTLP_<SIGNAL>_PROTOCOL`.
+    fn env_name(self) -> &'static str {
+        match self {
+            Self::Logs => "LOGS",
+            Self::Metrics => "METRICS",
+            Self::Traces => "TRACES",
+        }
+    }
+
+    /// The upstream `otel.component.type` of this signal's gRPC exporter.
+    fn grpc_component_type(self) -> &'static str {
+        match self {
+            Self::Logs => "otlp_grpc_log_exporter",
+            Self::Metrics => "otlp_grpc_metric_exporter",
+            Self::Traces => "otlp_grpc_span_exporter",
+        }
+    }
+}
+
+/// The requested protocol, trimmed, when it is set but this build cannot
+/// export with it: anything but `grpc`, and `http/protobuf` too without the
+/// `http-proto` feature. Such a signal falls back to gRPC.
+fn unsupported_protocol<'a>(
+    signal_protocol: Option<&'a str>,
+    protocol: Option<&'a str>,
+) -> Option<&'a str> {
+    let requested = first_set(signal_protocol, protocol)?.trim();
+    let supported = requested.eq_ignore_ascii_case("grpc")
+        || (cfg!(feature = "http-proto") && requested.eq_ignore_ascii_case("http/protobuf"));
+    (!supported).then_some(requested)
+}
+
+/// Warn when `signal`'s requested protocol is unsupported, naming it and the
+/// exporter actually built, so a fallback to gRPC is never silent.
+fn warn_if_protocol_unsupported(
+    signal: Signal,
+    signal_protocol: Option<&str>,
+    protocol: Option<&str>,
+) {
+    if let Some(requested) = unsupported_protocol(signal_protocol, protocol) {
+        let component_type = signal.grpc_component_type();
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_SERVER_TELEMETRY_PROTOCOL_UNSUPPORTED,
+            {
+                { ourios_semconv::OURIOS_SERVER_TELEMETRY_REQUESTED_PROTOCOL } = requested,
+                { OTEL_COMPONENT_TYPE } = component_type,
+            },
+            "OTLP protocol {requested:?} is not supported for {}; exporting with {component_type}",
+            signal.env_name().to_ascii_lowercase(),
+        );
+    }
+}
+
+/// Check every installed signal's requested protocol against the environment.
+fn warn_on_unsupported_protocols(installed: &[Signal]) {
+    let protocol = env_value("OTEL_EXPORTER_OTLP_PROTOCOL");
+    for &signal in installed {
+        let signal_protocol = env_value(&format!(
+            "OTEL_EXPORTER_OTLP_{}_PROTOCOL",
+            signal.env_name()
+        ));
+        warn_if_protocol_unsupported(signal, signal_protocol.as_deref(), protocol.as_deref());
+    }
 }
 
 /// The OTLP/HTTP client is built with `rustls-no-provider`, so it uses the
@@ -646,6 +722,18 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         (None, None)
     };
 
+    // After the subscriber is wired, so the warning reaches stderr and, when
+    // the logs pipeline is up, the OTLP logs signal too.
+    let installed: Vec<Signal> = [
+        (logs_enabled, Signal::Logs),
+        (metrics_enabled, Signal::Metrics),
+        (traces_enabled, Signal::Traces),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, signal)| enabled.then_some(signal))
+    .collect();
+    warn_on_unsupported_protocols(&installed);
+
     Ok(TelemetryGuard {
         provider,
         logger,
@@ -745,6 +833,175 @@ mod tests {
         );
         assert!(guard.logger.is_none(), "no logger when logs disabled");
         assert!(guard.tracer.is_none(), "no tracer when traces disabled");
+    }
+
+    /// Only a set protocol this build cannot export with is unsupported; the
+    /// signal-specific value wins over the general one, as for selection.
+    #[test]
+    fn unsupported_protocol_flags_only_what_this_build_cannot_export() {
+        assert_eq!(
+            unsupported_protocol(None, Some("http/json")),
+            Some("http/json")
+        );
+        assert_eq!(unsupported_protocol(None, Some(" kafka ")), Some("kafka"));
+        assert_eq!(unsupported_protocol(None, None), None, "unset");
+        assert_eq!(unsupported_protocol(Some(" "), Some("")), None, "blank");
+        assert_eq!(unsupported_protocol(None, Some("grpc")), None);
+        assert_eq!(unsupported_protocol(None, Some("GRPC")), None);
+        assert_eq!(
+            unsupported_protocol(None, Some("http/protobuf")).is_none(),
+            cfg!(feature = "http-proto"),
+            "http/protobuf is supported exactly when the feature is on",
+        );
+        assert_eq!(unsupported_protocol(Some("grpc"), Some("http/json")), None);
+        assert_eq!(
+            unsupported_protocol(Some("http/json"), Some("grpc")),
+            Some("http/json")
+        );
+    }
+
+    /// The named events `warn_if_protocol_unsupported` emits for one signal
+    /// and protocol pair, through the same appender bridge the logs pipeline
+    /// uses, under a scoped (not global) subscriber.
+    fn protocol_warnings(
+        signal: Signal,
+        signal_protocol: Option<&str>,
+        protocol: Option<&str>,
+    ) -> Vec<(String, i32, std::collections::BTreeMap<String, String>)> {
+        use opentelemetry::logs::AnyValue;
+        use opentelemetry_sdk::logs::InMemoryLogExporter;
+
+        let exporter = InMemoryLogExporter::default();
+        let logger = SdkLoggerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(OpenTelemetryTracingBridge::new(&logger));
+        tracing::subscriber::with_default(subscriber, || {
+            warn_if_protocol_unsupported(signal, signal_protocol, protocol);
+        });
+        exporter
+            .get_emitted_logs()
+            .expect("logs exported")
+            .iter()
+            .filter_map(|log| {
+                let name = log.record.event_name()?.to_owned();
+                let attributes = log
+                    .record
+                    .attributes_iter()
+                    .map(|(key, value)| {
+                        let value = match value {
+                            AnyValue::String(s) => s.as_str().to_owned(),
+                            other => format!("{other:?}"),
+                        };
+                        (key.as_str().to_owned(), value)
+                    })
+                    .collect();
+                let severity = log.record.severity_number().map_or(0, |s| s as i32);
+                Some((name, severity, attributes))
+            })
+            .collect()
+    }
+
+    /// `http/json` and an unknown value each warn once, naming the requested
+    /// protocol and the gRPC exporter actually built for that signal.
+    #[test]
+    fn an_unsupported_protocol_warns_with_the_requested_and_used_protocol() {
+        for (signal, signal_protocol, protocol, requested, component_type) in [
+            (
+                Signal::Logs,
+                None,
+                Some("http/json"),
+                "http/json",
+                "otlp_grpc_log_exporter",
+            ),
+            (
+                Signal::Metrics,
+                Some(" carrier-pigeon "),
+                Some("grpc"),
+                "carrier-pigeon",
+                "otlp_grpc_metric_exporter",
+            ),
+            (
+                Signal::Traces,
+                Some("http/json"),
+                None,
+                "http/json",
+                "otlp_grpc_span_exporter",
+            ),
+        ] {
+            let events = protocol_warnings(signal, signal_protocol, protocol);
+            assert_eq!(events.len(), 1, "{signal:?}: {events:?}");
+            let (name, severity, attributes) = &events[0];
+            assert_eq!(*severity, 13, "WARN");
+            assert_eq!(
+                name,
+                ourios_semconv::EVENT_OURIOS_SERVER_TELEMETRY_PROTOCOL_UNSUPPORTED
+            );
+            assert_eq!(
+                attributes
+                    .get(ourios_semconv::OURIOS_SERVER_TELEMETRY_REQUESTED_PROTOCOL)
+                    .map(String::as_str),
+                Some(requested),
+            );
+            assert_eq!(
+                attributes.get(OTEL_COMPONENT_TYPE).map(String::as_str),
+                Some(component_type),
+            );
+        }
+    }
+
+    /// A supported or absent protocol warns nothing.
+    #[test]
+    fn a_supported_or_unset_protocol_does_not_warn() {
+        let mut cases = vec![
+            (None, None),
+            (Some(""), Some(" ")),
+            (None, Some("grpc")),
+            (Some("GRPC"), Some("http/json")),
+        ];
+        if cfg!(feature = "http-proto") {
+            cases.push((None, Some("http/protobuf")));
+            cases.push((Some("http/protobuf"), Some("http/json")));
+        }
+        for (signal_protocol, protocol) in cases {
+            for signal in [Signal::Logs, Signal::Metrics, Signal::Traces] {
+                let events = protocol_warnings(signal, signal_protocol, protocol);
+                assert!(
+                    events.is_empty(),
+                    "{signal:?} {signal_protocol:?}/{protocol:?}: {events:?}"
+                );
+            }
+        }
+    }
+
+    /// The emitted event matches the registry: both declared attributes,
+    /// nothing else (and through weaver when the live-check env is set).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn protocol_unsupported_event_passes_the_live_check() {
+        let events: Vec<crate::live_check::Event> =
+            protocol_warnings(Signal::Logs, Some("http/json"), None)
+                .into_iter()
+                .map(|(_, severity, attributes)| crate::live_check::Event {
+                    name: ourios_semconv::EVENT_OURIOS_SERVER_TELEMETRY_PROTOCOL_UNSUPPORTED,
+                    severity,
+                    attributes,
+                    body: None,
+                })
+                .collect();
+        crate::live_check::live_check(
+            &events,
+            &[crate::live_check::EventSpec {
+                name: ourios_semconv::EVENT_OURIOS_SERVER_TELEMETRY_PROTOCOL_UNSUPPORTED,
+                required: &[
+                    ourios_semconv::OURIOS_SERVER_TELEMETRY_REQUESTED_PROTOCOL,
+                    OTEL_COMPONENT_TYPE,
+                ],
+                optional: &[],
+            }],
+        )
+        .expect("live-check");
     }
 
     /// #618 — `exporter_selected` reads an `OTEL_{TRACES,METRICS,LOGS}_EXPORTER`

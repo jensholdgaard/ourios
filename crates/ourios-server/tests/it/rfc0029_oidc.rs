@@ -14,7 +14,6 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::time::timeout;
 
 /// Scenario RFC0029.1 (startup errors) — a missing `auth.oidc.audience`,
@@ -45,7 +44,7 @@ async fn rfc0029_1_startup_configuration_errors() {
 
         let output = timeout(
             Duration::from_secs(15),
-            Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+            crate::server_bin::command()
                 .arg("--config")
                 .arg(&config_path)
                 // If the startup error ever regressed into a running
@@ -93,7 +92,7 @@ async fn rfc0029_1_oidc_only_starts_and_enforces() {
     )
     .expect("write config");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .arg("--config")
         .arg(&config_path)
         .env("RUST_LOG", "info")
@@ -200,7 +199,6 @@ pub(crate) mod ingest_binding {
     use p256::ecdsa::SigningKey;
     use p256::pkcs8::EncodePrivateKey as _;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::process::Command;
     use tokio::time::timeout;
 
     /// A fresh ES256 keypair (runtime-generated) and its public JWK.
@@ -345,7 +343,7 @@ pub(crate) mod ingest_binding {
         )
         .expect("write config");
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        let mut child = crate::server_bin::command()
             .arg("--config")
             .arg(&config_path)
             .env("RUST_LOG", "info")
@@ -476,7 +474,7 @@ pub(crate) mod ingest_binding {
         )
         .expect("write config");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        let output = crate::server_bin::command()
             .arg("--config")
             .arg(&config_path)
             .output()
@@ -502,7 +500,6 @@ pub(crate) mod claim_binding {
     use std::time::Duration;
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::process::Command;
     use tokio::time::timeout;
 
     use super::ingest_binding::{make_key, mint, serve_issuer, tenant_request};
@@ -545,7 +542,7 @@ pub(crate) mod claim_binding {
         )
         .expect("write config");
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ourios-server"));
+        let mut command = crate::server_bin::command();
         command
             .arg("--config")
             .arg(&config_path)
@@ -951,7 +948,7 @@ mod dex {
         )
         .expect("write config");
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        let mut child = crate::server_bin::command()
             .arg("--config")
             .arg(&config_path)
             .env("RUST_LOG", "info")

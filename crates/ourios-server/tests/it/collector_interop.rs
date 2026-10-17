@@ -135,7 +135,7 @@ async fn collector_exports_over_tls_and_oidc() {
     )
     .expect("write config");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .arg("--config")
         .arg(&config_path)
         .env("RUST_LOG", "info")
@@ -610,7 +610,7 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
     )
     .expect("write config");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut child = crate::server_bin::command()
         .arg("--config")
         .arg(&config_path)
         .stdout(std::process::Stdio::piped())

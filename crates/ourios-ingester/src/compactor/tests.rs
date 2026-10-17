@@ -300,6 +300,29 @@ fn an_empty_store_still_spans_its_planning() {
     );
 }
 
+/// The planning span says how many listed partitions it skipped as not yet
+/// sealed, so a no-op sweep over the open hour reads as such.
+#[test]
+fn the_planning_span_counts_unsealed_partitions() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    write_file(&store, "a", 7, NOW_SEALED);
+    write_file(&store, "b", 7, NOW_SEALED);
+
+    let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
+
+    result.expect("sweep");
+    assert_eq!(
+        attr(
+            only_span(&spans, "plan partitions"),
+            ourios_semconv::OURIOS_COMPACTION_PARTITION_UNSEALED_COUNT
+        ),
+        Some(opentelemetry::Value::I64(2)),
+        "one open hour per tenant"
+    );
+}
+
 /// A sweep that fails marks its span `Error`, with the failure's class as
 /// `error.type`: here the tenant listing under an unreadable `data/`.
 #[cfg(unix)]

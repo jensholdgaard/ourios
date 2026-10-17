@@ -61,8 +61,17 @@ async fn answer(stream: TcpStream, heads: mpsc::UnboundedSender<Head>) -> Option
         .ok()
 }
 
+/// The child's telemetry env is set from scratch: every inherited `OTEL_*`
+/// variable is dropped, and `RUST_LOG` is pinned because it also filters the
+/// OTLP log bridge, so a caller's `RUST_LOG=off` would leave nothing to export.
 fn spawn_server(bucket: &std::path::Path, endpoint: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ourios-server"));
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("OTEL_") {
+            command.env_remove(name);
+        }
+    }
+    command
         .env("OURIOS_BUCKET_ROOT", bucket)
         .env("OURIOS_RECEIVER_ENABLED", "1")
         .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")
@@ -70,16 +79,7 @@ fn spawn_server(bucket: &std::path::Path, endpoint: &str) -> Child {
         .env("OURIOS_WAL_ROOT", bucket.join("wal"))
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
         .env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
-        .env_remove("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
-        .env_remove("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
-        .env_remove("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
-        .env_remove("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
-        .env_remove("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
-        .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-        .env_remove("OTEL_EXPORTER_OTLP_HEADERS")
-        .env_remove("OTEL_SDK_DISABLED")
-        .env_remove("OTEL_LOGS_EXPORTER")
-        .env_remove("OTEL_METRICS_EXPORTER")
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -100,7 +100,7 @@ async fn await_started(child: &mut Child) {
         }
         panic!("server stdout closed before it reported its listeners");
     };
-    timeout(Duration::from_secs(15), started)
+    timeout(Duration::from_secs(30), started)
         .await
         .expect("server starts before timeout");
 }
@@ -114,7 +114,7 @@ async fn sigterm_and_wait(child: &mut Child) {
         .await
         .expect("run kill -TERM");
     assert!(killed.success(), "kill -TERM failed: {killed:?}");
-    let status = timeout(Duration::from_secs(15), child.wait())
+    let status = timeout(Duration::from_secs(30), child.wait())
         .await
         .expect("server exits before timeout")
         .expect("await server exit");

@@ -220,6 +220,37 @@ pub struct TelemetryGuard {
 }
 
 impl TelemetryGuard {
+    /// The guard over the pipelines `init` kept, after warning about any whose
+    /// requested protocol fell back to gRPC. Called once the subscriber is
+    /// wired, so the warning reaches stderr and, when the logs pipeline is up,
+    /// the OTLP logs signal too.
+    fn checked(
+        provider: Option<SdkMeterProvider>,
+        logger: Option<SdkLoggerProvider>,
+        tracer: Option<SdkTracerProvider>,
+    ) -> Self {
+        let guard = Self {
+            provider,
+            logger,
+            tracer,
+        };
+        warn_on_unsupported_protocols(&guard.exporting_signals());
+        guard
+    }
+
+    /// The signals whose pipeline this guard holds: a pipeline `init` shut
+    /// down (a subscriber was already installed) does not export at all.
+    fn exporting_signals(&self) -> Vec<Signal> {
+        [
+            (self.logger.is_some(), Signal::Logs),
+            (self.provider.is_some(), Signal::Metrics),
+            (self.tracer.is_some(), Signal::Traces),
+        ]
+        .into_iter()
+        .filter_map(|(held, signal)| held.then_some(signal))
+        .collect()
+    }
+
     /// Flush and shut the telemetry pipelines down explicitly,
     /// surfacing any flush error (the `Drop` path can only swallow it).
     /// Both pipelines are always attempted; the first error wins.
@@ -722,23 +753,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         (None, None)
     };
 
-    // After the subscriber is wired, so the warning reaches stderr and, when
-    // the logs pipeline is up, the OTLP logs signal too.
-    let installed: Vec<Signal> = [
-        (logs_enabled, Signal::Logs),
-        (metrics_enabled, Signal::Metrics),
-        (traces_enabled, Signal::Traces),
-    ]
-    .into_iter()
-    .filter_map(|(enabled, signal)| enabled.then_some(signal))
-    .collect();
-    warn_on_unsupported_protocols(&installed);
-
-    Ok(TelemetryGuard {
-        provider,
-        logger,
-        tracer,
-    })
+    Ok(TelemetryGuard::checked(provider, logger, tracer))
 }
 
 /// The OTLP metrics pipeline, carrying the metrics Ourios observes about
@@ -839,24 +854,50 @@ mod tests {
     /// signal-specific value wins over the general one, as for selection.
     #[test]
     fn unsupported_protocol_flags_only_what_this_build_cannot_export() {
+        // http/protobuf is supported exactly when the feature is on.
+        let http_protobuf = (!cfg!(feature = "http-proto")).then_some("http/protobuf");
+        let cases = [
+            (None, Some("http/json"), Some("http/json")),
+            (None, Some(" kafka "), Some("kafka")),
+            (None, None, None),
+            (Some(" "), Some(""), None),
+            (None, Some("grpc"), None),
+            (None, Some("GRPC"), None),
+            (None, Some("http/protobuf"), http_protobuf),
+            (Some("grpc"), Some("http/json"), None),
+            (Some("http/json"), Some("grpc"), Some("http/json")),
+        ];
+        for (signal_protocol, protocol, expected) in cases {
+            assert_eq!(
+                unsupported_protocol(signal_protocol, protocol),
+                expected,
+                "{signal_protocol:?}/{protocol:?}"
+            );
+        }
+    }
+
+    /// Only the pipelines `init` kept count as exporting: on the
+    /// subscriber-already-installed path the logger and tracer are shut down,
+    /// so no warning may claim they export over gRPC.
+    #[test]
+    fn only_surviving_pipelines_are_checked_for_their_protocol() {
+        let meter = || Some(SdkMeterProvider::builder().build());
+        let all = TelemetryGuard {
+            provider: meter(),
+            logger: Some(SdkLoggerProvider::builder().build()),
+            tracer: Some(SdkTracerProvider::builder().build()),
+        };
+        let discarded = TelemetryGuard {
+            provider: meter(),
+            logger: None,
+            tracer: None,
+        };
         assert_eq!(
-            unsupported_protocol(None, Some("http/json")),
-            Some("http/json")
-        );
-        assert_eq!(unsupported_protocol(None, Some(" kafka ")), Some("kafka"));
-        assert_eq!(unsupported_protocol(None, None), None, "unset");
-        assert_eq!(unsupported_protocol(Some(" "), Some("")), None, "blank");
-        assert_eq!(unsupported_protocol(None, Some("grpc")), None);
-        assert_eq!(unsupported_protocol(None, Some("GRPC")), None);
-        assert_eq!(
-            unsupported_protocol(None, Some("http/protobuf")).is_none(),
-            cfg!(feature = "http-proto"),
-            "http/protobuf is supported exactly when the feature is on",
-        );
-        assert_eq!(unsupported_protocol(Some("grpc"), Some("http/json")), None);
-        assert_eq!(
-            unsupported_protocol(Some("http/json"), Some("grpc")),
-            Some("http/json")
+            (all.exporting_signals(), discarded.exporting_signals()),
+            (
+                vec![Signal::Logs, Signal::Metrics, Signal::Traces],
+                vec![Signal::Metrics]
+            ),
         );
     }
 
@@ -930,23 +971,25 @@ mod tests {
                 "otlp_grpc_span_exporter",
             ),
         ] {
-            let events = protocol_warnings(signal, signal_protocol, protocol);
-            assert_eq!(events.len(), 1, "{signal:?}: {events:?}");
-            let (name, severity, attributes) = &events[0];
-            assert_eq!(*severity, 13, "WARN");
-            assert_eq!(
-                name,
-                ourios_semconv::EVENT_OURIOS_SERVER_TELEMETRY_PROTOCOL_UNSUPPORTED
+            // Exactly one WARN (13) with the registered name and exactly the
+            // two declared attributes.
+            let expected = (
+                ourios_semconv::EVENT_OURIOS_SERVER_TELEMETRY_PROTOCOL_UNSUPPORTED.to_owned(),
+                13,
+                [
+                    (
+                        ourios_semconv::OURIOS_SERVER_TELEMETRY_REQUESTED_PROTOCOL.to_owned(),
+                        requested.to_owned(),
+                    ),
+                    (OTEL_COMPONENT_TYPE.to_owned(), component_type.to_owned()),
+                ]
+                .into_iter()
+                .collect(),
             );
             assert_eq!(
-                attributes
-                    .get(ourios_semconv::OURIOS_SERVER_TELEMETRY_REQUESTED_PROTOCOL)
-                    .map(String::as_str),
-                Some(requested),
-            );
-            assert_eq!(
-                attributes.get(OTEL_COMPONENT_TYPE).map(String::as_str),
-                Some(component_type),
+                protocol_warnings(signal, signal_protocol, protocol),
+                vec![expected],
+                "{signal:?}"
             );
         }
     }

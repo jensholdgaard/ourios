@@ -424,8 +424,10 @@ closed-loop-install version="0.157.0":
 # Run the local closed-loop Collector (`dev/observability/closed-loop-collector.yaml`)
 # as a native binary on 127.0.0.1:4317/4318: Claude Code's logs go to
 # `dogfood-server` only; Claude Code's traces and metrics and Ourios's own
-# telemetry go to Dash0. Needs `otelcol-contrib` on PATH or in scratch/bin/
-# (`just closed-loop-install`), and DASH0_AUTHORIZATION_TOKEN in .env (gitignored). Start `closed-loop-ourios`
+# telemetry go to your own OTLP/HTTP backend. Needs `otelcol-contrib` on PATH or
+# in scratch/bin/ (`just closed-loop-install`), and in .env (gitignored)
+# CLOSED_LOOP_OTLP_ENDPOINT plus, if the backend wants one,
+# CLOSED_LOOP_OTLP_AUTHORIZATION (the Authorization header value). Start `closed-loop-ourios`
 # too, and run `just closed-loop-env` for the Claude Code settings.
 closed-loop-collector:
     #!/usr/bin/env bash
@@ -433,11 +435,12 @@ closed-loop-collector:
     bin="$(command -v otelcol-contrib || echo scratch/bin/otelcol-contrib)"
     [ -x "$bin" ] || { echo "otelcol-contrib not found (PATH or scratch/bin/)"; exit 1; }
     set -a; [ -f .env ] && . ./.env; set +a
-    : "${DASH0_AUTHORIZATION_TOKEN:?set DASH0_AUTHORIZATION_TOKEN in .env}"
+    : "${CLOSED_LOOP_OTLP_ENDPOINT:?set CLOSED_LOOP_OTLP_ENDPOINT (your OTLP/HTTP backend) in .env}"
+    export CLOSED_LOOP_OTLP_AUTHORIZATION="${CLOSED_LOOP_OTLP_AUTHORIZATION:-}"
     exec "$bin" --config dev/observability/closed-loop-collector.yaml
 
 # `dogfood-server` with its own logs, traces and metrics exported through the
-# closed-loop Collector (and so to Dash0), tagged as a development deployment.
+# closed-loop Collector (and so to your backend), tagged as a development deployment.
 # gRPC on 4317: the server binary is built without `ourios-telemetry`'s
 # `http-proto` feature, so it exports over gRPC whatever the protocol says.
 # Every exporter setting is set here, per signal included, so a shell still
@@ -467,7 +470,8 @@ closed-loop-up:
     bin="$(command -v otelcol-contrib || echo scratch/bin/otelcol-contrib)"
     [ -x "$bin" ] || { echo "otelcol-contrib not found; run 'just closed-loop-install'"; exit 1; }
     set -a; [ -f .env ] && . ./.env; set +a
-    : "${DASH0_AUTHORIZATION_TOKEN:?set DASH0_AUTHORIZATION_TOKEN in .env}"
+    : "${CLOSED_LOOP_OTLP_ENDPOINT:?set CLOSED_LOOP_OTLP_ENDPOINT (your OTLP/HTTP backend) in .env}"
+    export CLOSED_LOOP_OTLP_AUTHORIZATION="${CLOSED_LOOP_OTLP_AUTHORIZATION:-}"
     if running collector; then
       echo "collector already running (pid $(cat "$dir/collector.pid"))"
     else
@@ -523,7 +527,7 @@ closed-loop-down:
 # Prompt, tool-detail, tool-content, response and raw-body capture are set off
 # explicitly so inherited settings can't enable them: the logs only reach the
 # local Ourios, but `OTEL_LOG_TOOL_CONTENT` would put tool output on spans,
-# and spans go to Dash0.
+# and spans go to the remote backend.
 closed-loop-env:
     #!/usr/bin/env bash
     cat <<'JSON'

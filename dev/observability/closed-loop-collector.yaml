@@ -61,14 +61,19 @@ processors:
 connectors:
   # Route on the resource's service.name, failing closed: only the named
   # self-telemetry services reach the backend and every other log stays in the local
-  # Ourios. Claude Code's logs therefore stay local unless its service.name is
-  # set to one of those two names.
+    # Ourios. Claude Code's logs therefore stay local unless its service.name is
+  # set to one of those two names. The corpus replay (`just closed-loop-replay`)
+  # also stays local, in its own tenant so its templates never mix with Claude
+  # Code's.
   routing/logs:
     default_pipelines: [logs/ourios]
     table:
       - context: resource
         condition: attributes["service.name"] == "ourios-server" or attributes["service.name"] == "otelcol-contrib"
         pipelines: [logs/backend]
+      - context: resource
+        condition: attributes["service.name"] == "corpus-replay"
+        pipelines: [logs/replay]
 
 exporters:
   otlp_http/ourios:
@@ -76,6 +81,10 @@ exporters:
     # RFC 0046: the tenant is named out of band on every export.
     headers:
       x-ourios-tenant: claude-code
+  otlp_http/ourios_replay:
+    endpoint: http://127.0.0.1:24318
+    headers:
+      x-ourios-tenant: corpus-replay
   otlp_http/backend:
     endpoint: ${env:CLOSED_LOOP_OTLP_ENDPOINT}
     headers:
@@ -106,6 +115,10 @@ service:
       receivers: [routing/logs]
       processors: [batch]
       exporters: [otlp_http/ourios]
+    logs/replay:
+      receivers: [routing/logs]
+      processors: [batch]
+      exporters: [otlp_http/ourios_replay]
     logs/backend:
       receivers: [routing/logs]
       processors: [batch]

@@ -459,12 +459,28 @@ closed-loop-ourios:
 # Ourios run detached, so they outlive the terminal and a Claude Code restart.
 # Ourios is built first, each service must be listening before the next
 # starts, and state and logs go to scratch/closed-loop/. Idempotent.
-closed-loop-up:
-    dev/observability/closed-loop.sh up
+# `just closed-loop-up replay=true` also starts `closed-loop-replay` (default rate).
+closed-loop-up replay="false":
+    REPLAY={{replay}} dev/observability/closed-loop.sh up
 
-# Stop what `closed-loop-up` started, Ourios first so its last telemetry still
-# reaches the Collector. A recorded PID is only signalled while it is still the
-# process that was launched (PID plus start time).
+# `rate` is lines per second. Each line gets fresh parameter values, and a
+# `mutation_rate` fraction also gets a swapped corpus word or a long base64
+# parameter, so the miner keeps seeing near misses and parameter overflow
+# after the first pass (see dev/observability/corpus-replay.py). The
+# service.name is `corpus-replay`, which the Collector routes to the local
+# Ourios only, in tenant `corpus-replay`. Rows become queryable once the sink
+# flushes its buffer (within about five minutes at this rate); query them with
+#   curl -s http://127.0.0.1:4319/v1/query -H 'x-ourios-tenant: corpus-replay' \
+#     -H 'content-type: text/plain' -d 'true | count by template_id'
+# Runs detached with its state in scratch/closed-loop/; `closed-loop-down` stops it.
+# Replay the anonymised corpus (testdata/corpus/*.txt) in a loop into the closed-loop Collector.
+closed-loop-replay rate="3" mutation_rate="0.1":
+    REPLAY_RATE={{rate}} REPLAY_MUTATION_RATE={{mutation_rate}} dev/observability/closed-loop.sh replay
+
+# Stop what `closed-loop-up` and `closed-loop-replay` started, the replay and
+# then Ourios, so Ourios's last telemetry still reaches the Collector. A
+# recorded PID is only signalled while it is still the process that was
+# launched (PID plus start time).
 closed-loop-down:
     dev/observability/closed-loop.sh down
 

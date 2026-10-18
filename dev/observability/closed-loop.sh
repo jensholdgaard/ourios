@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Start or stop the local closed loop (`just closed-loop-up` / `closed-loop-down`):
 # the Collector and the local Ourios run detached, with state under
-# scratch/closed-loop/. Each service's state file records its PID and the
+# scratch/closed-loop/. `replay` (or `up` with REPLAY=true) also starts the
+# corpus replay (dev/observability/corpus-replay.py) against the Collector. Each service's state file records its PID and the
 # process start time, so a PID the OS has reused for another process is never
 # treated as ours or signalled.
 set -euo pipefail
@@ -127,11 +128,37 @@ up() {
   fi
 }
 
-# Ourios first, so its last telemetry still reaches the Collector.
-down() { stop ourios; stop collector; }
+# The replay sends to the Collector, so it needs the Collector up but not Ourios:
+# the Collector buffers and retries the export until Ourios is listening.
+replay() {
+  local pid
+  if pid="$(live_pid replay)"; then
+    echo "replay already running (pid $pid)"
+    return 0
+  fi
+  live_pid collector >/dev/null || { echo "collector is not running; run 'just closed-loop-up' first" >&2; exit 1; }
+  mkdir -p "$dir"
+  nohup python3 -I dev/observability/corpus-replay.py \
+    --endpoint "${REPLAY_ENDPOINT:-http://127.0.0.1:4318/v1/logs}" \
+    --rate "${REPLAY_RATE:-3}" --mutation-rate "${REPLAY_MUTATION_RATE:-0.1}" \
+    > "$dir/replay.log" 2>&1 < /dev/null &
+  pid=$!
+  record replay "$pid"
+  sleep 1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "replay exited during startup; see $dir/replay.log" >&2
+    rm -f "$dir/replay.state"
+    return 1
+  fi
+  echo "replay running (pid $pid), log $dir/replay.log"
+}
+
+# The replay first, then Ourios, so Ourios's last telemetry still reaches the Collector.
+down() { stop replay; stop ourios; stop collector; }
 
 case "${1:-}" in
-  up) up ;;
+  up) up; if [ "${REPLAY:-false}" = true ]; then replay; fi ;;
+  replay) replay ;;
   down) down ;;
-  *) echo "usage: $0 up|down" >&2; exit 2 ;;
+  *) echo "usage: $0 up|replay|down" >&2; exit 2 ;;
 esac

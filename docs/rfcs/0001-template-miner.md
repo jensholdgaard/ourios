@@ -251,6 +251,34 @@ the line exactly. Paper-pure Drain loses the original token; Ourios
 retains it as a parameter. This is what makes `[§3.3]` reconstruction
 possible at all.
 
+> **Amendment (2026-10-19, #1064, maintainer-approved) — timestamp and
+> decimal masking.** The masker shipped with three rules (UUID, IPv4,
+> integer). Timestamps are listed above but were never masked, and a
+> decimal such as `0.3786463` stayed a literal token. Logs that print
+> their own clock time, or a changing decimal, then mint a template
+> per line.
+>
+> Measured on the production `eq-perses` store (`store-v14/`, about
+> 30 hours, 1,141 templates in the tenant that receives other
+> programs' journal lines):
+> - Masking timestamps anywhere in the text collapses the tenant to
+>   643 templates (−43.6 %). Masking every digit run as well collapses
+>   it to 290 (−74.6 %).
+> - One Go-log error (`2026/10/17 16:55:02 traces export: …`) alone
+>   accounted for 200 templates, one per second it was logged.
+> - The structured-application tenant showed no timestamp effect
+>   (0.0 %) and −22.8 % under the digit mask.
+>
+> Those figures are upper bounds: the measurement masked substrings,
+> while this amendment masks whole tokens only. §6.2 step 2 adds two
+> rules: the reserved `TS` type, emitted for whole-token dates, times
+> of day and date-times, and an extension of `NUM` to whole-token
+> decimals. Each masked token keeps its exact original bytes as its
+> parameter, so `[§3.3]` reconstruction and OTLP fidelity are
+> unchanged (RFC0001.20). Timestamps embedded in a larger token
+> (`time=2026-…`, `[2026-…`, `"2026-…"`) are out of scope here and
+> recorded in §9. The criteria are RFC0001.17–RFC0001.21.
+
 ### 4.3 Variable-length wildcards — `adopt with constraint`
 
 Drain3's `MaskingInstruction` allows a single regex to match a
@@ -789,6 +817,89 @@ direction and the primary obligation lives in those other RFCs.
 > - **Then** the predicate expands to exactly `{Z}` — identical to
 >   the base-member behaviour and to bare `template_id = Z`
 >   (RFC0001.6)
+
+> **Scenario RFC0001.17 — Whole-token timestamps mask to `<TS>` and share one template**
+> - **Given** a tenant and two string-body records with the same
+>   severity and scope, whose bodies are
+>   `2026/10/17 16:55:02 traces export: rpc error` and
+>   `2026/10/17 16:55:09 traces export: rpc error`
+> - **When** both are mined
+> - **Then** both attach to one `template_id` whose template is
+>   `<TS> <TS> traces export: rpc error`
+> - **And** each record carries two `TS` params whose values are its
+>   own original bytes (`2026/10/17`, `16:55:02` and `2026/10/17`,
+>   `16:55:09`)
+> - **And** a single-token date-time such as
+>   `2026-10-18T13:28:29.674004Z` masks to one `<TS>` with one `TS`
+>   param
+> - (Locks the §6.2 step 2 `TS` shapes: `DATE`, `TIME` and
+>   `DATE "T" TIME`, each as a whole token.)
+
+> **Scenario RFC0001.18 — Near-timestamp shapes are not timestamps**
+> - **Given** tokens that look like, but are not, a §6.2 step 2
+>   timestamp: `2026-13-01` (month 13), `2026-10-32` (day 32),
+>   `2026-10/17` (mixed separators), `26-10-17` (two-digit year),
+>   `24:00:00` (hour 24), `9:05:00` (one-digit hour),
+>   `2026-10-17T25:00:00Z` (hour 25) and `16:55:02.` (empty fraction)
+> - **When** each is masked
+> - **Then** none is emitted as `TS`. Each token is masked by another
+>   rule if its whole shape matches one, and otherwise stays literal
+> - (Locks fixed field widths and value ranges. A loose pattern would
+>   capture version strings, ratios and identifiers that are not
+>   times.)
+
+> **Scenario RFC0001.19 — Whole-token decimals mask to `<NUM>`; other dotted shapes do not**
+> - **Given** two records whose bodies are
+>   `backing off for 0.1 seconds` and
+>   `backing off for 0.3786463 seconds`, same severity and scope
+> - **When** both are mined
+> - **Then** both attach to one template,
+>   `backing off for <NUM> seconds`, with `NUM` params `0.1` and
+>   `0.3786463`
+> - **And** `-1.5` masks to `<NUM>`
+> - **And** `1.2.3`, `.5`, `5.`, `1e5`, `0x1F`, `6.3ms` and `1,5` are
+>   not emitted as `NUM`. They stay literal unless another rule's
+>   whole shape matches; `10.0.0.1` stays `<IP>`, because the IPv4
+>   rule is tried first
+> - (Locks the decimal shape as `-? DIGITS "." DIGITS`, matching the
+>   whole token.)
+
+> **Scenario RFC0001.20 — Masking a timestamp never touches the record's time fields or body bytes (OTLP fidelity)**
+> - **Given** a string-body record with `time_unix_nano = X` and
+>   `observed_time_unix_nano = Y`, whose body is
+>   `2026-10-18T13:28:29.674004+02:00 worker started`, an instant
+>   different from both `X` and `Y`
+> - **When** it is mined, written and read back
+> - **Then** the stored `time_unix_nano` is `X`, the stored
+>   `observed_time_unix_nano` is `Y`, and the effective timestamp is
+>   the one RFC0001.10 derives from them
+> - **And** the `TS` param value is exactly
+>   `2026-10-18T13:28:29.674004+02:00`. Its precision, offset and
+>   separators are not parsed, normalised to UTC or re-rendered
+> - **And** the read path returns a body byte-identical to the
+>   ingested one (`[§3.3]`; reader render contract `Faithful`)
+> - **And** a record with `body_kind = Structured` whose `AnyValue`
+>   contains the same string is stored exactly as RFC0001.9 says, with
+>   no masking applied
+> - (Locks the faithful-witness rule: the miner never derives,
+>   corrects or fills an OTLP field from a timestamp it finds in the
+>   body.)
+
+> **Scenario RFC0001.21 — Snapshots from before the new rules restore; ids are never reused**
+> - **Given** a tenant snapshot taken by a build without the
+>   RFC0001.17/.19 rules, holding leaf `A` whose template has a
+>   literal timestamp token in place of a `<TS>`
+> - **When** a build with the new rules restores it and mines a line
+>   that differs from `A`'s only in that token
+> - **Then** restore succeeds and `A` keeps its id, template and
+>   version
+> - **And** the line attaches to a `<TS>` leaf with a newly allocated
+>   id, never to `A`'s id and never to a reused id (§6.1 *Template
+>   identity*, RFC 0059)
+> - **And** a snapshot taken after the new rules, with a `<TS>`
+>   wildcard on a leaf's descend path, restores to the same leaf, so
+>   that a line which mined to it before the restart mines to it
+>   after the restart
 
 ## 6. Proposed design
 
@@ -1348,6 +1459,65 @@ For each ingested OTLP `LogRecord`:
         # tag (e.g. <IP>) and the original bytes are pushed
         # into typed_params with that tag. Unmasked tokens
         # remain literal.
+
+> **Amendment (2026-10-19, #1064, maintainer-approved) — the rule
+> set.** Each rule matches a **whole token**. A token whose shape
+> matches a rule only after a prefix or suffix is removed (`time=…`,
+> `[…`, `…,`) stays literal (§9). Rules are tried in this order, and
+> the first match wins:
+>
+> 1. **`UUID`**: 8-4-4-4-12 hex digits with `-` separators.
+> 2. **`IP`**: four dot-separated decimal octets, each `0..=255`, with
+>    no leading zero.
+> 3. **`TS`**: exactly one of the following, all ASCII digits at the
+>    widths shown:
+>    - `DATE` = `YYYY s MM s DD`, where `s` is the same character
+>      (`-` or `/`) in both positions, `MM` is `01..=12` and `DD` is
+>      `01..=31`.
+>    - `TIME` = `hh:mm:ss [FRAC] [ZONE]`, where `hh` is `00..=23`,
+>      `mm` is `00..=59` and `ss` is `00..=60` (leap second).
+>      - `FRAC` = `.` or `,`, followed by 1–9 digits.
+>      - `ZONE` = `Z`, or `+`/`-` followed by `hh` (`00..=23`), an
+>        optional `:` and `mm` (`00..=59`).
+>    - `DATETIME` = `DATE "T" TIME`. Space-separated date-times are
+>      two tokens, so they mask as `DATE` and `TIME`.
+>
+>    There is no calendar validation: `2026-02-31` is a `DATE`. The
+>    rule recognises a shape; it does not check the date. Epoch
+>    seconds and milliseconds are plain integers and keep masking as
+>    `NUM`.
+> 4. **`NUM`**: an integer, `-? DIGITS` (unchanged), or a decimal,
+>    `-? DIGITS "." DIGITS`.
+>
+> Neither new rule changes what is stored. The param value is the
+> token's original bytes, and reconstruction (§6.6) concatenates them
+> exactly as before. The record's OTLP fields are never read from or
+> written to by masking (RFC0001.20). `tag_str_for` maps `TS` to
+> `<TS>`, so a snapshot can restore a `<TS>` descend-path wildcard
+> (RFC0001.21). As with the other tags, a literal `<TS>` in a log line
+> is left unchanged and is not a parameter (`wildcard_positions` is
+> the source of truth).
+>
+> **Why masking cannot cross a semantic boundary.** Both rules
+> recognise a token by its shape. Two lines therefore share a
+> template under the new rules only if they agree on every token that
+> is not a timestamp or a number. Lines that differ only in a
+> timestamp or a decimal are the same statement, so merging them is
+> not a §3.1 violation. Rules that no token matches leave every token
+> unchanged, which the property test in §8 pins.
+>
+> **Rollout.** The first deploy is a one-time step change. Lines that
+> used to mine to literal-timestamp or literal-decimal leaves start
+> new `<TS>`/`<NUM>` leaves, while the old leaves keep their ids and
+> stay queryable (RFC0001.21). Fresh leaves emit no audit event
+> (RFC0001.1). After that, template growth on affected tenants
+> should slow. The release before/after check in Dash0 compares
+> `ourios.miner.template.count` per tenant by `service.version`.
+>
+> **Contract change.** The unit test
+> `tag_str_for_maps_only_mask_emitted_types` asserts that `TS` has no
+> tag string, and `mask.rs` documents `TS` as reserved. This amendment
+> replaces both. No other existing expectation changes.
 
 3.  parent = tree.descend(record.severity_number,
                            record.scope_name,
@@ -2647,6 +2817,22 @@ resolves bidirectionally between RFC and tests.
   true`. Property failure blocks merge.
   *Covers:* H7.1, H7.4, §3.3.1.
 
+  > **Amendment (2026-10-19, #1064, maintainer-approved).** The
+  > generators include `TS` and decimal tokens, so the property also
+  > covers lines masked by the two new rules.
+  > - A second property checks that `mask` changes only tokens a rule
+  >   matches.
+  > - Each `TS` or `NUM` param value must equal the original token.
+  > - Unit tests on `mask` cover RFC0001.17's shapes, RFC0001.18's
+  >   negatives and RFC0001.19.
+  > - An ingester round-trip test covers RFC0001.20. A snapshot
+  >   restore test covers RFC0001.21.
+  > - The corpus template-count bounds are re-baselined only where the
+  >   new rules lower a count. A rise is a regression.
+  >
+  > *Covers:* RFC0001.17, RFC0001.18, RFC0001.19, RFC0001.20,
+  > RFC0001.21.
+
 - **Corpus tests** on `testdata/corpus/` (fixed, anonymised; see
   `docs/benchmarks.md` §1): assert bounds on
   `ourios.miner.template.count`, `ourios.miner.merges`,
@@ -2810,6 +2996,32 @@ resolves bidirectionally between RFC and tests.
 
 Decisions explicitly deferred. Each must be resolved before this
 RFC's status flips to `accepted`.
+
+> **Open (2026-10-19, #1064) — values inside a larger token.** The
+> §6.2 step 2 rules match whole tokens only. A timestamp or number
+> inside a larger token stays literal. Examples:
+> - logfmt values: `time=2026-10-17T17:08:56.145Z`, `duration=6.3ms`
+> - bracketed or quoted values: `[2026-10-18`, `time="…"`
+> - `file:line` and `host:port` pairs: `nflog.go:422`
+>
+> In the `eq-perses` measurement these account for roughly half of
+> the timestamp effect (Alertmanager and Perses lines), and for most
+> of the extra collapse that the digit mask showed.
+>
+> Masking them needs a template token with a literal prefix or suffix
+> around a wildcard (`time=<TS>`). That is a new kind of template
+> token, so it changes the snapshot format, the canonical template
+> text, and the querier's template registry and body-literal
+> unification. It also carries a §3.1 risk that the whole-token rules
+> do not: digits inside an identifier are sometimes part of what the
+> statement means.
+>
+> The decision is deferred to its own amendment, made with its own
+> measurement on the store written after the whole-token rules
+> ship. Two things weigh against doing it in the miner: a Collector
+> `transform` processor can already pull logfmt values into
+> attributes upstream, and OTLP producers that emit structured bodies
+> avoid the problem entirely.
 
 **Persistence (from §6.9) — RESOLVED (2026-06-10).** The three
 sub-questions are pinned in §6.9; the resolutions are recorded here

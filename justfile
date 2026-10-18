@@ -441,16 +441,20 @@ closed-loop-collector:
 
 # `dogfood-server` with its own logs, traces and metrics exported through the
 # closed-loop Collector (and so to your backend), tagged as a development deployment.
-# gRPC on 4317: the server binary is built without `ourios-telemetry`'s
-# `http-proto` feature, so it exports over gRPC whatever the protocol says.
+# OTLP/HTTP on 4318, like every other source in the loop; each signal's
+# endpoint and protocol is pinned so an inherited setting can't redirect it.
 # Every exporter setting is set here, per signal included, so a shell still
 # carrying `dogfood-env`'s block can't redirect or disable a signal.
 closed-loop-ourios:
     OTEL_LOGS_EXPORTER=otlp OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp \
-    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
-    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:4317 \
-    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4317 \
-    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+    OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+    OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/protobuf \
+    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf \
+    OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http/protobuf \
+    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:4318/v1/logs \
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces \
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4318/v1/metrics \
     OTEL_SERVICE_NAME=ourios-server \
     OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=development \
     just dogfood-server

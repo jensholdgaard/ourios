@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.14.0] - 2026-10-18
+
+### Added
+
+- Finer confidence buckets near 1.0 and per-tenant zero points (#1058) (0eea0fb)
+- Count the batch on the ingest span and tenant the ingest counters (#1053) (3d4d59f)
+- Warn at start-up when an otlp protocol falls back to grpc (#1054) (0056f40)
+- Count unsealed partitions on the plan partitions span (#1055) (34611e8)
+- Confirm an erasure by partition generation and wait for erasure_settle (#1043) (0dcb0e8)
+- Span and count the orphan gc pass (#1041) (1129b89)
+- **BREAKING** Record consumed flush files in the manifest so a late write stays live (#1038) (a710c68)
+- Name each output for its generation and keep in-flight outputs from gc (#1037) (a37492b)
+
+### Changed
+
+- Drop the bootstrap manifest; the first commit creates it (#1040) (b43c251)
+
+### Chore
+
+- Capture Claude Code prompts and tool details locally and strip them from spans (#1057) (ebb5a75)
+- Run the closed loop in the background and make its OTLP backend configurable (#1046) (2168833)
+- Add a local closed loop that sends Claude Code and Ourios telemetry to Dash0 (#1044) (59305a1)
+
+### Documentation
+
+- Require the unsealed count on the plan partitions span (#1056) (18f59e4)
+- Amend §6.8 for finer confidence buckets and per-tenant zero points (#1052) (e1fc508)
+- Amend for an observable orphan gc pass (#1039) (a003c85)
+
+### Fixed
+
+- Keep the /mcp server span open until the tool result streams (#1048) (bacffc8)
+- Keep the store bridge's idle blocking threads for ten minutes (#1047) (f454954)
+- Record ourios.tenant on execute_tool spans (#1050) (df2ee76)
+- Export self-telemetry over otlp/http when the protocol env selects http/protobuf (#1045) (4614a73)
+- Resolve again when a scan fails over a file set a commit replaced (#1042) (7249af2)
+- Roll the compactor with the recreate strategy so two never run at once (#1036) (ec87bed)
+
+### Tests
+
+- Spawn every served-binary test without the ambient otel env (#1049) (4379f7a)
+
 ## [0.14.0-rc.1] - 2026-10-17
 
 ### Added

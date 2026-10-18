@@ -24,6 +24,26 @@ superseded-by: —
 > RFC 0001 keeps the old text with a dated pointer here,
 > the way RFC 0023 amended it.
 
+> **Amendment (2026-10-18, #1059, maintainer-approved) — the renaming is
+> observable as orphan template ids.** §3.4's "When the renaming is
+> observable" said the renaming is invisible in the steady state. Rows
+> still render correctly, but the renaming itself is visible:
+> - a crash after a template's binding is written and before its rows
+>   are durable leaves the earlier id bound by a published event and
+>   carried by no row;
+> - a frame above both horizons whose rows a size or age flush already
+>   stored is republished on replay under the re-minted id.
+>
+> The amendment:
+> - corrects §3.4 and names every case in which an orphan id can appear;
+> - corrects the matching sentence in §4;
+> - adds scenario RFC0059.20 (§5) and its tests (§6);
+> - records marking row-less ids as out-of-scope follow-up (§7).
+>
+> No publish path changes. The frontmatter stays `green` for RFC0059.1 to
+> RFC0059.19. RFC0059.20 pins today's behaviour; it starts `red` and moves
+> to `green` with its tests.
+
 ## 1. Summary
 
 `template_id` is allocated by one in-memory counter per process. A
@@ -373,6 +393,90 @@ RFC 0001 §6.9's 2026-06-12 amendment). They were never published, so the
 renaming is invisible. Only a lagging snapshot (`S < X`) re-mints
 templates whose rows in `(S, X]` were already published. That is
 drift, surfaced by RFC 0010, never a collision.
+
+> **Amendment (2026-10-18, #1059, maintainer-approved) — orphan ids and
+> duplicates.** The paragraph above infers "never published" from "above
+> `X`". That is wrong: above `X` means *uncheckpointed*. A size or age
+> flush publishes rows without advancing `X`, and recovery republishes
+> every frame above both horizons, `max(X, S)` (`Route::Published`). It
+> does so whether or not `S ≥ X`.
+>
+> **Rows render correctly.** Every id stays unique (RFC0059.1), and a row
+> only ever carries the id its own process minted. So no row renders
+> against another template's text. This is separate from whether the
+> renaming is visible, which it can be in two ways.
+>
+> **Duplicates under a new id (drift).** A frame above both horizons
+> whose rows were already stored by a size or age flush is replayed. If
+> it minted its template, replay re-mints it, and RFC 0014's
+> at-least-once contract republishes its rows under the re-minted id.
+> Both ids then carry rows. This is drift, and it was so before this
+> amendment.
+>
+> **Orphan ids.** An *orphan* is an id that a published audit event binds
+> and that no published row carries at the time it is looked at. An id left
+> behind by re-minting stays row-less for good; in cases 3 and 4 below a later
+> valid row of the template can still carry the id and end its orphan status. The registry then lists the template
+> twice, under the orphan and under the re-minted id. `list_templates`
+> shows both. RFC 0010's drift query does not show an orphan whose only
+> event is `Created`, because drift counts only widenings and type
+> expansions. An orphan arises in these cases:
+> 1. **A crash after a template's binding is written and before its rows
+>    are durable.** Every publish path writes audit before records, and
+>    none advances `X` until a cut installs a snapshot. If the process
+>    dies in between, the next start replays the frame, re-mints the
+>    template under a fresh block, and publishes the row under the new
+>    id. The earlier id is left with no row. Examples:
+>    - the age sweep (`PublishCoordinator::drain_aged`) takes the whole
+>      audit buffer but only the aged record partitions, so a new
+>      template's event is published on the next tick while its row
+>      waits for its partition to age;
+>    - a cut, or `flush_then_snapshot`, writes the audit buffer and then
+>      the records. A failed record write skips the snapshot;
+>    - a failed record PUT, or a ledger refusal after the audit write,
+>      requeues only the records (`Publisher::publish`,
+>      `PublishCoordinator::write`).
+> 2. **A discarded or lagging snapshot (`S < X`).** A template that replay
+>    mints afresh from frames whose rows were already published publishes
+>    its new binding before any listener opens (*A re-minted id publishes
+>    its mapping*, below). The new id is an orphan until a row matching
+>    the template is ingested after startup, which may be never.
+> 3. **A record rejected before it is buffered.** If the record sink
+>    cannot derive the record's partition (`PartitionKey::derive` fails,
+>    e.g. `time_unix_nano = u64::MAX`), the record is counted and dropped.
+>    The miner has already minted the template and emitted its event.
+>    This needs no crash.
+> 4. **A record quarantined after it was buffered.** A flush that hits a
+>    permanent per-record rejection quarantines the record (RFC 0025
+>    §3.3; e.g. `observed_time_unix_nano = u64::MAX` fails Parquet
+>    encoding) and publishes the rest. The template's binding is
+>    published, and if the quarantined record was its only row, no row
+>    carries it. This also needs no crash, and it can happen inside a
+>    successful shutdown.
+>
+> In cases 3 and 4 the id stops being an orphan once a valid row of the
+> template is published.
+>
+> **A graceful shutdown closes case 1 for publishable rows.**
+> `ReceiverHandle::shutdown` runs `flush_then_snapshot`. It publishes the
+> audit buffer, then every record, then installs the snapshot at the
+> high-water. The restart restores each template under its id and
+> replays nothing that could re-mint it. Any cut that installs a snapshot
+> does the same. It does not cover:
+> - a record flush that fails (the snapshot is skipped, and case 1
+>   applies on the next crash);
+> - a record quarantined during that flush (case 4).
+>
+> **Why this is accepted rather than prevented.** Publishing an event only
+> together with a row that carries its id was considered and declined:
+> - it would replace RFC 0052 §3.1's publication gate with per-template
+>   selection;
+> - it would publish events out of timestamp order, which pushes the
+>   RFC 0033/0060 incremental template-map refresh into full folds;
+> - it would still leave residual orphan cases.
+>
+> An orphan breaks no row. It costs a duplicate registry entry, and only
+> after a crash, a lagging or discarded snapshot, or a rejected record.
 
 **A re-minted id publishes its mapping.**
 - A frame at or below `X` replays for the miner's state alone, because
@@ -1007,6 +1111,11 @@ an RFC 0008 format change, and it still needs the store object for a
 lost root. The renaming it avoids is unobservable in the steady state
 (§3.4).
 
+> **Amendment (2026-10-18, #1059, maintainer-approved).** "Unobservable"
+> is wrong. Rows render correctly, but the renaming is visible as
+> duplicates under a re-minted id and as orphan ids (§3.4, *orphan ids and
+> duplicates*).
+
 **A per-node key with static disjoint ranges.** For example,
 `node k` issues ids `≡ k (mod R)`. It needs a stable node identity and a
 fixed `R`, and it breaks on scale-out. The compare-and-swap needs
@@ -1268,6 +1377,23 @@ The ids are referenced from test code.
 > - **And** no id minted afterwards equals an id still bound by stored
 >   data or audit; ids only the removed files bound may be reissued
 
+> **Amendment (2026-10-18, #1059, maintainer-approved).** One scenario
+> pinning §3.4's *orphan ids*.
+
+> **Scenario RFC0059.20 — A crash after an age sweep leaves an orphan id; a cut does not**
+> - **Given** a receiver that ingested a line minting a new template, and
+>   an age-sweep step that published the audit buffer while the record
+>   partition had not aged
+> - **When** the node stops with no cut and restarts through recovery
+> - **Then** replay publishes the line's row under a re-minted id, and
+>   forwards that id's binding
+> - **And** the id the first process published binds the same text and
+>   no row
+> - **And** when a cut (the same drain and snapshot a graceful shutdown's
+>   `flush_then_snapshot` runs) precedes the stop instead, and the row is
+>   publishable, the restart restores the template under its id: one id
+>   binds the text, and a published row carries it
+
 ## 6. Testing strategy
 
 **Integration tests (`ourios-ingester` `tests/it`).** These run on #898's
@@ -1286,6 +1412,12 @@ every newly minted id.
 - RFC0059.17 parses the chart README's JSON policies (`include_str!`)
   and evaluates their action and resource wildcards against the
   high-water key.
+- *(2026-10-18, #1059, maintainer-approved.)* RFC0059.20 is
+  `rfc0059_age_sweep_orphan.rs`: one age-sweep step on the production
+  coordinator, a stop, and a restart through recovery. It asserts the
+  orphan, and a second test with a cut before the stop asserts there is
+  none. That second test covers a publishable row; orphan cases 3 and 4
+  are documented, not tested here.
 - **RFC0052.10's transition.** Its audit-gate test
   (`rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_frame_order`)
   changes its contract with this RFC. The maintainer approved this on
@@ -1331,6 +1463,10 @@ kept snapshot restored under that id. This covers RFC0059.1 and .9.
       stream, so it inherits the audit fold's last-wins on historical
       collisions. Repairing already-collided history is out of scope; the
       DuckDB procedure from #908 detects it.
+- [ ] **Marking row-less ids** (2026-10-18, #1059; out of scope).
+      `list_templates` and the drift queries could flag an id that no row
+      carries. Doing that precisely needs per-file `template_id` statistics
+      or a data scan per listing, so it is deferred to its own RFC.
 
 ## 8. References
 

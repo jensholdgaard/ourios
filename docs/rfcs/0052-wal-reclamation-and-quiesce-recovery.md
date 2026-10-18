@@ -676,20 +676,6 @@ miner lock, the timer follows the same order — exclusion, then miner lock,
 then the `last_durable` mutex — and the exclusion is never requested while
 the miner lock is held.
 
-> **Coordination note (2026-10-18, RFC 0059 §3.4 amendment #1059,
-> maintainer-approved).** The age sweep's drain, and
-> the record sink's inline audit barrier, stop taking the whole audit
-> buffer. The rule is co-selection: a binding event and a record carrying
-> its `template_id` are selected in the same take, and an event with no
-> such record stays buffered. This does not make them visible
-> atomically. Audit-before-record still writes the event first, so it is
-> in the store, briefly, ahead of the row (RFC 0059 §3.4 lists the
-> residual cases). A take also checks the ledger before its audit write,
-> so a refusal requeues events and records together. The cut and the
-> post-recovery and shutdown flushes still take everything. This
-> section's exclusion, the in-flight registration and §3.7's gates at
-> `X` and `max(X, S)` are unchanged.
-
 **The age sweep participates in the same exclusion.** It drains under the
 miner lock alone today, so a sweep could begin after the timer's quiesce and
 before its stamp, leaving a drained-but-undurable batch outside the buffers

@@ -141,6 +141,12 @@ replay() {
     return 0
   fi
   live_pid collector >/dev/null || { echo "collector is not running; run 'just closed-loop-up' first" >&2; exit 1; }
+  # A Collector started from an older config may lack the corpus-replay route
+  # and would send the replay into the claude-code tenant.
+  if [ "$(sed -n 3p "$dir/collector.state")" != "$(config_digest)" ]; then
+    echo "collector runs an older config; run 'just closed-loop-up' to apply the new config" >&2
+    exit 1
+  fi
   mkdir -p "$dir"
   nohup python3 -I dev/observability/corpus-replay.py \
     --endpoint "${REPLAY_ENDPOINT:-http://127.0.0.1:4318/v1/logs}" \

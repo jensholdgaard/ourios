@@ -463,11 +463,14 @@ closed-loop-ourios:
 # Ourios run detached, so they outlive the terminal and a Claude Code restart.
 # Ourios is built first, each service must be listening before the next
 # starts, and state and logs go to scratch/closed-loop/. Idempotent.
-# `just closed-loop-up replay=true` also starts `closed-loop-replay` (default rate).
+# `just closed-loop-up true` also starts `closed-loop-replay` (default rate).
 closed-loop-up replay="false":
-    REPLAY={{replay}} dev/observability/closed-loop.sh up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    REPLAY="$1" exec dev/observability/closed-loop.sh up
 
-# `rate` is lines per second. Each line gets fresh parameter values, and a
+# Usage: `just closed-loop-replay [rate] [mutation_rate]`, e.g.
+# `just closed-loop-replay 5 0.2`. `rate` is lines per second. Each line gets fresh parameter values, and a
 # `mutation_rate` fraction also gets a swapped corpus word or a long base64
 # parameter, so the miner keeps seeing near misses and parameter overflow
 # after the first pass (see dev/observability/corpus-replay.py). The
@@ -479,7 +482,9 @@ closed-loop-up replay="false":
 # Runs detached with its state in scratch/closed-loop/; `closed-loop-down` stops it.
 # Replay the anonymised corpus (testdata/corpus/*.txt) in a loop into the closed-loop Collector.
 closed-loop-replay rate="3" mutation_rate="0.1":
-    REPLAY_RATE={{rate}} REPLAY_MUTATION_RATE={{mutation_rate}} dev/observability/closed-loop.sh replay
+    #!/usr/bin/env bash
+    set -euo pipefail
+    REPLAY_RATE="$1" REPLAY_MUTATION_RATE="$2" exec dev/observability/closed-loop.sh replay
 
 # Stop what `closed-loop-up` and `closed-loop-replay` started, the replay and
 # then Ourios, so Ourios's last telemetry still reaches the Collector. A

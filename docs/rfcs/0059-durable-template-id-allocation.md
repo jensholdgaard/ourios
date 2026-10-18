@@ -414,7 +414,9 @@ drift, surfaced by RFC 0010, never a collision.
 > amendment.
 >
 > **Orphan ids.** An *orphan* is an id that a published audit event binds
-> and that no row will ever carry. The registry then lists the template
+> and that no published row carries at the time it is looked at. An id left
+> behind by re-minting stays row-less for good; in cases 3 and 4 below a later
+> valid row of the template can still carry the id and end its orphan status. The registry then lists the template
 > twice, under the orphan and under the re-minted id. `list_templates`
 > shows both. RFC 0010's drift query does not show an orphan whose only
 > event is `Created`, because drift counts only widenings and type
@@ -474,7 +476,7 @@ drift, surfaced by RFC 0010, never a collision.
 > - it would still leave residual orphan cases.
 >
 > An orphan breaks no row. It costs a duplicate registry entry, and only
-> after a crash, a lagging snapshot, or a rejected record.
+> after a crash, a lagging or discarded snapshot, or a rejected record.
 
 **A re-minted id publishes its mapping.**
 - A frame at or below `X` replays for the miner's state alone, because

@@ -401,7 +401,8 @@ drift, surfaced by RFC 0010, never a collision.
 >   the next sweep tick, while the row minted with it stays buffered
 >   until its partition ages.
 > - Neither publish advances the checkpoint `X`; only a cut does. So the
->   frame stays above `X`, and the event is already in the store.
+>   frame stays above `X` (uncheckpointed), and its event is already in
+>   the store while its row is still unpublished.
 > - If the process stops before the row is published, the next start
 >   replays the frame. It re-mints the template under a fresh block,
 >   forwards the new id's events and publishes the row under the new id.
@@ -426,15 +427,21 @@ drift, surfaced by RFC 0010, never a collision.
 >   lags, and it leaves an id that only noise binds. Hazard #5's drift
 >   detection (RFC 0010) would report it as a real template version.
 >
-> **Corrected statement.** A frame above `X` was never published as
-> **rows**. Under the rule below, its template events were not published
-> either, except inside one ordered write (the residual window, below).
-> So the renaming is invisible in the steady state. It is observable:
-> - after a lagging snapshot (`S < X`), as before;
-> - after a stop when rows of a frame above `X` were published by a size
->   or age flush. RFC 0014's at-least-once contract then republishes those
->   rows under the re-minted id, so both ids carry rows. That is drift,
->   never an orphan, and this amendment does not change it.
+> **Corrected statement.** "Above `X`" means *uncheckpointed*, not
+> *unpublished*. A size or age flush publishes rows without advancing `X`,
+> so a frame above `X` may have published rows or not. Replay re-mints
+> every template first minted in such a frame, whichever it is:
+> - **The template's rows were published before the stop.** RFC 0014's
+>   at-least-once contract republishes them under the re-minted id, so
+>   both ids carry rows. That is drift, never an orphan, and this
+>   amendment does not change it.
+> - **None of its rows were published.** Today its event may already be
+>   in the store, which is the orphan. Under the rule below, its event is
+>   in the store only in the residual cases listed under *Residual
+>   orphans*.
+>
+> A lagging snapshot (`S < X`) stays observable as before; see the
+> replay-only exemption below.
 >
 > **Audit events travel with their rows (option (b)).**
 >
@@ -461,36 +468,93 @@ drift, surfaced by RFC 0010, never a collision.
 >   `flush_then_snapshot`).** These are unchanged: they take every
 >   record and every event. A cut advances `X` and installs the
 >   snapshot, so a restart restores the template under its id, and
->   nothing is re-minted.
+>   nothing is re-minted. They must take the whole audit buffer: an
+>   event still buffered when a snapshot records its template would
+>   never be emitted again (*Replay-only bindings*, below).
 >
 > *Ordering is unchanged.*
 > - `write_ordered` still writes a take's events before its records
 >   (RFC 0005 §3.7, `CLAUDE.md` §3.3), so no row is query-visible before
 >   its template event.
 > - The audit `Ledger`'s rules (no publish while an earlier take is in
->   limbo or went back) apply to the narrower takes as they are.
+>   limbo or went back) apply to the narrower takes. The amendment moves
+>   their check before the audit write (*One unpublished take at a time*,
+>   below).
 > - A record depends only on the events of its own `template_id` up to
 >   its `template_version`, and the rule takes exactly those (every
 >   buffered event of that id, in emission order). Taking fewer events
 >   therefore never publishes a row ahead of its binding.
 >
-> **Why it is sufficient.**
-> - **Crash or stop before a take.** No event of a frame above `X` is in
->   the store unless a row with its id is too. Replay re-mints and
->   publishes the event and the row together. Nothing is orphaned.
+> **Why it is sufficient, and where it is not.**
+> - **Crash or stop before a take.** A binding event whose rows are all
+>   unpublished is not in the store, except in the residual cases below.
+>   Replay re-mints the template and publishes the event and the row
+>   together. Nothing is orphaned.
 > - **Crash after a take's records are durable.** The old id carries
 >   rows, so it is not an orphan. The replayed duplicates under the
 >   re-minted id are RFC 0014's at-least-once contract, as above.
-> - **WAL replay itself.** RFC 0052 §3.7's capture sink forwards replayed
->   events into the same audit buffer as their records, and the
->   post-recovery `flush_then_snapshot` publishes both together. The
->   gates at `X` and `max(X, S)` are unchanged, including RFC0052.10's
->   re-minted-id exception.
-> - **Residual window.** A crash *inside* one `write_ordered`, after the
->   audit PUT and before the record PUTs of the same take, can still
->   orphan an id. Audit-before-record makes this window inherent. It
->   shrinks from "until the row's partition ages" (minutes) to one
->   ordered write. Closing it needs option (a) below.
+> - **WAL replay above `max(X, S)`** (`Route::Published`). The capture
+>   sink forwards a frame's events and its records into the same buffers,
+>   and the post-recovery flush publishes both. The rule holds.
+> - **Replay-only bindings: an explicit exemption.** A frame in `(S, X]`
+>   replays with `Route::MinerOnly` (`recovery.rs`, `settle`). Its rows
+>   are withheld, because they were published before the stop under the
+>   old ids. But an event of a template that the replay minted afresh
+>   (id above the seated high-water) is forwarded (RFC0059.9,
+>   RFC0052.10's exception), and the post-recovery flush publishes it
+>   with no row.
+>   - It cannot be held back for a later row. The post-recovery snapshot
+>     records the re-minted template, so after it the miner never emits
+>     that template's `Created` event again. A row ingested later
+>     carries the re-minted id, and if the event had been held in memory
+>     and lost to a crash, that row could not be rendered (`CLAUDE.md`
+>     §3.3). So every cut and post-recovery flush publishes the whole
+>     audit buffer, as today.
+>   - Such a binding is an orphan until a row matching the template is
+>     ingested after startup, which may be never. It arises only when a
+>     snapshot is discarded or lags (`S < X`), the case this section
+>     already calls drift.
+> - **One unpublished take at a time.** The rule alone still lets a
+>   take's events become durable while its records go back to the
+>   buffer. Two paths do this today:
+>   - **Ledger refusal** (`write_ordered`, `PublishCoordinator::write`).
+>     The take's events are written first, then `ticket.clear()`
+>     refuses, because an earlier take's events are in limbo or went
+>     back. Only the records are requeued.
+>   - **Failed record PUT** (`Publisher::publish`). The events are
+>     durable, a partition's PUT fails, and its records are requeued for
+>     a later drain.
+>   - A stop after either return, and before a later drain publishes the
+>     requeued records, orphans the ids those records alone carried. This
+>     can last minutes: until the next tick, or for as long as the data
+>     PUTs keep failing.
+>
+>   The amendment closes the first and bounds the second:
+>   - **Check before writing.** A take checks the ledger *before* its
+>     audit write. If an earlier take is in limbo or went back, the take
+>     requeues its events and its records together, unwritten. Nothing
+>     can doom the take after the check, because only an earlier take
+>     that is in limbo can doom it. So a take that passes the check
+>     always clears after its own write, and a ledger refusal never
+>     follows an audit write.
+>   - **A failed record PUT** stays possible: the store accepted the
+>     audit PUT and refused a data PUT. That window is not closed. It
+>     lasts until the requeued records publish, which is the next drain
+>     once the store accepts data writes again.
+>
+> **Residual orphans** (every case left after the amendment):
+> 1. A stop between a take's audit write and the durability of all its
+>    record PUTs. In the common case this is one in-flight
+>    `write_ordered`. If a data PUT fails after the audit PUT succeeded,
+>    it extends until the requeued records publish, which lasts as long
+>    as the store keeps refusing data writes.
+> 2. A replay-only binding (snapshot discarded or `S < X`) that no row
+>    ingested after startup ever carries.
+> 3. A template whose every row is permanently rejected and quarantined
+>    (RFC 0025 §3.3) after its event was written in the same take.
+>
+> Closing (1) entirely needs option (a) below, or writing audit and
+> records in one object.
 >
 > **What it costs.**
 > - **Registry visibility.** A new template appears in the audit stream,
@@ -512,7 +576,8 @@ drift, surfaced by RFC 0010, never a collision.
 >   ceiling.
 > - **Code.** Audit events must be selectable by `template_id` under the
 >   miner lock. That is a cheap index next to the buffer, and no change
->   to `AuditEvent` or to any on-disk format.
+>   to `AuditEvent` or to any on-disk format. The ledger check moves
+>   before the audit write, and a refused take requeues its events too.
 >
 > **Alternatives.**
 > - **(a) Seed replay from the published audit stream.** Before replay,
@@ -539,9 +604,10 @@ drift, surfaced by RFC 0010, never a collision.
 > - **`CLAUDE.md` §3.3, bit-identical reconstruction.** Preserved.
 >   Events still precede their rows (RFC0059.22).
 > - **Hazard #5, template schema evolution.** Touched and improved. The
->   audit stream no longer carries template ids that no row selects, so
->   drift (RFC 0010) reports real version changes only. The
->   lagging-snapshot and at-least-once cases stay drift, as before.
+>   audit stream carries a template id that no row selects only in the
+>   three residual cases, instead of after any stop between a sweep tick
+>   and the record publish. The lagging-snapshot and at-least-once cases
+>   stay drift, as before.
 
 **A re-minted id publishes its mapping.**
 - A frame at or below `X` replays for the miner's state alone, because
@@ -1473,10 +1539,18 @@ The ids are referenced from test code.
 > - **When** it is killed between an age sweep and the publish of the
 >   remaining records, and restarted through recovery
 > - **Then** every id an audit event in the store binds is carried by
->   at least one published row, except an id whose event a crash
->   inside one `write_ordered` call published without its records
-> - **And** the test kills only outside `write_ordered`, so it asserts
->   that there is no such id at all
+>   at least one published row, except the residual cases of §3.4:
+>   a take whose audit write landed and whose records are not yet all
+>   durable, a replay-only binding, and a quarantined template
+> - **And** the test kills only between takes, with every data PUT
+>   succeeding and a snapshot that neither lags nor is discarded, so it
+>   asserts that there is no such id at all
+> - **And** a take that the ledger refuses requeues its events with its
+>   records: a kill right after the refusal leaves no event of that take
+>   in the store
+> - **And** a take whose data PUT fails after its audit PUT is named as
+>   the residual case: the test injects that failure, kills, and asserts
+>   that only the ids of the requeued records are unbound by rows
 
 > **Scenario RFC0059.22 — Rows render as before**
 > - **Given** the same workload published under the rule and under
@@ -1529,7 +1603,13 @@ every newly minted id.
 >   change, approved together with this amendment.
 > - **RFC0059.21**: the RFC 0052 crash fixture, with kill points before
 >   and after an age sweep and before a size publish. It asserts, over
->   the store, that every bound id is carried by a row.
+>   the store, that every bound id is carried by a row. Two more legs:
+>   - a held earlier take (the barrier rig's held audit PUT) forces a
+>     ledger refusal, then a kill; the store holds none of the refused
+>     take's events;
+>   - a data store that fails one PUT after the audit PUT, then a kill;
+>     only the requeued records' ids are unbound, which is the named
+>     residual.
 > - **RFC0059.22**: one workload run with and without the rule (the old
 >   behaviour behind a test-only switch), then a comparison of the
 >   rendered bodies. A unit test on `PublishCoordinator` covers the

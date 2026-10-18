@@ -485,6 +485,7 @@ Used by:
 - `encoding_rs` 0.8.42 — <https://github.com/hsivonen/encoding_rs>
 - `multiversion_no_op` 1.0.0 — <https://github.com/hsivonen/multiversion_no_op>
 - `parquet` 59.3.0 — <https://github.com/apache/arrow-rs>
+- `sse-stream` 0.2.6 — <https://github.com/4t145/sse-stream/>
 - `utf8_iter` 1.0.4 — <https://github.com/hsivonen/utf8_iter>
 - `zeroize` 1.9.0 — <https://github.com/RustCrypto/utils>
 - `zeroize_derive` 1.5.0 — <https://github.com/RustCrypto/utils>
@@ -7027,8 +7028,8 @@ Used by:
 - `rand_xorshift` 0.5.0 — <https://github.com/rust-random/rngs>
 - `ref-cast-impl` 1.0.25 — <https://github.com/dtolnay/ref-cast>
 - `ref-cast` 1.0.25 — <https://github.com/dtolnay/ref-cast>
-- `rmcp-macros` 2.2.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
-- `rmcp` 2.2.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
+- `rmcp-macros` 3.5.1 — <https://github.com/modelcontextprotocol/rust-sdk/>
+- `rmcp` 3.5.1 — <https://github.com/modelcontextprotocol/rust-sdk/>
 - `rustls-platform-verifier-android` 0.2.0 — <https://github.com/rustls/rustls-platform-verifier>
 - `rustversion` 1.0.22 — <https://github.com/dtolnay/rustversion>
 - `ryu` 1.0.23 — <https://github.com/dtolnay/ryu>
@@ -7044,7 +7045,6 @@ Used by:
 - `shlex` 2.0.1 — <https://github.com/comex/rust-shlex>
 - `simdutf8` 0.1.5 — <https://github.com/rusticstuff/simdutf8>
 - `siphasher` 1.0.3 — <https://github.com/jedisct1/rust-siphash>
-- `sse-stream` 0.2.3 — <https://github.com/4t145/sse-stream/>
 - `syn` 2.0.118 — <https://github.com/dtolnay/syn>
 - `syn` 3.0.2 — <https://github.com/dtolnay/syn>
 - `sync_wrapper` 1.0.2 — <https://github.com/Actyx/sync_wrapper>
@@ -9078,9 +9078,9 @@ SOFTWARE.
 
 Used by:
 
-- `darling` 0.23.0 — <https://github.com/TedDriggs/darling>
-- `darling_core` 0.23.0 — <https://github.com/TedDriggs/darling>
-- `darling_macro` 0.23.0 — <https://github.com/TedDriggs/darling>
+- `darling` 0.24.1 — <https://github.com/TedDriggs/darling>
+- `darling_core` 0.24.1 — <https://github.com/TedDriggs/darling>
+- `darling_macro` 0.24.1 — <https://github.com/TedDriggs/darling>
 
 <details>
 <summary>Full license text</summary>

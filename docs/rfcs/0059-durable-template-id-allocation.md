@@ -24,9 +24,8 @@ superseded-by: —
 > RFC 0001 keeps the old text with a dated pointer here,
 > the way RFC 0023 amended it.
 
-> **Amendment (2026-10-17, #1059) — `drafted`, pending maintainer
-> approval: an audit event is published only with a row that carries its
-> id.** §3.4's claim that the renaming is invisible in the steady state is
+> **Amendment (2026-10-18, #1059, maintainer-approved) — an audit event
+> is published only with a row that carries its id.** §3.4's claim that the renaming is invisible in the steady state is
 > wrong for the audit stream. The receiver's age sweep publishes template
 > events ahead of their rows, so a stop before the row is published leaves
 > a template id with no row (an *orphan*). The amendment:
@@ -36,8 +35,12 @@ superseded-by: —
 > - adds a note to §4, scenarios RFC0059.20 to RFC0059.22 in §5, and
 >   their tests in §6.
 >
-> Until the maintainer approves it, the `green` status above covers
-> RFC0059.1 to RFC0059.19 only.
+> The frontmatter stays `green` for RFC0059.1 to RFC0059.19. The new
+> scenarios RFC0059.20 to RFC0059.22 were approved with the amendment.
+> They start `red` and move to `green` with their tests. The maintainer
+> approved the option (b) rule, the three residual cases, the ledger check
+> before the audit write, and the contract change to
+> `rfc0059_age_sweep_orphan.rs`.
 
 ## 1. Summary
 
@@ -389,8 +392,8 @@ renaming is invisible. Only a lagging snapshot (`S < X`) re-mints
 templates whose rows in `(S, X]` were already published. That is
 drift, surfaced by RFC 0010, never a collision.
 
-> **Amendment (2026-10-17, #1059) — `drafted`, pending maintainer
-> approval: the renaming is observable through the audit stream.** The
+> **Amendment (2026-10-18, #1059, maintainer-approved) — the renaming is
+> observable through the audit stream.** The
 > paragraph above is right about **rows** and wrong about **audit
 > events**.
 >
@@ -1181,7 +1184,7 @@ needs.
   - RFC 0052's own RFC0052.10 carries the matching dated And-clause, so
     the two green gates agree.
   - The maintainer approved the change on 2026-10-06.
-  - *(2026-10-17, #1059, `drafted`, pending maintainer approval.)* The
+  - *(2026-10-18, #1059, maintainer-approved.)* The
     age sweep, the inline audit barrier and the encode pool's publisher
     take only the audit events whose ids their records carry (§3.4,
     *Audit events travel with their rows*). This changes RFC 0052
@@ -1249,8 +1252,7 @@ an RFC 0008 format change, and it still needs the store object for a
 lost root. The renaming it avoids is unobservable in the steady state
 (§3.4).
 
-> **Amendment (2026-10-17, #1059) — `drafted`, pending maintainer
-> approval.** "Unobservable in the steady state" held only for rows. The
+> **Amendment (2026-10-18, #1059, maintainer-approved).** "Unobservable in the steady state" held only for rows. The
 > age sweep made the renaming observable through orphan audit events
 > until §3.4's *Audit events travel with their rows* rule. That section
 > also gives options (a) and (c) and why neither was chosen.
@@ -1516,8 +1518,7 @@ The ids are referenced from test code.
 > - **And** no id minted afterwards equals an id still bound by stored
 >   data or audit; ids only the removed files bound may be reissued
 
-> **Amendment (2026-10-17, #1059) — `drafted`, pending maintainer
-> approval.** Three scenarios for §3.4's *Audit events travel with their
+> **Amendment (2026-10-18, #1059, maintainer-approved).** Three scenarios for §3.4's *Audit events travel with their
 > rows*.
 
 > **Scenario RFC0059.20 — An age sweep publishes no event without its row**
@@ -1529,8 +1530,8 @@ The ids are referenced from test code.
 > - **And** after a restart through recovery, the store binds the
 >   template's text to exactly one id, and a published row carries it
 > - **And** `rfc0059_age_sweep_orphan.rs`, which asserts the orphan
->   today, asserts this instead (the contract change this amendment
->   requests)
+>   today, asserts this instead (the contract change approved with this
+>   amendment)
 
 > **Scenario RFC0059.21 — No template id is left without rows after a crash**
 > - **Given** a receiver with new templates, some of their rows in aged
@@ -1594,8 +1595,7 @@ every newly minted id.
   - RFC0059.9's `rfc0059_9_a_reminted_replay_id_publishes_its_mapping`
     covers the discarded-snapshot and `S < X` cases end to end.
 
-> **Amendment (2026-10-17, #1059) — `drafted`, pending maintainer
-> approval.**
+> **Amendment (2026-10-18, #1059, maintainer-approved).**
 > - **RFC0059.20**: `rfc0059_age_sweep_orphan.rs` moves from the
 >   investigation branch into `tests/it`. Its final assertion flips from
 >   "the published id is disjoint from the replayed row's" to "the store

@@ -676,8 +676,8 @@ miner lock, the timer follows the same order — exclusion, then miner lock,
 then the `last_durable` mutex — and the exclusion is never requested while
 the miner lock is held.
 
-> **Coordination note (2026-10-17, RFC 0059 §3.4 amendment #1059,
-> `drafted`, pending maintainer approval).** The age sweep's drain, and
+> **Coordination note (2026-10-18, RFC 0059 §3.4 amendment #1059,
+> maintainer-approved).** The age sweep's drain, and
 > the record sink's inline audit barrier, stop taking the whole audit
 > buffer. The rule is co-selection: a binding event and a record carrying
 > its `template_id` are selected in the same take, and an event with no

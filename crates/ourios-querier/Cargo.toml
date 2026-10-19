@@ -173,9 +173,9 @@ testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # the same arrow/parquet version the whole workspace shares, so
 # `Cargo.lock` carries one copy (RFC 0021 retired the pre-upgrade
 # cross-version handoff).
-parquet = { version = "=59.3.0", default-features = false, features = ["arrow"] }
-arrow-array = { version = "=59.3.0", default-features = false }
-arrow-schema = { version = "=59.3.0", default-features = false }
+parquet = { version = "=59.3.1", default-features = false, features = ["arrow"] }
+arrow-array = { version = "=59.3.1", default-features = false }
+arrow-schema = { version = "=59.3.1", default-features = false }
 # RFC0002.10 — proves the canonical β serialisation survives a YAML
 # scalar round-trip (the Perses-embedding guarantee). Test-only.
 serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize", "serialize"] }

@@ -893,12 +893,19 @@ direction and the primary obligation lives in those other RFCs.
 > - **Then** restore succeeds and `A` keeps its id, template and
 >   version
 > - **And** a line whose timestamp lies **inside** the routing prefix
->   (its first `d` tokens) descends a `<TS>` path that `A` is not on,
->   so it attaches to a new leaf with a newly allocated id
+>   (its first `d` tokens), at an unsaturated node, descends a `<TS>`
+>   path that `A` is not on, so it attaches to a new leaf with a newly
+>   allocated id
+> - **And** the same line at a node saturated under RFC 0023 §3.1
+>   follows the `<*>` overflow child. If `A` sits under that child,
+>   the unchanged §6.2 steps 4–5 decide the attachment
 > - **And** a line whose timestamp lies **outside** the routing
->   prefix reaches `A`'s bucket, and the unchanged §6.2 steps 4–5
->   decide its attachment. It either attaches to `A` through an
->   audited widening (`template_widened`, same id, version + 1), or it
+>   prefix reaches `A`'s bucket, and steps 4–5 decide its attachment
+> - **And** a decimal line reaching a restored leaf that already has
+>   `<NUM>` at that position attaches to it as an ordinary match, with
+>   the same id and version
+> - **And** in every case the line matches, attaches through an
+>   audited widening (`template_widened`, same id, version + 1), or
 >   attaches to a new leaf with a new id. It never attaches silently,
 >   and no id is reused (§6.1 *Template identity*, RFC 0059)
 > - **And** a snapshot taken after the new rules, with a `<TS>`
@@ -1464,6 +1471,7 @@ For each ingested OTLP `LogRecord`:
         # tag (e.g. <IP>) and the original bytes are pushed
         # into typed_params with that tag. Unmasked tokens
         # remain literal.
+```
 
 > **Amendment (2026-10-19, #1064, maintainer-approved) — the rule
 > set.** Each rule matches a **whole token**. A token whose shape
@@ -1529,12 +1537,23 @@ For each ingested OTLP `LogRecord`:
 > `ourios.miner.merges` before and after the new rules, and every
 > increase is reviewed.
 >
-> **Rollout.** The first deploy is a one-time step change (RFC0001.21):
-> - A line whose timestamp or decimal lies in the routing prefix
->   descends a new `<TS>`/`<NUM>` path and starts a new leaf.
-> - A line whose value lies outside the prefix may instead attach to
->   an existing leaf through an audited widening.
-> - Old leaves keep their ids and stay queryable.
+> **Rollout.** The first deploy is a one-time step change
+> (RFC0001.21). The new rules guarantee no particular leaf, because
+> the unchanged §6.2 steps 3–5 still decide where each line goes:
+> - A timestamp in the routing prefix usually descends a new `<TS>`
+>   path and starts a new leaf. At a node saturated under RFC 0023
+>   §3.1's bounded fan-out, an unseen `<TS>` follows the `<*>` overflow
+>   child instead. That child can hold a restored leaf, so the line may
+>   widen it instead.
+> - A decimal shares the `<NUM>` tag with integers. A restored leaf
+>   that already has `<NUM>` at that position accepts the decimal line
+>   as an ordinary match: same id, same version, no widening.
+> - A value outside the routing prefix reaches the old leaf's bucket.
+>   The line either attaches through an audited widening or starts a
+>   new leaf.
+> - In every case the attachment is a match, an audited widening or
+>   a new id. It is never silent, and no id is reused. Old leaves keep
+>   their ids and stay queryable.
 > - Fresh string-body leaves emit `template_created` (RFC 0017 §3.1,
 >   which supersedes RFC0001.1), so the query registry has their
 >   version-1 tokens.
@@ -1548,6 +1567,7 @@ For each ingested OTLP `LogRecord`:
 > tag string, and `mask.rs` documents `TS` as reserved. This amendment
 > replaces both. No other existing expectation changes.
 
+```
 3.  parent = tree.descend(record.severity_number,
                            record.scope_name,
                            len(L_masked),
@@ -2855,8 +2875,11 @@ resolves bidirectionally between RFC and tests.
   > - Unit tests on `mask` cover RFC0001.17's shapes, RFC0001.18's
   >   negatives and RFC0001.19.
   > - An ingester round-trip test covers RFC0001.20. A snapshot
-  >   restore test covers RFC0001.21, with one timestamp inside the
-  >   routing prefix and one outside it.
+  >   restore test covers RFC0001.21 with four cases:
+  >   - a timestamp inside the routing prefix at an unsaturated node
+  >   - the same at a saturated node
+  >   - a timestamp outside the prefix
+  >   - a decimal reaching a restored `<NUM>` leaf
   > - The corpus template-count bounds are re-baselined only where the
   >   new rules lower a count. A rise is a regression.
   > - The corpus tests report `ourios.miner.merges` before and after

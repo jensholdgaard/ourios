@@ -904,10 +904,14 @@ direction and the primary obligation lives in those other RFCs.
 > - **And** a decimal line reaching a restored leaf that already has
 >   `<NUM>` at that position attaches to it as an ordinary match, with
 >   the same id and version
-> - **And** in every case the line matches, attaches through an
->   audited widening (`template_widened`, same id, version + 1), or
->   attaches to a new leaf with a new id. It never attaches silently,
->   and no id is reused (§6.1 *Template identity*, RFC 0059)
+> - **And** in every case the line has exactly one of four outcomes.
+>   It matches; it attaches through an audited widening
+>   (`template_widened`, same id, version + 1); it attaches to a new
+>   leaf with a new id; or one of the existing guards rejects it
+>   (template ceiling, below-floor match, degenerate widening), in
+>   which case it is recorded as a parse failure with its body
+>   retained. It never attaches silently, and no id is reused (§6.1
+>   *Template identity*, RFC 0059)
 > - **And** a snapshot taken after the new rules, with a `<TS>`
 >   wildcard on a leaf's descend path, restores to the same leaf, so
 >   that a line which mined to it before the restart mines to it
@@ -1551,8 +1555,10 @@ For each ingested OTLP `LogRecord`:
 > - A value outside the routing prefix reaches the old leaf's bucket.
 >   The line either attaches through an audited widening or starts a
 >   new leaf.
-> - In every case the attachment is a match, an audited widening or
->   a new id. It is never silent, and no id is reused. Old leaves keep
+> - In every case the outcome is a match, an audited widening, a new
+>   id, or a guard rejection (template ceiling, below-floor match,
+>   degenerate widening) recorded as a parse failure with the body
+>   retained. It is never silent, and no id is reused. Old leaves keep
 >   their ids and stay queryable.
 > - Fresh string-body leaves emit `template_created` (RFC 0017 §3.1,
 >   which supersedes RFC0001.1), so the query registry has their

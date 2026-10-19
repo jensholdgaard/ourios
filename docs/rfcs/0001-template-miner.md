@@ -905,13 +905,19 @@ direction and the primary obligation lives in those other RFCs.
 >   `<NUM>` at that position attaches to it as an ordinary match, with
 >   the same id and version
 > - **And** in every case the line has exactly one of four outcomes.
->   It matches; it attaches through an audited widening
->   (`template_widened`, same id, version + 1); it attaches to a new
->   leaf with a new id; or one of the existing guards rejects it
->   (template ceiling, below-floor match, degenerate widening), in
->   which case it is recorded as a parse failure with its body
->   retained. It never attaches silently, and no id is reused (§6.1
->   *Template identity*, RFC 0059)
+>   - It matches.
+>   - It attaches to the same id through an audited mutation: a
+>     widening (`template_widened`), a type expansion
+>     (`template_type_expanded`, for example a `{STR}` slot gaining
+>     `TS` or `NUM`), or both, in RFC0001.7's order. Each event
+>     advances the version by one.
+>   - It attaches to a new leaf with a new id.
+>   - One of the existing guards rejects it (template ceiling,
+>     below-floor match, degenerate widening). It is recorded as a
+>     parse failure with its body retained.
+>
+>   It never attaches silently, and no id is reused (§6.1 *Template
+>   identity*, RFC 0059).
 > - **And** a snapshot taken after the new rules, with a `<TS>`
 >   wildcard on a leaf's descend path, restores to the same leaf, so
 >   that a line which mined to it before the restart mines to it
@@ -1553,10 +1559,13 @@ For each ingested OTLP `LogRecord`:
 >   that already has `<NUM>` at that position accepts the decimal line
 >   as an ordinary match: same id, same version, no widening.
 > - A value outside the routing prefix reaches the old leaf's bucket.
->   The line either attaches through an audited widening or starts a
+>   The line either attaches through an audited mutation or starts a
 >   new leaf.
-> - In every case the outcome is a match, an audited widening, a new
->   id, or a guard rejection (template ceiling, below-floor match,
+> - In every case the outcome is one of four. The line matches, or it
+>   attaches through an audited mutation: a widening, a type expansion
+>   (a `{STR}` slot gaining `TS` or `NUM`), or both, in RFC0001.7's
+>   order, with one version increment per event. Otherwise it gets a
+>   new id, or a guard rejects it (template ceiling, below-floor match,
 >   degenerate widening) recorded as a parse failure with the body
 >   retained. It is never silent, and no id is reused. Old leaves keep
 >   their ids and stay queryable.

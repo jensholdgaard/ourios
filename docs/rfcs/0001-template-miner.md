@@ -889,13 +889,18 @@ direction and the primary obligation lives in those other RFCs.
 > - **Given** a tenant snapshot taken by a build without the
 >   RFC0001.17/.19 rules, holding leaf `A` whose template has a
 >   literal timestamp token in place of a `<TS>`
-> - **When** a build with the new rules restores it and mines a line
->   that differs from `A`'s only in that token
+> - **When** a build with the new rules restores it
 > - **Then** restore succeeds and `A` keeps its id, template and
 >   version
-> - **And** the line attaches to a `<TS>` leaf with a newly allocated
->   id, never to `A`'s id and never to a reused id (§6.1 *Template
->   identity*, RFC 0059)
+> - **And** a line whose timestamp lies **inside** the routing prefix
+>   (its first `d` tokens) descends a `<TS>` path that `A` is not on,
+>   so it attaches to a new leaf with a newly allocated id
+> - **And** a line whose timestamp lies **outside** the routing
+>   prefix reaches `A`'s bucket, and the unchanged §6.2 steps 4–5
+>   decide its attachment. It either attaches to `A` through an
+>   audited widening (`template_widened`, same id, version + 1), or it
+>   attaches to a new leaf with a new id. It never attaches silently,
+>   and no id is reused (§6.1 *Template identity*, RFC 0059)
 > - **And** a snapshot taken after the new rules, with a `<TS>`
 >   wildcard on a leaf's descend path, restores to the same leaf, so
 >   that a line which mined to it before the restart mines to it
@@ -1477,8 +1482,9 @@ For each ingested OTLP `LogRecord`:
 >    - `TIME` = `hh:mm:ss [FRAC] [ZONE]`, where `hh` is `00..=23`,
 >      `mm` is `00..=59` and `ss` is `00..=60` (leap second).
 >      - `FRAC` = `.` or `,`, followed by 1–9 digits.
->      - `ZONE` = `Z`, or `+`/`-` followed by `hh` (`00..=23`), an
->        optional `:` and `mm` (`00..=59`).
+>      - `ZONE` = `Z`, `±hh`, `±hhmm` or `±hh:mm`, where `±` is `+`
+>        or `-`, `hh` is `00..=23` and `mm` is `00..=59`. No other
+>        offset form is accepted.
 >    - `DATETIME` = `DATE "T" TIME`. Space-separated date-times are
 >      two tokens, so they mask as `DATE` and `TIME`.
 >
@@ -1498,20 +1504,43 @@ For each ingested OTLP `LogRecord`:
 > is left unchanged and is not a parameter (`wildcard_positions` is
 > the source of truth).
 >
-> **Why masking cannot cross a semantic boundary.** Both rules
-> recognise a token by its shape. Two lines therefore share a
-> template under the new rules only if they agree on every token that
-> is not a timestamp or a number. Lines that differ only in a
-> timestamp or a decimal are the same statement, so merging them is
-> not a §3.1 violation. Rules that no token matches leave every token
-> unchanged, which the property test in §8 pins.
+> **What masking does and does not decide (`[§3.1]`).** The masking
+> pass itself merges nothing. It replaces a token only when the whole
+> token has a `TS` or decimal `NUM` shape, and it leaves every other
+> token unchanged; the property test in §8 pins this. Two lines that
+> differ **only** in a timestamp or decimal mask to the same token
+> sequence, which is the same outcome the existing UUID, IP and
+> integer rules give for their values.
 >
-> **Rollout.** The first deploy is a one-time step change. Lines that
-> used to mine to literal-timestamp or literal-decimal leaves start
-> new `<TS>`/`<NUM>` leaves, while the old leaves keep their ids and
-> stay queryable (RFC0001.21). Fresh leaves emit no audit event
-> (RFC0001.1). After that, template growth on affected tenants
-> should slow. The release before/after check in Dash0 compares
+> Masking does change what the tree walk sees afterwards:
+> - A masked token in the routing prefix can put lines that used to
+>   descend separate paths into one bucket.
+> - Two tags that now compare equal raise `simSeq`. For example,
+>   `worker finished 0.1 successfully` against
+>   `worker finished 0.2 unsuccessfully` scores 0.5 before the decimal
+>   rule and 0.75 after it, which is above the default 0.7, so the
+>   final word may widen.
+>
+> Every such attachment still goes through the unchanged §6.2
+> steps 4–5, the §6.3 confidence zones and the §6.4 merge policy. A
+> widening is audited (`template_widened`) and counts in
+> `ourios.miner.merges`, and low-confidence lines keep their body.
+> The amendment relaxes none of these. The corpus tests in §8 report
+> `ourios.miner.merges` before and after the new rules, and every
+> increase is reviewed.
+>
+> **Rollout.** The first deploy is a one-time step change (RFC0001.21):
+> - A line whose timestamp or decimal lies in the routing prefix
+>   descends a new `<TS>`/`<NUM>` path and starts a new leaf.
+> - A line whose value lies outside the prefix may instead attach to
+>   an existing leaf through an audited widening.
+> - Old leaves keep their ids and stay queryable.
+> - Fresh string-body leaves emit `template_created` (RFC 0017 §3.1,
+>   which supersedes RFC0001.1), so the query registry has their
+>   version-1 tokens.
+>
+> After that, template growth on affected tenants should slow. The
+> release before/after check in Dash0 compares
 > `ourios.miner.template.count` per tenant by `service.version`.
 >
 > **Contract change.** The unit test
@@ -2826,9 +2855,13 @@ resolves bidirectionally between RFC and tests.
   > - Unit tests on `mask` cover RFC0001.17's shapes, RFC0001.18's
   >   negatives and RFC0001.19.
   > - An ingester round-trip test covers RFC0001.20. A snapshot
-  >   restore test covers RFC0001.21.
+  >   restore test covers RFC0001.21, with one timestamp inside the
+  >   routing prefix and one outside it.
   > - The corpus template-count bounds are re-baselined only where the
   >   new rules lower a count. A rise is a regression.
+  > - The corpus tests report `ourios.miner.merges` before and after
+  >   the new rules. Each increase is reviewed against §3.1 before
+  >   the implementation merges.
   >
   > *Covers:* RFC0001.17, RFC0001.18, RFC0001.19, RFC0001.20,
   > RFC0001.21.

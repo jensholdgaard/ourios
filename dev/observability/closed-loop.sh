@@ -109,13 +109,17 @@ up() {
   if pid="$(live_pid ourios)"; then
     echo "ourios already running (pid $pid)"
   else
-    # gRPC on 4317 with every exporter setting pinned, as closed-loop-ourios.
+    # OTLP/HTTP on 4318 with every exporter setting pinned, as closed-loop-ourios.
     OURIOS_DOGFOOD_ROOT="$(pwd)/scratch/dogfood" \
     OTEL_LOGS_EXPORTER=otlp OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp \
-    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
-    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:4317 \
-    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4317 \
-    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4317 \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+    OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+    OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/protobuf \
+    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf \
+    OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http/protobuf \
+    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:4318/v1/logs \
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces \
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4318/v1/metrics \
     OTEL_SERVICE_NAME=ourios-server \
     OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=development \
       nohup "$ourios_bin" --config dogfood-config.yaml \

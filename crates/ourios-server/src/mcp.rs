@@ -35,7 +35,8 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, ListResourcesResult, ReadResourceRequestParams,
-    ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+    ServerConfig,
 };
 use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -688,20 +689,16 @@ impl OuriosMcp {
 // `unused_async_trait_impl`, which cannot see the trait's shape here).
 #[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for OuriosMcp {
-    // `ServerInfo` is `#[non_exhaustive]` upstream, so struct-update
-    // syntax is a compile error (E0639); mutate-a-default is the only
-    // construction.
-    #[allow(clippy::field_reassign_with_default)]
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder()
-            .enable_tools()
-            .enable_resources()
-            .build();
-        info.instructions = Some(format!(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_instructions(format!(
             "Read-only query access to the Ourios log backend. {UNTRUSTED_NOTE}"
-        ));
-        info
+        ))
     }
 
     async fn list_resources(
@@ -739,21 +736,23 @@ impl ServerHandler for OuriosMcp {
         &self,
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
-        match request.uri.as_str() {
-            GRAMMAR_URI => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                *GRAMMAR_SECTION,
-                GRAMMAR_URI,
-            )])),
-            QUERY_SCHEMA_URI => Ok(ReadResourceResult::new(vec![
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let result = match request.uri.as_str() {
+            GRAMMAR_URI => {
+                ReadResourceResult::new(vec![ResourceContents::text(*GRAMMAR_SECTION, GRAMMAR_URI)])
+            }
+            QUERY_SCHEMA_URI => ReadResourceResult::new(vec![
                 ResourceContents::text(self.query_schema.as_ref(), QUERY_SCHEMA_URI)
                     .with_mime_type("application/json"),
-            ])),
-            _ => Err(ErrorData::resource_not_found(
-                format!("unknown resource: {}", request.uri),
-                None,
-            )),
-        }
+            ]),
+            _ => {
+                return Err(ErrorData::resource_not_found(
+                    format!("unknown resource: {}", request.uri),
+                    None,
+                ));
+            }
+        };
+        Ok(result.into())
     }
 }
 
@@ -1012,6 +1011,10 @@ pub(crate) fn mcp_router(
     // is startup-static, so every session serves the same bytes.
     let query_schema: Arc<str> = query_schema_document(promoted).to_string().into();
     let mut config = StreamableHttpServerConfig::default();
+    // The querier's body cap (unbounded bodies on a network surface). rmcp
+    // reads the body itself rather than through an axum extractor, so a
+    // `DefaultBodyLimit` layer would not reach it; the cap goes here.
+    config.max_request_body_bytes = crate::querier::MAX_BODY_BYTES;
     if !auth.is_open() {
         config.allowed_hosts = Vec::new();
     }
@@ -1031,12 +1034,6 @@ pub(crate) fn mcp_router(
     );
     Router::new()
         .fallback_service(service)
-        // `Router::layer` only covers routes added before it, so the
-        // querier's body limit does not reach this nested router — apply
-        // the same cap here (unbounded bodies on a network surface).
-        .layer(axum::extract::DefaultBodyLimit::max(
-            crate::querier::MAX_BODY_BYTES,
-        ))
         .layer(middleware::from_fn(move |request, next| {
             require_bearer(auth.clone(), request, next)
         }))

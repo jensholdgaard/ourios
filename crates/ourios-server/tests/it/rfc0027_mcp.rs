@@ -641,3 +641,35 @@ async fn rfc0027_7_output_discipline() {
         );
     }
 }
+
+/// The `/mcp` body cap is the querier's `MAX_BODY_BYTES`: a well-formed
+/// JSON-RPC request just past it is refused with `413` before dispatch,
+/// while the same request under it is served.
+#[tokio::test]
+async fn mcp_request_body_is_capped_at_the_querier_limit() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let router = ourios_server::querier::router_with_mcp(
+        bucket.path().to_path_buf(),
+        3_600_000_000_000,
+        ourios_serving::AuthResolver::static_only(None),
+        true,
+    );
+    let initialize = |name_len: usize| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "x".repeat(name_len), "version": "0"}}
+        })
+    };
+    let limit = ourios_server::querier::MAX_BODY_BYTES;
+
+    let (status, body, _) = mcp_post(router.clone(), None, None, initialize(limit)).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "over the cap: {body}"
+    );
+
+    let (status, body, _) = mcp_post(router, None, None, initialize(limit / 2)).await;
+    assert_eq!(status, StatusCode::OK, "under the cap: {body}");
+}

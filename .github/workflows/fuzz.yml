@@ -242,7 +242,8 @@ jobs:
     name: cflite prune
     if: github.event.schedule == '0 1 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'prune')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The build takes ~18 min; the rest is the prune budget below.
+    timeout-minutes: 75
     concurrency:
       group: fuzz-corpus-${{ github.ref }}
       cancel-in-progress: false
@@ -258,13 +259,15 @@ jobs:
           sanitizer: address
       # Minimises each `cifuzz-corpus-<target>` and uploads the result in its
       # place (`fuzz-seconds` is the time limit of the merge, shared across
-      # the targets).
+      # the targets). A target whose merge outruns its share fails the job:
+      # dsl_parse runs ~60 inputs/s, so its ~6.6k-input corpus needs several
+      # minutes, more than a 600 s budget split seven ways leaves it.
       - name: Prune the corpus
         id: run
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 600
+          fuzz-seconds: 2400
           mode: prune
           sanitizer: address
 

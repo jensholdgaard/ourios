@@ -464,6 +464,13 @@ mod tests {
         assert!(!r);
     }
 
+    const EMITTED: [(MaskTag, &str, ParamType); 4] = [
+        (MaskTag::Uuid, "<UUID>", ParamType::Uuid),
+        (MaskTag::Ip, "<IP>", ParamType::Ip),
+        (MaskTag::Ts, "<TS>", ParamType::Ts),
+        (MaskTag::Num, "<NUM>", ParamType::Num),
+    ];
+
     // Regression for the `MaskTag` split: pin the canonical tag
     // strings so a future rename of the &'static str literals in
     // `MaskTag::as_str` would fail loudly here rather than silently
@@ -471,13 +478,9 @@ mod tests {
     // routes against.
     #[test]
     fn mask_tag_as_str_pins_canonical_strings() {
-        // Arrange — the four currently-emitted variants
-
-        // Act + Assert
-        assert_eq!(MaskTag::Uuid.as_str(), "<UUID>");
-        assert_eq!(MaskTag::Ip.as_str(), "<IP>");
-        assert_eq!(MaskTag::Ts.as_str(), "<TS>");
-        assert_eq!(MaskTag::Num.as_str(), "<NUM>");
+        for (tag, s, _) in EMITTED {
+            assert_eq!(tag.as_str(), s, "{tag:?}");
+        }
     }
 
     // Regression for the `MaskTag` split: pin the From mapping so
@@ -485,13 +488,9 @@ mod tests {
     // would silently mis-attribute typed-param data on the wire.
     #[test]
     fn param_type_from_mask_tag_pins_mapping() {
-        // Arrange — the four currently-emitted variants
-
-        // Act + Assert
-        assert_eq!(ParamType::from(MaskTag::Uuid), ParamType::Uuid);
-        assert_eq!(ParamType::from(MaskTag::Ip), ParamType::Ip);
-        assert_eq!(ParamType::from(MaskTag::Ts), ParamType::Ts);
-        assert_eq!(ParamType::from(MaskTag::Num), ParamType::Num);
+        for (tag, _, t) in EMITTED {
+            assert_eq!(ParamType::from(tag), t, "{tag:?}");
+        }
     }
 
     // Pin `tag_str_for` as the partial inverse of the two mappings
@@ -501,10 +500,9 @@ mod tests {
     // that could not have come from mask emission).
     #[test]
     fn tag_str_for_maps_only_mask_emitted_types() {
-        assert_eq!(tag_str_for(ParamType::Uuid), Some("<UUID>"));
-        assert_eq!(tag_str_for(ParamType::Ip), Some("<IP>"));
-        assert_eq!(tag_str_for(ParamType::Ts), Some("<TS>"));
-        assert_eq!(tag_str_for(ParamType::Num), Some("<NUM>"));
+        for (_, s, t) in EMITTED {
+            assert_eq!(tag_str_for(t), Some(s), "{t:?}");
+        }
         for t in [
             ParamType::Hex,
             ParamType::Path,
@@ -527,11 +525,23 @@ mod tests {
 
         let r = mask(&tokens);
 
-        assert_eq!(r.tokens, vec!["<TS>", "<TS>", "traces", "export:"]);
-        assert_eq!(r.wildcard_positions, vec![0, 1]);
-        assert_eq!(r.typed_params[0].type_tag, ParamType::Ts);
-        assert_eq!(r.typed_params[0].value, "2026/10/17");
-        assert_eq!(r.typed_params[1].value, "16:55:02");
+        assert_eq!(
+            r,
+            Masked {
+                tokens: vec!["<TS>", "<TS>", "traces", "export:"],
+                wildcard_positions: vec![0, 1],
+                typed_params: vec![
+                    TypedParam {
+                        type_tag: ParamType::Ts,
+                        value: "2026/10/17"
+                    },
+                    TypedParam {
+                        type_tag: ParamType::Ts,
+                        value: "16:55:02"
+                    },
+                ],
+            }
+        );
         for ts in [
             "2026-10-17",
             "2026-02-31",
@@ -591,16 +601,33 @@ mod tests {
 
         let r = mask(&tokens);
 
-        assert_eq!(r.tokens, vec!["backing", "off", "for", "<NUM>", "seconds"]);
-        assert_eq!(r.typed_params[0].type_tag, ParamType::Num);
-        assert_eq!(r.typed_params[0].value, "0.3786463");
-        assert_eq!(classified("0.1"), Some(ParamType::Num));
-        assert_eq!(classified("-1.5"), Some(ParamType::Num));
-        assert_eq!(classified("10.0.0.1"), Some(ParamType::Ip));
-        for not_num in [
-            "1.2.3", ".5", "5.", "-.5", "1e5", "0x1F", "6.3ms", "1,5", "-", ".",
+        assert_eq!(
+            r,
+            Masked {
+                tokens: vec!["backing", "off", "for", "<NUM>", "seconds"],
+                wildcard_positions: vec![3],
+                typed_params: vec![TypedParam {
+                    type_tag: ParamType::Num,
+                    value: "0.3786463"
+                }],
+            }
+        );
+        for (token, expected) in [
+            ("0.1", Some(ParamType::Num)),
+            ("-1.5", Some(ParamType::Num)),
+            ("10.0.0.1", Some(ParamType::Ip)),
+            ("1.2.3", None),
+            (".5", None),
+            ("5.", None),
+            ("-.5", None),
+            ("1e5", None),
+            ("0x1F", None),
+            ("6.3ms", None),
+            ("1,5", None),
+            ("-", None),
+            (".", None),
         ] {
-            assert_eq!(classified(not_num), None, "{not_num}");
+            assert_eq!(classified(token), expected, "{token}");
         }
     }
 }

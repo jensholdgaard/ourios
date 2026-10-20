@@ -455,7 +455,7 @@ impl TemplateChange {
 /// it in [`SlotExpansion`]) and `ourios-miner`'s masking layer
 /// (which emits it as the `type_tag` on every typed parameter)
 /// share a single type. Not every variant has an emitter yet —
-/// `Hex`, `Ts`, `Path`, and `Overflow` ship now so the schema is
+/// `Hex`, `Path`, and `Overflow` ship now so the schema is
 /// stable across the §6.5 mask-rule expansions and the H2
 /// overflow PR that will add their emitters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -469,7 +469,8 @@ pub enum ParamType {
     Num,
     /// Hex string (reserved; no emitter yet).
     Hex,
-    /// Timestamp (reserved; no emitter yet).
+    /// Whole-token date, time or date-time per the `TS` masking
+    /// rule. The rendered tag is `<TS>`.
     Ts,
     /// Filesystem or URL path (reserved; no emitter yet).
     Path,

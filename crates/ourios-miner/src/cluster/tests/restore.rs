@@ -87,6 +87,61 @@ fn restore_with_wildcard_in_prefix_path() {
 }
 
 #[test]
+fn restore_round_trips_a_literal_wildcard_token_on_the_path() {
+    // A literal `<*>` token keys the same child as RFC 0023 §3.1's
+    // overflow route, so capture records its position as wildcard-routed.
+    let t = TenantId::new("tenant-x");
+    let mut original = MinerCluster::new(MinerConfig::default());
+    let id = original.ingest(&string_record(&t, "<*> beta finished ok"));
+    let s1 = original.snapshot_state(&t);
+    assert_eq!(s1.leaves[0].wildcard_routed, vec![0]);
+
+    let mut restored = MinerCluster::new(MinerConfig::default());
+    restored.restore_tenant(&t, &s1).expect("restore succeeds");
+
+    assert_eq!(restored.snapshot_state(&t), s1);
+    assert_eq!(
+        restored.ingest(&string_record(&t, "<*> beta finished ok")),
+        id
+    );
+}
+
+#[test]
+fn restore_rejects_a_literal_wildcard_token_not_recorded_as_routed() {
+    // No live tree descends a `<*>` path token through a keyed child, so
+    // a record claiming one is inconsistent: restoring it would capture
+    // back a different `wildcard_routed`.
+    let state = SnapshotState {
+        leaves: vec![LeafRecord {
+            template: ["<*>", "beta", "finished", "ok"]
+                .map(|s| TokenRecord::Fixed(s.to_string()))
+                .to_vec(),
+            template_id: 1,
+            template_version: 1,
+            severity_number: 0,
+            scope_name: None,
+            slot_types: vec![],
+            provenance: vec![],
+            upstream_associations: vec![],
+            upstream_association_overflow: 0,
+            wildcard_routed: vec![],
+        }],
+        structured_templates: vec![],
+        wal_high_water: None,
+        adopted_templates: vec![],
+    };
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+
+    let err = cluster
+        .restore_tenant(&t, &state)
+        .expect_err("a keyed `<*>` path component is not a live tree");
+
+    assert!(matches!(err, RestoreError::Inconsistent { .. }), "{err:?}");
+    assert_eq!(cluster.template_count(&t), 0);
+}
+
+#[test]
 fn restore_rejects_live_tenant() {
     let t = TenantId::new("tenant-x");
     let mut cluster = MinerCluster::new(MinerConfig::default());

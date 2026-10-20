@@ -242,8 +242,8 @@ jobs:
     name: cflite prune
     if: github.event.schedule == '0 1 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'prune')
     runs-on: ubuntu-latest
-    # The build takes ~18 min; the rest is the prune budget below.
-    timeout-minutes: 75
+    # RFC 0015 §3.4's 60 min: the ~18 min build plus the prune budget below.
+    timeout-minutes: 60
     concurrency:
       group: fuzz-corpus-${{ github.ref }}
       cancel-in-progress: false
@@ -267,7 +267,7 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 2400
+          fuzz-seconds: 2100
           mode: prune
           sanitizer: address
 

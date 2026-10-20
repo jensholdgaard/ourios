@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.15.0] - 2026-10-20
+
+### Upgrade note
+
+- The miner now masks whole-token timestamps (`TS`) and decimals (`NUM`), per the RFC 0001 §6.2 amendment.
+- The first deploy is a one-time step change:
+  - Lines with such a token in the routing prefix start new templates with new ids.
+  - Other lines may widen existing templates. Each widening is audited and keeps the id.
+- Old snapshots restore unchanged, no template id is reused, and stored records and their OTLP time fields are untouched.
+
+### Added
+
+- Mask whole-token timestamps and decimals (#1073) (d11561b)
+
+### CI
+
+- Give the corpus prune enough time for dsl_parse (#1075) (47a3357)
+
+### Chore
+
+- Update arrow + parquet to v59.3.1 (#1071) (ba3fc22)
+- Update helm/kind-action action to v1.15.1 (#1072) (4b15026)
+- Pin rust crate serde-saphyr to =1.3.0 (#1069) (96c02b9)
+- Update github-actions (#1070) (8b9d79e)
+- Upgrade rmcp to 3.5.1 (#1067) (2abbd00)
+- Export the closed-loop Ourios's own telemetry over otlp/http (#1062) (5da88d7)
+
+### Documentation
+
+- Amend §6.2 masking with whole-token timestamps and decimals (#1068) (e1453cc)
+- Document orphan template ids after a crash (#1060) (0fd7894)
+
+### Fixed
+
+- Reject a restored literal `<*>` path token not recorded as routed (#1074) (a4096ec)
+
+### Tests
+
+- Cover rfc0001.17-.19 and .21 masking scenarios (#1078) (a769612)
+- Pin rfc0001.20 otlp fidelity under timestamp masking (#1077) (3979a7b)
+- Seed artifact_decode with the literal-wildcard-route reproducers (#1076) (4f0e3b0)
+- Pin rfc0059.20, orphan id after a crash and none after a cut (#1066) (f982b10)
+
 ## [0.14.0] - 2026-10-18
 
 ### Added

@@ -6,13 +6,13 @@
 //! walk routes against the type tag; reconstruction (§6.6) walks
 //! the parallel `typed_params` to recover the original line bytes.
 //!
-//! Default rule set: UUID, IPv4, NUM. The other RFC §6.1
-//! variants (`Hex`, `Ts`, `Path`, `Str`, `Overflow`) are reserved
-//! on [`ParamType`] because the Parquet record schema (§6.1) is
-//! the data contract, but they have no `mask()` emitter — `Str`
-//! is added by the widening PR (§6.2 step 5b), `Overflow` by the
-//! byte-limit PR (§6.5), and `Hex` / `Ts` / `Path` by future
-//! masking-rule PRs. Internally the masking-emit subset is the
+//! Default rule set: UUID, IPv4, TS, NUM (integer or decimal), each
+//! matching a whole token. The other RFC §6.1 variants (`Hex`,
+//! `Path`, `Str`, `Overflow`) are reserved on [`ParamType`] because
+//! the Parquet record schema (§6.1) is the data contract, but they
+//! have no `mask()` emitter — `Str` comes from widening (§6.2 step
+//! 5b), `Overflow` from the byte limit (§6.5), and `Hex` / `Path`
+//! are unassigned. Internally the masking-emit subset is the
 //! private `MaskTag` enum, kept separate from [`ParamType`] so its
 //! tag-string and [`ParamType`] mappings are exhaustive total
 //! functions the compiler will hold us to.
@@ -62,9 +62,9 @@ pub struct Masked<'a> {
 
 /// Apply the default masking rules to a tokenized line.
 ///
-/// Rules are tried in order: UUID, IPv4, NUM (most specific first,
-/// so a 36-char UUID is not misclassified as `NUM`, and a dotted
-/// quad like `1.2.3.4` is not split into `NUM` tokens by the
+/// Rules are tried in order: UUID, IPv4, TS, NUM (most specific
+/// first, so a 36-char UUID is not misclassified as `NUM`, and a
+/// dotted quad like `1.2.3.4` is not split into `NUM` tokens by the
 /// upstream tokenizer — punctuation stays inside tokens per
 /// `RFC0001.3`). The first match wins; an unmatched token stays
 /// literal. Per RFC 0001 §6.2 the emitted `tokens` are what the
@@ -102,25 +102,26 @@ pub fn mask<'a>(tokens: &[&'a str]) -> Masked<'a> {
 /// functions: the compiler refuses to add a new `MaskTag`
 /// variant without a tag and a `ParamType` mapping. Variants
 /// reserved by RFC 0001 §6.1 but not emitted by `mask()`
-/// (`Hex`, `Ts`, `Path`, `Str`, `Overflow`) live only on
-/// `ParamType`, where they belong — `Str` is added by widening
-/// (§6.2 step 5b), `Overflow` by the byte-limit check (§6.5),
-/// `Hex` / `Ts` / `Path` by future masking-rule PRs.
+/// (`Hex`, `Path`, `Str`, `Overflow`) live only on `ParamType`,
+/// where they belong — `Str` is added by widening (§6.2 step 5b),
+/// `Overflow` by the byte-limit check (§6.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MaskTag {
     Uuid,
     Ip,
+    Ts,
     Num,
 }
 
 impl MaskTag {
     /// The tag string this variant emits in the masked-token
-    /// sequence (`<UUID>`, `<IP>`, `<NUM>`). Total — every
+    /// sequence (`<UUID>`, `<IP>`, `<TS>`, `<NUM>`). Total — every
     /// `MaskTag` has a tag by construction.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Uuid => "<UUID>",
             Self::Ip => "<IP>",
+            Self::Ts => "<TS>",
             Self::Num => "<NUM>",
         }
     }
@@ -131,6 +132,7 @@ impl From<MaskTag> for ParamType {
         match t {
             MaskTag::Uuid => Self::Uuid,
             MaskTag::Ip => Self::Ip,
+            MaskTag::Ts => Self::Ts,
             MaskTag::Num => Self::Num,
         }
     }
@@ -138,7 +140,7 @@ impl From<MaskTag> for ParamType {
 
 /// The tag string `mask()` emits for `t`, or `None` when `t` is
 /// not a mask-emitted type. The partial inverse of
-/// `From<MaskTag> for ParamType`: only `Uuid` / `Ip` / `Num` have
+/// `From<MaskTag> for ParamType`: only `Uuid` / `Ip` / `Ts` / `Num` have
 /// a tag; every other `ParamType` arises from widening, overflow,
 /// or future masking rules and never appears as a masked token.
 /// Snapshot restore uses this to reconstruct the descend-path tag
@@ -147,6 +149,7 @@ pub(crate) fn tag_str_for(t: ParamType) -> Option<&'static str> {
     match t {
         ParamType::Uuid => Some(MaskTag::Uuid.as_str()),
         ParamType::Ip => Some(MaskTag::Ip.as_str()),
+        ParamType::Ts => Some(MaskTag::Ts.as_str()),
         ParamType::Num => Some(MaskTag::Num.as_str()),
         _ => None,
     }
@@ -157,6 +160,8 @@ fn classify(token: &str) -> Option<MaskTag> {
         Some(MaskTag::Uuid)
     } else if is_ipv4(token) {
         Some(MaskTag::Ip)
+    } else if is_ts(token.as_bytes()) {
+        Some(MaskTag::Ts)
     } else if is_num(token) {
         Some(MaskTag::Num)
     } else {
@@ -207,10 +212,88 @@ fn is_ipv4(s: &str) -> bool {
     parts == 4
 }
 
-/// All ASCII digits, optional leading `-`, length ≥ 1 digit.
+/// An integer (`-? DIGITS`) or a decimal (`-? DIGITS "." DIGITS`).
 fn is_num(s: &str) -> bool {
     let body = s.strip_prefix('-').unwrap_or(s);
-    !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit())
+    match body.split_once('.') {
+        Some((int, frac)) => is_digits(int) && is_digits(frac),
+        None => is_digits(body),
+    }
+}
+
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// RFC 0001 §6.2 step 2 `TS`: a whole-token `DATE`, `TIME` or
+/// `DATE "T" TIME`, at fixed field widths with range-checked fields.
+/// A shape, not a calendar: `2026-02-31` is a `DATE`.
+fn is_ts(b: &[u8]) -> bool {
+    is_date(b) || is_time(b) || is_datetime(b)
+}
+
+fn is_datetime(b: &[u8]) -> bool {
+    match (b.get(..10), b.get(10), b.get(11..)) {
+        (Some(date), Some(b'T'), Some(time)) => is_date(date) && is_time(time),
+        _ => false,
+    }
+}
+
+/// `YYYY s MM s DD` with the same `s` (`-` or `/`) in both places.
+fn is_date(b: &[u8]) -> bool {
+    b.len() == 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && matches!(b[4], b'-' | b'/')
+        && b[7] == b[4]
+        && two_digits(b, 5).is_some_and(|m| (1..=12).contains(&m))
+        && two_digits(b, 8).is_some_and(|d| (1..=31).contains(&d))
+}
+
+/// `hh:mm:ss [FRAC] [ZONE]`; `ss` allows 60 for a leap second.
+fn is_time(b: &[u8]) -> bool {
+    let clock = b.len() >= 8
+        && two_digits(b, 0).is_some_and(|h| h <= 23)
+        && b[2] == b':'
+        && two_digits(b, 3).is_some_and(|m| m <= 59)
+        && b[5] == b':'
+        && two_digits(b, 6).is_some_and(|s| s <= 60);
+    clock && strip_fraction(&b[8..]).is_some_and(is_zone)
+}
+
+/// Strips an optional `.` / `,` fraction of 1–9 digits; `None` when
+/// the separator is present but the digit run is empty or too long.
+fn strip_fraction(b: &[u8]) -> Option<&[u8]> {
+    match b.first() {
+        Some(b'.' | b',') => {
+            let digits = b[1..].iter().take_while(|c| c.is_ascii_digit()).count();
+            (1..=9).contains(&digits).then(|| &b[1 + digits..])
+        }
+        _ => Some(b),
+    }
+}
+
+/// Empty, `Z`, `±hh`, `±hhmm` or `±hh:mm`.
+fn is_zone(b: &[u8]) -> bool {
+    match b {
+        [] | [b'Z'] => true,
+        [b'+' | b'-', rest @ ..] => {
+            let hours = two_digits(rest, 0).is_some_and(|h| h <= 23);
+            let minutes = match &rest[2.min(rest.len())..] {
+                [] => true,
+                [b':', mm @ ..] | mm => mm.len() == 2 && two_digits(mm, 0).is_some_and(|m| m <= 59),
+            };
+            hours && minutes
+        }
+        _ => false,
+    }
+}
+
+/// The two ASCII digits at `at..at + 2` as a number, or `None`.
+fn two_digits(b: &[u8], at: usize) -> Option<u8> {
+    match b.get(at..at + 2)? {
+        [hi @ b'0'..=b'9', lo @ b'0'..=b'9'] => Some((hi - b'0') * 10 + (lo - b'0')),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +464,13 @@ mod tests {
         assert!(!r);
     }
 
+    const EMITTED: [(MaskTag, &str, ParamType); 4] = [
+        (MaskTag::Uuid, "<UUID>", ParamType::Uuid),
+        (MaskTag::Ip, "<IP>", ParamType::Ip),
+        (MaskTag::Ts, "<TS>", ParamType::Ts),
+        (MaskTag::Num, "<NUM>", ParamType::Num),
+    ];
+
     // Regression for the `MaskTag` split: pin the canonical tag
     // strings so a future rename of the &'static str literals in
     // `MaskTag::as_str` would fail loudly here rather than silently
@@ -388,12 +478,9 @@ mod tests {
     // routes against.
     #[test]
     fn mask_tag_as_str_pins_canonical_strings() {
-        // Arrange — the three currently-emitted variants
-
-        // Act + Assert
-        assert_eq!(MaskTag::Uuid.as_str(), "<UUID>");
-        assert_eq!(MaskTag::Ip.as_str(), "<IP>");
-        assert_eq!(MaskTag::Num.as_str(), "<NUM>");
+        for (tag, s, _) in EMITTED {
+            assert_eq!(tag.as_str(), s, "{tag:?}");
+        }
     }
 
     // Regression for the `MaskTag` split: pin the From mapping so
@@ -401,12 +488,9 @@ mod tests {
     // would silently mis-attribute typed-param data on the wire.
     #[test]
     fn param_type_from_mask_tag_pins_mapping() {
-        // Arrange — the three currently-emitted variants
-
-        // Act + Assert
-        assert_eq!(ParamType::from(MaskTag::Uuid), ParamType::Uuid);
-        assert_eq!(ParamType::from(MaskTag::Ip), ParamType::Ip);
-        assert_eq!(ParamType::from(MaskTag::Num), ParamType::Num);
+        for (tag, _, t) in EMITTED {
+            assert_eq!(ParamType::from(tag), t, "{tag:?}");
+        }
     }
 
     // Pin `tag_str_for` as the partial inverse of the two mappings
@@ -416,18 +500,134 @@ mod tests {
     // that could not have come from mask emission).
     #[test]
     fn tag_str_for_maps_only_mask_emitted_types() {
-        assert_eq!(tag_str_for(ParamType::Uuid), Some("<UUID>"));
-        assert_eq!(tag_str_for(ParamType::Ip), Some("<IP>"));
-        assert_eq!(tag_str_for(ParamType::Num), Some("<NUM>"));
+        for (_, s, t) in EMITTED {
+            assert_eq!(tag_str_for(t), Some(s), "{t:?}");
+        }
         for t in [
             ParamType::Hex,
-            ParamType::Ts,
             ParamType::Path,
             ParamType::Str,
             ParamType::Overflow,
             ParamType::Unknown(99),
         ] {
             assert_eq!(tag_str_for(t), None, "{t:?} is not mask-emitted");
+        }
+    }
+
+    fn classified(token: &str) -> Option<ParamType> {
+        mask(&[token]).typed_params.first().map(|p| p.type_tag)
+    }
+
+    /// RFC0001.17 — whole-token dates, times of day and date-times.
+    #[test]
+    fn mask_classifies_whole_token_timestamps_as_ts() {
+        let tokens = ["2026/10/17", "16:55:02", "traces", "export:"];
+
+        let r = mask(&tokens);
+
+        assert_eq!(
+            r,
+            Masked {
+                tokens: vec!["<TS>", "<TS>", "traces", "export:"],
+                wildcard_positions: vec![0, 1],
+                typed_params: vec![
+                    TypedParam {
+                        type_tag: ParamType::Ts,
+                        value: "2026/10/17"
+                    },
+                    TypedParam {
+                        type_tag: ParamType::Ts,
+                        value: "16:55:02"
+                    },
+                ],
+            }
+        );
+        for ts in [
+            "2026-10-17",
+            "2026-02-31",
+            "00:00:00",
+            "23:59:60",
+            "16:55:02.674004",
+            "16:55:02,674",
+            "16:55:02.123456789",
+            "16:55:02Z",
+            "2026-10-18T13:28:29.674004Z",
+            "2026-10-18T13:28:29+02",
+            "2026-10-18T13:28:29+0200",
+            "2026-10-18T13:28:29.674004+02:00",
+            "2026/10/18T13:28:29-05:30",
+        ] {
+            assert_eq!(classified(ts), Some(ParamType::Ts), "{ts}");
+        }
+    }
+
+    /// RFC0001.18 — near-timestamp shapes are not `TS`.
+    #[test]
+    fn mask_rejects_near_timestamp_shapes() {
+        for not_ts in [
+            "2026-13-01",
+            "2026-10-32",
+            "2026-00-10",
+            "2026-10-00",
+            "2026-10/17",
+            "26-10-17",
+            "24:00:00",
+            "9:05:00",
+            "12:60:00",
+            "12:00:61",
+            "2026-10-17T25:00:00Z",
+            "16:55:02.",
+            "16:55:02,",
+            "16:55:02.1234567890",
+            "16:55:02+2",
+            "16:55:02+24:00",
+            "16:55:02+05:60",
+            "16:55:02+05:3",
+            "16:55:02+053",
+            "16:55:02z",
+            "16:55:02 ",
+            "2026-10-17t13:28:29",
+            "2026-10-17 ",
+        ] {
+            assert_ne!(classified(not_ts), Some(ParamType::Ts), "{not_ts}");
+        }
+    }
+
+    /// RFC0001.19 — whole-token decimals mask to `<NUM>`; other dotted
+    /// shapes do not, and IPv4 still wins over `NUM`.
+    #[test]
+    fn mask_classifies_decimals_as_num() {
+        let tokens = ["backing", "off", "for", "0.3786463", "seconds"];
+
+        let r = mask(&tokens);
+
+        assert_eq!(
+            r,
+            Masked {
+                tokens: vec!["backing", "off", "for", "<NUM>", "seconds"],
+                wildcard_positions: vec![3],
+                typed_params: vec![TypedParam {
+                    type_tag: ParamType::Num,
+                    value: "0.3786463"
+                }],
+            }
+        );
+        for (token, expected) in [
+            ("0.1", Some(ParamType::Num)),
+            ("-1.5", Some(ParamType::Num)),
+            ("10.0.0.1", Some(ParamType::Ip)),
+            ("1.2.3", None),
+            (".5", None),
+            ("5.", None),
+            ("-.5", None),
+            ("1e5", None),
+            ("0x1F", None),
+            ("6.3ms", None),
+            ("1,5", None),
+            ("-", None),
+            (".", None),
+        ] {
+            assert_eq!(classified(token), expected, "{token}");
         }
     }
 }

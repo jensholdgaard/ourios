@@ -19,6 +19,7 @@ mod execution;
 mod forward_compat;
 mod manifest;
 mod query_read_accounting;
+mod rfc0001_otlp_fidelity;
 mod rfc0001_query_semantics;
 mod rfc0001_time_preserved;
 mod rfc0002_21_unspecified_severity;

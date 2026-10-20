@@ -484,6 +484,10 @@ pub(super) fn restore_leaf_into(
 /// [`WILDCARD_CHILD`] at each recorded wildcard-routed position, the
 /// template's own token or mask tag at every other one. Positions past
 /// the walk only fix the length bucket, so they take a filler.
+///
+/// A literal `<*>` token on the walk keys the wildcard child itself, so
+/// capture always records its position as routed; a record that does
+/// not is inconsistent.
 fn descent_path<'r>(
     record: &crate::snapshot::LeafRecord,
     template: &'r [OwnedToken],
@@ -506,6 +510,15 @@ fn descent_path<'r>(
         let on_path = position < walk_depth;
         masked.push(match token {
             _ if on_path && routed.contains(&position) => WILDCARD_CHILD,
+            OwnedToken::Fixed(s) if on_path && s == WILDCARD_CHILD => {
+                return Err(RestoreError::Inconsistent {
+                    detail: format!(
+                        "template_id {}: literal {WILDCARD_CHILD} at path position \
+                         {position} is not recorded as wildcard-routed",
+                        record.template_id,
+                    ),
+                });
+            }
             OwnedToken::Fixed(s) => s.as_str(),
             OwnedToken::Wildcard if on_path => path_tag(record, slot, position)?,
             OwnedToken::Wildcard => "<*>",

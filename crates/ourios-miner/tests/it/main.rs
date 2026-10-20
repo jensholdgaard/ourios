@@ -9,6 +9,7 @@
 //! provider (`init_in_memory`) for one telemetry arm, and two installers
 //! in one process race — see `tests/README.md`.
 
+mod rfc0001_masking_properties;
 mod rfc0004_configuration_policy;
 mod rfc0017_template_created;
 mod rfc0024_properties;

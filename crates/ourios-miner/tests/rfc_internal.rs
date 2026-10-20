@@ -748,3 +748,199 @@ fn rfc0001_11_severity_zero_and_scope_none_are_distinct_key_buckets() {
         "the UNSPECIFIED-severity / None-scope buckets must never coalesce with specified ones",
     );
 }
+
+/// One string-body record for `tenant` per `body`, mined in order;
+/// returns each line's `(template_id, mined record)`.
+fn mine_lines(
+    cluster: &mut ourios_miner::cluster::MinerCluster,
+    tenant: &ourios_core::tenant::TenantId,
+    bodies: &[&str],
+) -> Vec<(u64, ourios_core::record::MinedRecord)> {
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+
+    bodies
+        .iter()
+        .map(|body| {
+            let (id, mined) = cluster.ingest_mined(&OtlpLogRecord {
+                tenant_id: tenant.clone(),
+                body: Some(Body::String((*body).to_string())),
+                ..Default::default()
+            });
+            (id, mined.expect("every ingest yields one mined record"))
+        })
+        .collect()
+}
+
+/// The `(type_tag, value)` pairs of a mined record's params.
+fn typed_params(
+    mined: &ourios_core::record::MinedRecord,
+) -> Vec<(ourios_core::audit::ParamType, String)> {
+    mined
+        .params
+        .iter()
+        .map(|p| (p.type_tag, p.value.clone()))
+        .collect()
+}
+
+/// What mining lines that should share one template shows: how many
+/// distinct ids they got, the merges they caused, each line's typed
+/// params, and the canonical text of the first line's leaf.
+#[derive(Debug, PartialEq)]
+struct SharedTemplate {
+    distinct_ids: usize,
+    merges: u64,
+    params: Vec<Vec<(ourios_core::audit::ParamType, String)>>,
+    canonical: String,
+}
+
+fn mine_shared(
+    cluster: &mut ourios_miner::cluster::MinerCluster,
+    tenant: &ourios_core::tenant::TenantId,
+    bodies: &[&str],
+) -> SharedTemplate {
+    let merges_before = cluster.merges_total();
+    let mined = mine_lines(cluster, tenant, bodies);
+    let ids: std::collections::BTreeSet<u64> = mined.iter().map(|(id, _)| *id).collect();
+    let canonical = cluster
+        .templates_for(tenant)
+        .into_iter()
+        .find(|l| l.template_id == mined[0].0)
+        .map(|l| ourios_miner::tree::format_template(&l.template))
+        .unwrap_or_default();
+    SharedTemplate {
+        distinct_ids: ids.len(),
+        merges: cluster.merges_total() - merges_before,
+        params: mined.iter().map(|(_, m)| typed_params(m)).collect(),
+        canonical,
+    }
+}
+
+fn ts(value: &str) -> (ourios_core::audit::ParamType, String) {
+    (ourios_core::audit::ParamType::Ts, value.to_string())
+}
+
+fn num(value: &str) -> (ourios_core::audit::ParamType, String) {
+    (ourios_core::audit::ParamType::Num, value.to_string())
+}
+
+/// Scenario RFC0001.17 — Whole-token timestamps mask to `<TS>` and share
+/// one template.
+/// See `docs/rfcs/0001-template-miner.md` §5.
+#[test]
+fn rfc0001_17_whole_token_timestamps_share_one_template() {
+    use ourios_config::MinerConfig;
+    use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    let sink = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
+    let t = TenantId::new("tenant-x");
+
+    let shared = mine_shared(
+        &mut cluster,
+        &t,
+        &[
+            "2026/10/17 16:55:02 traces export: rpc error",
+            "2026/10/17 16:55:09 traces export: rpc error",
+        ],
+    );
+
+    // The canonical template text writes every wildcard as `<*>`; the
+    // `TS` type lives in the slot types and the params.
+    assert_eq!(
+        shared,
+        SharedTemplate {
+            distinct_ids: 1,
+            merges: 0,
+            params: vec![
+                vec![ts("2026/10/17"), ts("16:55:02")],
+                vec![ts("2026/10/17"), ts("16:55:09")],
+            ],
+            canonical: "<*> <*> traces export: rpc error".to_string(),
+        }
+    );
+    let created: Vec<String> = sink
+        .drain()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            AuditPayload::Template {
+                change: TemplateChange::Created { new_template },
+                ..
+            } => Some(new_template),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec!["<*> <*> traces export: rpc error".to_string()]
+    );
+
+    let single = mine_lines(
+        &mut cluster,
+        &t,
+        &["2026-10-18T13:28:29.674004Z worker started"],
+    );
+    assert_eq!(
+        typed_params(&single[0].1),
+        vec![ts("2026-10-18T13:28:29.674004Z")],
+        "a single-token date-time is one TS param",
+    );
+}
+
+/// Scenario RFC0001.19 — Whole-token decimals mask to `<NUM>`; other
+/// dotted shapes do not.
+/// See `docs/rfcs/0001-template-miner.md` §5.
+#[test]
+fn rfc0001_19_whole_token_decimals_share_one_template() {
+    use ourios_config::MinerConfig;
+    use ourios_core::audit::ParamType;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::tree::OwnedToken;
+
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let shared = mine_shared(
+        &mut cluster,
+        &t,
+        &[
+            "backing off for 0.1 seconds",
+            "backing off for 0.3786463 seconds",
+        ],
+    );
+
+    assert_eq!(
+        shared,
+        SharedTemplate {
+            distinct_ids: 1,
+            merges: 0,
+            params: vec![vec![num("0.1")], vec![num("0.3786463")]],
+            canonical: "backing off for <*> seconds".to_string(),
+        }
+    );
+
+    for (token, expected) in [("-1.5", ParamType::Num), ("10.0.0.1", ParamType::Ip)] {
+        let mined = mine_lines(&mut cluster, &t, &[&format!("value {token} reported")]);
+        assert_eq!(
+            typed_params(&mined[0].1),
+            vec![(expected, token.to_string())],
+            "{token}"
+        );
+    }
+    for literal in ["1.2.3", ".5", "5.", "1e5", "0x1F", "6.3ms", "1,5"] {
+        let mined = mine_lines(&mut cluster, &t, &[&format!("{literal} is literal")]);
+        assert!(
+            mined[0].1.params.is_empty(),
+            "{literal} is not a NUM param: {:?}",
+            mined[0].1.params,
+        );
+        let leaf = cluster
+            .templates_for(&t)
+            .into_iter()
+            .find(|l| l.template_id == mined[0].0)
+            .expect("its leaf");
+        assert_eq!(leaf.template[0], OwnedToken::Fixed(literal.to_string()));
+    }
+}

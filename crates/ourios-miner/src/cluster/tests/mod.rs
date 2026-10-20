@@ -83,6 +83,7 @@ mod emission;
 mod id_reservation;
 mod ingest;
 mod restore;
+mod restore_masking;
 mod restore_properties;
 mod structured;
 mod type_expansion;

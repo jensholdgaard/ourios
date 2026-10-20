@@ -774,12 +774,53 @@ fn mine_lines(
 /// The `(type_tag, value)` pairs of a mined record's params.
 fn typed_params(
     mined: &ourios_core::record::MinedRecord,
-) -> Vec<(ourios_core::audit::ParamType, &str)> {
+) -> Vec<(ourios_core::audit::ParamType, String)> {
     mined
         .params
         .iter()
-        .map(|p| (p.type_tag, p.value.as_str()))
+        .map(|p| (p.type_tag, p.value.clone()))
         .collect()
+}
+
+/// What mining lines that should share one template shows: how many
+/// distinct ids they got, the merges they caused, each line's typed
+/// params, and the canonical text of the first line's leaf.
+#[derive(Debug, PartialEq)]
+struct SharedTemplate {
+    distinct_ids: usize,
+    merges: u64,
+    params: Vec<Vec<(ourios_core::audit::ParamType, String)>>,
+    canonical: String,
+}
+
+fn mine_shared(
+    cluster: &mut ourios_miner::cluster::MinerCluster,
+    tenant: &ourios_core::tenant::TenantId,
+    bodies: &[&str],
+) -> SharedTemplate {
+    let merges_before = cluster.merges_total();
+    let mined = mine_lines(cluster, tenant, bodies);
+    let ids: std::collections::BTreeSet<u64> = mined.iter().map(|(id, _)| *id).collect();
+    let canonical = cluster
+        .templates_for(tenant)
+        .into_iter()
+        .find(|l| l.template_id == mined[0].0)
+        .map(|l| ourios_miner::tree::format_template(&l.template))
+        .unwrap_or_default();
+    SharedTemplate {
+        distinct_ids: ids.len(),
+        merges: cluster.merges_total() - merges_before,
+        params: mined.iter().map(|(_, m)| typed_params(m)).collect(),
+        canonical,
+    }
+}
+
+fn ts(value: &str) -> (ourios_core::audit::ParamType, String) {
+    (ourios_core::audit::ParamType::Ts, value.to_string())
+}
+
+fn num(value: &str) -> (ourios_core::audit::ParamType, String) {
+    (ourios_core::audit::ParamType::Num, value.to_string())
 }
 
 /// Scenario RFC0001.17 — Whole-token timestamps mask to `<TS>` and share
@@ -788,7 +829,7 @@ fn typed_params(
 #[test]
 fn rfc0001_17_whole_token_timestamps_share_one_template() {
     use ourios_config::MinerConfig;
-    use ourios_core::audit::{AuditPayload, ParamType, SharedAuditSink, TemplateChange};
+    use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
 
@@ -796,7 +837,7 @@ fn rfc0001_17_whole_token_timestamps_share_one_template() {
     let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
     let t = TenantId::new("tenant-x");
 
-    let mined = mine_lines(
+    let shared = mine_shared(
         &mut cluster,
         &t,
         &[
@@ -805,34 +846,35 @@ fn rfc0001_17_whole_token_timestamps_share_one_template() {
         ],
     );
 
-    assert_eq!(
-        mined[0].0, mined[1].0,
-        "both lines attach to one template_id"
-    );
-    assert_eq!(cluster.template_count(&t), 1);
-    assert_eq!(cluster.merges_total(), 0, "a match is not a merge");
-    assert_eq!(
-        typed_params(&mined[0].1),
-        vec![(ParamType::Ts, "2026/10/17"), (ParamType::Ts, "16:55:02")],
-    );
-    assert_eq!(
-        typed_params(&mined[1].1),
-        vec![(ParamType::Ts, "2026/10/17"), (ParamType::Ts, "16:55:09")],
-    );
-    let events = sink.drain();
-    let [event] = events.as_slice() else {
-        panic!("one template_created for the shared leaf, got {events:?}");
-    };
-    let AuditPayload::Template {
-        change: TemplateChange::Created { new_template },
-        ..
-    } = &event.payload
-    else {
-        panic!("expected template_created, got {:?}", event.payload);
-    };
     // The canonical template text writes every wildcard as `<*>`; the
     // `TS` type lives in the slot types and the params.
-    assert_eq!(new_template, "<*> <*> traces export: rpc error");
+    assert_eq!(
+        shared,
+        SharedTemplate {
+            distinct_ids: 1,
+            merges: 0,
+            params: vec![
+                vec![ts("2026/10/17"), ts("16:55:02")],
+                vec![ts("2026/10/17"), ts("16:55:09")],
+            ],
+            canonical: "<*> <*> traces export: rpc error".to_string(),
+        }
+    );
+    let created: Vec<String> = sink
+        .drain()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            AuditPayload::Template {
+                change: TemplateChange::Created { new_template },
+                ..
+            } => Some(new_template),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec!["<*> <*> traces export: rpc error".to_string()]
+    );
 
     let single = mine_lines(
         &mut cluster,
@@ -841,7 +883,7 @@ fn rfc0001_17_whole_token_timestamps_share_one_template() {
     );
     assert_eq!(
         typed_params(&single[0].1),
-        vec![(ParamType::Ts, "2026-10-18T13:28:29.674004Z")],
+        vec![ts("2026-10-18T13:28:29.674004Z")],
         "a single-token date-time is one TS param",
     );
 }
@@ -855,12 +897,12 @@ fn rfc0001_19_whole_token_decimals_share_one_template() {
     use ourios_core::audit::ParamType;
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
-    use ourios_miner::tree::{OwnedToken, format_template};
+    use ourios_miner::tree::OwnedToken;
 
     let mut cluster = MinerCluster::new(MinerConfig::default());
     let t = TenantId::new("tenant-x");
 
-    let mined = mine_lines(
+    let shared = mine_shared(
         &mut cluster,
         &t,
         &[
@@ -870,30 +912,20 @@ fn rfc0001_19_whole_token_decimals_share_one_template() {
     );
 
     assert_eq!(
-        mined[0].0, mined[1].0,
-        "both lines attach to one template_id"
-    );
-    assert_eq!(cluster.merges_total(), 0, "a match is not a merge");
-    assert_eq!(typed_params(&mined[0].1), vec![(ParamType::Num, "0.1")]);
-    assert_eq!(
-        typed_params(&mined[1].1),
-        vec![(ParamType::Num, "0.3786463")]
-    );
-    let leaf = cluster
-        .templates_for(&t)
-        .into_iter()
-        .find(|l| l.template_id == mined[0].0)
-        .expect("the shared leaf");
-    assert_eq!(
-        format_template(&leaf.template),
-        "backing off for <*> seconds"
+        shared,
+        SharedTemplate {
+            distinct_ids: 1,
+            merges: 0,
+            params: vec![vec![num("0.1")], vec![num("0.3786463")]],
+            canonical: "backing off for <*> seconds".to_string(),
+        }
     );
 
     for (token, expected) in [("-1.5", ParamType::Num), ("10.0.0.1", ParamType::Ip)] {
         let mined = mine_lines(&mut cluster, &t, &[&format!("value {token} reported")]);
         assert_eq!(
             typed_params(&mined[0].1),
-            vec![(expected, token)],
+            vec![(expected, token.to_string())],
             "{token}"
         );
     }

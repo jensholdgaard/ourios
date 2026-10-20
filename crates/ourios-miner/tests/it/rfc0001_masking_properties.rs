@@ -6,6 +6,8 @@
 //!    token; every masked position yields one typed param whose value
 //!    is the original token; generated well-formed timestamps classify
 //!    as `TS` and decimals and integers as `NUM`.
+//!    Tokens no rule matches, including RFC0001.18/.19 near-misses,
+//!    are never masked.
 //! 2. **Reconstruction covers the new shapes** (§3.3, H7.1). Lines
 //!    mixing timestamps, decimals and the other masked shapes with
 //!    arbitrary whitespace mine to records that rebuild byte for byte,
@@ -87,6 +89,21 @@ fn token() -> impl Strategy<Value = (String, Option<ParamType>)> {
     ]
 }
 
+/// A token no rule may mask: plain words and RFC0001.18/.19 near-misses
+/// (out-of-range date and time fields, dangling or suffixed decimals).
+fn literal() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[a-z]{1,8}",
+        (1000u16..=9999, 13u8..=99, two_digits(1..=31))
+            .prop_map(|(y, m, d)| format!("{y}-{m}-{d}")),
+        (24u8..=99, two_digits(0..=59), two_digits(0..=59))
+            .prop_map(|(h, m, s)| format!("{h}:{m}:{s}")),
+        "[0-9]{1,6}\\.",
+        "\\.[0-9]{1,6}",
+        "-?[0-9]{1,6}\\.[0-9]{1,6}[a-z]{1,3}",
+    ]
+}
+
 fn whitespace() -> impl Strategy<Value = String> {
     prop::string::string_regex("[ \t]{1,3}").expect("valid regex")
 }
@@ -132,6 +149,19 @@ proptest! {
                 prop_assert!(expected.is_none(), "{:?} must mask as {:?}", original, expected);
             }
         }
+    }
+
+    #[test]
+    fn mask_leaves_non_matching_tokens_literal(
+        tokens in prop::collection::vec(literal(), 1..16),
+    ) {
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+
+        let m = mask(&refs);
+
+        prop_assert!(m.wildcard_positions.is_empty(), "{:?} masked {:?}", refs, m.wildcard_positions);
+        prop_assert!(m.typed_params.is_empty());
+        prop_assert_eq!(m.tokens, refs);
     }
 
     #[test]

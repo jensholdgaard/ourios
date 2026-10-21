@@ -824,8 +824,10 @@ direction and the primary obligation lives in those other RFCs.
 >   `2026/10/17 16:55:02 traces export: rpc error` and
 >   `2026/10/17 16:55:09 traces export: rpc error`
 > - **When** both are mined
-> - **Then** both attach to one `template_id` whose template is
->   `<TS> <TS> traces export: rpc error`
+> - **Then** both attach to one `template_id` whose template text is
+>   `<*> <*> traces export: rpc error`, with both wildcard slots
+>   typed `TS` (template text writes every wildcard as `<*>`; the
+>   mask tag is the slot's type, not its text)
 > - **And** each record carries two `TS` params whose values are its
 >   own original bytes (`2026/10/17`, `16:55:02` and `2026/10/17`,
 >   `16:55:09`)
@@ -853,9 +855,9 @@ direction and the primary obligation lives in those other RFCs.
 >   `backing off for 0.1 seconds` and
 >   `backing off for 0.3786463 seconds`, same severity and scope
 > - **When** both are mined
-> - **Then** both attach to one template,
->   `backing off for <NUM> seconds`, with `NUM` params `0.1` and
->   `0.3786463`
+> - **Then** both attach to one template, with text
+>   `backing off for <*> seconds`, whose slot is typed `NUM`, and
+>   with `NUM` params `0.1` and `0.3786463`
 > - **And** `-1.5` masks to `<NUM>`
 > - **And** `1.2.3`, `.5`, `5.`, `1e5`, `0x1F`, `6.3ms` and `1,5` are
 >   not emitted as `NUM`. They stay literal unless another rule's

@@ -517,11 +517,31 @@ below the server deadline stays the fail-closed pattern.
 > tuples are created again. The OpenFGA model and the tuple shapes do
 > not change. See RFC 0009 §3.4 (erasure note) and RFC0009.20–.23.
 
+> **Amendment (2026-10-23, #1034, maintainer-approved) — erasure requires
+> one compactor per store.** The race in the note above is not fenced. It
+> is excluded by deployment shape instead:
+> - A deployment that uses erasure runs **exactly one compactor per
+>   store**. Within one compactor the order already holds: a sweep
+>   finishes its graph phase before the next sweep starts, and that phase
+>   writes derived tuples before it deletes erased ones.
+> - The Helm chart enforces this. Its compactor Deployment has a fixed
+>   `replicas: 1` and the `Recreate` strategy (RFC0009.24), so no two
+>   compactors overlap, not even during an upgrade.
+> - A deployment outside the chart that runs more than one compactor
+>   keeps correct *rows* on S3 (the RFC 0013 publish-CAS commit), but an
+>   erased conversation can come back into `ListObjects`. That breaks
+>   "unreachable *and* unlisted" above. The rows stay erased, so layer 2
+>   still returns nothing for it.
+> - A fence that would make erasure safe with more than one compactor is
+>   a §7 open question.
+>
+> No code, model or tuple shape changes.
+
 ### 3.7 Operational posture
 
 Fail-closed everywhere OpenFGA is consulted (resolution, planner, tool
 gate); one store per deployment; the model id pinned in config and bumped
-by PR (the `.fga.yaml` tests run against the pinned model in CI); OpenFGA
+by PR (the `.fga.yaml` tests run against the pinned model in CI); one compactor per store when erasure is used (§3.6, 2026-10-23 amendment); OpenFGA
 availability is an operational cost the deployment opts into by configuring
 `auth.openfga` at all — static tokens and OIDC keep working without it, and
 a deployment that wants coarse tenants only never touches this RFC.
@@ -695,6 +715,16 @@ planner's returned row set equals the naive "rows whose conversation ∈
       carriers. RFC 0048 further takes over the tenant id grammar (removing
       the §3.3 percent-encoding), the identity keys as configuration, the
       erasure front door and a backfill pass.
+- [ ] **Erasure with more than one compactor (#1034).** §3.6's 2026-10-23
+      amendment requires one compactor per store. Lifting that needs a
+      fence between a sweep's buffered `observe` tuples and another sweep's
+      erasure. The candidate is a durable record of each completed erasure
+      and its time: before writing, the graph phase drops buffered tuples
+      for conversations erased after its sweep started, and the erasure
+      deletes the object's tuples once more after that record is written,
+      to close the gap between the check and the write. A per-tenant epoch
+      on its own is not enough, because it cannot name which conversations
+      to drop.
 - [x] **OpenFGA MCP for design time — a docs assistant, not a store MCP.**
       The OpenFGA maintainers enabled a documentation assistant at
       `https://openfga.mcp.kapa.ai` (openfga/openfga discussion #560); it

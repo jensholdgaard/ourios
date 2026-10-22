@@ -524,9 +524,11 @@ below the server deadline stays the fail-closed pattern.
 >   store**. Within one compactor the order already holds: a sweep
 >   finishes its graph phase before the next sweep starts, and that phase
 >   writes derived tuples before it deletes erased ones.
-> - The Helm chart enforces this. Its compactor Deployment has a fixed
->   `replicas: 1` and the `Recreate` strategy (RFC0009.24), so no two
->   compactors overlap, not even during an upgrade.
+> - The Helm chart gives each release one compactor Deployment, with a
+>   fixed `replicas: 1` and the `Recreate` strategy (RFC0009.24), so no two
+>   compactors of one release overlap, not even during an upgrade. The
+>   chart cannot see other releases, so it cannot stop a second release
+>   from sweeping the same store. Operators install one release per store.
 > - A deployment outside the chart that runs more than one compactor
 >   keeps correct *rows* on S3 (the RFC 0013 publish-CAS commit), but an
 >   erased conversation can come back into `ListObjects`. That breaks
@@ -718,13 +720,15 @@ planner's returned row set equals the naive "rows whose conversation ∈
 - [ ] **Erasure with more than one compactor (#1034).** §3.6's 2026-10-23
       amendment requires one compactor per store. Lifting that needs a
       fence between a sweep's buffered `observe` tuples and another sweep's
-      erasure. The candidate is a durable record of each completed erasure
-      and its time: before writing, the graph phase drops buffered tuples
-      for conversations erased after its sweep started, and the erasure
-      deletes the object's tuples once more after that record is written,
-      to close the gap between the check and the write. A per-tenant epoch
-      on its own is not enough, because it cannot name which conversations
-      to drop.
+      erasure. A durable record of each completed erasure, which the graph
+      phase checks before writing, is not enough on its own: a sweep can
+      check before the record exists, pause while another sweep writes it
+      and deletes the tuples, then resume and write them again. A further
+      delete after the record has the same gap. The protocol must order
+      every in-flight graph write before the erasure's final delete, or
+      stop such a write from committing after it. How to do that is
+      unresolved. A per-tenant epoch on its own is not enough either,
+      because it cannot name which conversations to drop.
 - [x] **OpenFGA MCP for design time — a docs assistant, not a store MCP.**
       The OpenFGA maintainers enabled a documentation assistant at
       `https://openfga.mcp.kapa.ai` (openfga/openfga discussion #560); it

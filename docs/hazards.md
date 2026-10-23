@@ -42,7 +42,10 @@ operator never knows.
 - Three-zone confidence model: clean match (≥ threshold) / lossy
   match (floor ≤ x < threshold, retain body — reconstruction still
   succeeds, so `lossy_flag` is **not** set) / parse failure
-  (< floor, retain body, increment counter). `lossy_flag` is
+  (< floor: since the RFC 0001 §6.3 2026-10-23 amendment, mint a
+  fresh leaf like a line with no candidate, subject to the template
+  ceiling; a guard rejection such as the ceiling is a parse failure,
+  body retained, counter incremented). `lossy_flag` is
   reserved for the H7 case (genuine tokenizer / preprocessing
   failure where `reconstruct(record) != ingested_bytes` is
   possible); it is not a low-confidence signal. See

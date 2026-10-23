@@ -1712,13 +1712,14 @@ For each ingested OTLP `LogRecord`:
         return
 
     # similarity < floor: a genuinely different event (§6.3,
-    # 2026-10-23 amendment). Mint a fresh leaf exactly as the
-    # candidate-is-None branch does: clean, confidence 1.0, no
-    # forced body retention. The template ceiling still applies.
-    leaf = new Leaf(template = L_masked)
-    parent.leaves.push(leaf)
-    attach(L_masked, typed_params, separators, leaf,
-           confidence = 1.0, lossy_flag = false)
+    # 2026-10-23 amendment). Mint through the same fresh-leaf
+    # operation as the candidate-is-None branch, which since
+    # RFC 0023, RFC 0059 and RFC 0017 §3.1 checks the template
+    # ceiling (else parse failure, reason template_ceiling),
+    # reserves the id (else id_reservation_failed), inserts and
+    # attaches the leaf, and emits template_created.
+    create_fresh_leaf(parent, L_masked, typed_params, separators,
+                      confidence = 1.0, lossy_flag = false)
 ```
 
 Branching invariants:
@@ -1817,8 +1818,10 @@ invariant.
 >
 > **What is unchanged.** The template ceiling (RFC 0023) still turns a
 > mint at the ceiling into a `template_ceiling` parse failure, and id
-> reservation failures still fail. No merge happens on this path, so
-> `ourios.miner.merges` is unaffected. The `below_floor` member stays in
+> reservation failures still fail. Minting merges nothing. A later line
+> can widen the new leaf, which is an ordinary audited merge (§6.4), so
+> corpus merge totals can rise where a failed line now has a leaf to
+> widen. The `below_floor` member stays in
 > the `ourios.miner.parse_failure.reason` registry enum and keeps its
 > zero point (§6.8); the miner no longer emits it with a non-zero
 > value. Removing it is a separate semantic-conventions change.
@@ -1827,6 +1830,19 @@ invariant.
 > by the ceiling. A one-off line costs a template it never shares; a
 > recurring one gains the template it could not get before. The
 > criterion is RFC0001.22.
+>
+> **RFC 0023.** This supersedes RFC0023.3's parenthetical "a
+> below-floor line still fails parse rather than merging" and the
+> `< floor → parse-failure` edge of RFC 0023 §3.1's flowchart (both
+> amended to match). Under the wildcard child a below-floor line now
+> mints its own leaf, subject to the ceiling, like any other bucket.
+> RFC 0023's guarantee is kept: routing is not merging, attach stays
+> `simSeq`-gated, and no line is forced into a leaf below the
+> threshold. Memory stays bounded by `max_templates`, which also bounds
+> the candidate scan of any one bucket. The implementation revises
+> `rfc0023_3_node_fanout_caps_via_wildcard_routing` to assert no
+> forced merge (the below-floor line gets its own id) instead of no
+> mint.
 
 ### 6.4 Merge policy `[§3.1]`
 
@@ -2979,7 +2995,10 @@ resolves bidirectionally between RFC and tests.
   > ceiling case and a lossy-zone control. The corpus template-count
   > bounds are re-baselined where this rule raises a count, since a rise
   > is the expected effect here; each rise is reported with the
-  > `parse_failures` drop it trades for. Merges must not change.
+  > `parse_failures` drop it trades for. Minting adds no merge. A change
+  > in corpus merge totals can only come from later lines widening a
+  > newly minted leaf; it is reported and each case reviewed against
+  > `[§3.1]` before the implementation merges.
   >
   > *Covers:* RFC0001.22.
 

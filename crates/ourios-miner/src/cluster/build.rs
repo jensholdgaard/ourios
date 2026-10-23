@@ -166,8 +166,9 @@ impl MinerCluster {
     /// - §6.3 / §6.4 body-retention paths: empty /
     ///   whitespace-only `Body::String`, over-cap lines
     ///   (`> u16::MAX` tokens), the §6.4 degenerate-template
-    ///   rejection branch, and the §6.3 parse-failure zone
-    ///   (`simSeq < similarity_floor`). These also bump
+    ///   rejection branch, and the RFC 0023 template ceiling. A
+    ///   below-floor line mints a clean leaf instead (§6.3
+    ///   2026-10-23 amendment). These also bump
     ///   `body_retentions_total`.
     /// - §6.6 tokenizer-failure paths (today: embedded NUL byte
     ///   per H7.2). These set `lossy_flag = true` on the emitted
@@ -189,8 +190,7 @@ impl MinerCluster {
     ///
     /// - §6.3 lossy zone (`floor ≤ sim < threshold`) — line
     ///   attaches to a fresh leaf with body retained.
-    /// - §6.3 parse-failure zone (`sim < floor`) — no template,
-    ///   body retained.
+    /// - RFC 0023 template ceiling — no template, body retained.
     /// - §6.2 step 1 parse-failure paths: empty / whitespace-only
     ///   input and over-cap input (line longer than the
     ///   `u16::MAX`-token bound). Both are emitted as parse-

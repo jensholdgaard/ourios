@@ -32,7 +32,7 @@ fn lossy_zone_creates_new_leaf_and_bumps_body_retention() {
 }
 
 #[test]
-fn parse_failure_zone_returns_no_template_and_bumps_counters() {
+fn below_floor_zone_mints_a_clean_leaf() {
     // L1 = "alpha beta gamma delta epsilon zeta"  (length 6).
     // L2 = "alpha beta phi rho sigma omega"        → sim with L1 = 2/6
     //                                              ≈ 0.333 →
@@ -46,35 +46,30 @@ fn parse_failure_zone_returns_no_template_and_bumps_counters() {
     // unambiguously below the floor without re-introducing a
     // boundary-dependent assertion.
     //
-    // Parse failure: no leaf created, NO_TEMPLATE returned,
-    // parse_failures_total AND body_retentions_total both
-    // bump (RFC §6.3 says parse failure also retains body).
+    // §6.3 2026-10-23 amendment: a below-floor line is a genuinely
+    // different event, so it mints a clean fresh leaf exactly as a
+    // line with no candidate does — no parse failure, no forced body
+    // retention, no merge.
     let (mut cluster, sink) = cluster_with_observable_sink();
     let t = TenantId::new("tenant-x");
 
     let id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon zeta"));
     let id2 = cluster.ingest(&string_record(&t, "alpha beta phi rho sigma omega"));
 
-    assert_ne!(id1, NO_TEMPLATE, "L1 created the only leaf");
-    assert_eq!(
-        id2, NO_TEMPLATE,
-        "below-floor similarity → parse failure, not new leaf",
-    );
-    assert_eq!(
-        cluster.template_count(&t),
-        1,
-        "parse failure must not allocate a leaf",
-    );
-    assert_eq!(cluster.parse_failures_total(), 1);
+    assert_ne!(id1, NO_TEMPLATE, "L1 created the first leaf");
+    assert_ne!(id2, NO_TEMPLATE, "below-floor similarity → new leaf");
+    assert_ne!(id1, id2, "below-floor line gets its own template");
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(cluster.parse_failures_total(), 0);
     assert_eq!(
         cluster.body_retentions_total(),
-        1,
-        "RFC §6.3: parse failure retains body too",
+        0,
+        "below-floor mint is clean: no forced body retention",
     );
     assert_eq!(cluster.merges_total(), 0);
     assert!(
         drain_changes(&sink).is_empty(),
-        "parse failure emits no audit event"
+        "below-floor mint emits no change beyond its Created event"
     );
 }
 
@@ -98,7 +93,8 @@ fn clean_attach_does_not_bump_body_retentions() {
 #[test]
 fn floor_at_threshold_collapses_lossy_zone() {
     // With floor == threshold, the lossy zone is empty. Every
-    // below-threshold attach goes straight to parse failure.
+    // below-threshold line mints a clean leaf (§6.3 2026-10-23
+    // amendment), so nothing retains its body.
     // Pin the corner case so a future config refactor that
     // accidentally re-introduces the lossy zone is caught.
     let config = MinerConfig::try_new_full(0.7, 0.7, 256).expect("valid config");
@@ -106,13 +102,14 @@ fn floor_at_threshold_collapses_lossy_zone() {
     let t = TenantId::new("tenant-x");
 
     // L1 establishes the leaf; L2 has sim 3/5 = 0.6 — under
-    // the collapsed-zone config this is < floor, so parse
-    // failure (not lossy, since lossy zone is empty).
-    let _id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
+    // the collapsed-zone config this is < floor, so a clean mint
+    // (not lossy, since lossy zone is empty).
+    let id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
     let id2 = cluster.ingest(&string_record(&t, "alpha beta gamma rho sigma"));
 
-    assert_eq!(id2, NO_TEMPLATE);
-    assert_eq!(cluster.template_count(&t), 1);
-    assert_eq!(cluster.parse_failures_total(), 1);
-    assert_eq!(cluster.body_retentions_total(), 1);
+    assert_ne!(id2, NO_TEMPLATE);
+    assert_ne!(id1, id2);
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(cluster.parse_failures_total(), 0);
+    assert_eq!(cluster.body_retentions_total(), 0);
 }

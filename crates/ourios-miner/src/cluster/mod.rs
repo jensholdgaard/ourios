@@ -15,7 +15,9 @@
 //! tree on `Body::String` records:
 //!
 //! - **No candidate** in the `(severity, scope, length, prefix)`
-//!   bucket → fresh leaf, emitting a `TemplateChange::Created` audit
+//!   bucket, or a best candidate with `sim_seq < floor` (§6.3
+//!   2026-10-23 amendment: a genuinely different event) → clean
+//!   fresh leaf, emitting a `TemplateChange::Created` audit
 //!   event (`event_type` `template_created`, RFC 0017 §3.1; not a merge).
 //! - **Best candidate has `sim_seq == 1.0`** → clean attach to the
 //!   existing leaf, no widening, no audit.
@@ -27,10 +29,12 @@
 //!   Otherwise apply the widening, bump the leaf's
 //!   `template_version`, emit `TemplateWidened`, increment
 //!   `merges_total`, return the leaf's `template_id`.
-//! - **Best candidate has `sim_seq < threshold`** → fresh leaf in
-//!   the same bucket. The three-zone confidence model (lossy-zone
-//!   body retention + parse-failure floor per RFC §6.3) lands in
-//!   a follow-up PR; today this branch simply creates a new leaf.
+//! - **Best candidate has `floor ≤ sim_seq < threshold`** (§6.3
+//!   lossy zone) → fresh leaf in the same bucket with the body
+//!   retained.
+//!
+//! Every fresh leaf is subject to the RFC 0023 template ceiling: at
+//! the ceiling the line is a `template_ceiling` parse failure.
 //!
 //! Audit events flow to the [`AuditSink`] the cluster was
 //! constructed with — [`MinerCluster::new`] defaults to an
@@ -86,8 +90,8 @@ use plan::{
 };
 
 /// Sentinel `template_id` returned by [`MinerCluster::ingest`] when
-/// no template was allocated for the input. Three paths reach this
-/// today:
+/// no template was allocated for the input. Among the paths that
+/// reach it:
 ///
 /// - `Body::None` — the wire delivered no body.
 /// - `Body::String("")` (or whitespace-only) — `tokenize` yields
@@ -97,6 +101,7 @@ use plan::{
 ///   guard. The audit-event stream records the rejection and the
 ///   line is treated as a parse failure
 ///   (`parse_failures_total` increments).
+/// - A fresh leaf was refused by the RFC 0023 template ceiling.
 ///
 /// Real templates always have id `>= 1` (see `IdRange::new`).
 pub const NO_TEMPLATE: u64 = 0;
@@ -152,12 +157,12 @@ pub struct MinerCluster {
     merges_total: AtomicU64,
     // §6.8 counter: lines that produced no template. Increments
     // on empty / over-cap input, degenerate-widening rejection,
-    // and the §6.3 parse-failure zone (`simSeq < floor`).
+    // and the RFC 0023 template ceiling.
     parse_failures_total: AtomicU64,
     // §6.8 counter: lines whose body must be retained in the
     // emitted data record per RFC §6.3. Increments on the
-    // lossy *zone* (`floor ≤ simSeq < threshold`) and on the
-    // parse-failure zone (`simSeq < floor`); does **not**
+    // lossy *zone* (`floor ≤ simSeq < threshold`) and on every
+    // parse failure; does **not**
     // increment for clean attaches or for the orthogonal
     // §6.6 `lossy_flag = true` (tokenizer-failure) path —
     // see `ConfidenceZone::retains_body`. The numerator of the
@@ -448,7 +453,7 @@ struct MaskedLine<'a> {
 /// [`MinerCluster::emit_fresh_leaf_record`] varies on.
 #[derive(Clone, Copy)]
 enum FreshLeafZone {
-    /// No candidate existed; clean by definition.
+    /// No candidate, or one below the §6.3 floor: clean by definition.
     Clean,
     /// The best candidate fell in the lossy zone; the mint retains
     /// the body and carries `similarity / threshold`.
@@ -489,7 +494,7 @@ impl MinerCluster {
     /// params.
     ///
     /// The override of `body` is intentional: even on paths that
-    /// already retain body (lossy zone, parse-failure zone), the
+    /// already retain body (lossy zone, parse failures), the
     /// caller's `body` may be `None` or partial; an overflow
     /// record's body must always carry the original line bytes
     /// so `reconstruct()`'s `Overflow` branch (RFC §6.6) has
@@ -523,7 +528,7 @@ impl MinerCluster {
     /// template was allocated), so the two counters move
     /// together at every parse-failure site — empty input,
     /// over-cap input, the §6.4 degenerate-widening rejection,
-    /// and the §6.3 parse-failure zone. Centralised here so a
+    /// and the RFC 0023 template ceiling. Centralised here so a
     /// future contract change touches one site, not four.
     ///
     /// The §6.6 `lossy_flag = true` tokenizer-failure path is
@@ -941,12 +946,42 @@ impl MinerCluster {
         let threshold = effective_config.similarity_threshold;
         let floor = effective_config.similarity_floor;
 
-        let template_id = match best {
-            // No candidate at all → fresh leaf. Treated as clean
-            // by definition: there was no weaker match to drop
-            // into the lossy zone against, and no template to
-            // declare a parse failure against.
-            None => self.mint_fresh_leaf(
+        let scored = best.map(|c| (c, ConfidenceZone::classify(c.similarity, threshold, floor)));
+        let template_id = match scored {
+            // Clean: attach to candidate, optionally widening. RFC
+            // §6.2 step 5. No body retention. The helper emits its
+            // own record (one of: clean-reuse, widening, or
+            // degenerate-rejection); the per-tenant byte_limit is
+            // threaded through so the helper's rebuilt aligned
+            // params also get §6.5 capping.
+            Some((c, ConfidenceZone::Clean)) => self.attach_and_maybe_widen(
+                line,
+                masked_line,
+                Attach::new(c, &effective_config, observed),
+                parts,
+            ),
+            // Lossy: new leaf rather than force-merge into a too-weak
+            // candidate (RFC §6.2 step 5b), so at the ceiling it must
+            // fail parse, not merge. Body retained; no *widening*
+            // event, but `create_new_leaf` audits the leaf's creation
+            // (RFC 0017 §3.1).
+            Some((c, ConfidenceZone::Lossy)) => self.mint_fresh_leaf(
+                line,
+                FreshLeaf {
+                    masked: masked_line,
+                    parts,
+                    observed,
+                    zone: FreshLeafZone::Lossy {
+                        confidence: c.similarity / threshold,
+                    },
+                },
+                effective_config.max_templates,
+            ),
+            // No candidate, or one below the floor (§6.3 2026-10-23
+            // amendment): a genuinely different event, so a clean
+            // fresh leaf. Nothing is a near miss here, so no body is
+            // forced.
+            None | Some((_, ConfidenceZone::ParseFailure)) => self.mint_fresh_leaf(
                 line,
                 FreshLeaf {
                     masked: masked_line,
@@ -956,51 +991,6 @@ impl MinerCluster {
                 },
                 effective_config.max_templates,
             ),
-            Some(c) => {
-                match ConfidenceZone::classify(c.similarity, threshold, floor) {
-                    // Clean: attach to candidate, optionally
-                    // widening. RFC §6.2 step 5. No body
-                    // retention. The helper emits its own
-                    // record (one of: clean-reuse, widening, or
-                    // degenerate-rejection); the per-tenant
-                    // byte_limit is threaded through so the
-                    // helper's rebuilt aligned params also get
-                    // §6.5 capping.
-                    ConfidenceZone::Clean => self.attach_and_maybe_widen(
-                        line,
-                        masked_line,
-                        Attach::new(c, &effective_config, observed),
-                        parts,
-                    ),
-                    // Lossy: new leaf rather than force-merge
-                    // into a too-weak candidate (RFC §6.2 step
-                    // 5b). Body retained; no *widening* event, but
-                    // `create_new_leaf` audits the leaf's creation
-                    // (RFC 0017 §3.1). The retention counter bumps
-                    // here; `record_parse_failure` covers the
-                    // parse-failure-zone path separately.
-                    // The §6.3 lossy zone mints rather than
-                    // force-merges into the too-weak candidate, so at
-                    // the ceiling it must fail parse, not merge.
-                    ConfidenceZone::Lossy => self.mint_fresh_leaf(
-                        line,
-                        FreshLeaf {
-                            masked: masked_line,
-                            parts,
-                            observed,
-                            zone: FreshLeafZone::Lossy {
-                                confidence: c.similarity / threshold,
-                            },
-                        },
-                        effective_config.max_templates,
-                    ),
-                    // Parse failure: no template allocated.
-                    // Both counters bump via the shared helper.
-                    ConfidenceZone::ParseFailure => {
-                        self.emit_string_parse_failure(line, parts, "below_floor")
-                    }
-                }
-            }
         };
         // RFC 0050 §3.2 `observe` success half of the `.processed`
         // shape: the valid string found a mined home (the
@@ -1019,7 +1009,7 @@ impl MinerCluster {
     /// (epic #745 wave 1; this replaced two divergent copies in
     /// [`Self::ingest_string`]):
     ///
-    /// - a no-candidate mint is clean by definition — confidence 1.0,
+    /// - a no-candidate or below-floor mint is clean — confidence 1.0,
     ///   no body (only §6.5 overflow may retain it);
     /// - a §6.3 lossy-zone mint retains the body, bumps both
     ///   retention counters, and carries `similarity / threshold` as
@@ -1058,8 +1048,7 @@ impl MinerCluster {
     }
 
     /// Emit the §6.3 parse-failure record for a string line — the
-    /// shared exit for the below-floor zone, the §6.4
-    /// degenerate-widening rejection, the RFC 0023 §3.1 long-line
+    /// shared exit for the §6.4 degenerate-widening rejection, the RFC 0023 §3.1 long-line
     /// guard, and the RFC 0023 template-ceiling diverts: no
     /// template, body retained verbatim, lossy-flagged, counted.
     fn emit_string_parse_failure(

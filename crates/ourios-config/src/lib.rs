@@ -71,9 +71,10 @@ pub struct MinerConfig {
     ///   force-merging into a weaker match) and the line's body
     ///   is retained in the eventual data record. Counted by
     ///   `MinerCluster::body_retentions_total`.
-    /// - `simSeq < similarity_floor` → parse failure: no
-    ///   template is allocated, the line is dropped to the
-    ///   parse-failure path, the body is still retained.
+    /// - `simSeq < similarity_floor` → a genuinely different
+    ///   event: a clean fresh leaf, exactly as for a line with no
+    ///   candidate, with no forced body retention (§6.3
+    ///   2026-10-23 amendment).
     ///
     /// The default is `0.4` per RFC §6.3 *Defaults*: the floor
     /// matches the threshold from the original Drain paper, on
@@ -85,9 +86,7 @@ pub struct MinerConfig {
     /// Must hold `0 < similarity_floor ≤ similarity_threshold`.
     /// Setting the floor equal to the threshold collapses the
     /// lossy zone to zero width — every below-threshold line
-    /// routes straight to the parse-failure path. This is
-    /// **stricter** than the pre-§6.3 "create a fresh leaf for
-    /// every below-threshold line" shape, not equivalent to it.
+    /// mints a clean fresh leaf and none retains its body.
     pub similarity_floor: f32,
 
     /// Per-parameter byte limit (post-masking). Values above

@@ -128,26 +128,25 @@ fn lossy_attach_emits_record_with_retained_body_and_lossy_flag_false() {
 }
 
 #[test]
-fn parse_failure_zone_emits_record_with_lossy_flag_and_no_template() {
+fn below_floor_zone_emits_clean_record_on_a_new_template() {
     let (mut cluster, _audit, records) = cluster_with_observable_sinks();
     let t = TenantId::new("tenant-x");
 
-    // sim 2/6 ≈ 0.333 < 0.4 floor → parse-failure zone.
+    // sim 2/6 ≈ 0.333 < 0.4 floor → a clean fresh leaf (RFC 0001 §6.3
+    // 2026-10-23 amendment).
     let _ = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon zeta"));
     let l2_raw = "alpha beta phi rho sigma omega";
     let _ = cluster.ingest(&string_record(&t, l2_raw));
 
     let emitted = records.drain();
     assert_eq!(emitted.len(), 2);
-    let pf = &emitted[1];
-    assert_eq!(pf.template_id, NO_TEMPLATE);
-    assert_eq!(pf.template_version, 0);
-    assert!(pf.lossy_flag, "parse-failure records are lossy");
-    assert_eq!(pf.body.as_deref(), Some(l2_raw));
-    assert!(
-        pf.confidence.abs() < f32::EPSILON,
-        "parse-failure confidence is the 0.0 sentinel",
-    );
+    let minted = &emitted[1];
+    assert_ne!(minted.template_id, NO_TEMPLATE);
+    assert_ne!(minted.template_id, emitted[0].template_id);
+    assert_eq!(minted.template_version, 1);
+    assert!(!minted.lossy_flag);
+    assert_eq!(minted.body, None, "no forced body retention");
+    assert!((minted.confidence - 1.0).abs() < f32::EPSILON);
 }
 
 #[test]

@@ -154,17 +154,39 @@ fn rfc0023_3_node_fanout_caps_via_wildcard_routing() {
     // below-floor line landing in gamma's exact bucket (unseen first
     // token ⇒ wildcard route; second token "worker" ⇒ gamma's
     // prefix path; same length) matches gamma's leaf at 1/4 < the
-    // 0.4 floor and must fail parse — not merge, not mint.
-    let templates_before = cluster.templates_for(&tenant).len();
+    // 0.4 floor and must not be forced into it: it mints its own
+    // leaf (RFC 0001 §6.3 2026-10-23 amendment), leaving gamma's
+    // template untouched.
+    let gamma_before = cluster
+        .templates_for(&tenant)
+        .into_iter()
+        .find(|l| l.template_id == third)
+        .expect("gamma's leaf");
     let unrelated = cluster.ingest(&record(&tenant, "omega worker jumped nowhere"));
-    assert_eq!(
-        unrelated, NO_TEMPLATE,
-        "below-floor under the wildcard child fails parse rather than merging",
+    assert!(
+        unrelated != NO_TEMPLATE && !minted.contains(&unrelated),
+        "below-floor under the wildcard child mints its own leaf rather than merging",
     );
+    let gamma_after = cluster
+        .templates_for(&tenant)
+        .into_iter()
+        .find(|l| l.template_id == third)
+        .expect("gamma's leaf");
     assert_eq!(
-        cluster.templates_for(&tenant).len(),
-        templates_before,
-        "the parse failure minted nothing",
+        (gamma_after.template, gamma_after.template_version),
+        (gamma_before.template, gamma_before.template_version),
+        "gamma's template is not widened by the below-floor line",
+    );
+    let keyed_first_tokens: std::collections::HashSet<String> = cluster
+        .snapshot_state(&tenant)
+        .leaves
+        .iter()
+        .filter(|l| !l.wildcard_routed.contains(&0))
+        .map(|l| format!("{:?}", l.template[0]))
+        .collect();
+    assert!(
+        keyed_first_tokens.len() <= 2,
+        "the root still holds at most max_node_children keyed children",
     );
 }
 

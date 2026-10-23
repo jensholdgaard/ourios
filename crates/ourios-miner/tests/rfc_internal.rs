@@ -945,80 +945,144 @@ fn rfc0001_19_whole_token_decimals_share_one_template() {
     }
 }
 
-/// Scenario RFC0001.22 — A below-floor line mints its own template, and
-/// its next occurrence attaches to it.
-/// See `docs/rfcs/0001-template-miner.md` §5 and the §6.3 2026-10-23
-/// amendment.
+// Scenario RFC0001.22 — A below-floor line mints its own template, and
+// its next occurrence attaches to it. See `docs/rfcs/0001-template-miner.md`
+// §5 and the §6.3 2026-10-23 amendment.
+
+// Same severity, scope, length and prefix ("worker pool"), so the seed is
+// the below-floor line's candidate: sim_seq 2/6 < 0.4.
+const RFC0001_22_SEED: &str = "worker pool drained queue backlog cleanly";
+const RFC0001_22_BELOW_FLOOR: &str = "worker pool rejected job 17 again";
+const RFC0001_22_BELOW_FLOOR_AGAIN: &str = "worker pool rejected job 99 again";
+// sim_seq 3/6 = 0.5: the lossy zone.
+const RFC0001_22_LOSSY: &str = "worker pool drained stack overflow loudly";
+
+/// A tenant whose bucket holds only the seed template, with the seed's
+/// audit events already drained.
+struct BelowFloorBucket {
+    cluster: ourios_miner::cluster::MinerCluster,
+    sink: ourios_core::audit::SharedAuditSink,
+    tenant: ourios_core::tenant::TenantId,
+    seed_id: u64,
+}
+
+impl BelowFloorBucket {
+    fn new() -> Self {
+        let sink = ourios_core::audit::SharedAuditSink::new();
+        let mut cluster = ourios_miner::cluster::MinerCluster::with_audit_sink(
+            ourios_config::MinerConfig::default(),
+            Box::new(sink.clone()),
+        );
+        let tenant = ourios_core::tenant::TenantId::new("tenant-x");
+        let seed_id = mine_lines(&mut cluster, &tenant, &[RFC0001_22_SEED])[0].0;
+        let _ = sink.drain();
+        Self {
+            cluster,
+            sink,
+            tenant,
+            seed_id,
+        }
+    }
+
+    fn mine(&mut self, lines: &[&str]) -> Vec<(u64, ourios_core::record::MinedRecord)> {
+        mine_lines(&mut self.cluster, &self.tenant, lines)
+    }
+
+    fn created_templates(&self) -> Vec<String> {
+        use ourios_core::audit::{AuditPayload, TemplateChange};
+        self.sink
+            .drain()
+            .into_iter()
+            .filter_map(|e| match e.payload {
+                AuditPayload::Template {
+                    change: TemplateChange::Created { new_template },
+                    ..
+                } => Some(new_template),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// What a mined record says about how it was stored: clean confidence,
+/// retained body, lossy flag.
+fn storage_outcome(record: &ourios_core::record::MinedRecord) -> (bool, Option<&str>, bool) {
+    (
+        (record.confidence - 1.0).abs() < f32::EPSILON,
+        record.body.as_deref(),
+        record.lossy_flag,
+    )
+}
+
 #[test]
-fn rfc0001_22_below_floor_line_mints_its_own_template() {
-    use ourios_config::MinerConfig;
-    use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
-    use ourios_core::tenant::TenantId;
-    use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
-
-    // Same severity, scope, length and prefix ("worker pool"), so the
-    // seed is the below-floor line's candidate: sim_seq 2/6 < 0.4.
-    const SEED: &str = "worker pool drained queue backlog cleanly";
-    const BELOW_FLOOR: &str = "worker pool rejected job 17 again";
-    const BELOW_FLOOR_AGAIN: &str = "worker pool rejected job 99 again";
-    // sim_seq 3/6 = 0.5: the lossy zone.
-    const LOSSY: &str = "worker pool drained stack overflow loudly";
-
-    let sink = SharedAuditSink::new();
-    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
-    let t = TenantId::new("tenant-x");
-
-    let seed = mine_lines(&mut cluster, &t, &[SEED]);
-    let _ = sink.drain();
-    let failures_before = cluster.parse_failures_total();
-    let merges_before = cluster.merges_total();
-
-    let mined = mine_lines(&mut cluster, &t, &[BELOW_FLOOR, BELOW_FLOOR_AGAIN]);
-    let (id, first) = &mined[0];
-    assert_ne!(*id, NO_TEMPLATE, "a below-floor line gets a template");
-    assert_ne!(*id, seed[0].0, "and it is a new one, not the seed's");
-    assert!((first.confidence - 1.0).abs() < f32::EPSILON);
-    assert_eq!(first.body, None, "no forced body retention");
-    assert!(!first.lossy_flag);
-    assert_eq!(cluster.parse_failures_total(), failures_before);
-    assert_eq!(
-        cluster.merges_total(),
-        merges_before,
-        "no merge on this path"
+fn rfc0001_22_below_floor_line_mints_a_clean_new_template() {
+    let mut bucket = BelowFloorBucket::new();
+    let mined = bucket.mine(&[RFC0001_22_BELOW_FLOOR]);
+    let (id, record) = &mined[0];
+    assert!(
+        ![ourios_miner::cluster::NO_TEMPLATE, bucket.seed_id].contains(id),
+        "a below-floor line gets a template of its own, got {id}"
     );
-    let created: Vec<String> = sink
-        .drain()
-        .into_iter()
-        .filter_map(|e| match e.payload {
-            AuditPayload::Template {
-                change: TemplateChange::Created { new_template },
-                ..
-            } => Some(new_template),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        created,
+        storage_outcome(record),
+        (true, None, false),
+        "clean: confidence 1.0, no forced body, no lossy flag"
+    );
+}
+
+#[test]
+fn rfc0001_22_below_floor_mint_is_audited_and_moves_no_failure_or_merge() {
+    let mut bucket = BelowFloorBucket::new();
+    let counters =
+        |c: &ourios_miner::cluster::MinerCluster| (c.parse_failures_total(), c.merges_total());
+    let before = counters(&bucket.cluster);
+    bucket.mine(&[RFC0001_22_BELOW_FLOOR]);
+    assert_eq!(counters(&bucket.cluster), before);
+    assert_eq!(
+        bucket.created_templates(),
         vec!["worker pool rejected job <*> again".to_string()],
         "one template_created event whose template is the masked line",
     );
-    assert_eq!(mined[1].0, *id, "the next occurrence attaches to it");
+}
 
-    // At the template ceiling the same line is a parse failure with its
-    // body retained.
-    let capped_config = MinerConfig::default()
+#[test]
+fn rfc0001_22_next_occurrence_attaches_to_the_minted_template() {
+    let mut bucket = BelowFloorBucket::new();
+    let mined = bucket.mine(&[RFC0001_22_BELOW_FLOOR, RFC0001_22_BELOW_FLOOR_AGAIN]);
+    assert_eq!(mined[1].0, mined[0].0);
+}
+
+#[test]
+fn rfc0001_22_at_the_ceiling_a_below_floor_line_fails_with_its_body() {
+    use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
+    let config = ourios_config::MinerConfig::default()
         .with_max_templates(1)
         .expect("non-zero ceiling");
-    let mut capped = MinerCluster::new(capped_config);
-    mine_lines(&mut capped, &t, &[SEED]);
-    let at_ceiling = mine_lines(&mut capped, &t, &[BELOW_FLOOR]);
-    assert_eq!(at_ceiling[0].0, NO_TEMPLATE);
-    assert_eq!(at_ceiling[0].1.body.as_deref(), Some(BELOW_FLOOR));
-    assert_eq!(capped.parse_failures_total(), 1);
+    let mut capped = MinerCluster::new(config);
+    let t = ourios_core::tenant::TenantId::new("tenant-x");
+    mine_lines(&mut capped, &t, &[RFC0001_22_SEED]);
+    let at_ceiling = mine_lines(&mut capped, &t, &[RFC0001_22_BELOW_FLOOR]);
+    assert_eq!(
+        (
+            at_ceiling[0].0,
+            at_ceiling[0].1.body.as_deref(),
+            capped.parse_failures_total()
+        ),
+        (NO_TEMPLATE, Some(RFC0001_22_BELOW_FLOOR), 1),
+    );
+}
 
-    // A lossy-zone line still mints with its body retained.
-    let lossy = mine_lines(&mut cluster, &t, &[LOSSY]);
-    assert!(![NO_TEMPLATE, seed[0].0, *id].contains(&lossy[0].0));
-    assert_eq!(lossy[0].1.body.as_deref(), Some(LOSSY));
-    assert!(lossy[0].1.confidence < 1.0);
+#[test]
+fn rfc0001_22_lossy_zone_still_mints_with_its_body() {
+    let mut bucket = BelowFloorBucket::new();
+    let lossy = bucket.mine(&[RFC0001_22_LOSSY]);
+    assert!(
+        ![ourios_miner::cluster::NO_TEMPLATE, bucket.seed_id].contains(&lossy[0].0),
+        "a lossy-zone line mints a new template"
+    );
+    assert_eq!(
+        storage_outcome(&lossy[0].1),
+        (false, Some(RFC0001_22_LOSSY), false),
+        "lossy: confidence below 1.0, body retained"
+    );
 }

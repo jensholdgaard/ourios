@@ -13,7 +13,8 @@
 //! through one `Wal` that rotates (`RotationKind::Owed`) between segments, so
 //! its `RECLAIM` / `CHECKPOINT` sidecars match its segments (RFC 0052 §3.2
 //! refuses a version-2 segment without them). Construction sits outside the
-//! timed closure; the replay walk is the only thing timed.
+//! timed closure, which times `Wal::open` (sidecar reads and recovery checks)
+//! followed by the replay walk.
 
 use std::hint::black_box;
 use std::path::Path;

@@ -15,9 +15,11 @@
 //!   original line even though the template was "close enough"
 //!   to suggest the candidate without being close enough to
 //!   bind.
-//! - **Parse failure** — `simSeq < similarity_floor`. No template
-//!   is allocated; the line is dropped to the parse-failure path
-//!   and the body is still retained for forensic inspection.
+//! - **Parse failure** — `simSeq < similarity_floor`. The line is a
+//!   genuinely different event from the candidate, so since the
+//!   §6.3 2026-10-23 amendment it mints a clean fresh leaf exactly
+//!   as a line with no candidate does: no body retention. The
+//!   variant keeps its name; it no longer implies a parse failure.
 //!
 //! Lines with no candidate at all (empty leaf list under the
 //! `(severity, scope, length, prefix)` parent) take the
@@ -43,8 +45,9 @@ pub enum ConfidenceZone {
     /// `similarity_floor ≤ simSeq < similarity_threshold`. New
     /// leaf created; body retained in the data record.
     Lossy,
-    /// `simSeq < similarity_floor`. No template allocated;
-    /// parse-failure path with body retention.
+    /// `simSeq < similarity_floor`. A genuinely different event:
+    /// mints a clean fresh leaf, as with no candidate (§6.3
+    /// 2026-10-23 amendment); no body retention.
     ParseFailure,
 }
 
@@ -72,11 +75,12 @@ impl ConfidenceZone {
 
     /// `true` iff the row at this zone should retain its
     /// original body bytes in the data record per RFC §6.3.
-    /// Clean rows do not retain; lossy and parse-failure rows
-    /// do. The §6.6 `lossy_flag` is independent of this.
+    /// Only the lossy zone, the one near miss, retains; clean and
+    /// below-floor rows do not (§6.3 2026-10-23 amendment). The
+    /// §6.6 `lossy_flag` is independent of this.
     #[must_use]
     pub fn retains_body(self) -> bool {
-        matches!(self, Self::Lossy | Self::ParseFailure)
+        matches!(self, Self::Lossy)
     }
 }
 
@@ -118,10 +122,10 @@ mod tests {
     }
 
     #[test]
-    fn retains_body_true_for_lossy_and_parse_failure_only() {
+    fn retains_body_true_for_lossy_only() {
         assert!(!ConfidenceZone::Clean.retains_body());
         assert!(ConfidenceZone::Lossy.retains_body());
-        assert!(ConfidenceZone::ParseFailure.retains_body());
+        assert!(!ConfidenceZone::ParseFailure.retains_body());
     }
 
     #[test]

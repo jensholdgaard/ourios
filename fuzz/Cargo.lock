@@ -2434,11 +2434,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-config"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "ourios-core"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "blake3",
  "opentelemetry",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-df-otel"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "datafusion",
  "opentelemetry",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-ingester"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-miner"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "opentelemetry",
  "ourios-config",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-parquet"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-querier"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2574,11 +2574,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-semconv"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "ourios-serving"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axum",
  "futures-core",
@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-telemetry"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "opentelemetry",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-wal"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "crc32c",
  "ourios-core",
@@ -3172,9 +3172,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -3960,9 +3960,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]

@@ -83,6 +83,13 @@ retained verbatim, counted.
    wildcard child stays `simSeq`-gated exactly as everywhere else —
    a line that matches no leaf at or above the floor still mints its
    own leaf (subject to bound 2) or fails parse.
+
+   > **Amendment (2026-10-23, RFC 0001 §6.3 amendment, #1007,
+   > maintainer-approved).** A below-floor line no longer fails parse:
+   > it mints its own leaf, subject to bound 2, here as in every other
+   > bucket. Routing is still not merging, and attach stays
+   > `simSeq`-gated. The flowchart below and RFC0023.3 are amended to
+   > match.
 2. **`max_templates`** (default **20,000**) — per-tenant ceiling on
    Drain-tree leaves. At the ceiling, both minting paths (the §6.3
    lossy-zone new leaf and the no-candidate new leaf) divert to
@@ -104,10 +111,9 @@ flowchart LR
     T -- yes --> D["descend tree<br/>(full node → wildcard child)"]
     D --> M{"simSeq vs leaves"}
     M -- "≥ threshold" --> A[clean attach / widen]
-    M -- "lossy zone /<br/>no candidate" --> C{"leaves < max_templates?"}
+    M -- "lossy zone / < floor /<br/>no candidate" --> C{"leaves < max_templates?"}
     C -- yes --> N[mint new leaf]
     C -- no --> PF
-    M -- "< floor" --> PF
 ```
 
 ### 3.2 Why fail-honest instead of Drain3's alternatives
@@ -212,6 +218,10 @@ Scenario ids `RFC0023.<m>`.
 > route through the wildcard child, and attach under that child
 > remains threshold-gated (a below-floor line still fails parse
 > rather than merging).
+> *(Amended 2026-10-23 with RFC 0001 §6.3: a below-floor line under
+> the wildcard child mints its own leaf, subject to the template
+> ceiling, rather than merging. The scenario's guarantee is no forced
+> merge; the test asserts the line gets its own id.)*
 
 > **Scenario RFC0023.4 — the long-line guard.**
 > Given a line tokenizing past `max_line_tokens`,

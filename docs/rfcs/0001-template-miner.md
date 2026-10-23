@@ -915,8 +915,9 @@ direction and the primary obligation lives in those other RFCs.
 >     advances the version by one.
 >   - It attaches to a new leaf with a new id.
 >   - One of the existing guards rejects it (template ceiling,
->     below-floor match, degenerate widening). It is recorded as a
->     parse failure with its body retained.
+>     degenerate widening). It is recorded as a parse failure with its
+>     body retained. *(A below-floor match mints a new leaf since the
+>     §6.3 2026-10-23 amendment.)*
 >
 >   It never attaches silently, and no id is reused (§6.1 *Template
 >   identity*, RFC 0059).
@@ -924,6 +925,23 @@ direction and the primary obligation lives in those other RFCs.
 >   wildcard on a leaf's descend path, restores to the same leaf, so
 >   that a line which mined to it before the restart mines to it
 >   after the restart
+
+> **Scenario RFC0001.22 — A below-floor line mints its own template, and its next occurrence attaches to it**
+> - **Given** a tenant whose bucket for a line's
+>   `(severity, scope, length, prefix)` already holds a template whose
+>   similarity to the line is below `similarity_floor`
+> - **When** the line is mined
+> - **Then** it gets a new `template_id` whose template is its masked
+>   line, with a `template_created` audit event, `confidence = 1.0`, no
+>   forced body retention, and no change to
+>   `ourios.miner.parse_failures`
+> - **And** a second occurrence of the same event (same masked tokens,
+>   different masked values) attaches to that new id
+> - **And** at the template ceiling the same line is a
+>   `template_ceiling` parse failure with its body retained
+> - **And** a line in the lossy zone still mints with its body retained
+> - (Locks §6.3's 2026-10-23 amendment: below the floor behaves as no
+>   candidate.)
 
 ## 6. Proposed design
 
@@ -1567,8 +1585,9 @@ For each ingested OTLP `LogRecord`:
 >   attaches through an audited mutation: a widening, a type expansion
 >   (a `{STR}` slot gaining `TS` or `NUM`), or both, in RFC0001.7's
 >   order, with one version increment per event. Otherwise it gets a
->   new id, or a guard rejects it (template ceiling, below-floor match,
->   degenerate widening) recorded as a parse failure with the body
+>   new id, or a guard rejects it (template ceiling, degenerate
+>   widening; a below-floor match mints a new id since the §6.3
+>   2026-10-23 amendment) recorded as a parse failure with the body
 >   retained. It is never silent, and no id is reused. Old leaves keep
 >   their ids and stay queryable.
 > - Fresh string-body leaves emit `template_created` (RFC 0017 §3.1,
@@ -1692,9 +1711,14 @@ For each ingested OTLP `LogRecord`:
         ourios.miner.body_retention.utilization.observe(retained = true)
         return
 
-    # similarity < floor: parse failure
-    ourios.miner.parse_failures.inc()
-    emit_failure_record(L_raw, reason = "no candidate above floor")
+    # similarity < floor: a genuinely different event (§6.3,
+    # 2026-10-23 amendment). Mint a fresh leaf exactly as the
+    # candidate-is-None branch does: clean, confidence 1.0, no
+    # forced body retention. The template ceiling still applies.
+    leaf = new Leaf(template = L_masked)
+    parent.leaves.push(leaf)
+    attach(L_masked, typed_params, separators, leaf,
+           confidence = 1.0, lossy_flag = false)
 ```
 
 Branching invariants:
@@ -1752,7 +1776,8 @@ Three zones, with concrete defaults:
   available either way).
 - `confidence < floor / threshold`: **parse failure**.
   `ourios.miner.parse_failures` increments; the line is written to a
-  failure record with the original bytes intact.
+  failure record with the original bytes intact. *(Superseded by the
+  2026-10-23 amendment below: this zone now mints a fresh leaf.)*
 
 **Defaults.** `threshold = 0.7`, `floor = 0.4`. The threshold floor
 is fixed by `[§3.1]` ("threshold ≥ 0.7, lowering requires an RFC,
@@ -1762,6 +1787,46 @@ default threshold, on the reasoning that lines below the paper's own
 bar are likely genuinely different events. Tuning the floor is a
 per-tenant config decision; it is not load-bearing for any
 invariant.
+
+> **Amendment (2026-10-23, #1007, maintainer-approved) — a below-floor
+> line mints its own template.** Below the floor the line is, by the
+> reasoning above, a genuinely different event from its best candidate.
+> Failing it was inconsistent with the candidate-is-`None` branch, which
+> mints a fresh leaf for exactly that kind of line:
+> - **Order dependence.** A line minted while its
+>   `(severity, scope, length, prefix)` bucket was empty, and failed
+>   once the bucket held any unrelated template. A recurring event that
+>   first arrived in an occupied bucket could never get a template: each
+>   occurrence failed, so no leaf for it ever existed to attach to.
+> - **Production evidence.** On `eq-perses` the `everquest` service's
+>   `below_floor` share was 64–87 % of its lines on a weeks-old tree,
+>   2 % after the 2026-10-17 empty-store restart, and 27–32 % five days
+>   later. The share follows the tree's age, not the input.
+>
+> **The new rule.** `confidence < floor / threshold` mints a fresh leaf
+> exactly as the candidate-is-`None` branch does: clean, `confidence =
+> 1.0`, no forced body retention, a `template_created` audit event. The
+> floor now separates the two kinds of new leaf:
+> - **Lossy zone** (`floor ≤ simSeq < threshold`): a near miss, the one
+>   case where the line might be the candidate's event with different
+>   tokens. It mints with the body retained, as before; `[§3.1]`'s
+>   retention rule is unchanged.
+> - **Below the floor**: not a near miss, so nothing is ambiguous and
+>   no body is forced. The template is `L_masked` verbatim, so `[§3.3]`
+>   reconstruction is exact by construction.
+>
+> **What is unchanged.** The template ceiling (RFC 0023) still turns a
+> mint at the ceiling into a `template_ceiling` parse failure, and id
+> reservation failures still fail. No merge happens on this path, so
+> `ourios.miner.merges` is unaffected. The `below_floor` member stays in
+> the `ourios.miner.parse_failure.reason` registry enum and keeps its
+> zero point (§6.8); the miner no longer emits it with a non-zero
+> value. Removing it is a separate semantic-conventions change.
+>
+> **Cost.** More templates: one per distinct below-floor event, bounded
+> by the ceiling. A one-off line costs a template it never shares; a
+> recurring one gains the template it could not get before. The
+> criterion is RFC0001.22.
 
 ### 6.4 Merge policy `[§3.1]`
 
@@ -2467,6 +2532,8 @@ and emits real data under the required attributes.
 >       `ourios.miner.parse_failure.reason` member (`below_floor`,
 >       `empty_line`, `tokenizer_failure`, `degenerate_widening`,
 >       `line_too_long`, `template_ceiling`, `id_reservation_failed`).
+>       `below_floor` keeps its zero point but is no longer emitted
+>       with a non-zero value (§6.3, 2026-10-23 amendment).
 >   - `ourios.miner.params.overflow` and
 >     `ourios.miner.template.version_changes` record one point each,
 >     on `ourios.tenant` alone.
@@ -2906,6 +2973,16 @@ resolves bidirectionally between RFC and tests.
   > *Covers:* RFC0001.17, RFC0001.18, RFC0001.19, RFC0001.20,
   > RFC0001.21.
 
+  > **Amendment (2026-10-23, #1007, maintainer-approved).** A
+  > cluster-level test covers RFC0001.22: a bucket seeded with an
+  > unrelated template, a below-floor line, its second occurrence, the
+  > ceiling case and a lossy-zone control. The corpus template-count
+  > bounds are re-baselined where this rule raises a count, since a rise
+  > is the expected effect here; each rise is reported with the
+  > `parse_failures` drop it trades for. Merges must not change.
+  >
+  > *Covers:* RFC0001.22.
+
 - **Corpus tests** on `testdata/corpus/` (fixed, anonymised; see
   `docs/benchmarks.md` §1): assert bounds on
   `ourios.miner.template.count`, `ourios.miner.merges`,
@@ -3135,7 +3212,9 @@ and the remaining future work is the two items below them.
       have" been parse failures), tighten; if too narrow (too
       many parse failures on lines a human would accept),
       loosen. This is per-tenant tunable; the question is the
-      out-of-the-box default.
+      out-of-the-box default. *(Since the §6.3 2026-10-23
+      amendment the floor only decides which new leaves keep their
+      body; it no longer decides whether a line gets a template.)*
 - [ ] Tree depth `d`. Paper default 4; Drain3 default 4. Open
       question: do any of our representative corpora benefit from
       `d = 3` or `d = 5`?

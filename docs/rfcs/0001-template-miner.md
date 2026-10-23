@@ -2995,10 +2995,12 @@ resolves bidirectionally between RFC and tests.
   > ceiling case and a lossy-zone control. The corpus template-count
   > bounds are re-baselined where this rule raises a count, since a rise
   > is the expected effect here; each rise is reported with the
-  > `parse_failures` drop it trades for. Minting adds no merge. A change
-  > in corpus merge totals can only come from later lines widening a
-  > newly minted leaf; it is reported and each case reviewed against
-  > `[§3.1]` before the implementation merges.
+  > accompanying `parse_failures` change. Minting adds no merge. Corpus
+  > merge totals can still move either way: later lines can widen a
+  > newly minted leaf, and a tenant that reaches the template ceiling
+  > sooner (RFC 0023 §3.1) stops minting, and so stops widening,
+  > elsewhere. Every change in merges or parse failures is reported and
+  > reviewed against `[§3.1]` before the implementation merges.
   >
   > *Covers:* RFC0001.22.
 

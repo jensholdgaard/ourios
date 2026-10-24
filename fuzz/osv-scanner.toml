@@ -52,3 +52,16 @@ reason = "quick-xml <0.41 DoS via object_store; no upgrade path until an object_
 id = "RUSTSEC-2023-0071"
 ignoreUntil = 2026-12-31
 reason = "rsa Marvin side-channel needs RSA private-key ops; Ourios only verifies with public JWKS keys and never signs in production; mirrors deny.toml"
+
+# reason: `crypto-bigint` 0.5.5 (RUSTSEC-2026-0387) constant-time operations can
+# branch on their operands; only 0.7.6 fixes it. It reaches us only through
+# jsonwebtoken's rust_crypto backend (p256 / p384 0.13 -> elliptic-curve 0.13),
+# and jsonwebtoken 11.1 still pins p256 ^0.13, so no fixed version is reachable.
+# Ourios only verifies ES256 / ES384 signatures against the issuer's public JWKS
+# keys, so every operand is public and timing has no secret to leak. Mirrors the
+# reasoned `deny.toml` ignore. Remove when jsonwebtoken moves to p256 0.14;
+# re-evaluate if we ever sign tokens.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+ignoreUntil = 2026-12-31
+reason = "crypto-bigint 0.5 timing variability; reached only via jsonwebtoken ES256/ES384 verify with public JWKS keys, no secret operand; no fixed version reachable (jsonwebtoken pins p256 ^0.13); mirrors deny.toml"

@@ -9635,7 +9635,7 @@ Used by:
 
 - `tokio-stream` 0.1.19 — <https://github.com/tokio-rs/tokio>
 - `tokio-util` 0.7.18 — <https://github.com/tokio-rs/tokio>
-- `tokio` 1.53.2 — <https://github.com/tokio-rs/tokio>
+- `tokio` 1.54.1 — <https://github.com/tokio-rs/tokio>
 
 <details>
 <summary>Full license text</summary>

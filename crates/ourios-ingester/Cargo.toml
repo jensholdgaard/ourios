@@ -222,7 +222,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 # The metrics test collects via the in-memory reader's periodic-export
 # path, which needs a multi-thread runtime; `test-util` gives the RFC0008.8
 # latency test a paused virtual clock for deterministic, jitter-free timing.
-tokio = { version = "=1.53.2", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
 # RFC 0052 §3.1's publisher legs hold a PUT at the object-store seam
 # (`Store::wrap_backend`) — the one place the publisher's write waits with
 # no sink lock held. Both are already in the tree via ourios-parquet, as

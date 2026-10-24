@@ -168,9 +168,14 @@ auth:
 ```
 
 Layer-2 visibility inside a tenant (RFC 0047, RFC 0048) goes under
-`auth.openfga.visibility`. Every column it names must be a promoted
-attribute (see [Configuration](#configuration)); the server checks this at
-startup. Binding a `conversation` object turns on the graph emitter on the
+`auth.openfga.visibility`. The object column, `selfPrincipalColumn` and
+any identity columns you list must be promoted attributes (see
+[Configuration](#configuration)); the server checks this at startup.
+`contentColumns` names the fields masked from a metadata-only reader and
+needs no promotion (`body` is one). A custom `contentColumns` list
+**replaces** the default (`body` plus the GenAI message, instruction and
+tool-call attributes), so it must keep every field you still want masked,
+`body` included. Binding a `conversation` object turns on the graph emitter on the
 receiver and the compactor. The compactor's config then carries the same
 `auth` section and token env, so the `graph` verbs run from its pod:
 

@@ -531,6 +531,9 @@ type: "i64"' \
     "$(role_config "$role" "${promoted_args[@]}" \
         | sed -n '/^  promoted_attributes:/,/^[a-z]/p' | sed '$d' | sed 's/^ *//')"
 done
+check_fails "an unknown promotedAttributes scope fails render" \
+  "storage.promotedAttributes.resources: unknown scope" \
+  --set 'storage.promotedAttributes.resources[0]=k8s.namespace.name'
 check "promotedAttributes with only one list renders only that list" \
   'promoted_attributes:
 log:

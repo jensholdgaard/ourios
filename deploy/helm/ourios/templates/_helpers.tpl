@@ -135,6 +135,11 @@ storage:
 {{- if not (kindIs "map" $promoted) }}
 {{- fail (printf "storage.promotedAttributes must be a map with resource and log lists, got %v" $promoted) }}
 {{- end }}
+{{- range $scope, $_ := $promoted }}
+{{- if not (has $scope (list "resource" "log")) }}
+{{- fail (printf "storage.promotedAttributes.%s: unknown scope (expected resource or log)" $scope) }}
+{{- end }}
+{{- end }}
 {{- if or $promoted.resource $promoted.log }}
   promoted_attributes:
 {{- range $scope := list "resource" "log" }}

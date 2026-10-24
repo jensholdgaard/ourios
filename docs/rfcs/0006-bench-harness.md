@@ -980,7 +980,7 @@ Per `CLAUDE.md` §6.2 / `docs/verification.md` §2:
 - **RFC0006.1** — integration test in
   `crates/ourios-bench/tests/a1.rs`. Calls
   `ourios_bench::run` against a fixture corpus committed under
-  `crates/ourios-bench/tests/fixtures/`, captures the
+  `testdata/corpus/`, captures the
   resulting JSON, and asserts each formula leg
   (`raw_bytes` from `fs::metadata`, `total_parquet_bytes` from
   inspecting the output bucket, `zstd_bytes` from the

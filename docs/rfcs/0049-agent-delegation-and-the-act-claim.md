@@ -23,7 +23,7 @@ superseded-by: —
 
 [RFC 8693][rfc8693] defines the `act` (actor) claim: a token whose
 subject is one party and whose *acting* party is another. Ourios's OIDC
-verifier never inspects it (`crates/ourios-core/src/auth/oidc.rs`: the
+verifier never inspects it (`crates/ourios-serving/src/oidc.rs`: the
 principal is `sub`, and `agent:` versus `user:` is decided solely by the
 configured `agent_claim`). A deployment that turns on token exchange
 therefore gets **silent impersonation**: an agent presenting a valid

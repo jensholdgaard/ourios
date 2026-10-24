@@ -91,12 +91,11 @@ never swallow the role suffix, or all three roles collide on one SA. */ -}}
 {{- end }}
 
 {{/*
-The image reference (repository:tag). The tag defaults to `latest`, a floating
-tag that follows the newest release, rather than the chart appVersion. Pin a
-released tag via image.tag in production.
+The image reference (repository:tag). The tag defaults to the chart
+appVersion, so a chart version always deploys the same image.
 */}}
 {{- define "ourios.image" -}}
-{{- printf "%s:%s" .Values.image.repository (default "latest" .Values.image.tag) }}
+{{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
 {{- end }}
 
 {{/*

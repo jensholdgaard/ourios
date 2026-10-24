@@ -32,13 +32,16 @@ Compacted *row groups* are smaller than ingest-side ones: an adaptive
 1–32 MiB, for pruning granularity (RFC 0036 §3.3). Driven by the
 small-file hazard (H4).
 
-**Confidence.** `simSeq / threshold`, computed by the *miner* for
-each line against its best candidate template. The three-zone model
-(RFC 0001 §6.3): clean attach (`simSeq ≥ threshold`), lossy zone
+**Confidence.** The *miner* scores each line's best candidate
+template as `simSeq / threshold` and uses it to pick a zone (RFC 0001
+§6.3): clean attach (`simSeq ≥ threshold`), lossy zone
 (`floor ≤ simSeq < threshold`: a fresh leaf, body retained), and
 below the *floor* (a fresh clean leaf, as for a line with no
-candidate). **(Ourios)** — extends Drain, which is
-binary-classifying.
+candidate). The stored `confidence` column keeps that ratio only for
+lossy-zone rows. Clean attaches, fresh clean leaves (below-floor mints
+included) and structured rows store `1.0`, and parse failures store
+`0.0`, so a confidence predicate cannot pick out below-floor rows.
+**(Ourios)** — extends Drain, which is binary-classifying.
 
 **Corpus.** A collection of anonymised log lines used as test input.
 Lives under `testdata/corpus/`. Public LogPAI corpora form the
@@ -237,8 +240,12 @@ templates.
 **Template id.** See *`template_id`*: a `u64` the miner allocates
 in first-observation order from one cluster-wide id space, drawing
 only from blocks durably reserved in the store (RFC 0059). Ids are
-monotonic within each *tenant* but not dense, and never shared
-across tenants (RFC 0001 §6.1, "Template identity"). Not a hash of the template
+unique against every id still bound by stored data or audit, and
+never shared across tenants. They are not dense, and they increase
+only per allocator: two receivers interleave disjoint blocks, and a
+quiesced re-bootstrap may restart lower, so comparing ids across a
+*tenant* does not give creation order (RFC 0059 §3.7; RFC 0001 §6.1,
+"Template identity"). Not a hash of the template
 string — RFC 0001 rejects content hashing as a tenant-isolation leak.
 
 **Template tree.** The Drain parse tree, scoped per *tenant*. Its

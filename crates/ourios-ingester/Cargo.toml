@@ -64,10 +64,8 @@ ourios-config = { path = "../ourios-config" }
 ourios-core = { path = "../ourios-core" }
 # RFC 0030 TLS seam: rustls builds each listener's ServerConfig (already
 # in the workspace tree via reqwest; the provider is pinned to ring in
-# code, so only that provider feature is enabled here), and pki-types'
-# `pem` feature reads the cert/key/CA files.
+# code, so only that provider feature is enabled here).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
 # tokio-rustls wraps each accepted TcpStream in the TLS handshake for
 # the RFC 0030 listener acceptors; pinned to rustls 0.23's `ring`
 # provider (matching tls.rs) — already in the tree via reqwest.
@@ -80,8 +78,6 @@ futures-core = { version = "0.3", default-features = false }
 # are already in the tree via ourios-parquet.
 object_store = { version = "=0.13.2", default-features = false }
 async-trait = "=0.1.92"
-# `.next()` on the incoming stream inside the gRPC TLS adapter.
-tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 # Structured per-connection handshake-failure logs on the TLS listeners.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The ingest pipeline's WAL-before-ack durability (RFC 0003 §6.5 /

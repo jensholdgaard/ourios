@@ -2,8 +2,22 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-09-27** — a status reconciliation, not a new
+> Last updated: **2026-10-24** — a status reconciliation, not a new
 > milestone. §3's ladder is regenerated from every RFC's `status:`
+> front matter, RFC 0001 through RFC 0060. Since the prior entry,
+> RFC 0052 (WAL reclamation) went `green` on 2026-09-30 and RFC 0059
+> (durable template-id allocation) went `green` on 2026-10-06.
+> RFC 0058 (query resource limits) is `drafted`. RFC 0060 (background
+> template-map refresh) is `red`, with one live-check stub open.
+> RFC 0036 (write-side layout) was reopened to `red` on 2026-10-02
+> (#895) after a compaction memory regression. The miner gained
+> whole-token timestamp and decimal masking (v0.15.0) and mints a
+> template for a below-floor line instead of failing it (v0.16.0),
+> both as RFC 0001 amendments. The RFC0041.5 deferral and the Grafana
+> datasource follow-up are both closed.
+>
+> Prior entry — 2026-09-27: a status reconciliation. §3's ladder was
+> regenerated from every RFC's `status:`
 > front matter, RFC 0001 through RFC 0057: the 2026-08-25
 > completed-backlog batch flip moved most of the `green` rows to
 > `accepted`, and RFC 0007 and RFC 0009 are `accepted`, not
@@ -14,7 +28,8 @@
 > landed; DataFusion 55 arrived (RFC 0021 phase 2a, #773). The open arc
 > is WAL reclamation (RFC 0052, `red`, slices A–D1 merged), with
 > backpressure, unwind safety, publication frontiers and audit
-> durability drafted behind it (RFC 0053–0056).
+> durability drafted behind it (RFC 0053–0056). *(RFC 0052 has since
+> gone `green` — see the current entry.)*
 >
 > Prior entry — 2026-07-27: the typed-promotion arc landed
 > end-to-end and the dashboard decision is made. **RFC 0042** (typed numeric
@@ -169,7 +184,7 @@ goals, or post-MVP shipping concerns.
 
 ---
 
-## 3. Current state (as of 2026-09-27)
+## 3. Current state (as of 2026-10-24)
 
 **The thesis is proven on representative corpora.** All four gating
 thesis-gates pass authoritatively on the `benchmarks.md` §1 baseline
@@ -188,7 +203,7 @@ structural and template mining's value is logical / query-pruning,
 captured by B1/B2 (see `benchmarks.md` §2 / §7).
 
 **RFC ladder status** (read from each RFC's `status:` front matter on
-`main`, 2026-09-27):
+`main`, 2026-10-24):
 
 | RFC | Area | Status |
 |---|---|---|
@@ -227,12 +242,12 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0033 | Cached template-map artifact | **`accepted`** |
 | 0034 | D1 re-scope: per-node ingest-throughput bar | **`accepted`** — satisfied by the §9.20–§9.23 measurement series |
 | 0035 | Ingest concurrency (ordered mining, concurrent encode/publish) | **`accepted`** |
-| 0036 | Write-side layout (compaction-time service/time sort) | **`accepted`** |
+| 0036 | Write-side layout (compaction-time service/time sort) | `red` — reopened 2026-10-02 (#895): the compaction memory criterion RFC0036.3 was invalidated after `validated`; its two fixes (#900, #916) are on `main` |
 | 0037 | GenAI / structured-event log support | `green` |
 | 0038 | Self-tracing (OTel traces for Ourios itself) | **`accepted`** |
 | 0039 | Inbound trace-context propagation | **`accepted`** |
 | 0040 | DataFusion operator instrumentation | **`accepted`** |
-| 0041 | Dashboard datasource plugins (Grafana / Perses) | **`accepted`** — Perses plugins shipped in `ourios-perses-plugin`; Grafana an ungated follow-up |
+| 0041 | Dashboard datasource plugins (Grafana / Perses) | **`accepted`** — Perses plugins shipped in `ourios-perses-plugin`; the RFC0041.5 deferral closed and the Grafana datasource shipped in `ourios-grafana-datasource` |
 | 0042 | Typed numeric promotion (RFC 0022 amendment) | **`accepted`** |
 | 0043 | Derive `event_name` from the legacy `event.name` attribute | **`accepted`** |
 | 0044 | Template-aware body equality (`body ==` two-arm compile) | **`accepted`** |
@@ -243,12 +258,15 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0049 | Agent delegation and the RFC 8693 `act` claim | `specified` |
 | 0050 | Upstream-derived templates (`log.record.template`) | **`accepted`** |
 | 0051 | `ourios-serving`: shared serving infrastructure out of the ingest crate | `green` |
-| 0052 | WAL reclamation and quiesce recovery | `red` — slices A1 (#820), A2 (#821), B (#823), C (#828) and D1 (#831, the publication barrier) merged; four slice-D stubs and slices E–F remain |
-| 0053 | WAL backpressure | `drafted` |
+| 0052 | WAL reclamation and quiesce recovery | `green` (2026-09-30) — the RFC0052.17 `PUBLISHED` legs moved to RFC 0055 as RFC0055.5; the long soak run for `validated` is still to come |
+| 0053 | WAL backpressure | `drafted` — split from the original RFC 0053 draft into 0053–0056 (`0053-SPLIT.md`) |
 | 0054 | Publish unwind safety | `drafted` |
 | 0055 | Publication frontiers and tenant settlement | `drafted` |
 | 0056 | Audit-sink durability on permanent write failure (RFC 0005 amendment) | `drafted` |
 | 0057 | meta: move CLAUDE.md to AGENTS.md | `drafted` |
+| 0058 | Query resource limits | `drafted` |
+| 0059 | Durable template-id allocation (RFC 0001 amendment) | `green` |
+| 0060 | Background template-map refresh | `red` — RFC0060.8's weaver live-check is the one open stub |
 
 **Crates — fourteen workspace crates, thirteen of them product crates**
 (`ourios-core`, `-config`, `-miner`, `-wal`, `-parquet`, `-ingester`,
@@ -256,14 +274,18 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 `-df-otel`; the fourteenth, `-testgen`, is dev-only):
 
 - **`ourios-miner`** — the Drain-derived miner, RFC 0001 `accepted`:
-  `(severity, scope)` keying, three-zone confidence, widening +
-  type-expansion with audit events, 256 B param-overflow spill,
+  `(severity, scope)` keying, three-zone confidence (a below-floor line
+  mints its own template), whole-token UUID / IPv4 / timestamp / number
+  masking (decimals included), durable template-id allocation
+  (RFC 0059), widening + type-expansion with audit events, 256 B
+  param-overflow spill,
   bit-identical reconstruction + the H7.3 render contract, structured-body
   canonical encoding, and §6.9 snapshot + v2 restore. Zero
   `#[ignore]`/`todo!()` acceptance stubs.
 - **`ourios-wal`** — RFC 0008 `accepted`: append/sync, crash recovery (the
   real-SIGKILL CI gate), snapshot-restore, segment rotation, group-commit
   batched fsync, checkpoint-driven truncation; §5 arms .1–.10 green.
+  RFC 0052 (`green`) adds segment reclamation and quiesce recovery.
 - **`ourios-parquet`** — RFC 0005 §3: atomic-publish writer + reader with
   the §3.9 compat contract, the §3.7 audit-event series, and the §3.6
   encoding policy (dict + page index + `template_id` bloom filter).
@@ -296,7 +318,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
   **`-server`** — shared types + tenancy + record/audit shapes; the RFC
   0004 miner tunables (split out per RFC 0028 §3.2); the
   weaver-generated OTel name constants; the OTel export surface —
-  metrics (RFC 0018) and, since RFC 0038/0039, traces; the two-role
+  metrics (RFC 0001 §6.8) and, since RFC 0038/0039, traces; the two-role
   binary, now with TLS/mTLS (RFC 0030), an OIDC bearer layer (RFC 0029),
   and the S3-native Helm chart, deploy-validated on kind.
 
@@ -310,20 +332,20 @@ and the shipping milestone that followed (WAL, wire endpoints, DSL,
 auth, S3, Helm — the whole §5 table below except Perses) is
 substantially done. What's actually open:
 
-- **The Perses plugins** — RFC 0041 is `accepted` (2026-07-28,
-  terminal): all three plugins shipped in `ourios-perses-plugin`, the
-  RFC0041.6 dashboard is committed in this repo and verified rendering.
-  What remains is RFC0041.5's recorded deferral (the `latest` e2e leg +
-  wire-level `sum`, unblocked by the next server release, tracked in
-  the plugin repo) and the Grafana datasource as an ungated follow-up.
+- ~~The Perses plugins~~ — done. RFC 0041 is `accepted` (2026-07-28,
+  terminal). The RFC0041.5 deferral closed with v0.6.0, and the Grafana
+  datasource shipped in its own repository.
 - ~~RFC 0040 → `accepted`~~ — done (2026-07-28), alongside RFC 0041 and
   RFC 0042: all three flipped `accepted` on maintainer sign-off.
-- **WAL reclamation and its follow-ons** — RFC 0052 is `red` with
-  slices A1–D1 merged (#820, #821, #823, #828, #831); the remaining
-  slice-D stubs, the timer/telemetry slice E and the crash/soak slice F
-  are open. RFC 0053 (backpressure), RFC 0054 (publish unwind safety),
-  RFC 0055 (publication frontiers) and RFC 0056 (audit durability) are
-  `drafted` and depend on it.
+- **WAL reclamation follow-ons** — RFC 0052 is `green` (2026-09-30);
+  its long soak run for `validated` is still to come. RFC 0053
+  (backpressure), RFC 0054 (publish unwind safety), RFC 0055
+  (publication frontiers) and RFC 0056 (audit durability) are `drafted`.
+- **RFC 0036 reopened** — `red` since 2026-10-02 (#895). Both memory
+  fixes (#900, #916) are on `main`; the RFC file still reads `red`.
+- **RFC 0060** (background template-map refresh) is `red`, with the
+  RFC0060.8 weaver live-check open. **RFC 0058** (query resource
+  limits) is `drafted`.
 - RFC 0049 (agent delegation, the `act` claim) is `specified`; RFC 0057
   (`meta:` CLAUDE.md → AGENTS.md) is `drafted`.
 - Scattered §7/§9 open items on already-`green`/`accepted` RFCs (e.g.
@@ -456,11 +478,11 @@ records what shipped and what's still genuinely open.
 | **Write-ahead log** (`ourios-wal`) | Corpus replay is bounded and reproducible; durability is irrelevant for thesis-proving | **Landed** — RFC 0008 `accepted`: append/sync, real-SIGKILL crash recovery, snapshot-restore, group-commit batched fsync |
 | **OTLP wire endpoints** (gRPC + HTTP listeners) | Bench reads OTLP from disk, not the network — see Phase 3 | **Landed** — RFC 0003 `accepted`: gRPC + HTTP receivers, WAL-before-ack; tenancy out of band per RFC 0046 |
 | **Snapshot mechanism** (RFC 0001 §6.9) | Corpus runs from cold start; replay budget moot | **Landed** — part of RFC 0008 (`accepted`), v2 restore format |
-| **Full §6.8 telemetry surface** | One or two metrics suffice for the bench; the §3.1.2 mandatory set is a production observability concern | **Landed** — OTel meters + OTLP metric exporter (RFC 0018 `accepted`); Ourios's own logs ship via its own OTLP exporter (dogfooded: one deployment ingests another's telemetry). **Traces landed too** (2026-07-24/25): RFC 0038 gives request-scoped spans on ingest/query/`/mcp`/sweep, RFC 0039 continues an inbound caller's trace rather than starting a new one, and RFC 0040 adds a DataFusion operator span tree under a query. All three signals are now configured through the standard `OTEL_*` env vars |
+| **Full §6.8 telemetry surface** | One or two metrics suffice for the bench; the §3.1.2 mandatory set is a production observability concern | **Landed** — OTel meters + OTLP metric exporter (RFC 0001 §6.8); Ourios's own logs ship via its own OTLP exporter (dogfooded: one deployment ingests another's telemetry). **Traces landed too** (2026-07-24/25): RFC 0038 gives request-scoped spans on ingest/query/`/mcp`/sweep, RFC 0039 continues an inbound caller's trace rather than starting a new one, and RFC 0040 adds a DataFusion operator span tree under a query. All three signals are now configured through the standard `OTEL_*` env vars |
 | **Query DSL** (RFC 0002) | Raw SQL through DataFusion serves the bench; DSL is operator UX | **Landed** — RFC 0002 `accepted`, including the `param(n)`/`bucket(width)` aggregation amendment |
-| **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | **Partially landed** — authentication + enforced tenant binding (RFC 0026), out-of-band tenancy where the credential names the tenant and the data never does (RFC 0046, superseding RFC 0045), ReBAC graph-fed visibility inside a tenant (RFC 0047), and the tenant id grammar, erasure and backfill surfaces (RFC 0048) are all `accepted`; rate-limit/eviction/lifecycle orchestration is still open, tied to an operator-console RFC that hasn't been drafted (RFC 0001 §9) |
+| **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | **Partially landed** — authentication + enforced tenant binding (RFC 0026), out-of-band tenancy where the credential names the tenant and the data never does (RFC 0046, superseding RFC 0045), ReBAC graph-fed visibility inside a tenant (RFC 0047), and the tenant id grammar, erasure and backfill surfaces (RFC 0048) are all `accepted`; rate-limit/eviction/lifecycle orchestration is still open, tied to an operator-console RFC that hasn't been drafted (RFC 0001 §9). RFC 0058 (`drafted`) covers query resource limits only, not ingest rate limits |
 | **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | **Landed** — two-role binary with TLS/mTLS (RFC 0030) + OIDC (RFC 0029); S3-native Helm chart shipped and deploy-validated on kind |
-| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Landed** (the plugin half) — **RFC 0041 `accepted`** (`green` 2026-07-27): three plugins (`Datasource`, `LogQuery`, `TimeSeriesQuery`) shipped in the dedicated `ourios-perses-plugin` repository, and the committed FinOps dashboard (RFC0041.6, `examples/perses/`) rendered unmodified against the live dogfood capture. Both hosts were spiked and measured first; RFC0041.5 carries a recorded deferral until the next server release; the Grafana datasource is an ungated follow-up. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
+| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Landed** (the plugin half) — **RFC 0041 `accepted`** (`green` 2026-07-27): three plugins (`Datasource`, `LogQuery`, `TimeSeriesQuery`) shipped in the dedicated `ourios-perses-plugin` repository, and the committed FinOps dashboard (RFC0041.6, `examples/perses/`) rendered unmodified against the live dogfood capture. Both hosts were spiked and measured first. The RFC0041.5 deferral closed with v0.6.0, and the Grafana datasource shipped in its own repository. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
 
 **Note on OTLP scope (historical).** The pre-amendment roadmap
 listed "OTLP receiver (gRPC + HTTP)" as a single post-MVP item.

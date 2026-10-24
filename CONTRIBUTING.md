@@ -19,22 +19,32 @@ Thanks for your interest! ourios is design-first and pre-release.
 We follow [Conventional Commits](https://www.conventionalcommits.org/) for the
 history that lands on `main`, but we don't dictate how you craft your branch.
 
-- **PR titles must be conventional** (enforced by CI). The title is what ends
-  up on `main` if your PR is squashed.
-- **Per-commit conventional messages are encouraged but not required.** A bot
-  will comment if your commits don't conform — that's a hint to the reviewer,
-  not a blocker.
-- **Choose the merge strategy that fits the change:**
+- **PR titles must be conventional.** The `PR Title` check (`lint`) is required
+  on `main`. The title is what ends up on `main` if your PR is squashed.
+- **Per-commit conventional messages are encouraged but not required.** The
+  advisory `Commitlint` check reports commits that don't conform. It never
+  blocks a merge.
+- **Choose the merge strategy that fits the change.** `main` requires linear
+  history, so merge commits are not possible:
   - **Squash** — default, especially if commits are messy or non-conventional.
   - **Rebase** — when each commit is meaningful and individually conventional.
-  - **Merge commit** — for landing larger features (e.g. an RFC implementation)
-    where preserving the branch shape matters.
 
 Reviewers pick the strategy at merge time. When in doubt, squash.
 
-## Signed commits required
+## What `main` requires
 
-`main` requires every commit to be signed and verified. Quick setup with SSH:
+The `main protection` ruleset requires:
+
+- a pull request, with every review thread resolved (no approval count is set);
+- the `CI Success` and `lint` (PR title) status checks, on a branch that is up
+  to date with `main`;
+- linear history (squash or rebase only);
+- no force-pushes and no deletion of `main`.
+
+## Signing commits
+
+Signed commits are encouraged but the ruleset does not require them. Quick
+setup with SSH:
 
 ```bash
 git config --global gpg.format ssh
@@ -53,9 +63,9 @@ Every non-merge commit in a PR must be **signed off** with the [Developer
 Certificate of Origin](https://developercertificate.org/) (DCO 1.1). This is
 separate from the cryptographic signing above: signing proves *who* authored
 the commit, sign-off certifies you have the *right* to submit it under the
-project's license. Both are required, and CI enforces the sign-off (merge
-commits and PRs opened by a bot actor — e.g. Renovate, Dependabot — are
-exempt).
+project's license. Sign-off is required, and the `dco` workflow checks it on
+every PR (merge commits and PRs opened by a bot actor — e.g. Renovate,
+Dependabot — are exempt).
 
 Add the trailer automatically with `-s`:
 

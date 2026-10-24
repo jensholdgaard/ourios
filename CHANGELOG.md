@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.16.0] - 2026-10-23
+
+### Behaviour change
+
+- A string-body line whose best candidate template is below `similarity_floor` now gets a template of its own, as a line with no candidate always did, instead of failing parse with `below_floor` (RFC 0001 §6.3 amendment, #1007). Such lines previously had no `template_id`, and a recurring event that first arrived in an occupied bucket could never get one. Expect fewer `ourios.miner.parse_failures` and more templates on tenants with varied lines; the template ceiling (`max_templates`) still bounds them. Lossy-zone body retention is unchanged.
+
+### Added
+
+- Mint a clean template for a below-floor line instead of failing it (#1084) (6aaaf75)
+
+### Documentation
+
+- Mint a template for a below-floor line instead of failing it (#1083) (b168001)
+- Require one compactor per store for erasure (#1082) (11af23e)
+
 ## [0.15.1] - 2026-10-22
 
 ### Security

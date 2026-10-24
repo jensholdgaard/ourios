@@ -125,7 +125,9 @@ under-counting) is evidence of fit, not a ranking.
   ([`docs/benchmarks.md` §9.13](docs/benchmarks.md)), and we publish it
   rather than argue with it.
 - **You live in the Grafana ecosystem** and its integrations are the
-  point.
+  point. Ourios has a
+  [Grafana datasource](https://github.com/jensholdgaard/ourios-grafana-datasource)
+  for its queries, but the rest of that ecosystem is built around Loki.
 - **You need years of operational hardening today.** Ourios is
   pre-release; the incumbents have production miles we simply do not.
 
@@ -186,7 +188,16 @@ One binary, three roles — **receiver**, **querier**, and the background
 WAL **before** it is acknowledged and before the miner touches it
 (WAL-before-ack, [`CLAUDE.md`](CLAUDE.md) §3.4), and object storage is
 the source of truth — in the S3-backed topology local disk holds only
-the WAL and caches (§3.6). All storage seams run against S3-compatible
+the WAL and caches (§3.6).
+
+Receivers and queriers scale out; the compactor does not. Run exactly
+one compactor per store. On the local backend two compactors can lose
+rows, and with erasure a second compactor can bring erased graph
+tuples back ([RFC 0047](docs/rfcs/0047-rebac-resolver-and-graph-visibility.md)
+§3.6). The Helm chart runs one compactor per release, but it cannot see
+other releases, so install one release per store.
+
+All storage seams run against S3-compatible
 object storage
 ([RFC 0013](docs/rfcs/0013-object-storage.md),
 [RFC 0019](docs/rfcs/0019-storage-backend-selection.md)); the local
@@ -204,13 +215,20 @@ code that turns them green. Statuses live in each RFC's frontmatter
   compliance-scenario set ([RFC 0003](docs/rfcs/0003-otlp-receiver.md),
   [RFC 0018](docs/rfcs/0018-otlp-log-spec-compliance.md)); WAL with
   fsync-before-ack and a SIGKILL crash-recovery test in CI
-  ([RFC 0008](docs/rfcs/0008-wal.md)); the record-sink write path
+  ([RFC 0008](docs/rfcs/0008-wal.md)); WAL reclamation and quiesce
+  recovery
+  ([RFC 0052](docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md));
+  the record-sink write path
   ([RFC 0014](docs/rfcs/0014-ingest-write-path.md)).
 - **Template miner** ([RFC 0001](docs/rfcs/0001-template-miner.md)) —
-  per-tenant Drain-derived trees, three-zone confidence matching,
+  per-tenant Drain-derived trees, three-zone confidence matching (a
+  line below the floor mints its own template), whole-token masking of
+  UUIDs, IPv4 addresses, timestamps and numbers (including decimals),
   byte-identical reconstruction (lossy lines flagged and retained
   verbatim), audited merges and aliases, bounded memory at corpus scale
-  ([RFC 0023](docs/rfcs/0023-bounded-template-memory.md)), and
+  ([RFC 0023](docs/rfcs/0023-bounded-template-memory.md)), template ids
+  that stay unique across restarts
+  ([RFC 0059](docs/rfcs/0059-durable-template-id-allocation.md)), and
   `ourios.miner.*` telemetry defined through an OTel weaver registry.
 - **Storage** — per-tenant, hour-partitioned Parquet on S3-compatible
   object storage ([RFC 0005](docs/rfcs/0005-parquet-storage.md),

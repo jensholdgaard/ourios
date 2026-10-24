@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::audit::ParamType;
 use crate::otlp::KeyValue;
+use crate::sync::lock_recover;
 use crate::tenant::TenantId;
 
 /// RFC 0001 §6.1 *Body representation* discriminator.
@@ -282,45 +283,27 @@ impl SharedRecordSink {
     /// Take ownership of every buffered record in emission order.
     /// The shared buffer is empty afterwards.
     ///
-    /// # Panics
-    ///
-    /// Panics if another thread panicked while holding the
-    /// internal mutex. A poisoned record buffer can't be trusted
-    /// to be complete or ordered.
+    /// A poisoned mutex is recovered: every critical section is one
+    /// `Vec` push, take or read, so a panic cannot leave the buffer torn.
     #[must_use]
     pub fn drain(&self) -> Vec<MinedRecord> {
-        self.inner
-            .lock()
-            .expect("record sink mutex poisoned")
-            .drain()
+        lock_recover(&self.inner).drain()
     }
 
-    /// # Panics
-    ///
-    /// As [`Self::drain`].
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("record sink mutex poisoned").len()
+        lock_recover(&self.inner).len()
     }
 
-    /// # Panics
-    ///
-    /// As [`Self::drain`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("record sink mutex poisoned")
-            .is_empty()
+        lock_recover(&self.inner).is_empty()
     }
 }
 
 impl RecordSink for SharedRecordSink {
     fn emit(&mut self, record: MinedRecord) {
-        self.inner
-            .lock()
-            .expect("record sink mutex poisoned")
-            .emit(record);
+        lock_recover(&self.inner).emit(record);
     }
 }
 
@@ -427,6 +410,30 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].template_id, 7);
         assert!(observer_handle.is_empty());
+    }
+
+    #[test]
+    fn shared_sink_keeps_working_after_its_mutex_is_poisoned() {
+        let handle = SharedRecordSink::new();
+        let t = TenantId::new("tenant-x");
+        let mut producer = handle.clone();
+        producer.emit(sample_clean_record(&t));
+
+        let inner = Arc::clone(&handle.inner);
+        let _ = std::thread::spawn(move || {
+            let _guard = inner.lock().unwrap();
+            panic!("poison the record sink");
+        })
+        .join();
+        assert!(handle.inner.is_poisoned());
+
+        producer.emit(sample_parse_failure_record(&t));
+        assert_eq!(handle.len(), 2);
+        assert!(!handle.is_empty());
+        let drained = handle.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].template_id, 7);
+        assert!(handle.is_empty());
     }
 
     #[test]

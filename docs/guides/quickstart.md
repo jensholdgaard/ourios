@@ -49,8 +49,8 @@ OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
 ./ourios-server
 ```
 
-Startup prints the bound addresses and warns once that auth is in
-open mode:
+Startup prints the bound addresses on stdout, and warns once on
+stderr that auth is in open mode:
 
 ```text
 receiver gRPC listening on 127.0.0.1:4317
@@ -89,7 +89,9 @@ exporters:
 An SDK sets the same header through the standard variable:
 `OTEL_EXPORTER_OTLP_HEADERS=x-ourios-tenant=checkout`.
 
-Or hand-deliver one OTLP/JSON record for a first smoke test:
+Or hand-deliver one OTLP/JSON record for a first smoke test. The
+`date` expression stamps it with the current time, so it falls inside
+the query's default one-hour window:
 
 ```sh
 curl -s http://localhost:4318/v1/logs \
@@ -101,7 +103,7 @@ curl -s http://localhost:4318/v1/logs \
         { "key": "service.name", "value": { "stringValue": "checkout" } }
       ]},
       "scopeLogs": [{ "logRecords": [{
-        "timeUnixNano": "1751971200000000000",
+        "timeUnixNano": "'"$(date +%s)"'000000000",
         "severityNumber": 9,
         "body": { "stringValue": "user 42 logged in" }
       }]}]
@@ -109,14 +111,22 @@ curl -s http://localhost:4318/v1/logs \
   }'
 ```
 
-An empty `{}` response is the OTLP success shape. The batch is
-fsynced to the write-ahead log **before** that acknowledgement — kill
-the process mid-ingest and acknowledged data survives.
+A `{"partialSuccess":null}` response means the whole batch was
+accepted. The batch is fsynced to the write-ahead log **before** that
+acknowledgement — kill the process mid-ingest and acknowledged data
+survives.
+
+The querier reads Parquet only. A low-volume batch is written to
+Parquet once it is five minutes old, checked every 30 seconds, so it
+becomes queryable within about five and a half minutes. To see it
+sooner, stop the server with Ctrl-C (shutdown flushes everything
+buffered) and start it again.
 
 ## 4. Query
 
 `POST /v1/query` takes the logs DSL as plain text, with the tenant in
-a header:
+a header. A query with no `range(...)` stage covers the last hour
+(`OURIOS_QUERIER_DEFAULT_WINDOW_SECS`, default 3600):
 
 ```sh
 curl -s http://localhost:4319/v1/query \
@@ -132,15 +142,21 @@ statistics that show the Parquet pruning at work:
 ```json
 {
   "rows": 1,
-  "stats": { "row_groups_scanned": 1, "row_groups_pruned": 0, "bytes_read": 4096 },
+  "stats": { "row_groups_scanned": 1, "row_groups_pruned": 0, "bytes_read": 129, "rows_excluded": 0 },
   "records": [ {
-    "time_unix_nano": 1751971200000000000,
+    "time_unix_nano": 1792876565000000000,
     "severity_number": 9,
+    "template": "user <*> logged in",
     "body": { "kind": "rendered", "line": "user 42 logged in", "reconstruction": "faithful" },
     "...": "..."
   } ]
 }
 ```
+
+`"rows": 0` with no records usually means the record is still waiting
+to be flushed (see above). An aggregation query such as
+`true | count by service` also returns an `aggregate` list with one
+entry per group.
 
 The DSL's full grammar — field predicates, regex, time ranges,
 aggregation pipelines like

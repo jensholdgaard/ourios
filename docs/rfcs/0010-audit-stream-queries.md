@@ -33,7 +33,7 @@ superseded-by: —
 >
 > **RFC0010.1 discharges RFC 0001 H5.3.** That hazard test was *relocated*
 > out of `crates/ourios-miner/tests/hazards.rs` (now a relocation pointer
-> there) to `crates/ourios-querier/tests/drift.rs::h5_3_drift_query_returns_templates_that_gained_a_version`,
+> there) to `crates/ourios-querier/tests/it/drift.rs::h5_3_drift_query_returns_templates_that_gained_a_version`,
 > where the `drift` surface lives — it is no longer `#[ignore]` / `todo!()`.
 >
 > This RFC **extends** RFC 0002 (it does not reopen or renumber it; RFC 0002
@@ -447,7 +447,7 @@ the pushdown surface for exactly this query), scan stats surfaced on the
 result.
 
 The querier today scans only the `data/` series and rejects `Count` / `Agg`
-stages (`crates/ourios-querier/src/compile.rs`). This RFC adds the audit
+stages (`crates/ourios-querier/src/compile.rs`, now `crates/ourios-querier/src/plan/`). This RFC adds the audit
 source and the one closed aggregation the drift head needs — it does **not**
 unblock the general `Count` / `Agg` stages over `data/`, which remain the
 RFC 0002 deferred work (§8 alternative A).

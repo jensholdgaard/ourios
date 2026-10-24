@@ -168,7 +168,7 @@ Extend the `count … by` group surface so a `GroupTerm` may reference a
 **promoted** attribute column (`service` already works; generalize to
 `resource.<key>` / `attr.<key>` when the key is in the effective promoted
 set and its column is present in the scanned union schema). The compiler
-(`crates/ourios-querier/src/compile.rs` `field_group_expr`) currently
+(`crates/ourios-querier/src/plan/group.rs` `field_group_expr`) currently
 rejects `Field::Resource(_)` / `Field::Attr(_)` group keys; allow them
 **only** when promoted, falling back to the same typed-NULL literal that
 `service` uses for partitions predating the promotion. A non-promoted

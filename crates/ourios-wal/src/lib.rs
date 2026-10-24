@@ -11,7 +11,7 @@
 //! startup recovery driver. Segment file layout (`segment`), frame
 //! format (`frame`), fsync policy, recovery walk and the `CHECKPOINT`
 //! sidecar (`checkpoint`) follow §§6.2–6.7. The §9 corruption *audit
-//! event* is the open item: `encode_audit_event` stays `unimplemented!()`
+//! event* is the open item: no `AuditEvent` frame encoder exists yet,
 //! pending a system-scoped-audit design.
 //!
 //! **RFC 0052** covers giving disk back. `retain` derives which closed
@@ -27,8 +27,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, ErrorKind};
 use std::path::PathBuf;
-
-use ourios_core::audit::AuditEvent;
 
 pub(crate) mod checkpoint;
 mod export;
@@ -117,10 +115,10 @@ pub enum FrameKind {
     /// frame carries no tenant, so current replay refuses it as
     /// unsupported (not corruption) — see [`TenantBatch`].
     OtlpBatch = 0x01,
-    /// One serialised [`AuditEvent`]. The exact encoding is still
-    /// deferred per RFC 0008 §9 — `encode_audit_event` is
-    /// `unimplemented!()` pending the system-scoped-audit design — but
-    /// the frame layout does not depend on it.
+    /// One serialised [`AuditEvent`](ourios_core::audit::AuditEvent).
+    /// The exact encoding is still deferred per RFC 0008 §9 — no encoder
+    /// exists yet, pending the system-scoped-audit design — but the frame
+    /// layout does not depend on it.
     AuditEvent = 0x02,
     /// RFC 0046 §3.3: the tenant the export was acknowledged under,
     /// then the `ExportLogsServiceRequest` protobuf bytes —
@@ -2442,16 +2440,6 @@ pub enum CorruptionReason {
     NonZeroPad,
     OversizeLen,
     TornOnClosedSegment,
-}
-
-/// Stub helper that lets a test create an
-/// [`AuditEvent`]-bearing frame payload once the encoder
-/// lands (the §9 open-question encoder choice). Documented
-/// here so the trait surface is complete; returns
-/// `unimplemented!()` for now.
-#[must_use]
-pub fn encode_audit_event(_event: &AuditEvent) -> Vec<u8> {
-    unimplemented!("RFC 0008 §9 — AuditEvent serde format lands with the encoder PR");
 }
 
 #[cfg(test)]

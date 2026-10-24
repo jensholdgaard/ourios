@@ -38,7 +38,7 @@ superseded-by: —
 > 11 / 28 rows); (3) second corpus family for B2 — **✓ done**
 > (HDFS_v1 via the query-bench arm). Earlier history: the §5
 > acceptance criteria RFC0007.1–.5 went `green` via
-> `crates/ourios-querier/tests/{execution,boundary,forward_compat}.rs`
+> `crates/ourios-querier/tests/it/{execution,boundary,forward_compat}.rs`
 > and the `crates/ourios-querier/src/lib.rs` no-leakage unit test
 > (`tests/acceptance.rs` is a pointer to them); the first indicative
 > `ci-runner` B1/B2 readings are §9.3. `accepted` follows on

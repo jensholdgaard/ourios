@@ -4,8 +4,13 @@ The release pipeline publishes a multi-arch image (amd64 + arm64) to
 GHCR, cosign-signed keyless:
 
 ```sh
-docker pull ghcr.io/jensholdgaard/ourios:0.1.1
+docker pull ghcr.io/jensholdgaard/ourios:0.16.0
 ```
+
+Each release `vX.Y.Z` is tagged `X.Y.Z` and `X.Y` (the latter moves to
+the newest patch release), plus `latest`. The examples on this page use
+0.16.0; substitute the release you want from the
+[releases page](https://github.com/jensholdgaard/ourios/releases).
 
 Verify the signature before trusting it — the identity is pinned to
 the exact release tag, so **substitute both occurrences of the
@@ -15,9 +20,9 @@ is the authoritative verification reference):
 
 ```sh
 cosign verify \
-  --certificate-identity 'https://github.com/jensholdgaard/ourios/.github/workflows/image.yml@refs/tags/v0.1.1' \
+  --certificate-identity 'https://github.com/jensholdgaard/ourios/.github/workflows/image.yml@refs/tags/v0.16.0' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  ghcr.io/jensholdgaard/ourios:0.1.1
+  ghcr.io/jensholdgaard/ourios:0.16.0
 ```
 
 ## Image variants
@@ -42,7 +47,20 @@ All three run identically (same flags, ports, and config surface below).
 ## Run
 
 Same binary, same configuration surface as the
-[quickstart](./quickstart.md) — env vars, or a mounted config file:
+[quickstart](./quickstart.md) — env vars, or a mounted config file.
+
+The image runs as the non-root user `65532:65532` and does not contain
+`/var/lib/ourios`, so a new named volume mounted there is owned by
+root and the server cannot write to it. Create the volume and hand it
+to that user once:
+
+```sh
+docker volume create ourios-data
+docker run --rm -v ourios-data:/var/lib/ourios busybox \
+  chown 65532:65532 /var/lib/ourios
+```
+
+Then run the server:
 
 ```sh
 docker run --rm \
@@ -52,8 +70,13 @@ docker run --rm \
   -e OURIOS_WAL_ROOT=/var/lib/ourios/wal \
   -e OURIOS_RECEIVER_ENABLED=1 \
   -e OURIOS_QUERIER_ENABLED=1 \
-  ghcr.io/jensholdgaard/ourios:0.1.1
+  ghcr.io/jensholdgaard/ourios:0.16.0
 ```
+
+These `-p` mappings publish the listeners on every host interface, and
+this example has no auth. Use `-p 127.0.0.1:4317:4317` (and so on) to
+keep them on loopback, or configure
+[authentication](./authentication.md) first.
 
 With a config file instead (the production posture — auth lives in
 the file):
@@ -65,7 +88,7 @@ docker run --rm \
   -v "$PWD/ourios.yaml:/etc/ourios/ourios.yaml:ro" \
   -e OURIOS_EDGE_TOKEN \
   -e OURIOS_S3_ACCESS_KEY_ID -e OURIOS_S3_SECRET_ACCESS_KEY \
-  ghcr.io/jensholdgaard/ourios:0.1.1 \
+  ghcr.io/jensholdgaard/ourios:0.16.0 \
   --config /etc/ourios/ourios.yaml
 ```
 

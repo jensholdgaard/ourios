@@ -13,6 +13,21 @@ created: 2026-04-24
 *A lecture manuscript. Prose is written for spoken delivery; figures
 are sized to lift onto slides.*
 
+> **Note (2026-10-24).** This manuscript dates from 2026-04-24. Three
+> things have changed since:
+> - **Compression framing.** §1 and the abstract sell mining as
+>   compression on top of zstd. RFC 0011 measured that a whole-stream
+>   codec captures the same redundancy, and RFC 0012 recast the 50–200×
+>   as a *logical* reduction whose payoff is query pruning (benchmark
+>   gates B1/B2), not fewer on-disk bytes.
+> - **Below the floor.** Since the RFC 0001 §6.3 amendment of
+>   2026-10-23, a line below the floor mints a clean template of its
+>   own instead of failing. §4.2 and Figure 3 are updated to match.
+> - **Open questions.** The items in §4.5 and §7 have since been
+>   delivered: RFC 0001 is accepted, masking is a fixed whole-token
+>   rule set (RFC 0001 §4.2, amended 2026-10-19), `resolves_to` ships
+>   in the DSL, and drift is a query (RFC 0010).
+
 ---
 
 ## Abstract
@@ -196,7 +211,7 @@ Step 4 — decide
     template unchanged (already fully general at that slot)
 
 Result
-    template_id  = hash("ERROR db connection failed for user <*>")
+    template_id  = group A's id (allocated when A was created)
     params       = ["42"]
 ```
 
@@ -230,7 +245,7 @@ request payloads into each line.
 This is not a criticism of the paper. This is a reminder that the
 paper reports *that there exists a sweet spot*, not *what it is for
 you*. In Ourios we default to a strict threshold — at least 0.7 —
-and expose it as tenant-configurable, and we gate any reduction
+and we gate any reduction
 below 0.7 behind an RFC. That last part matters. There is always an
 engineer who, when templates look noisy, wants to lower the
 threshold to "clean things up." What they are actually doing is
@@ -256,22 +271,32 @@ Ourios handles this with a three-zone model.
 
 ### Figure 3 — The three-zone confidence model
 
-![Three-zone confidence model: a horizontal axis from 0 to 1 with dashed verticals marking the floor and the threshold. The axis splits into three labelled zones — parse_failed (retain body, count error), lossy match (retain body and template, set lossy_flag), and clean match (template plus params only; body optional).](./img/fig-3-confidence-zones.svg)
+![Three-zone confidence model: a horizontal similarity axis from 0 to 1 with dashed verticals marking the floor (0.4) and the threshold (0.7). The axis splits into three labelled zones — below floor (a different event: new clean template), lossy zone (new template with the body retained; lossy_flag stays false), and clean attach (template plus params only).](./img/fig-3-confidence-zones.svg)
 
 Three zones, three behaviours. Above the threshold, the happy path:
-store the template id and the parameters. Below the threshold but
-above the floor — what I am calling the lossy zone — store the
-template id, the parameters, *and* the original body, and raise a
-flag on the row so the reader knows not to trust reconstruction
-against this row. Below the floor, parse failed altogether: store
-only the body, increment `parse_failures_total`, and move on.
+attach to the candidate and store the template id and the
+parameters. Below the threshold but above the floor — what I am
+calling the lossy zone — the line is a near miss. We do not force it
+into the candidate; it gets a new template of its own, and we also
+keep the original body on the row, because this is the one case
+where the line might really be the candidate's event. The
+`lossy_flag` stays false: reconstruction still works, and the body
+is there either way. Below the floor the line is simply a different
+event, so it gets a new clean template, exactly as if it had no
+candidate at all.
 
-The floor is the second most important knob in the system. Set it
-too low and you never see parse failures — everything is technically
-a match, just a bad one. Set it too high and you throw away useful
-partial matches. A reasonable default sits around 0.3. The point is
-that the three-zone model exists at all, because without it the
-backend is lying to the user in the lossy zone.
+The floor is the second most important knob in the system. It
+decides which new templates are near misses that keep their body.
+Set it too low and almost every new template pays for a retained
+body; set it equal to the threshold and the lossy zone disappears.
+The default is 0.4, the threshold the Drain paper itself reports.
+The point is that the three-zone model exists at all, because
+without it the backend is lying to the user in the lossy zone.
+
+Parse failures still exist, but they are guard rejections, not a
+zone: for example, a new template that would exceed the tenant's
+template ceiling (RFC 0023) fails as `template_ceiling`, keeps its
+body, and increments `ourios.miner.parse_failures`.
 
 ### 4.3 It does not say what to do when parameters are enormous
 
@@ -332,6 +357,8 @@ how a query that says "template X" either resolves across versions
 or surfaces the drift explicitly to the user. This is hazard 5 in
 `docs/hazards.md` and it is genuinely hard — hard enough that the
 RFC has it as an open question rather than a solved problem.
+*(Since delivered: versioning, aliases, `resolves_to` and the drift
+query all ship; see the note at the top.)*
 
 ### 4.6 It does not say anything about multi-tenancy
 
@@ -367,6 +394,11 @@ makes the invariants concrete.
 
 ![The Ourios log record: a 3×3 grid of fields. Row 1: tenant_id, template_id, template_version. Row 2: params[], body?, confidence. Row 3: lossy_flag, timestamp, service. tenant_id is highlighted as the partition key, confidence and lossy_flag are highlighted as honesty-contract fields.](./img/fig-5-record-shape.svg)
 
+The figure uses two shorthand names. In the schema, `timestamp` is
+`time_unix_nano` (alongside the observed and effective times), and
+`service` is the promoted `service.name` resource attribute
+(RFC 0022).
+
 Every field on that diagram is a commitment:
 
 - `tenant_id` is present on every row, not on every file — the
@@ -379,11 +411,9 @@ Every field on that diagram is a commitment:
 - `template_version` lets a template's representation change over
   time while the logical identity persists.
 - `params` are length-bounded per 4.3 above.
-- `body?` is present whenever the lossy-or-fail zone fired, and
-  optionally always, as a tenant-configurable choice. Paying the
-  storage cost of always keeping the body buys perfect
-  reconstructability; most tenants will not want to pay it, and the
-  default should be "only when needed."
+- `body?` is present only when needed: in the lossy zone, on a
+  parse failure, on a parameter overflow, or when reconstruction
+  would be lossy. There is no always-retain option.
 - `confidence` is the scalar the three-zone model was defending.
 - `lossy_flag` is the boolean the reader checks before trusting
   template-based rendering.
@@ -396,12 +426,12 @@ template at those positions becomes a wildcard. The template has
 widened. This is a merge. The paper does not call it that and does
 not audit it.
 
-In Ourios, every widening event that crosses a configurable
-threshold of semantic change fires a merge audit event — a
-structured record with the old template, the new template, the
+In Ourios, every widening fires a `template_widened` audit event —
+a structured record with the old template, the new template, the
 tenant, the timestamp, and the reason. The audit event is a
-first-class citizen: it goes to the same storage, it is queryable,
-and there is a metric `merges_total` that dashboards the rate.
+first-class citizen: it goes to the same object store as its own
+audit stream, it is queryable, and the `ourios.miner.merges` counter
+(`merges_total` in `CLAUDE.md`) dashboards the rate.
 
 Why does this matter? Because the horror story for a template miner
 is a silent merge that crosses a semantic boundary. `user logged
@@ -492,6 +522,10 @@ These four items are in `docs/rfcs/0001-template-miner.md` under
 Open Questions, and the RFC cannot move to accepted until they are
 resolved.
 
+*(Since delivered: RFC 0001 is accepted. Masking is a fixed
+whole-token rule set (RFC 0001 §4.2, amended 2026-10-19); aliases
+and `resolves_to` ship in the DSL; drift is a query (RFC 0010).)*
+
 ## Thesis, restated
 
 > **Drain is not a log parser. Drain is a tree. What makes it safe
@@ -525,5 +559,5 @@ audience is quiet.*
   Approach with Fixed Depth Tree.* ICWS 2017.
 - Drain3 (IBM): https://github.com/logpai/Drain3
 - LogPAI benchmark suite: https://github.com/logpai/logparser
-- Ourios: `CLAUDE.md` §2.2, §3.1–§3.3, §3.5, §3.7, §4, §6.2, §6.3
+- Ourios: `CLAUDE.md` §2 (pillar 2), §3.1–§3.3, §3.5, §3.7, §4, §6.2, §6.3
 - Companion RFC: `docs/rfcs/0001-template-miner.md`

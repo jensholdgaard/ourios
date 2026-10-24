@@ -142,7 +142,7 @@ The id is referenced from the test code in a doc comment, exactly:
 /// Scenario H1.1 — Semantically distinct templates do not silently merge.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-fn login_and_logout_do_not_merge_at_default_threshold() { /* … */ }
+fn h1_1_login_and_logout_remain_distinct_at_default_threshold() { /* … */ }
 ```
 
 `grep -R "H1.1" .` then yields the scenario in the RFC, the test in
@@ -234,8 +234,10 @@ The Red signal lives at two granularities, deliberately:
   `todo!()` panic. Each panic is one TODO item; as the body fills
   in, the `#[ignore]` comes off and the test joins the default
   run.
-- *Outer loop (CI).* Default `cargo test` skips ignored tests,
-  so the Red-stage PR lands cleanly through branch protection
+- *Outer loop (CI).* CI runs `cargo nextest run --workspace
+  --all-features` plus `cargo test --doc` for doctests
+  (`.github/workflows/ci.yml`). Both skip ignored tests by default,
+  as plain `cargo test` does, so the Red-stage PR lands cleanly through branch protection
   rather than fighting it. CI's signal that the Red gate is
   satisfied is structural: stubs compile, every §5 scenario has
   an `#[ignore]`'d test with a matching id, and `cargo test --

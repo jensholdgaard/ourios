@@ -48,15 +48,20 @@ this config has no `auth` section and so runs open (RFC 0026); a bare
 `-p 4318:4318` would expose an unauthenticated receiver to your LAN:
 
 ```sh
+# once: the image runs as uid 65532, so hand the new volume to it
+docker volume create ourios-data
+docker run --rm -v ourios-data:/var/lib/ourios busybox \
+  chown 65532:65532 /var/lib/ourios
+
 docker run --rm \
   -p 127.0.0.1:4317:4317 -p 127.0.0.1:4318:4318 -p 127.0.0.1:4319:4319 \
   -v ourios-data:/var/lib/ourios \
   -v "$PWD/ourios.yaml:/etc/ourios/ourios.yaml:ro" \
-  ghcr.io/jensholdgaard/ourios:0.1.1 \
+  ghcr.io/jensholdgaard/ourios:0.16.0 \
   --config /etc/ourios/ourios.yaml
 ```
 
-See [Docker](./docker.md) for image variants and signature
+See [Docker](./docker.md) for image tags, variants and signature
 verification. `docker stop` flushes the ingest pipeline on SIGTERM.
 
 ## 2. Point the agent at it

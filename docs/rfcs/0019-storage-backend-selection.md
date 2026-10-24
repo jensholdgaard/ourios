@@ -272,7 +272,7 @@ All eight scenarios have passing tests; the RFC is `accepted` (§9).
   `crates/ourios-server/src/main.rs` (`rfc0019_1_*` / `rfc0019_6_*` /
   `rfc0019_7_*`) and run in the default `cargo test` job.
 - **RFC0019.2 / .3 / .4 / .5** — server-level testcontainers + localstack
-  integration tests in `crates/ourios-server/tests/rfc0019_storage_backend.rs`,
+  integration tests in `crates/ourios-server/tests/it/rfc0019_storage_backend.rs`,
   reusing the `rfc0013_object_store.rs` harness (`Store::s3` against a localstack
   endpoint) and spawning the `ourios-server` binary configured for the S3
   backend, driven over HTTP. `.2` asserts the WAL stays local while the data
@@ -319,11 +319,11 @@ All eight scenarios have passing tests; the RFC is `accepted` (§9).
   and WAL), §3.7 (multi-tenancy on every data path), §6.3 (observability /
   self-telemetry — no secret leakage).
 - `crates/ourios-parquet/src/store.rs` (`Store`, `S3Config`, `StoreError`),
-  `crates/ourios-parquet/tests/rfc0013_object_store.rs` (the localstack
+  `crates/ourios-parquet/tests/it/rfc0013_object_store.rs` (the localstack
   harness), `crates/ourios-server/src/main.rs`,
   `crates/ourios-server/src/receiver.rs`,
   `crates/ourios-server/src/querier.rs`,
-  `crates/ourios-ingester/src/compactor.rs`.
+  `crates/ourios-ingester/src/compactor/`.
 - Prior art for the deferred WAL-replication/archive tier (§3.1): PostgreSQL
   WAL archiving (`archive_command` / `archive_library`) and CloudNativePG's
   Barman Cloud (`barman-cloud-wal-archive`) — the same layering, a hot

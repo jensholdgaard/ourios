@@ -9,8 +9,8 @@ entries here.
 
 **Audit event.** A structured record emitted by the *miner* every
 time a *template* is widened (parameters generalised), merged with
-another template, or versioned. Audit events are themselves stored
-as logs and are queryable. They are the trail by which an operator
+another template, or versioned. Audit events are stored in their own
+audit-stream Parquet files and are queryable (RFC 0010). They are the trail by which an operator
 can answer "did this template silently change yesterday?" See
 `hazards.md` H1.
 
@@ -23,19 +23,21 @@ test* against the corpus. See `CLAUDE.md` §3.3, `hazards.md` H7.
 **Body.** The free-form text content of a log record. In OTel terms,
 the `body` field of a `LogRecord`. In Ourios storage, the body is
 either reconstructible from `template + params` (most rows) or
-retained verbatim in a dedicated column (lossy rows, parse failures,
-or tenants who opted in to always-retain).
+retained verbatim in a dedicated column (lossy-zone rows, parse
+failures, overflowed params, structured bodies).
 
 **Compaction.** Background process that merges many small *Parquet*
-files into fewer large ones, targeting *row-group* sizes of 128 MB
-to 1 GB and file sizes of 256 MB to 2 GB. Driven by the small-file
-hazard (H4).
+files into fewer large ones, targeting file sizes of 256 MB to 2 GB.
+Compacted *row groups* are smaller than ingest-side ones: an adaptive
+1–32 MiB, for pruning granularity (RFC 0036 §3.3). Driven by the
+small-file hazard (H4).
 
-**Confidence.** A scalar in [0, 1] assigned by the *miner* to each
-matched row, measuring how well the row matched its assigned
-template. The three-zone model partitions confidence into clean
-match (≥ threshold), lossy match (floor ≤ x < threshold), and parse
-failure (< floor). **(Ourios)** — extends Drain, which is
+**Confidence.** `simSeq / threshold`, computed by the *miner* for
+each line against its best candidate template. The three-zone model
+(RFC 0001 §6.3): clean attach (`simSeq ≥ threshold`), lossy zone
+(`floor ≤ simSeq < threshold`: a fresh leaf, body retained), and
+below the *floor* (a fresh clean leaf, as for a line with no
+candidate). **(Ourios)** — extends Drain, which is
 binary-classifying.
 
 **Corpus.** A collection of anonymised log lines used as test input.
@@ -70,15 +72,18 @@ ones. **(Ourios)** — drift is detected as a first-class query, not
 an after-the-fact discovery. See H5 and RFC 0001 §6.7.
 
 **DSL.** The user-facing query language for Ourios logs (RFC 0002).
-Compiles to DataFusion logical plans; does not expose SQL. Two
-candidate predicate sublanguages (OTTL-borrowed vs. distanced) and
-three top-level surfaces (SQL-clause, LogQL-pipe, Insights-verb)
-are under design.
+Compiles to DataFusion logical plans; does not expose SQL. RFC 0002
+(accepted) chose an Ourios-native predicate sublanguage that keeps
+its distance from OTTL, and a pipe-composable surface, e.g.
+`severity >= error | range(-1h, now) | count by template_id`. A
+structured JSON form parses to the same query.
 
-**Floor.** The lower bound of confidence below which the *miner*
-declares a parse failure. Default ~0.3. Below the floor, the row is
-stored body-only and `parse_failures_total` increments. **(Ourios)**
-— not present in the Drain paper.
+**Floor (`similarity_floor`).** The lower edge of the lossy zone:
+lines with `floor ≤ simSeq < threshold` get a fresh leaf with the
+body retained. Default 0.4. Since the RFC 0001 §6.3 amendment of
+2026-10-23, a line below the floor is treated as a different event
+and mints a clean fresh leaf; it is not a parse failure.
+**(Ourios)** — not present in the Drain paper.
 
 **Fsync.** The POSIX call that forces buffered writes to durable
 storage. The *WAL* fsyncs before acknowledging an OTLP batch. See
@@ -90,9 +95,9 @@ proposition. The eight current hazards are catalogued in
 `docs/hazards.md`. New hazards are added via a `meta:` RFC.
 
 **Ingester.** The Ourios role that receives OTLP over gRPC/HTTP,
-mines templates, writes to the *WAL*, and (eventually) flushes to
-*Parquet* via the compactor. One half of the ingester/querier
-binary split.
+writes each batch to the *WAL* and fsyncs it, then mines templates
+and writes the records to *Parquet*. The compactor later merges
+those files. One half of the ingester/querier binary split.
 
 **Length group.** The first-level partition in the Drain *parse
 tree*: one branch per distinct token count. Drain assumes lines of
@@ -113,10 +118,11 @@ See H7.
 BGL, Spark, Apache, OpenSSH, Windows) as the public-corpus floor
 for benchmarks.
 
-**Masking.** Pre-tokenisation regex rules that replace volatile
-sub-strings (IPs, UUIDs, numbers) with placeholders before the
-miner walks the tree. A Drain3 extension. Whether and where Ourios
-applies masking is a design choice in RFC 0001 §4.
+**Masking.** A fixed set of shape rules that replace a whole token
+with a type tag (`<UUID>`, `<IP>` for IPv4, `<TS>`, `<NUM>`, where NUM
+covers integers and decimals) before the miner walks the tree. The
+original bytes become a typed parameter. Adapted from Drain3's
+masking; see RFC 0001 §4.2 (amended 2026-10-19).
 
 **Merge.** When the *miner* widens an existing template to absorb
 a new line — e.g. replacing a literal token with a wildcard. Every
@@ -130,8 +136,9 @@ Lives in the `ourios-miner` crate. Designed in RFC 0001.
 
 **`template_id`.** The miner's key for a template: a `u64` that is
 **Ourios-derived and tenant-local**, not an OTLP field and not
-portable. Two stores — or one store after an RFC 0023 eviction or a
-re-mint — can give the same log shape different ids, which is why
+portable. Two stores — or one store that re-mints an old shape on a
+fresh id after a restart (RFC 0059) — can give the same log shape
+different ids, which is why
 drift is a first-class query (RFC 0010) and aliases exist (RFC 0001
 §6.7).
 It shares the Parquet record's flat namespace with genuine OTLP
@@ -149,8 +156,9 @@ or HTTP. We do not invent our own format.
 
 **OTTL.** OpenTelemetry Transformation Language, the OTel
 Collector's text-based DSL for filtering and mutating telemetry in
-processor pipelines. Ourios deliberates between borrowing OTTL's
-predicate sublanguage and distancing from it (RFC 0002).
+processor pipelines. The Ourios *DSL* deliberately keeps its
+distance from OTTL's syntax (RFC 0002 §3): a query language that
+looks like OTTL but behaves differently would mislead OTTL users.
 
 **Parquet.** The Apache columnar file format Ourios uses for
 on-disk storage. Per-column compression, predicate pushdown via
@@ -162,9 +170,14 @@ of the system; local disk is cache and *WAL* only. See `CLAUDE.md`
 extracts when matching a *template*. Bounded per-parameter to
 256 B by default; overflow spills to the *body* column. See H2.
 
-**Parse failure.** A row whose match confidence falls below the
-*floor*. Stored body-only; `parse_failures_total` counter
-increments.
+**Parse failure.** A line the *miner* cannot give a template, for
+example because minting would exceed the tenant's template ceiling
+(`template_ceiling`, RFC 0023) or an empty or over-long line. The
+row is stored with its original *body* and no template, and
+`ourios.miner.parse_failures` (`parse_failures_total` in `CLAUDE.md`
+§3.1) increments with an `ourios.miner.parse_failure.reason`. A line
+below the *floor* is no longer a parse failure (RFC 0001 §6.3,
+amended 2026-10-23).
 
 **Predicate pushdown.** A query-engine optimisation where filter
 predicates are applied as early as possible — at the storage layer
@@ -188,9 +201,11 @@ the captured whitespace state). Subject to the *bit-identical*
 guarantee. See H7.
 
 **Row group.** Parquet's unit of compression and predicate-pushdown
-locality — a horizontal partition of rows within a file. Target
-size 128 MB to 1 GB. Smaller row groups mean faster row-group skip
-but worse compression and more metadata overhead.
+locality — a horizontal partition of rows within a file. Ingest-side
+files rotate row groups at 128 MiB (RFC 0005 §3.5); compacted files
+use an adaptive 1–32 MiB threshold (RFC 0036 §3.3). Smaller row
+groups mean faster row-group skip but worse compression and more
+metadata overhead.
 
 **Semconv registry (Ourios).** The weaver registry defining every
 Ourios telemetry name (`ourios.*` metrics and attributes), from
@@ -220,9 +235,10 @@ scoped per *tenant*; the same string in two tenants is two
 templates.
 
 **Template id.** See *`template_id`*: a `u64` the miner allocates
-from one cluster-wide counter in first-observation order, so it is
-monotonic within each *tenant* and never shared across tenants
-(RFC 0001 §6.1, "Template identity"). Not a hash of the template
+in first-observation order from one cluster-wide id space, drawing
+only from blocks durably reserved in the store (RFC 0059). Ids are
+monotonic within each *tenant* but not dense, and never shared
+across tenants (RFC 0001 §6.1, "Template identity"). Not a hash of the template
 string — RFC 0001 rejects content hashing as a tenant-isolation leak.
 
 **Template tree.** The Drain parse tree, scoped per *tenant*. Its
@@ -244,7 +260,9 @@ scoped per tenant. Multi-tenancy is *not bolted on*
 **Thesis-gate.** A benchmark goal whose failure on representative
 corpora invalidates an *architectural pillar* — meaning the
 response is an RFC to revisit `CLAUDE.md` §2, not a tuning sprint.
-The five thesis-gates are catalogued in `docs/benchmarks.md` §7.
+The four gating thesis-gates (B1, B2, C1, C2) are catalogued in
+`docs/benchmarks.md` §7; A1 keeps its `[THESIS]` tag but is a
+recorded diagnostic since RFC 0011.
 
 **Threshold (`st`).** The Drain similarity cutoff above which a
 line is assigned to an existing *log group* rather than opening a
@@ -261,7 +279,8 @@ original value spills to the *body* column. See H2.
 
 **WAL.** Write-ahead log. The Ourios *ingester* writes every
 acknowledged batch to the WAL, fsyncs, and only then acknowledges
-to the OTLP client. WAL segments are eventually flushed to *Parquet*
-by the compactor. The crash-recovery test SIGKILLs the ingester
+to the OTLP client. The ingester writes the records to *Parquet*
+separately; once the publication barrier checkpoints past a segment,
+housekeeping reclaims it (RFC 0052). The crash-recovery test SIGKILLs the ingester
 mid-batch and asserts no acknowledged data is lost. See H3,
 `CLAUDE.md` §3.4.

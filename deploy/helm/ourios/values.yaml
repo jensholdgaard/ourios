@@ -88,6 +88,33 @@ storage:
     storageClassName: ""
     accessModes:
       - ReadWriteOnce
+  # Promoted attribute columns (storage.promoted_attributes; RFC 0022, typed
+  # entries RFC 0042). Each listed key gets its own Parquet column, so a
+  # query filtering on it prunes row groups instead of scanning. Rendered
+  # into every role's config: the receiver, compactor and querier must agree
+  # on the set. An entry is a bare key (the string class) or a map
+  # {key, type} with type string, i64 or f64. service.name is always
+  # promoted and never needs listing. Empty (the default) promotes nothing
+  # else.
+  promotedAttributes:
+    resource: []
+      # - k8s.namespace.name
+    log: []
+      # - gen_ai.conversation.id
+      # - key: http.response.status_code
+      #   type: i64
+
+# The RFC 0050 upstream-template dial (the `miner` section of the
+# receiver's config). Empty takes the server default.
+miner:
+  # ignore (the server default), observe or adopt: what the receiver does
+  # with an inbound log.record.template value.
+  upstreamTemplates: ""
+  # UTF-8 byte cap on an inbound template value (server default 8192; 0
+  # disables all upstream-template handling).
+  upstreamTemplateByteLimit: ""
+  # Per-template bound on stored upstream associations (server default 4).
+  upstreamAssociationLimit: ""
 
 # OTLP receiver role (RFC 0003): a StatefulSet, one durable WAL PVC per replica.
 receiver:
@@ -119,6 +146,10 @@ receiver:
   # The chart runs the binary with --config, which reads no bare
   # OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP env var, so extraEnv cannot set it.
   templateIdsAllowBootstrap: false
+  # Worker count for the concurrent encode pool (receiver.encode_workers,
+  # RFC 0035). Empty takes the server default: the available cores, which
+  # is the node's core count when the pod has no CPU limit.
+  encodeWorkers: ""
   # How long the receiver may take to start before the kubelet restarts it:
   # periodSeconds x failureThreshold (default 1 h). Its OTLP port opens
   # only after startup recovery, which replays the WAL and, on the RFC 0059
@@ -293,7 +324,9 @@ otel:
   exporterEndpoint: ""
 
 # Authentication and tenant binding for the receiver and querier (the `auth`
-# section of their config file). With none of tokens / oidc configured the
+# section of their config file). The compactor gets the same section when
+# auth.openfga.visibility.objects is set, for the graph emitter and the
+# `graph backfill` verb. With none of tokens / oidc configured the
 # install runs in RFC 0026 open mode: any client that reaches a listener can
 # write and read every tenant. See docs/guides/authentication.md.
 #
@@ -332,8 +365,6 @@ auth:
     groupsClaim: ""
   # OpenFGA (RFC 0047) binds the tenants of whatever tokens / oidc
   # authenticate; it never authenticates on its own, so it needs one of them.
-  # Only the tenant-binding layer is exposed here: the layer-2 visibility
-  # section needs promoted attribute columns the chart does not render.
   openfga:
     enabled: false
     # The OpenFGA HTTP API root, e.g. http://openfga.openfga.svc:8080. Required.
@@ -353,6 +384,34 @@ auth:
     consistency: ""
     requestTimeoutSecs: ""
     serverListObjectsDeadlineMs: ""
+    # Layer-2 visibility inside a tenant (auth.openfga.visibility; RFC 0047
+    # §3.4, RFC 0048). Every column named here must be in
+    # storage.promotedAttributes (the server checks at startup). Binding a
+    # conversation object turns on the graph emitter on the receiver and
+    # compactor, which RFC 0048 erasure and `graph backfill` need. Empty
+    # fields take the server defaults. See docs/guides/authentication.md.
+    visibility:
+      # Object type to promoted column bindings; v1 accepts type
+      # conversation only.
+      objects: []
+        # - type: conversation
+        #   column: attr.gen_ai.conversation.id
+      # The columns carrying the principals (RFC 0048 §3.2). An empty list
+      # takes the semantic-convention default.
+      identities:
+        userColumns: []
+        agentColumns: []
+      # The column compared to a user: principal's subject; one of the
+      # user columns.
+      selfPrincipalColumn: ""
+      # The columns a metadata-only reader may not read. Empty takes the
+      # default set (body and the GenAI content attributes); a list
+      # replaces it.
+      contentColumns: []
+      # Optional; empty takes the server default (10000 objects, 2000 ms).
+      # listTimeoutMs must stay below serverListObjectsDeadlineMs.
+      maxObjects: ""
+      listTimeoutMs: ""
 
 # Extra environment variables appended verbatim to every container. Entries
 # are Kubernetes EnvVar objects, so valueFrom works too. Per-role additions go

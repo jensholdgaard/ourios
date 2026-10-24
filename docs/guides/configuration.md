@@ -176,8 +176,11 @@ type ([RFC 0042](../rfcs/0042-typed-numeric-promotion.md)):
 | `f64` | 64-bit float | a double or an int |
 
 A value of any other type, including a number sent as a string, is
-stored as NULL. An unknown `type`, a key listed twice, or a typed
-`service.name` fails startup.
+stored as NULL. An unknown `type`, a key listed twice, or a numeric
+`type` on `service.name` under `resource` fails startup: `service.name`
+is always promoted as a string. Declaring it as `string` there is
+redundant but allowed, and `service.name` under `log` is an ordinary
+key that may take any type.
 
 ## The `miner` and `compaction` sections
 

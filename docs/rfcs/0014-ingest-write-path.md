@@ -43,7 +43,7 @@ superseded-by: —
 > implementation detail, decided across the `red`/`green` PRs.
 >
 > **`red`** landed the six `#[ignore]`d acceptance stubs (RFC0014.1–.6) in
-> `crates/ourios-ingester/tests/rfc0014_ingest_write_path.rs`. **`green`**
+> `crates/ourios-ingester/tests/it/rfc0014_ingest_write_path.rs`. **`green`**
 > built the buffering `ParquetRecordSink` (the hybrid size/age/rotation flush
 > policy + the hard ceiling), then wired it into the miner in place of
 > `NoOpRecordSink` via a `SharedParquetSink` the server constructs and the
@@ -51,7 +51,7 @@ superseded-by: —
 > sweep, a drain on graceful shutdown). All six §5 scenarios pass: RFC0014.1–.4
 > and .6 drive the sink directly against a `LocalFileSystem`-backed `Store`;
 > RFC0014.5 (no acknowledged-data loss) is a real-process SIGKILL crash test
-> (`tests/rfc0014_5_crash_no_loss.rs`) that extends the RFC 0008 harness —
+> (`tests/it/rfc0014_5_crash_no_loss.rs`) that extends the RFC 0008 harness —
 > after a crash with a non-empty buffer, WAL replay re-mines every un-flushed
 > acknowledged record into a fresh sink, which flushes them to the store.
 >

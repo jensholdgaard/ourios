@@ -32,6 +32,17 @@ ignore = [
     # (issuer-side) rather than verify, or when the constant-time rewrite
     # ships upstream.
     "RUSTSEC-2023-0071",
+    # reason: `crypto-bigint` 0.5.5 constant-time operations can branch on
+    # their operands (fixed only in 0.7.6, a major line elliptic-curve 0.13
+    # does not use). It reaches us only through jsonwebtoken's rust_crypto
+    # backend (p256 / p384 0.13 -> elliptic-curve 0.13); jsonwebtoken 11.1
+    # still pins p256 ^0.13, so no upgrade path exists. As for the `rsa`
+    # entry above, Ourios only verifies ES256 / ES384 signatures against the
+    # issuer's public JWKS keys: every operand is public, so a timing
+    # difference has no secret to leak. The p256 dev-dependency signs
+    # throwaway per-test keys only. Remove when jsonwebtoken moves to p256
+    # 0.14 / elliptic-curve 0.14; re-evaluate if we ever sign tokens.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]

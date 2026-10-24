@@ -3,7 +3,7 @@
 The querier role (RFC 0016) as a stateless Deployment: it reads the shared store
 (the configured backend — local by default, S3 in production) and scales
 independently of ingest. No WAL, no per-replica state. Compaction is disabled
-here (OURIOS_COMPACTION_ENABLED=0) — only the dedicated compactor sweeps.
+in its config (compaction.enabled: false) — only the dedicated compactor sweeps.
 */}}
 apiVersion: apps/v1
 kind: Deployment

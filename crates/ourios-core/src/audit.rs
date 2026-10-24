@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::alias::ActorId;
+use crate::sync::lock_recover;
 use crate::tenant::TenantId;
 
 /// The specific state-change of a template-mining
@@ -874,46 +875,27 @@ impl SharedAuditSink {
     /// Take ownership of every buffered event in emission order.
     /// The shared buffer is empty afterwards.
     ///
-    /// # Panics
-    ///
-    /// Panics if another thread panicked while holding the
-    /// internal mutex. Sinks have no recovery story for a
-    /// poisoned mutex — a poisoned audit buffer cannot be
-    /// trusted to be complete or ordered.
+    /// A poisoned mutex is recovered: every critical section is one
+    /// `Vec` push, take or read, so a panic cannot leave the buffer torn.
     #[must_use]
     pub fn drain(&self) -> Vec<AuditEvent> {
-        self.inner
-            .lock()
-            .expect("audit sink mutex poisoned")
-            .drain()
+        lock_recover(&self.inner).drain()
     }
 
-    /// # Panics
-    ///
-    /// As [`Self::drain`].
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("audit sink mutex poisoned").len()
+        lock_recover(&self.inner).len()
     }
 
-    /// # Panics
-    ///
-    /// As [`Self::drain`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("audit sink mutex poisoned")
-            .is_empty()
+        lock_recover(&self.inner).is_empty()
     }
 }
 
 impl AuditSink for SharedAuditSink {
     fn emit(&mut self, event: AuditEvent) {
-        self.inner
-            .lock()
-            .expect("audit sink mutex poisoned")
-            .emit(event);
+        lock_recover(&self.inner).emit(event);
     }
 }
 
@@ -1024,6 +1006,36 @@ mod tests {
         ));
         // The producer's view is also drained — same buffer.
         assert!(observer_handle.is_empty());
+    }
+
+    #[test]
+    fn shared_sink_keeps_working_after_its_mutex_is_poisoned() {
+        let handle = SharedAuditSink::new();
+        let t = TenantId::new("tenant-x");
+        let mut producer = handle.clone();
+        producer.emit(widened_event(&t));
+
+        let inner = Arc::clone(&handle.inner);
+        let _ = std::thread::spawn(move || {
+            let _guard = inner.lock().unwrap();
+            panic!("poison the audit sink");
+        })
+        .join();
+        assert!(handle.inner.is_poisoned());
+
+        producer.emit(rejection_event(&t));
+        assert_eq!(handle.len(), 2);
+        assert!(!handle.is_empty());
+        let drained = handle.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(
+            drained[1].payload,
+            AuditPayload::Template {
+                change: TemplateChange::RejectedDegenerate { .. },
+                ..
+            },
+        ));
+        assert!(handle.is_empty());
     }
 
     #[test]

@@ -131,7 +131,9 @@ Secret object. The ConfigMap does hold the TLS file paths, which include the
 client CA's key name (`client_ca_file: /etc/ourios-tls/<listener>-client-ca/<key>`):
 that path is not secret.
 Rotating a token Secret needs `kubectl rollout restart` of the receiver and
-querier; rotated TLS Secrets are picked up in place when
+querier, and of the compactor too when `auth.openfga.visibility` binds an
+object (the compactor then carries the auth section and the token env);
+rotated TLS Secrets are picked up in place when
 `reloadIntervalSecs` is set.
 
 Static tokens and OIDC (either or both):

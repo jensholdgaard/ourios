@@ -232,7 +232,14 @@ jobs:
         # up the same way the telemetrygen path does.
         run: |
           set -euxo pipefail
-          CORPUS_DIR="bench-corpus/otel-demo-v1"
+          # Name the directory after the tag so the results JSON's
+          # `corpus.directory` says which corpus was measured. Reject
+          # anything that could escape `bench-corpus/` first.
+          if ! [[ "$CORPUS_TAG" =~ ^corpus/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::invalid corpus tag '$CORPUS_TAG' (expected corpus/<name> with a safe basename)"
+            exit 1
+          fi
+          CORPUS_DIR="bench-corpus/${CORPUS_TAG##*/}"
           mkdir -p "$CORPUS_DIR"
           gh release download "$CORPUS_TAG" --pattern 'logs.jsonl.gz' --dir "$CORPUS_DIR"
           gunzip -f "$CORPUS_DIR/logs.jsonl.gz"

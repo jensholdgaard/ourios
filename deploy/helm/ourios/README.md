@@ -132,7 +132,9 @@ Secret object. The ConfigMap does hold the TLS file paths, which include the
 client CA's key name (`client_ca_file: /etc/ourios-tls/<listener>-client-ca/<key>`):
 that path is not secret.
 Rotating a token Secret needs `kubectl rollout restart` of the receiver and
-querier; rotated TLS Secrets are picked up in place when
+querier, and of the compactor too when `auth.openfga.visibility` binds an
+object (the compactor then carries the auth section and the token env);
+rotated TLS Secrets are picked up in place when
 `reloadIntervalSecs` is set.
 
 Static tokens and OIDC (either or both):
@@ -153,8 +155,7 @@ auth:
 ```
 
 OpenFGA binds the tenants of whatever tokens or OIDC authenticate, so it
-needs one of them. Only the tenant-binding layer is exposed: layer-2
-visibility needs promoted attribute columns the chart does not render.
+needs one of them.
 
 ```yaml
 auth:
@@ -165,6 +166,32 @@ auth:
     authorizationModelId: ""        # empty = the store's latest model
     apiToken:
       secretKeyRef: {name: openfga-token, key: token}
+```
+
+Layer-2 visibility inside a tenant (RFC 0047, RFC 0048) goes under
+`auth.openfga.visibility`. Every column it names must be a promoted
+attribute (see [Configuration](#configuration)); the server checks this at
+startup. Binding a `conversation` object turns on the graph emitter on the
+receiver and the compactor. The compactor's config then carries the same
+`auth` section and token env, so the `graph` verbs run from its pod:
+
+```yaml
+storage:
+  promotedAttributes:
+    log: [gen_ai.conversation.id, user.hash]
+auth:
+  openfga:
+    visibility:
+      objects:
+        - type: conversation
+          column: attr.gen_ai.conversation.id
+      selfPrincipalColumn: attr.user.hash   # optional
+      listTimeoutMs: 2000                   # must stay below serverListObjectsDeadlineMs
+```
+
+```sh
+kubectl exec deploy/<fullname>-compactor -- \
+  /usr/local/bin/ourios-server --config /etc/ourios/config.yaml graph backfill --tenant <tenant>
 ```
 
 Listener TLS, per listener, from a `kubernetes.io/tls` Secret (`tls.crt`,
@@ -214,6 +241,22 @@ settings map onto it. Object-store credentials are **not** written into the file
 and the AWS SDK region stay plain environment variables — those are read by their
 own SDKs, never modelled in the config (RFC 0020 §3.8). A `checksum/config` pod
 annotation rolls the workloads when the rendered config changes.
+
+`storage.promotedAttributes` lists the attributes that get their own Parquet
+columns (RFC 0022), so a query filtering on them prunes row groups. It is
+rendered into every role's config, because the receiver, compactor and
+querier must agree on the set. An entry is a bare key (string class) or
+`{key, type}` with `type` `string`, `i64` or `f64` (RFC 0042):
+
+```yaml
+storage:
+  promotedAttributes:
+    resource: [k8s.namespace.name]
+    log:
+      - gen_ai.conversation.id
+      - key: http.response.status_code
+        type: i64
+```
 
 ## Self-telemetry
 
@@ -382,7 +425,9 @@ role:
 - `erasure/` and `backfill/`: the RFC 0048 erasure markers and backfill locks.
   The compactor's sweep advances and removes them; the `graph erase` and
   `graph backfill` verbs create them, so run those with the compactor's
-  credentials.
+  credentials (`kubectl exec` into the compactor pod; `graph backfill` needs
+  `auth.openfga.visibility.objects` set, see
+  [Authentication and TLS](#authentication-and-tls)).
 
 `ListBucket` is a bucket action: AWS checks it against the bucket arn, never
 an object arn, so it is scoped with an `s3:prefix` condition rather than a
@@ -709,10 +754,14 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `storage.s3.existingSecret` | `""` | Secret with the S3-named credential keys (`OURIOS_S3_ACCESS_KEY_ID`/`OURIOS_S3_SECRET_ACCESS_KEY`), injected via `envFrom`. Used by any S3-compatible provider. |
 | `storage.local.bucketRoot` | `/var/lib/ourios/data` | Data dir for the local backend. |
 | `storage.local.size` | `10Gi` | Local data PVC size. |
+| `storage.promotedAttributes.{resource,log}` | `[]` | Promoted attribute columns (RFC 0022), a bare key or `{key, type}` (RFC 0042). Rendered into every role's config. |
+| `miner.upstreamTemplates` | `""` | RFC 0050 dial: `ignore` (server default), `observe` or `adopt`. Receiver only. |
+| `miner.upstreamTemplateByteLimit` / `.upstreamAssociationLimit` | `""` | Server defaults 8192 bytes (0 disables) and 4 associations. Receiver only. |
 | `receiver.enabled` | `true` | OTLP ingest StatefulSet (gRPC `:4317` + HTTP `:4318`). |
 | `receiver.replicas` | `1` | Receiver replicas (each gets its own WAL PVC). |
 | `receiver.wal.size` | `2Gi` | WAL PVC size (`OURIOS_WAL_ROOT`, always local). |
 | `receiver.wal.storageClassName` | `""` | WAL StorageClass (`""` = cluster default). |
+| `receiver.encodeWorkers` | `""` | Encode pool size (RFC 0035); empty = available cores, the node's count without a CPU limit. |
 | `querier.enabled` | `true` | Querier Deployment (HTTP `:4319`). |
 | `querier.replicas` | `2` | Querier replicas (scales independently, no PVC). |
 | `querier.defaultWindowSecs` | `3600` | Default look-back for a query with no `range(...)`. |
@@ -728,6 +777,7 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `auth.tokens` | `[]` | Static bearer tokens: `name`, `tenants`, `secretKeyRef` (`name`, `key`). An inline `token` fails render. |
 | `auth.oidc.enabled` | `false` | OIDC bearer JWTs; needs `issuer`, `audience`, and `tenantClaim` unless OpenFGA is on. |
 | `auth.openfga.enabled` | `false` | OpenFGA tenant binding; needs `apiUrl`, `storeId`, and tokens or OIDC. API token via `apiToken.secretKeyRef`. |
+| `auth.openfga.visibility.*` | empty | Layer-2 visibility: `objects`, `identities.{userColumns,agentColumns}`, `selfPrincipalColumn`, `contentColumns`, `maxObjects`, `listTimeoutMs`. A bound object gives the compactor the `auth` section too. |
 | `receiver.tls.{grpc,http}.existingSecret` | `""` | `kubernetes.io/tls` Secret for that listener; empty = plaintext. |
 | `querier.tls.http.existingSecret` | `""` | `kubernetes.io/tls` Secret for the query API and `/mcp`; empty = plaintext. |
 | `<listener>.clientCA.existingSecret` / `.key` | `""` / `ca.crt` | Client CA for mTLS on that listener. |

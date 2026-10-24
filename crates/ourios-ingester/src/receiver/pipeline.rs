@@ -24,6 +24,7 @@ use std::time::Instant;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::MinedRecord;
+use ourios_core::sync::{lock_recover, read_recover, write_recover};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{
@@ -400,15 +401,11 @@ impl IngestPipeline {
     /// Take the barrier exclusion in **exclusive** mode — a cut capture,
     /// and nothing else.
     pub(crate) fn exclude_ingest(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
-        self.ingest_bound
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        write_recover(&self.ingest_bound)
     }
 
     fn share_bound(&self) -> std::sync::RwLockReadGuard<'_, ()> {
-        self.ingest_bound
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        read_recover(&self.ingest_bound)
     }
 
     /// Enable the RFC 0035 §3.1 ordered/concurrent ingest split: the
@@ -448,10 +445,7 @@ impl IngestPipeline {
         self,
         sink: Box<dyn ourios_core::audit::AuditSink + Send>,
     ) -> Self {
-        *self
-            .denial_audit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+        *lock_recover(&self.denial_audit) = Some(sink);
         self
     }
 
@@ -526,10 +520,7 @@ impl IngestPipeline {
             {
                 self.metrics
                     .record_rejected_batch(crate::metrics::ERROR_TYPE_PERMISSION_DENIED);
-                let mut sink = self
-                    .denial_audit
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut sink = lock_recover(&self.denial_audit);
                 if let Some(sink) = sink.as_mut() {
                     sink.emit(ourios_core::audit::AuditEvent {
                         tenant_id: denied_tenant.clone(),
@@ -985,21 +976,15 @@ impl IngestPipeline {
     }
 
     fn lock_miner(&self) -> std::sync::MutexGuard<'_, MinerCluster> {
-        self.miner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_recover(&self.miner)
     }
 
     fn lock_last_durable(&self) -> std::sync::MutexGuard<'_, Option<DurableMark>> {
-        self.last_durable
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_recover(&self.last_durable)
     }
 
     fn lock_hook(&self) -> std::sync::MutexGuard<'_, Option<RotationHook>> {
-        self.rotation_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_recover(&self.rotation_hook)
     }
 }
 

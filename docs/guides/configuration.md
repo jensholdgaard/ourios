@@ -28,16 +28,22 @@ storage:
     region: eu-central-1
     # Any S3-compatible provider: AWS, MinIO, R2, Ceph/RGW, …
     endpoint: https://s3.eu-central-1.amazonaws.com
+    prefix: prod                      # optional key prefix inside the bucket
     # Secret hygiene is enforced: credentials MUST be ${env:…}
     # references — inline literals fail startup.
     access_key_id: ${env:OURIOS_S3_ACCESS_KEY_ID}
     secret_access_key: ${env:OURIOS_S3_SECRET_ACCESS_KEY}
+    # session_token: ${env:OURIOS_S3_SESSION_TOKEN}   # temporary credentials
+  # With backend: local, set the store directory instead:
+  # local:
+  #   bucket_root: /var/lib/ourios/store
   # RFC 0022: per-key promoted attribute columns (service.name is
-  # always promoted). Each key costs bytes on every row — opt in
-  # deliberately.
+  # always promoted). See "Promoted attributes" below.
   promoted_attributes:
     resource: [k8s.namespace.name]
-    log: [http.request.method, http.route]
+    log:
+      - http.route
+      - { key: http.response.status_code, type: i64 }
 
 receiver:
   enabled: true
@@ -73,6 +79,15 @@ querier:
       enabled: true
       interval: 5m                    # idle time between passes; ms/s/m/h, at least 10s
 
+compaction:                           # RFC 0009; on unless disabled
+  enabled: true
+  interval_secs: 300                  # time between sweeps (default 300)
+
+miner:                                # RFC 0050: upstream log.record.template values
+  upstream_templates: ignore          # ignore (default) | observe | adopt
+  upstream_template_byte_limit: 8192  # default 8192; 0 turns the handling off
+  upstream_association_limit: 4       # default 4
+
 auth:
   # See the Authentication guide. Omit the whole section for open
   # mode (development only — the server warns once at startup).
@@ -85,6 +100,7 @@ auth:
     audience: ourios-collector
     tenant_claim: groups              # optional once openfga binds the tenants
     name_claim: name
+    clock_skew_secs: 60               # exp/nbf leeway (default 60)
     # RFC 0047: agent principals + group claims for the graph resolver
     agent_claim: ourios_principal_type=agent
     groups_claim: groups
@@ -137,6 +153,41 @@ auth:
 Auth configuration is **file-only** — there are deliberately no
 `OURIOS_AUTH_*` variables; token values reach the file through
 `${env:…}` references.
+
+## Promoted attributes
+
+`storage.promoted_attributes.resource` and `.log` list attribute keys
+to store as their own columns
+([RFC 0022](../rfcs/0022-queryable-attribute-columns.md)). They are
+file-only. A query needs a promoted key to group by it
+(`count by attr.<key>`) or to aggregate it (`sum(attr.<key>)`);
+without one the query fails and names the key to add. Predicates work
+on any attribute. `service.name` is always promoted. Each key costs
+bytes on every row, and promotion applies only to data written after
+the change.
+
+An entry is either a bare key (a string column) or a mapping with a
+type ([RFC 0042](../rfcs/0042-typed-numeric-promotion.md)):
+
+| `type` | Column | A value is stored when it is |
+|---|---|---|
+| `string` (default) | string | a string |
+| `i64` | 64-bit integer | an int |
+| `f64` | 64-bit float | a double or an int |
+
+A value of any other type, including a number sent as a string, is
+stored as NULL. An unknown `type`, a key listed twice, or a typed
+`service.name` fails startup.
+
+## The `miner` and `compaction` sections
+
+`miner.*` covers only the upstream-template handling of
+[RFC 0050](../rfcs/0050-upstream-derived-templates.md); the miner's other
+settings are not configurable. These keys are file-only.
+`compaction.enabled` and `compaction.interval_secs` are the file
+spellings of `OURIOS_COMPACTION_ENABLED` and
+`OURIOS_COMPACTION_INTERVAL_SECS`. Compaction is on unless set to
+`0`, `false`, `no` or `off`.
 
 ## The template-id bootstrap
 

@@ -154,7 +154,7 @@ ourios-testgen = { path = "../ourios-testgen" }
 # `#[tokio::test(flavor = "multi_thread")]` localstack publish arm.
 # `time` for the delayed-GET store wrapper (`test_support::SlowStore`);
 # `test-util` for RFC0060.11's paused clock.
-tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
+tokio = { version = "=1.54.1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
 tempfile = "=3.27.0"
 # #895 (`tests/rfc0033_bounded_fold.rs`) — testing-mode heap profiler as the
 # global allocator, so the cold template-map derivation's peak heap is

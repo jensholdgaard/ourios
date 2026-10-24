@@ -174,14 +174,17 @@ check "NOTES budget with only periodSeconds set" "10800s" \
 
 # The security surface is opt-in: a default install must render exactly what
 # it rendered before it existed. The chart/app version labels move with every
-# release, so they are dropped before the comparison. A deliberate change to
-# the default render regenerates the golden file:
+# release, so they are dropped before the comparison, and the default image
+# tag (the appVersion) is masked here and pinned by its own check below. A
+# deliberate change to the default render regenerates the golden file:
 #   UPDATE_GOLDEN=1 bash deploy/helm/render-tests.sh
 GOLDEN="$(dirname "${BASH_SOURCE[0]}")/testdata/default-render.yaml"
+APP_VERSION="$(sed -n 's/^appVersion: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CHART/Chart.yaml")"
 # Blank lines are dropped: Helm versions disagree on whether a blank line
 # precedes each `---` separator, and they carry no meaning in the manifests.
 default_render() {
-  helm template t "$CHART" | grep -v -e 'helm.sh/chart:' -e 'app.kubernetes.io/version:' -e '^$'
+  helm template t "$CHART" | grep -v -e 'helm.sh/chart:' -e 'app.kubernetes.io/version:' -e '^$' \
+    | sed "s#^\( *image: ghcr.io/jensholdgaard/ourios\):$APP_VERSION\$#\1:<appVersion>#"
 }
 if [[ -n "${UPDATE_GOLDEN:-}" ]]; then
   default_render > "$GOLDEN"
@@ -193,6 +196,23 @@ else
   default_render | diff -u "$GOLDEN" - | sed 's/^/      /' | head -40
   failures=$((failures + 1))
 fi
+
+# --- image tag and pod security ----------------------------------------------
+
+workload_images() {
+  helm template t "$CHART" "$@" \
+    | sed -n 's/^ *image: \(ghcr\.io\/jensholdgaard\/ourios:.*\)$/\1/p' | sort -u
+}
+check "the image tag defaults to the chart appVersion" \
+  "ghcr.io/jensholdgaard/ourios:$APP_VERSION" "$(workload_images)"
+check "image.tag overrides the appVersion" \
+  "ghcr.io/jensholdgaard/ourios:0.16.0-static" \
+  "$(workload_images --set image.tag=0.16.0-static)"
+for template in receiver-statefulset.yaml querier-deployment.yaml compactor-deployment.yaml; do
+  check "$template runs under the RuntimeDefault seccomp profile" "type: RuntimeDefault" \
+    "$(helm template t "$CHART" --show-only "templates/$template" \
+        | sed -n '/^ *seccompProfile:$/{n;s/^ *//p;}')"
+done
 
 # --- auth, TLS, MCP, OpenFGA -------------------------------------------------
 

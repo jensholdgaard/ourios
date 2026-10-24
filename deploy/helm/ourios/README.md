@@ -5,9 +5,8 @@ query backend on Apache Parquet, a Drain-derived template miner, and Apache
 DataFusion — backed by **S3-compatible object storage** (RFC 0019).
 
 "S3" here means the S3 API, **not AWS specifically**: the store works with AWS
-S3 and any S3-compatible provider — MinIO, Cloudflare R2, Hetzner Object
-Storage, Ceph/RADOS Gateway, Google Cloud Storage via its S3 interop endpoint,
-and so on. Point `storage.s3.endpoint` at a non-AWS provider (see
+S3 and any S3-compatible provider — MinIO, Cloudflare R2, Ceph/RADOS Gateway,
+Google Cloud Storage via its S3 interop endpoint, and so on. Point `storage.s3.endpoint` at a non-AWS provider (see
 [Credentials](#credentials)).
 
 Ourios is one binary (`ourios-server`) running three roles. This chart deploys
@@ -65,7 +64,7 @@ helm install ourios deploy/helm/ourios \
   --set storage.s3.existingSecret=ourios-s3   # OR use IRSA (see below)
 ```
 
-**S3-compatible backend (MinIO / R2 / Hetzner / Ceph / … — production):** the
+**S3-compatible backend (MinIO / R2 / Ceph / … — production):** the
 same, plus `storage.s3.endpoint`:
 
 ```sh
@@ -100,10 +99,10 @@ Verify:
 helm test ourios
 ```
 
-> The image tag defaults to `latest`, not the chart's `appVersion`, so an
-> unpinned install floats to whatever the newest release is. Pin a released
-> tag via `image.tag` in production (the chart's `appVersion` names the
-> release it was published alongside).
+> The image tag defaults to the chart's `appVersion`, the release the chart
+> was published alongside, so a pinned chart version deploys a fixed image.
+> Set `image.tag` to deploy another release, or a variant such as
+> `<version>-static`.
 
 > **Warning: a default install runs unauthenticated and over plaintext.**
 > Authentication and listener TLS are opt-in, so with no `auth` values the
@@ -360,7 +359,7 @@ Credentials are **never** chart config as plaintext, and never written into the
 mounted config file — the file references them as `${env:…}` (RFC 0020 §3.5) and
 they are injected as environment variables at startup. Static credentials use the
 **S3-named** keys Ourios reads (`OURIOS_S3_*`, RFC 0019 §3.4) — not AWS-specific;
-they work against AWS S3 and every S3-compatible provider (MinIO, R2, Hetzner,
+they work against AWS S3 and every S3-compatible provider (MinIO, R2,
 Ceph, …). Supply exactly one of:
 
 1. **`storage.s3.existingSecret`** — the name of a `Secret` holding
@@ -393,7 +392,7 @@ Setting **both** `storage.s3.existingSecret` and the IRSA `role-arn` annotation
 exactly one mode must be chosen.
 
 For a **non-AWS provider**, also set `storage.s3.endpoint` to its S3 endpoint URL
-(e.g. `http://minio:9000`, a Cloudflare R2 / Hetzner endpoint, …) and
+(e.g. `http://minio:9000`, a Cloudflare R2 endpoint, …) and
 `storage.s3.region` to the provider's region (or a placeholder like `us-east-1`
 if it has none).
 
@@ -738,52 +737,78 @@ A `replicas: 1` Deployment self-heals (k8s reschedules a dead pod; a brief gap
 in this background maintenance is harmless), so leader election isn't needed and
 is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 
+> **One compactor per store, not per release.** RFC 0047 requires exactly
+> one compactor per store for erasure to hold. The chart guarantees one per
+> release only, so never point two releases, or any other compactor (a bare
+> `ourios-server`, another cluster), at the same bucket and
+> `storage.s3.prefix`. Give each release its own bucket or prefix.
+
 ## Key values
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/jensholdgaard/ourios` | Image repository. |
-| `image.tag` | `""` (→ `latest`) | Image tag; pin a released tag in production. |
+| `image.tag` | `""` (→ `appVersion`) | Image tag; empty deploys the chart's `appVersion`. |
+| `image.pullPolicy` | `IfNotPresent` | Image pull policy. |
+| `imagePullSecrets` | `[]` | Pull secrets for every workload. |
+| `nameOverride` / `fullnameOverride` | `""` | Override the chart name / the full resource-name prefix. |
 | `storage.backend` | `local` | `local` (single-node/dev) or `s3` (production — the S3 API, AWS or any S3-compatible provider). |
 | `storage.s3.bucket` | `""` | **Required for s3** (`OURIOS_S3_BUCKET`); render fails if empty. |
-| `storage.s3.endpoint` | `""` | S3-compatible endpoint URL — set for any non-AWS provider (MinIO/R2/Hetzner/Ceph/LocalStack); empty targets AWS. |
+| `storage.s3.endpoint` | `""` | S3-compatible endpoint URL — set for any non-AWS provider (MinIO/R2/Ceph/LocalStack); empty targets AWS. |
 | `storage.s3.region` | `""` | Bucket region; drives both `OURIOS_S3_REGION` and `AWS_DEFAULT_REGION`. |
 | `storage.s3.prefix` | `""` | Key prefix within the bucket. |
 | `storage.s3.existingSecret` | `""` | Secret with the S3-named credential keys (`OURIOS_S3_ACCESS_KEY_ID`/`OURIOS_S3_SECRET_ACCESS_KEY`), injected via `envFrom`. Used by any S3-compatible provider. |
 | `storage.local.bucketRoot` | `/var/lib/ourios/data` | Data dir for the local backend. |
 | `storage.local.size` | `10Gi` | Local data PVC size. |
+| `storage.local.storageClassName` / `.accessModes` | `""` / `[ReadWriteOnce]` | Local data PVC StorageClass and access modes. |
 | `storage.promotedAttributes.{resource,log}` | `[]` | Promoted attribute columns (RFC 0022), a bare key or `{key, type}` (RFC 0042). Rendered into every role's config. |
 | `miner.upstreamTemplates` | `""` | RFC 0050 dial: `ignore` (server default), `observe` or `adopt`. Receiver only. |
 | `miner.upstreamTemplateByteLimit` / `.upstreamAssociationLimit` | `""` | Server defaults 8192 bytes (0 disables) and 4 associations. Receiver only. |
 | `receiver.enabled` | `true` | OTLP ingest StatefulSet (gRPC `:4317` + HTTP `:4318`). |
 | `receiver.replicas` | `1` | Receiver replicas (each gets its own WAL PVC). |
+| `receiver.templateIdsAllowBootstrap` | `false` | RFC 0059: authorise the one-time template-id bootstrap over a store that already holds data. For the upgrade step only; see the upgrade notes in `values.yaml`. |
+| `receiver.startupProbe.periodSeconds` / `.failureThreshold` | `10` / `360` | Startup budget (default 1 h) for WAL replay and the RFC 0059 bootstrap scan. |
+| `receiver.service.type` | `ClusterIP` | Receiver Service type. |
 | `receiver.wal.size` | `2Gi` | WAL PVC size (`OURIOS_WAL_ROOT`, always local). |
 | `receiver.wal.storageClassName` | `""` | WAL StorageClass (`""` = cluster default). |
+| `receiver.wal.mountPath` / `.accessModes` | `/var/lib/ourios/wal` / `[ReadWriteOnce]` | WAL mount path and access modes. |
 | `receiver.encodeWorkers` | `""` | Encode pool size (RFC 0035); empty = available cores, the node's count without a CPU limit. |
 | `querier.enabled` | `true` | Querier Deployment (HTTP `:4319`). |
 | `querier.replicas` | `2` | Querier replicas (scales independently, no PVC). |
+| `querier.service.type` | `ClusterIP` | Querier Service type. |
 | `querier.defaultWindowSecs` | `3600` | Default look-back for a query with no `range(...)`. |
 | `compactor.enabled` | `true` | Dedicated singleton compactor Deployment. Setting `false` **fails render** (the only sweeper — hazard #4). |
 | `compactor.intervalSecs` | `300` | Compaction sweep cadence (used only by the dedicated compactor). |
+| `serviceAccount.create` / `.automount` / `.name` | `true` / `true` / `""` | The shared ServiceAccount, used by every role without its own. |
 | `serviceAccount.annotations` | `{}` | AWS EKS IRSA `eks.amazonaws.com/role-arn` goes here (alternative to `storage.s3.existingSecret`). One identity for all roles — prefer the per-role split. |
 | `<role>.serviceAccount.create` | `false` | Role-scoped ServiceAccount for `receiver`/`querier`/`compactor` — the least-privilege IAM seam ("Per-role IAM" above). `false` falls back to the shared `serviceAccount`. |
 | `<role>.serviceAccount.annotations` | `{}` | The role's own IRSA `role-arn` (querier read-only, receiver no-delete, compactor sole delete-holder). |
 | `<role>.serviceAccount.name` | `""` | With `create=true`: overrides the rendered `<fullname>-<role>` name. With `create=false`: binds an **existing** ServiceAccount of that name (managed out-of-band). |
 | `otel.exporterEndpoint` | `""` | `OTEL_EXPORTER_OTLP_ENDPOINT` — where Ourios exports **all three** of its own signals (metrics, logs, traces). The only OTel knob the chart models; SDK behaviour is configured through the standard `OTEL_*` variables in `extraEnv` — see [Self-telemetry](#self-telemetry). |
 | `extraEnv` | `[]` | Env vars appended verbatim to every container (the place for `OTEL_*`). No plaintext creds. |
+| `<role>.resources` | `{}` | Container resources per role. |
+| `podAnnotations` / `podLabels` | `{}` | Added to every pod. |
+| `<role>.podAnnotations` / `<role>.podLabels` | `{}` | Added to that role's pods; a role entry wins over a global one. |
 | `<role>.extraEnv` | `[]` | Role-only env, appended after the global `extraEnv` (a duplicate name resolves to the role's value) — e.g. per-role `OTEL_RESOURCE_ATTRIBUTES`. |
 | `auth.tokens` | `[]` | Static bearer tokens: `name`, `tenants`, `secretKeyRef` (`name`, `key`). An inline `token` fails render. |
 | `auth.oidc.enabled` | `false` | OIDC bearer JWTs; needs `issuer`, `audience`, and `tenantClaim` unless OpenFGA is on. |
+| `auth.oidc.{nameClaim,clockSkewSecs,agentClaim,groupsClaim}` | `""` | Optional; empty takes the server default (`sub`, 60 s, unset, unset). |
 | `auth.openfga.enabled` | `false` | OpenFGA tenant binding; needs `apiUrl`, `storeId`, and tokens or OIDC. API token via `apiToken.secretKeyRef`. |
+| `auth.openfga.authorizationModelId` | `""` | Pinned model id; empty = the store's latest. |
+| `auth.openfga.{sessionTtlSecs,consistency,requestTimeoutSecs,serverListObjectsDeadlineMs}` | `""` | Optional; empty takes the server default (60 s, `minimize_latency`, 5 s, 3000 ms). |
 | `auth.openfga.visibility.*` | empty | Layer-2 visibility: `objects`, `identities.{userColumns,agentColumns}`, `selfPrincipalColumn`, `contentColumns`, `maxObjects`, `listTimeoutMs`. A bound object gives the compactor the `auth` section too. |
 | `receiver.tls.{grpc,http}.existingSecret` | `""` | `kubernetes.io/tls` Secret for that listener; empty = plaintext. |
 | `querier.tls.http.existingSecret` | `""` | `kubernetes.io/tls` Secret for the query API and `/mcp`; empty = plaintext. |
 | `<listener>.clientCA.existingSecret` / `.key` | `""` / `ca.crt` | Client CA for mTLS on that listener. |
 | `<listener>.minVersion` / `.reloadIntervalSecs` | `""` | `"1.2"` or `"1.3"`; re-read the mounted files every N seconds. |
 | `querier.mcp.enabled` | `false` | Serve the RFC 0027 MCP surface at `/mcp`. |
+| `podSecurityContext` | nonroot uid 65532, `fsGroup` 65532, `seccompProfile: RuntimeDefault` | Pod security context for every workload. |
+| `securityContext` | no privilege escalation, read-only root, all capabilities dropped | Container security context for every workload. |
+| `nodeSelector` / `tolerations` / `affinity` | `{}` / `[]` / `{}` | Scheduling, applied to all three workloads. |
 
-The image runs as nonroot (uid 65532) with a read-only root filesystem; the
-chart sets `fsGroup` so the process can write the WAL PVC.
+The image runs as nonroot (uid 65532) with a read-only root filesystem and the
+runtime's default seccomp profile, which Pod Security "restricted" requires;
+the chart sets `fsGroup` so the process can write the WAL PVC.
 
 ## Probes
 

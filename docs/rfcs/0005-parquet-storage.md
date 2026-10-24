@@ -34,7 +34,7 @@ superseded-by: —
 > parquet + querier), **.14** alias audit events back the v1 map
 > (`rfc0005_14_*`).
 >
-> **RFC0005.6 is an `#[ignore]`d heavyweight test** (`tests/sizing.rs`):
+> **RFC0005.6 is an `#[ignore]`d heavyweight test** (`tests/it/sizing.rs`):
 > it pushes >256 MiB through the production writer and asserts every
 > non-final row group's uncompressed `total_byte_size` ∈ [128 MiB, 1 GiB]
 > per §3.5 / H4. Per §6 it is not run by CI (the project has no
@@ -1303,25 +1303,25 @@ column the bench won't measure.
 ## 6. Testing strategy
 
 - **RFC0005.1** — property test in
-  `crates/ourios-parquet/tests/roundtrip.rs` using `proptest` to
+  `crates/ourios-parquet/tests/it/round_trip.rs` using `proptest` to
   generate `MinedRecord`s spanning every column variant; asserts
   byte-equality after a round trip through the writer and reader.
   Corpus integration test in the same file drives the H7.1
   corpus through writer → reader and asserts the same property
   end-to-end.
 - **RFC0005.2, RFC0005.3, RFC0005.4** — schema-evolution tests
-  in `crates/ourios-parquet/tests/evolution.rs`. Each test
+  in the `tests` module of `crates/ourios-parquet/src/reader.rs`. Each test
   builds a Parquet file with the `parquet` crate directly (not
   through the project's writer), exercising a specific shape:
   missing-OPTIONAL, unknown-column, missing-REQUIRED. Asserts
   the §3.9 reader contract.
 - **RFC0005.5** — integration test in
-  `crates/ourios-parquet/tests/partition.rs` that drives the
+  `crates/ourios-parquet/tests/it/partition_layout.rs` that drives the
   writer with a synthetic multi-tenant, multi-hour stream and
   asserts the bucket layout via filesystem inspection. The
   non-ASCII tenant id case is a sub-test.
 - **RFC0005.6** — corpus integration test in
-  `crates/ourios-parquet/tests/sizing.rs`. Generates ≥256 MiB of
+  `crates/ourios-parquet/tests/it/sizing.rs`. Generates ≥256 MiB of
   records, flushes through the writer, parses each emitted file's
   Parquet footer, asserts row-group sizes inside the H4 range.
   Marked `#[ignore]` by default (slow); contributors run it
@@ -1330,12 +1330,12 @@ column the bench won't measure.
   has no `schedule` trigger today, so the RFC does not commit to
   one.
 - **RFC0005.7** — integration test in
-  `crates/ourios-parquet/tests/audit.rs` that wires the audit
+  `crates/ourios-parquet/tests/it/audit_round_trip.rs` that wires the audit
   sink to the writer's audit path, triggers a widening through
   the miner, flushes, and reads back the audit file. Asserts
   the §3.7 column set.
 - **RFC0005.8** — Parquet-metadata inspection test in
-  `crates/ourios-parquet/tests/encoding.rs`. Drives 100+ unique
+  `crates/ourios-parquet/tests/it/no_body_dict.rs`. Drives 100+ unique
   bodies through the writer, opens the resulting file's footer
   via the `parquet` crate's column-chunk metadata, asserts the
   `body` column's `compression` is `ZSTD` and its `encodings`
@@ -1345,13 +1345,13 @@ column the bench won't measure.
   with an in-memory Parquet file built directly from `arrow`
   arrays carrying a forged `99` in the `type_tag` list.
 - **RFC0005.10** — unit test in
-  `crates/ourios-parquet/tests/schema_pin.rs` that holds a const
+  `crates/ourios-parquet/tests/it/schema_pin.rs` that holds a const
   expected-column-list and compares against `Schema::columns()`.
   This is the "schema-as-spec" pin: adding a column to `Schema`
   without updating the expected list (and, by implication, this
   RFC) fails the test, mirroring the RFC0004.3 pattern.
 - **RFC0005.11** — integration test in
-  `crates/ourios-parquet/tests/partition_validation.rs` that
+  `crates/ourios-parquet/tests/it/row_vs_path_validation.rs` that
   builds Parquet files at deliberately mismatched partition
   paths (row says `tenant_id = a`, path segment says
   `tenant_id=b`) and asserts the reader's hard-error path fires
@@ -1375,7 +1375,7 @@ column the bench won't measure.
   directly, per the RFC0005.2 pattern, and assert the window
   filter behaves as `effective := time_unix_nano`.
 - **RFC0005.14** — lands with the issue-#148 implementation
-  slice. Round-trip test in `crates/ourios-parquet/tests/audit.rs`
+  slice. Round-trip test in `crates/ourios-parquet/tests/it/audit_round_trip.rs`
   per the RFC0005.12 pattern: write `alias_asserted` /
   `alias_retracted` and a `template_widened` event through
   `AuditWriter`, read back via `AuditReader`, assert each kind's

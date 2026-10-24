@@ -673,3 +673,24 @@ async fn mcp_request_body_is_capped_at_the_querier_limit() {
     let (status, body, _) = mcp_post(router, None, None, initialize(limit / 2)).await;
     assert_eq!(status, StatusCode::OK, "under the cap: {body}");
 }
+
+/// A non-initialize `POST /mcp` without an `mcp-session-id` is a client
+/// error per the MCP streamable-HTTP spec: `400`, not `422`. Clients hit
+/// this when they reconnect after the server reaps an idle session.
+#[tokio::test]
+async fn mcp_sessionless_non_initialize_post_is_400() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let router = ourios_server::querier::router_with_mcp(
+        bucket.path().to_path_buf(),
+        3_600_000_000_000,
+        ourios_serving::AuthResolver::static_only(None),
+        true,
+    );
+    let list = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let (status, body, _) = mcp_post(router, None, None, list).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "session-less tools/list: {body}"
+    );
+}

@@ -41,7 +41,7 @@ operator never knows.
   change.
 - Three-zone confidence model: clean match (≥ threshold) / lossy
   match (floor ≤ x < threshold, retain body — reconstruction still
-  succeeds, so `lossy_flag` is **not** set) / parse failure
+  succeeds, so `lossy_flag` is **not** set) / below floor
   (< floor: since the RFC 0001 §6.3 2026-10-23 amendment, mint a
   fresh leaf like a line with no candidate, subject to the template
   ceiling; a guard rejection such as the ceiling is a parse failure,
@@ -54,18 +54,26 @@ operator never knows.
 - Every template-widening event is audited: the audit record names
   the old template, the new template, tenant, timestamp, and reason.
 
-**Detection.** All metrics carry `tenant_id`; some carry `service`.
-- `merges_total` counter: spike on stable input → service-version
-  change *or* threshold drift.
-- `body_retention_ratio` gauge: rising → input shifted *or*
-  threshold is too tight.
-- `confidence_p01` histogram tail: collapsing → many matches are
+**Detection.** All metrics carry `ourios.tenant`; some also carry
+`ourios.service`. The `CLAUDE.md` §3.1 short names map to the emitted
+instruments as shown in brackets.
+- `merges_total` (`ourios.miner.merges` counter): spike on stable
+  input → service-version change *or* threshold drift.
+- `body_retention_ratio` (`ourios.miner.body_retention.utilization`
+  gauge): rising → input shifted *or* threshold is too tight.
+- `confidence_p01` (`ourios.miner.confidence.p01` gauge, a view of the
+  `ourios.miner.confidence` histogram): collapsing → many matches are
   barely passing; threshold should be revisited.
-- `parse_failures_total`: nonzero is genuine failure, not lossy.
+- `parse_failures_total` (`ourios.miner.parse_failures` counter, by
+  `ourios.miner.parse_failure.reason`): nonzero is a genuine failure,
+  such as `template_ceiling`, not a lossy match.
+- `template_count` (`ourios.miner.template.count` gauge): see C2.
 
-**Escalation.** A spike on one tenant is a tuning question (masking
-rules, per-tenant threshold). A spike across many tenants on a
-stable corpus is a policy question — RFC.
+**Escalation.** A spike on one tenant is a tuning question. The served
+binary has no per-tenant miner settings and a fixed masking rule set
+(RFC 0020 leaves the miner out of the config file), so tuning is a
+code change to the miner defaults or masking rules. A spike across
+many tenants on a stable corpus is a policy question — RFC.
 
 **See also.** `CLAUDE.md` §3.1; `docs/rfcs/0001-template-miner.md`
 §§6.3–6.4; `docs/benchmarks.md` C2 (template count convergence),
@@ -91,15 +99,17 @@ compression claim evaporates for that workload.
 - Counter increments on overflow.
 
 **Detection.**
-- `params_overflow_ratio` per service: alert when **> 1 %** of
-  lines for any one service hit overflow.
+- `params_overflow_ratio` (`ourios.miner.params.overflow.utilization`)
+  per service: alert when **> 1 %** of lines for any one service hit
+  overflow.
 - Parquet column-size variance: a column whose dictionary efficiency
   drops sharply between compactions usually means a new overflow
   pattern.
 
-**Escalation.** Service-specific spike → masking rule that
-pre-redacts the offending field. Broad spike → revisit the limit
-(still ≤ 1 KiB). Anyone proposing > 1 KiB → RFC.
+**Escalation.** Service-specific spike → redact or shorten the
+offending field at the emitter or in the Collector; the masking rule
+set is fixed. Broad spike → revisit the limit in code (still ≤ 1 KiB;
+it is not a config-file setting). Anyone proposing > 1 KiB → RFC.
 
 **Structured bodies (RFC 0037, `green` — implemented).** The
 per-parameter byte limit above guards the *string* path only. A structured (non-string) body — a GenAI event's
@@ -146,12 +156,20 @@ the data was accepted; we have lost data we promised to keep.
   runs on every PR; failure blocks merge.
 - Replication, when added, is **in addition to** the WAL, not a
   replacement.
+- Segments are reclaimed once the publication barrier has
+  checkpointed past them, and a
+  failed rotation retries in place under a bounded budget before the
+  WAL enters a terminal state that refuses appends (and so acks)
+  until an operator intervenes
+  ([RFC 0052](rfcs/0052-wal-reclamation-and-quiesce-recovery.md)).
 
 **Detection.**
-- `ingest_ack_latency_p99`: rising trend usually means fsync is the
-  bottleneck.
-- `wal_unflushed_bytes`: bytes acked but not yet on durable storage
-  — must always be bounded.
+- `ourios.wal.append.duration` (append + fsync, the WAL-before-ack
+  latency): a rising p99 usually means fsync is the bottleneck.
+- `ourios.wal.unflushed.size`: bytes appended but not yet fsync'd, and
+  so not yet acked — must always be bounded.
+- `ourios.wal.unreclaimed.size` / `.age` and `ourios.wal.rotation.*`:
+  reclamation stalling or rotation failing (RFC 0052 §3.3, §3.5).
 - CI crash-recovery test: any failure is critical, regardless of
   flake history.
 
@@ -159,35 +177,41 @@ the data was accepted; we have lost data we promised to keep.
 faster storage. Ack-without-fsync ever observed in code review → P0
 bug, hotfix path.
 
-**See also.** `CLAUDE.md` §3.4; RFC 0008 (WAL design);
+**See also.** `CLAUDE.md` §3.4; RFC 0008 (WAL design); RFC 0052;
 benchmark D2 (compaction keeps up).
 
 ---
 
 ## H4 — The small-file problem
 
-**Failure mode.** WAL segments get rotated and flushed to Parquet
-too eagerly. The result is thousands of small files per tenant per
+**Failure mode.** Ingest writes Parquet files too eagerly and
+compaction does not merge them. The result is thousands of small files per tenant per
 day. Object-storage `LIST` calls dominate query planning time. Cold
 cache hits are murderous. Operators see "query took 12 s on 4 GB of
 logs" and lose faith in the backend.
 
 **Mitigation.**
 - Target **row-group size 128 MB – 1 GB** for **ingest-side** Parquet
-  files. Compacted files deliberately rotate row groups at a smaller
-  threshold (RFC 0036 §3.3, initially 32 MiB) — the pruning-granularity
+  files. Compacted files deliberately rotate row groups at a smaller,
+  adaptive threshold (RFC 0036 §3.3: the partition's estimated size / 8,
+  clamped to 1–32 MiB) — the pruning-granularity
   knob: within one compacted file a smaller row group buys tighter
   per-group min/max statistics (so a windowed query scans the groups
   that hold its answer, not the whole hour) at the cost of a few more
   footer entries. File economics are governed by the **file** band
   below, which compaction leaves untouched.
-- Target **file size 256 MB – 2 GB** post-compaction.
-- Background compaction job per tenant; cadence is a tunable.
+- Target **file size 256 MB – 2 GB** post-compaction. This is a goal
+  the detection histogram measures; the writer does not enforce it.
+- Background compaction: one sweep covers every tenant in the store,
+  every 300 s by default (`compaction.interval_secs`).
+- A deployment that uses erasure runs exactly one compactor per store
+  ([RFC 0047](rfcs/0047-rebac-resolver-and-graph-visibility.md) §3.6,
+  2026-10-23 amendment).
 - Compaction is required to keep the WAL backlog bounded under
   sustained ingest (D2).
 
 **Detection.**
-- File-size histogram per tenant: fewer than **5 %** of files
+- File-size histogram (`ourios.storage.parquet.file.size`): fewer than **5 %** of files
   below 128 MiB at steady state.
 - File count vs. data volume: file count must grow sub-linearly
   with bytes ingested.
@@ -213,8 +237,8 @@ volume and misdiagnoses it as an outage.
 **Mitigation.**
 - Templates are versioned: a template's *internal representation*
   can change; the *logical identity* persists across versions.
-- Explicit alias mechanism: `template_id.resolves_to(X)` in the
-  DSL resolves a query across all aliases of `X`.
+- Explicit alias mechanism: `resolves_to(X)` in the DSL resolves a
+  query across all aliases of `X`.
 - Drift detection is a first-class query — operators can ask "what
   templates drifted in the last 24 h?" and get a list.
 - A new `template_version` emits an audit event, just like a merge.
@@ -222,8 +246,8 @@ volume and misdiagnoses it as an outage.
 **Detection.**
 - Spike in distinct template count immediately after a deploy →
   expected; investigate only if it persists past the deploy window.
-- Diff between `template_id = X` and `template_id.resolves_to(X)`
-  result counts → measures alias coverage.
+- Diff between `template_id == X` and `resolves_to(X)` result
+  counts → measures alias coverage.
 - Audit event volume: drift events should correlate with deploy
   cadence, not appear randomly.
 
@@ -231,7 +255,8 @@ volume and misdiagnoses it as an outage.
 aliases or cycles) → revisit alias semantics, RFC. Drift correlated
 with deploys → expected; not an alert.
 
-**See also.** `CLAUDE.md` §3.5; RFC 0001 §6.7.
+**See also.** `CLAUDE.md` §3.5; RFC 0001 §6.7; RFC 0010 (drift
+queries over the audit stream).
 
 ---
 
@@ -287,15 +312,14 @@ line looked normal.
 - Reconstruction is a **property test** against the testdata
   corpus: for every non-lossy row, `reconstruct(record) ==
   ingested_bytes` exactly. Property failure blocks merge.
-- The reader honours `lossy_flag`. The UI surfaces lossy rows with
-  an explicit warning ("this row's body cannot be exactly
-  reconstructed") rather than rendering them.
-- Tenants may opt into default-on body retention at a storage cost.
+- The reader honours `lossy_flag`: a lossy row returns its retained
+  `body` verbatim rather than a render, and `lossy == true` selects
+  such rows in the DSL.
 
 **Detection.**
 - Reconstruction property test (CI): zero failures, ever, on the
   committed corpus.
-- `body_retention_ratio` gauge: a sudden rise indicates input
+- `ourios.miner.body_retention.utilization` gauge: a sudden rise indicates input
   distribution change OR a regression in whitespace capture.
 - User complaint of "the rendered log does not match what we sent"
   → reproduce, add to corpus, fix.
@@ -353,6 +377,8 @@ re-architecture of its durability layer.
 - A "dedup hit rate" metric on the dedup pass — a sudden drop
   signals that something is masking what should be visible
   duplicates.
+- Neither signal is emitted today. An RFC that proposes replication
+  must add them.
 
 **Escalation.** Replication proposed → RFC must explicitly address
 this hazard. Time-window dedup proposed → block, redirect to a

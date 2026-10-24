@@ -334,7 +334,8 @@ otel:
 # from an existing Kubernetes Secret into an env var through secretKeyRef,
 # and the config file holds only the `${env:…}` reference to it (the server
 # rejects an inline token). Rotating a referenced Secret needs a rollout
-# restart of the receiver and querier.
+# restart of the receiver and querier, and of the compactor when
+# auth.openfga.visibility binds an object.
 auth:
   # Static bearer tokens (RFC 0026). Each entry:
   #   name          the audit/metric label (never secret)

@@ -7251,8 +7251,8 @@ Used by:
 - `rand_xorshift` 0.5.0 — <https://github.com/rust-random/rngs>
 - `ref-cast-impl` 1.0.25 — <https://github.com/dtolnay/ref-cast>
 - `ref-cast` 1.0.25 — <https://github.com/dtolnay/ref-cast>
-- `rmcp-macros` 3.5.1 — <https://github.com/modelcontextprotocol/rust-sdk/>
-- `rmcp` 3.5.1 — <https://github.com/modelcontextprotocol/rust-sdk/>
+- `rmcp-macros` 3.7.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
+- `rmcp` 3.7.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
 - `rustls-platform-verifier-android` 0.2.0 — <https://github.com/rustls/rustls-platform-verifier>
 - `rustversion` 1.0.22 — <https://github.com/dtolnay/rustversion>
 - `ryu` 1.0.23 — <https://github.com/dtolnay/ryu>

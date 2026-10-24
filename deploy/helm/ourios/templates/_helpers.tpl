@@ -132,12 +132,54 @@ storage:
   local:
     bucket_root: {{ .Values.storage.local.bucketRoot | quote }}
 {{- end }}
+{{- $promoted := .Values.storage.promotedAttributes | default dict }}
+{{- if not (kindIs "map" $promoted) }}
+{{- fail (printf "storage.promotedAttributes must be a map with resource and log lists, got %v" $promoted) }}
+{{- end }}
+{{- if or $promoted.resource $promoted.log }}
+  promoted_attributes:
+{{- range $scope := list "resource" "log" }}
+{{- with include "ourios.promotedList" (dict "path" (printf "storage.promotedAttributes.%s" $scope) "entries" (index $promoted $scope)) }}
+    {{ $scope }}:
+{{- . }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+One storage.promotedAttributes list (RFC 0022 / RFC 0042 §3.2), 6-space
+indented; pass (dict "path" "<values path>" "entries" <list>). An entry is a
+bare key (the string class) or a {key, type} map. Renders nothing for an
+absent or empty list.
+*/}}
+{{- define "ourios.promotedList" -}}
+{{- if and (not (kindIs "invalid" .entries)) (not (kindIs "slice" .entries)) }}
+{{- fail (printf "%s must be a list of attribute keys, got %v" .path .entries) }}
+{{- end }}
+{{- range $i, $e := .entries }}
+{{- if kindIs "map" $e }}
+{{- range $k, $_ := $e }}
+{{- if not (has $k (list "key" "type")) }}
+{{- fail (printf "%s[%d] has an unknown field %q: an entry is a key, or a map with key and type" $.path $i $k) }}
+{{- end }}
+{{- end }}
+      - key: {{ required (printf "%s[%d].key is required" $.path $i) (include "ourios.setValue" $e.key) | quote }}
+{{- with include "ourios.setValue" $e.type }}
+        type: {{ . | quote }}
+{{- end }}
+{{- else if ne (include "ourios.setValue" $e) "" }}
+      - {{ toString $e | quote }}
+{{- else }}
+{{- fail (printf "%s[%d] is empty: an entry is a key, or a map with key and type" $.path $i) }}
+{{- end }}
+{{- end }}
 {{- end }}
 
 {{/*
 The full RFC 0020 config file for one role. Pass
 (dict "root" $ "role" "receiver"|"querier"|"compactor"): the shared storage block,
-the auth section for the two listening roles, plus that role's flags and
+the auth section (see ourios.roleHasAuth), plus that role's flags and
 listener TLS; the roles it does not run are absent (disabled). The
 receiver/querier disable compaction so only the dedicated compactor sweeps
 (RFC 0009 §3.2). Data-plane only — OTEL_* / AWS_* stay env (RFC 0020 §3.8).
@@ -146,15 +188,22 @@ receiver/querier disable compaction so only the dedicated compactor sweeps
 {{- $ := .root -}}
 {{- $role := .role -}}
 {{- include "ourios.storageConfig" $ }}
-{{- if or (eq $role "receiver") (eq $role "querier") }}
+{{- if include "ourios.roleHasAuth" (dict "root" $ "role" $role) }}
 {{- include "ourios.authConfig" $ }}
 {{- end }}
 {{- if eq $role "receiver" }}
+{{- include "ourios.minerConfig" $ }}
 receiver:
   enabled: true
   grpc_addr: "0.0.0.0:4317"
   http_addr: "0.0.0.0:4318"
   wal_root: {{ $.Values.receiver.wal.mountPath | quote }}
+  {{- with include "ourios.setValue" $.Values.receiver.encodeWorkers }}
+  {{- if not (regexMatch "^[1-9][0-9]*$" .) }}
+  {{- fail (printf "receiver.encodeWorkers must be a positive integer, got %v" $.Values.receiver.encodeWorkers) }}
+  {{- end }}
+  encode_workers: {{ . }}
+  {{- end }}
   {{- if $.Values.receiver.templateIdsAllowBootstrap }}
   template_ids_allow_bootstrap: true
   {{- end }}
@@ -189,6 +238,88 @@ compaction:
   interval_secs: {{ $.Values.compactor.intervalSecs }}
 {{- else }}
 {{- fail (printf "ourios.config: unknown role %q" $role) }}
+{{- end }}
+{{- end }}
+
+{{/*
+The RFC 0050 §3.2 upstream-template dial (`miner.*`). The server reads it
+only for the receiver, so only the receiver's config carries it. Absent
+unless a key is set.
+*/}}
+{{- define "ourios.minerConfig" -}}
+{{- $m := .Values.miner | default dict -}}
+{{- $mode := include "ourios.setValue" $m.upstreamTemplates -}}
+{{- $byteLimit := include "ourios.setValue" $m.upstreamTemplateByteLimit -}}
+{{- $assocLimit := include "ourios.setValue" $m.upstreamAssociationLimit -}}
+{{- if and $mode (not (has $mode (list "ignore" "observe" "adopt"))) }}
+{{- fail (printf "miner.upstreamTemplates must be \"ignore\", \"observe\" or \"adopt\", got %v" $m.upstreamTemplates) }}
+{{- end }}
+{{- range $path, $v := dict "miner.upstreamTemplateByteLimit" $byteLimit "miner.upstreamAssociationLimit" $assocLimit }}
+{{- if and $v (not (regexMatch "^[0-9]+$" $v)) }}
+{{- fail (printf "%s must be a non-negative integer, got %v" $path $v) }}
+{{- end }}
+{{- end }}
+{{- if or $mode $byteLimit $assocLimit }}
+miner:
+{{- with $mode }}
+  upstream_templates: {{ . | quote }}
+{{- end }}
+{{- with $byteLimit }}
+  upstream_template_byte_limit: {{ . }}
+{{- end }}
+{{- with $assocLimit }}
+  upstream_association_limit: {{ . }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether a role's config carries the auth section; pass (dict "root" $
+"role" "<role>"). Renders "true" or nothing. The receiver and querier take
+it to authenticate. The compactor takes it only when OpenFGA binds a
+visibility object: it then runs the graph emitter on each sweep (RFC 0047)
+and `graph backfill` reads auth.openfga from its config (RFC 0048).
+*/}}
+{{- define "ourios.roleHasAuth" -}}
+{{- if or (eq .role "receiver") (eq .role "querier") }}true
+{{- else if and (eq .role "compactor") (include "ourios.openfgaEnabled" .root) (include "ourios.visibilityObjects" .root) }}true
+{{- end }}
+{{- end }}
+
+{{/*
+The validated auth.openfga.visibility.objects list as JSON (read back with
+fromJson), or nothing when it is absent or empty.
+*/}}
+{{- define "ourios.visibilityObjects" -}}
+{{- $objects := dig "openfga" "visibility" "objects" nil (.Values.auth | default dict) -}}
+{{- if and (not (kindIs "invalid" $objects)) (not (kindIs "slice" $objects)) }}
+{{- fail (printf "auth.openfga.visibility.objects must be a list of {type, column} entries, got %v" $objects) }}
+{{- end }}
+{{- if $objects }}
+{{- range $i, $o := $objects }}
+{{- if not (kindIs "map" $o) }}
+{{- fail (printf "auth.openfga.visibility.objects[%d] must be a map with type and column, got %v" $i $o) }}
+{{- end }}
+{{- end }}
+{{- toJson $objects }}
+{{- end }}
+{{- end }}
+
+{{/*
+One optional string list of the visibility section; pass (dict "key" "<yaml
+key>" "path" "<values path>" "value" <v> "indent" <n>). Renders nothing for
+an absent or empty list, so the server default applies.
+*/}}
+{{- define "ourios.optList" -}}
+{{- if and (not (kindIs "invalid" .value)) (not (kindIs "slice" .value)) }}
+{{- fail (printf "%s must be a list of column names, got %v" .path .value) }}
+{{- end }}
+{{- $pad := repeat (int .indent) " " }}
+{{- if .value }}
+{{ $pad }}{{ .key }}:
+{{- range .value }}
+{{ $pad }}  - {{ toString . | quote }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -417,7 +548,7 @@ The OpenFGA API token's validated secretKeyRef; pass the auth.openfga map.
 
 {{/*
 The `auth` config section (RFC 0026 tokens, RFC 0029 oidc, RFC 0047 openfga)
-for the receiver and querier. Absent unless tokens or oidc are configured,
+for the roles ourios.roleHasAuth selects. Absent unless tokens or oidc are configured,
 which keeps open mode the default. Every secret leaf is an ${env:…}
 reference to a variable ourios.authEnv fills from a secretKeyRef, so no
 secret value reaches the ConfigMap.
@@ -485,14 +616,57 @@ auth:
 {{- include "ourios.optScalar" (dict "key" "consistency" "value" $fga.consistency) }}
 {{- include "ourios.optScalar" (dict "key" "request_timeout_secs" "value" $fga.requestTimeoutSecs) }}
 {{- include "ourios.optScalar" (dict "key" "server_list_objects_deadline_ms" "value" $fga.serverListObjectsDeadlineMs) }}
+{{- include "ourios.visibilityConfig" . }}
 {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+The RFC 0047 §3.4 / RFC 0048 §3.2 `auth.openfga.visibility` block; pass the
+root context. Absent unless a key is set, so every field takes the server
+default. Nothing in it is secret. Its columns must be promoted
+(storage.promotedAttributes); the server checks that at startup.
+*/}}
+{{- define "ourios.visibilityConfig" -}}
+{{- $v := dig "openfga" "visibility" (dict) (.Values.auth | default dict) | default dict -}}
+{{- $ids := $v.identities | default dict -}}
+{{- $objects := include "ourios.visibilityObjects" . -}}
+{{- $body := "" -}}
+{{- if $objects }}
+{{- $body = print $body "\n      objects:" }}
+{{- range $i, $o := fromJsonArray $objects }}
+{{- $body = print $body "\n        - type: " (required (printf "auth.openfga.visibility.objects[%d].type is required" $i) (include "ourios.setValue" $o.type) | quote) }}
+{{- $body = print $body "\n          column: " (required (printf "auth.openfga.visibility.objects[%d].column is required" $i) (include "ourios.setValue" $o.column) | quote) }}
+{{- end }}
+{{- end }}
+{{- $identities := print
+  (include "ourios.optList" (dict "key" "user_columns" "path" "auth.openfga.visibility.identities.userColumns" "value" $ids.userColumns "indent" 8))
+  (include "ourios.optList" (dict "key" "agent_columns" "path" "auth.openfga.visibility.identities.agentColumns" "value" $ids.agentColumns "indent" 8)) }}
+{{- with $identities }}
+{{- $body = print $body "\n      identities:" . }}
+{{- end }}
+{{- with include "ourios.setValue" $v.selfPrincipalColumn }}
+{{- $body = print $body "\n      self_principal_column: " (. | quote) }}
+{{- end }}
+{{- $body = print $body (include "ourios.optList" (dict "key" "content_columns" "path" "auth.openfga.visibility.contentColumns" "value" $v.contentColumns "indent" 6)) }}
+{{- range $key, $path := dict "max_objects" "maxObjects" "list_timeout_ms" "listTimeoutMs" }}
+{{- with include "ourios.setValue" (index $v $path) }}
+{{- if not (regexMatch "^[1-9][0-9]*$" .) }}
+{{- fail (printf "auth.openfga.visibility.%s must be a positive integer, got %v" $path .) }}
+{{- end }}
+{{- $body = print $body "\n      " $key ": " . }}
+{{- end }}
+{{- end }}
+{{- with $body }}
+    visibility:
+{{- . }}
 {{- end }}
 {{- end }}
 
 {{/*
 The env behind ourios.authConfig's ${env:…} references: each token and the
 OpenFGA API token, read from the referenced Secret with secretKeyRef. Empty
-when auth is off. Only the receiver and querier take it.
+when auth is off. Only the roles ourios.roleHasAuth selects take it.
 */}}
 {{- define "ourios.authEnv" -}}
 {{- if include "ourios.authEnabled" . }}
@@ -563,7 +737,7 @@ would replace the Secret-sourced token (Kubernetes keeps the last). */}}
 {{- end }}
 {{- end }}
 {{- end }}
-{{- if or (eq .role "receiver") (eq .role "querier") }}
+{{- if include "ourios.roleHasAuth" . }}
 {{- include "ourios.authEnv" .root }}
 {{- end }}
 {{- include "ourios.commonEnv" .root }}

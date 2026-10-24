@@ -1,17 +1,19 @@
-# Publishes the Helm chart (and its Artifact Hub metadata) to GHCR on
-# demand — for chart-only version bumps that don't ride an application
-# release tag. The steps mirror release.yml's `publish-chart` job (which
-# remains the path for tagged releases); keep the two in sync.
+# Publishes the Helm chart (and its Artifact Hub metadata) to GHCR.
+# Two callers: a manual dispatch, for chart-only version bumps that
+# don't ride an application release tag, and release.yml's
+# `publish-chart` job on a tagged release (`workflow_call`).
 name: Publish chart
 
 on:
   workflow_dispatch:
+  workflow_call:
 
-# Serialize publishes — parallel dispatches would race on the same
-# chart version and `:artifacthub.io` tag. No cancel-in-progress: a
-# publish in flight must finish.
+# Serialize publishes — parallel runs would race on the same chart
+# version and `:artifacthub.io` tag. A fixed group (not the caller's
+# workflow name) so a dispatch and a release run serialize too. No
+# cancel-in-progress: a publish in flight must finish.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: publish-chart
 
 permissions: {}
 

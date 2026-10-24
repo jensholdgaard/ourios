@@ -172,13 +172,8 @@ impl Compactor {
 /// and writing what the pass derived could bring them back (RFC0047.11).
 /// Returns the report, the wall-clock spent, and the audit sink handed
 /// back. Runs the same way whether called by
-/// [`Compactor::run`] or a test.
-///
-/// # Panics
-///
-/// If a blocking task panics — `run_sweep` returns errors rather than
-/// panicking, so this signals a bug, surfaced loudly rather than silently
-/// stalling the daemon.
+/// [`Compactor::run`] or a test. A blocking pass that panics fails this
+/// sweep with [`IngestError::Task`]; the daemon takes the next tick.
 pub async fn sweep_once(
     target: SweepTarget,
     audit_sink: Box<dyn AuditSink>,
@@ -209,14 +204,24 @@ pub(crate) async fn sweep_recorded(
     // (RFC 0019) — so it must run on the blocking pool, never on the async
     // task where slow S3 would stall the runtime.
     #[cfg_attr(not(feature = "openfga"), allow(unused_mut))]
-    let (mut result, mut audit_sink, tuples) = tokio::task::spawn_blocking(move || {
-        blocking_pass(&blocking_target, audit_sink, metrics.as_deref())
+    let (pass, mut audit_sink) = blocking_with_sink("compaction sweep", audit_sink, move |sink| {
+        blocking_pass(&blocking_target, sink, metrics.as_deref())
     })
-    .await
-    .expect("compaction sweep task should not panic");
+    .await;
+    #[cfg_attr(not(feature = "openfga"), allow(unused_mut))]
+    let (mut result, tuples) = match pass {
+        Ok((result, tuples)) => (result, Some(tuples)),
+        Err(error) => (
+            Err(FailedSweep {
+                error,
+                partial: None,
+            }),
+            None,
+        ),
+    };
 
     #[cfg(feature = "openfga")]
-    if let (Ok(report), Some(emitter)) = (&mut result, &target.emitter) {
+    if let (Ok(report), Some(emitter), Some(tuples)) = (&mut result, &target.emitter, tuples) {
         let graph = GraphPhase {
             store: &target.store,
             emitter,
@@ -224,7 +229,7 @@ pub(crate) async fn sweep_recorded(
         graph.run(report, &mut audit_sink, tuples).await;
     }
     #[cfg(not(feature = "openfga"))]
-    let GraphTuples = tuples;
+    let _: Option<GraphTuples> = tuples;
     (result, start.elapsed(), audit_sink)
 }
 
@@ -236,13 +241,9 @@ pub(crate) async fn sweep_recorded(
 /// that one event.
 fn blocking_pass(
     target: &SweepTarget,
-    mut audit_sink: Box<dyn AuditSink>,
+    audit_sink: &mut dyn AuditSink,
     metrics: Option<&CompactionMetrics>,
-) -> (
-    Result<SweepReport, FailedSweep>,
-    Box<dyn AuditSink>,
-    GraphTuples,
-) {
+) -> (Result<SweepReport, FailedSweep>, GraphTuples) {
     let mut on_commit = |commit: &PartitionCommitted<'_>| {
         if let Some(metrics) = metrics {
             metrics.record_partition(commit);
@@ -250,8 +251,40 @@ fn blocking_pass(
         audit_sink.emit(commit.event.clone());
     };
     let gauges = metrics.map(CompactionMetrics::gauges);
-    let (result, tuples) = sweep_deriving(target, gauges, &mut on_commit);
-    (result, audit_sink, tuples)
+    sweep_deriving(target, gauges, &mut on_commit)
+}
+
+/// Run `pass` on the blocking pool with the audit sink, catching its
+/// unwind so a panic fails this one step while the sink comes back for
+/// the next. A task the runtime cancelled (it is shutting down) takes the
+/// sink with it, and a no-op sink stands in for the rest of the process.
+/// Either failure is logged with its `error.type` (`panic` or
+/// `cancelled`) and returned as [`IngestError::Task`].
+pub(super) async fn blocking_with_sink<T: Send + 'static>(
+    task: &'static str,
+    mut audit_sink: Box<dyn AuditSink>,
+    pass: impl FnOnce(&mut dyn AuditSink) -> T + Send + 'static,
+) -> (Result<T, IngestError>, Box<dyn AuditSink>) {
+    let joined = tokio::task::spawn_blocking(move || {
+        // Only the sink outlives the unwind, and a panic outside its `emit`
+        // leaves it as it was.
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pass(audit_sink.as_mut())));
+        (outcome, audit_sink)
+    })
+    .await;
+    let (error_type, audit_sink): (_, Box<dyn AuditSink>) = match joined {
+        Ok((Ok(value), audit_sink)) => return (Ok(value), audit_sink),
+        Ok((Err(_), audit_sink)) => ("panic", audit_sink),
+        Err(e) if e.is_panic() => ("panic", Box::new(NoOpAuditSink::new())),
+        Err(_) => ("cancelled", Box::new(NoOpAuditSink::new())),
+    };
+    tracing::error!(
+        name: ourios_semconv::EVENT_OURIOS_COMPACTION_SWEEP_ERROR,
+        { { crate::metrics::ERROR_TYPE } = error_type },
+        "the {task} task ended without a result ({error_type}), so this sweep fails",
+    );
+    (Err(IngestError::Task { task, error_type }), audit_sink)
 }
 
 /// [`run_sweep_committing`] over `target`, deriving the RFC 0047 §3.3
@@ -311,4 +344,75 @@ fn sweep_deriving(
         on_commit,
     );
     (result, GraphTuples)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::SystemTime;
+
+    use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
+    use ourios_core::tenant::TenantId;
+
+    use super::{IngestError, blocking_with_sink};
+
+    struct CountingSink(Arc<AtomicUsize>);
+
+    impl AuditSink for CountingSink {
+        fn emit(&mut self, _event: AuditEvent) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn event() -> AuditEvent {
+        AuditEvent {
+            tenant_id: TenantId::new("t"),
+            timestamp: SystemTime::now(),
+            payload: AuditPayload::ConversationErased {
+                conversation_id: "c".to_owned(),
+                partitions_rewritten: 0,
+                rows_dropped: 0,
+                tuples_deleted: 0,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_returns_hands_back_its_value_and_sink() {
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let sink = Box::new(CountingSink(Arc::clone(&emitted)));
+        let (outcome, _sink) = blocking_with_sink("test", sink, |sink| {
+            sink.emit(event());
+            7
+        })
+        .await;
+        assert!(matches!(outcome, Ok(7)));
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_pass_fails_the_step_and_keeps_the_audit_sink() {
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let sink = Box::new(CountingSink(Arc::clone(&emitted)));
+        let (outcome, mut sink) = blocking_with_sink("test", sink, |sink| {
+            sink.emit(event());
+            panic!("injected sweep panic");
+        })
+        .await;
+        let outcome: Result<(), IngestError> = outcome;
+        assert!(matches!(
+            outcome,
+            Err(IngestError::Task {
+                task: "test",
+                error_type: "panic"
+            })
+        ));
+        sink.emit(event());
+        assert_eq!(
+            emitted.load(Ordering::SeqCst),
+            2,
+            "the sink handed back is the one the pass held, not a stand-in"
+        );
+    }
 }

@@ -81,14 +81,16 @@ impl GraphPhase<'_> {
         completions: Vec<Completion>,
     ) {
         let store = self.store.clone();
-        let mut sink = std::mem::replace(audit_sink, Box::new(NoOpAuditSink::new()));
-        let (sink, finished, errors) = tokio::task::spawn_blocking(move || {
-            let (finished, errors) = remove_markers(&store, sink.as_mut(), completions);
-            (sink, finished, errors)
+        let sink = std::mem::replace(audit_sink, Box::new(NoOpAuditSink::new()));
+        let (outcome, sink) = blocking_with_sink("erasure completion", sink, move |sink| {
+            remove_markers(&store, sink, completions)
         })
-        .await
-        .expect("erasure completion task should not panic");
+        .await;
         *audit_sink = sink;
+        // A marker the failed task did not remove stays in the `tuples`
+        // phase, so the next sweep finishes that erasure.
+        let (finished, errors) = outcome
+            .unwrap_or_else(|e| (Vec::new(), vec![format!("erase: {e} — retried next sweep")]));
         for index in finished {
             log_finished(&mut report.erasures[index]);
         }

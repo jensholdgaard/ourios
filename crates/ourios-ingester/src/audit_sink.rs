@@ -59,7 +59,9 @@ use ourios_core::audit::{AuditEvent, AuditSink};
 use ourios_parquet::{AuditWriter, AuditWriterError, PartitionKey, Store, derive_audit_partition};
 use tokio::sync::Notify;
 
-use crate::metrics::{AuditSinkMetrics, FLUSH_OUTCOME_PERMANENT, FLUSH_OUTCOME_TRANSIENT};
+use crate::metrics::{
+    AuditSinkMetrics, ERROR_TYPE, FLUSH_OUTCOME_PERMANENT, FLUSH_OUTCOME_TRANSIENT,
+};
 
 /// Counts accumulated by one off-lock write pass, settled back into the sink
 /// under the lock afterwards.
@@ -79,6 +81,17 @@ struct FlushSummary {
 /// rather than wedge the partition behind it forever).
 fn is_transient_flush_error(err: &AuditWriterError) -> bool {
     matches!(err, AuditWriterError::Io { .. })
+}
+
+/// The `error.type` of a permanent flush error.
+fn permanent_error_type(err: &AuditWriterError) -> &'static str {
+    match err {
+        AuditWriterError::Io { .. } => "io",
+        AuditWriterError::Parquet(_) => "parquet",
+        AuditWriterError::Batch(_) => "batch",
+        AuditWriterError::PartitionMismatch { .. } => "partition_mismatch",
+        AuditWriterError::Poisoned => "poisoned",
+    }
 }
 
 /// Apply one partition write's outcome to the pass accumulators: success
@@ -102,7 +115,11 @@ fn route_partition_result(
         }
         Err(err) => {
             summary.permanent_errors = summary.permanent_errors.saturating_add(1);
-            eprintln!(
+            tracing::error!(
+                {
+                    { ourios_semconv::OURIOS_TENANT } = partition.tenant_id.as_str(),
+                    { ERROR_TYPE } = permanent_error_type(&err),
+                },
                 "audit sink: dropping {} event(s) for tenant {:?} {:04}-{:02}-{:02} — \
                  permanent write error (not persisted): {err}",
                 batch.len(),

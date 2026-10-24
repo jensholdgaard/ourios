@@ -9,17 +9,19 @@
 //! we measure the thing those can't: the recovery time as a function of N.
 //!
 //! `recovery/{1,4,16}` — each group element replays a root holding N closed
-//! segments of `FRAMES_PER_SEGMENT` modest frames apiece. Segments are minted
-//! through the public API in scratch roots and moved in (rotation fills a
-//! 128 MiB segment — far too slow for a bench), so construction is fast and
-//! the replay walk is the only thing timed.
+//! segments of `FRAMES_PER_SEGMENT` modest frames apiece. The root is built
+//! through one `Wal` that rotates (`RotationKind::Owed`) between segments, so
+//! its `RECLAIM` / `CHECKPOINT` sidecars match its segments (RFC 0052 §3.2
+//! refuses a version-2 segment without them). Construction sits outside the
+//! timed closure, which times `Wal::open` (sidecar reads and recovery checks)
+//! followed by the replay walk.
 
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig, WalOffset};
+use ourios_wal::{FrameKind, FrameSink, RecoveryError, RotationKind, Wal, WalConfig, WalOffset};
 
 /// Frames per minted segment — enough to make the decode loop the dominant
 /// per-segment cost, small enough to keep fixture construction quick.
@@ -41,33 +43,31 @@ fn config(root: &Path) -> WalConfig {
     }
 }
 
-fn segment_files(root: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = std::fs::read_dir(root)
-        .expect("read_dir")
-        .map(|e| e.expect("dir entry").path())
-        .filter(|p| p.extension().is_some_and(|e| e == "wal"))
-        .collect();
-    out.sort();
-    out
-}
-
-/// Mint one closed segment of `FRAMES_PER_SEGMENT` frames in a scratch root,
-/// then move it into `dest_root`.
-fn build_closed_segment(dest_root: &Path) {
-    let scratch = tempfile::TempDir::new().expect("scratch root");
-    let mut wal = Wal::open(config(scratch.path())).expect("open scratch");
+/// Build `segments` segments of `FRAMES_PER_SEGMENT` frames each in `root`,
+/// rotating between them, then close the `Wal`.
+fn build_root(root: &Path, segments: usize) {
+    let mut wal = Wal::open(config(root)).expect("open bench root");
     let payload = vec![0xA5u8; PAYLOAD_LEN];
-    for _ in 0..FRAMES_PER_SEGMENT {
-        wal.append(FrameKind::OtlpBatch, &payload).expect("append");
+    for segment in 0..segments {
+        if segment > 0 {
+            wal.rotate(RotationKind::Owed).expect("rotate");
+        }
+        for _ in 0..FRAMES_PER_SEGMENT {
+            wal.append(FrameKind::OtlpBatch, &payload).expect("append");
+        }
     }
     wal.sync().expect("sync");
-    drop(wal);
-    let seg = segment_files(scratch.path())
-        .into_iter()
-        .next()
-        .expect("scratch holds one segment");
-    let dest = dest_root.join(seg.file_name().expect("segment file name"));
-    std::fs::rename(&seg, &dest).expect("move segment into dest root");
+    let built = std::fs::read_dir(root)
+        .expect("read_dir")
+        .filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "wal"))
+        })
+        .count();
+    assert_eq!(
+        built, segments,
+        "the bench root holds one segment per rotation"
+    );
 }
 
 /// A recovery sink that does the minimum real work (counts frames) without
@@ -97,9 +97,7 @@ fn recovery(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let tmp = tempfile::TempDir::new().expect("temp root");
-                    for _ in 0..n {
-                        build_closed_segment(tmp.path());
-                    }
+                    build_root(tmp.path(), n);
                     tmp
                 },
                 |tmp| {

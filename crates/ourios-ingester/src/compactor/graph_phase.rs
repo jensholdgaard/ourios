@@ -7,6 +7,10 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use std::sync::Mutex;
+
+use ourios_core::sync::lock_recover;
+
 /// The graph a sweep feeds, and the store its erasure markers live in.
 pub(super) struct GraphPhase<'a> {
     pub(super) store: &'a Store,
@@ -18,6 +22,15 @@ struct Completion {
     index: usize,
     marker: String,
     event: AuditEvent,
+}
+
+/// What `remove_markers` has done so far. It lives outside the blocking
+/// task's unwind boundary: a marker removed before a later one panics is
+/// gone for good, so only this sweep can report that erasure finished.
+#[derive(Default)]
+struct Progress {
+    finished: Vec<usize>,
+    errors: Vec<String>,
 }
 
 impl GraphPhase<'_> {
@@ -82,15 +95,22 @@ impl GraphPhase<'_> {
     ) {
         let store = self.store.clone();
         let sink = std::mem::replace(audit_sink, Box::new(NoOpAuditSink::new()));
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let shared = Arc::clone(&progress);
         let (outcome, sink) = blocking_with_sink("erasure completion", sink, move |sink| {
-            remove_markers(&store, sink, completions)
+            remove_markers(&store, sink, completions, &shared);
         })
         .await;
         *audit_sink = sink;
         // A marker the failed task did not remove stays in the `tuples`
         // phase, so the next sweep finishes that erasure.
-        let (finished, errors) = outcome
-            .unwrap_or_else(|e| (Vec::new(), vec![format!("erase: {e} — retried next sweep")]));
+        let Progress {
+            finished,
+            mut errors,
+        } = std::mem::take(&mut *lock_recover(&progress));
+        if let Err(e) = outcome {
+            errors.push(format!("erase: {e} — retried next sweep"));
+        }
         for index in finished {
             log_finished(&mut report.erasures[index]);
         }
@@ -115,14 +135,14 @@ fn erased_event(outcome: &ErasureOutcome, deleted: usize) -> AuditEvent {
 }
 
 /// Remove each completed erasure's marker, writing its audit event when
-/// this process removed it; the indexes finished, and the removal errors.
+/// this process removed it. Each outcome lands in `progress` as it
+/// happens, so a panic further down the list loses nothing already done.
 fn remove_markers(
     store: &Store,
     sink: &mut dyn AuditSink,
     completions: Vec<Completion>,
-) -> (Vec<usize>, Vec<String>) {
-    let mut finished = Vec::new();
-    let mut errors = Vec::new();
+    progress: &Mutex<Progress>,
+) {
     for Completion {
         index,
         marker,
@@ -136,14 +156,15 @@ fn remove_markers(
         // sweep repeats the (idempotent) tuple deletion and retries.
         match store.delete_blocking(&marker) {
             Ok(()) => {
+                lock_recover(progress).finished.push(index);
                 sink.emit(event);
-                finished.push(index);
             }
-            Err(e) if e.is_not_found() => finished.push(index),
-            Err(e) => errors.push(format!("erase: remove marker {marker}: {e}")),
+            Err(e) if e.is_not_found() => lock_recover(progress).finished.push(index),
+            Err(e) => lock_recover(progress)
+                .errors
+                .push(format!("erase: remove marker {marker}: {e}")),
         }
     }
-    (finished, errors)
 }
 
 /// Mark `outcome` finished, with the RFC 0048 §3.3 completion event:
@@ -166,4 +187,94 @@ fn log_finished(outcome: &mut ErasureOutcome) {
         outcome.rows_dropped,
         tuples_deleted,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
+
+    use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
+    use ourios_core::sync::lock_recover;
+    use ourios_core::tenant::TenantId;
+    use ourios_parquet::Store;
+
+    use super::super::IngestError;
+    use super::super::daemon::blocking_with_sink;
+    use super::super::erasure::erasure_marker_key;
+    use super::{Completion, Progress, remove_markers};
+
+    /// Panics on its second `emit`, like a sink wedged mid-list.
+    struct PanicOnSecondEmit(usize);
+
+    impl AuditSink for PanicOnSecondEmit {
+        fn emit(&mut self, _: AuditEvent) {
+            self.0 += 1;
+            assert!(self.0 < 2, "the second completion dies here");
+        }
+    }
+
+    fn completion(index: usize, marker: &str) -> Completion {
+        Completion {
+            index,
+            marker: marker.to_owned(),
+            event: AuditEvent {
+                tenant_id: TenantId::new("a"),
+                timestamp: SystemTime::now(),
+                payload: AuditPayload::ConversationErased {
+                    conversation_id: format!("c-{index}"),
+                    partitions_rewritten: 1,
+                    rows_dropped: 1,
+                    tuples_deleted: 1,
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panic_on_the_second_marker_keeps_the_first_one_finished() {
+        let bucket = tempfile::tempdir().expect("temp");
+        let store = Store::local(bucket.path()).expect("local store");
+        let markers = [
+            erasure_marker_key("a", "c-0"),
+            erasure_marker_key("a", "c-1"),
+        ];
+        for marker in &markers {
+            store.put_blocking(marker, Vec::new()).expect("put marker");
+        }
+        let completions = vec![completion(0, &markers[0]), completion(1, &markers[1])];
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let shared = Arc::clone(&progress);
+
+        let (outcome, _sink) = blocking_with_sink(
+            "erasure completion",
+            Box::new(PanicOnSecondEmit(0)),
+            move |sink| remove_markers(&store, sink, completions, &shared),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(IngestError::Task {
+                    error_type: "panic",
+                    ..
+                })
+            ),
+            "the panic fails the task"
+        );
+        let progress = lock_recover(&progress);
+        assert_eq!(
+            progress.finished,
+            vec![0, 1],
+            "both markers were removed before the panic"
+        );
+        assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+        for marker in &markers {
+            assert!(
+                !bucket.path().join(marker).exists(),
+                "{marker} was removed before the sink panicked"
+            );
+        }
+    }
 }

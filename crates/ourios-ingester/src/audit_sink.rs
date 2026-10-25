@@ -859,39 +859,32 @@ mod tests {
             .clone()
     }
 
-    #[test]
-    fn a_permanent_drop_emits_the_registered_dropped_event() {
-        let bad = created_event("alpha", 2, "GET <*>");
-        let partition = ourios_parquet::derive_audit_partition(&bad).expect("derive");
-
-        let events = dropped_events(|| {
+    /// The dropped-partition events one partition write's `result` logs.
+    fn dropped_events_for(result: Result<(), AuditWriterError>) -> Vec<(String, String)> {
+        let event = created_event("alpha", 2, "GET <*>");
+        let partition = ourios_parquet::derive_audit_partition(&event).expect("derive");
+        dropped_events(|| {
             route_partition_result(
                 &mut FlushSummary::default(),
                 &mut Vec::new(),
                 &partition,
-                vec![bad],
-                Err(AuditWriterError::Batch(AuditBatchError::PreEpochTimestamp)),
+                vec![event],
+                result,
             );
-        });
+        })
+    }
 
+    #[test]
+    fn a_permanent_drop_emits_the_registered_dropped_event() {
+        let events = dropped_events_for(Err(AuditWriterError::Batch(
+            AuditBatchError::PreEpochTimestamp,
+        )));
         assert_eq!(events, vec![("alpha".to_owned(), "batch".to_owned())]);
     }
 
     #[test]
     fn a_transient_retain_emits_no_dropped_event() {
-        let good = created_event("alpha", 1, "user <*> logged in");
-        let partition = ourios_parquet::derive_audit_partition(&good).expect("derive");
-
-        let events = dropped_events(|| {
-            route_partition_result(
-                &mut FlushSummary::default(),
-                &mut Vec::new(),
-                &partition,
-                vec![good],
-                Err(io_error()),
-            );
-        });
-
+        let events = dropped_events_for(Err(io_error()));
         assert!(events.is_empty(), "{events:?}");
     }
 

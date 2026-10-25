@@ -10,11 +10,11 @@ description: |
   audit store on object storage.
 type: application
 # Chart version — bumped on chart changes, independent of the app version.
-version: 0.5.13
+version: 0.5.14
 # Tracks the ourios-server release the chart publishes alongside.
 # Surfaces as the app.kubernetes.io/version label. See image.tag in
 # values.yaml for the deployed image tag.
-appVersion: "0.16.0"
+appVersion: "0.16.1"
 keywords:
   - logs
   - observability

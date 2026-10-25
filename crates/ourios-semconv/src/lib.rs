@@ -649,7 +649,8 @@ pub const OURIOS_STORAGE_BRIDGE_DURATION_UNIT: &str = "s";
 pub const OURIOS_STORAGE_BRIDGE_THREAD_CREATED: &str = "ourios.storage.bridge.thread.created";
 
 /// `ourios.storage.bridge.thread.created` description (the registry `brief`).
-pub const OURIOS_STORAGE_BRIDGE_THREAD_CREATED_DESCRIPTION: &str = "OS threads the blocking bridge created (#926). Flat when the bridge reuses threads; a rising rate is the #853 thread-explosion signature.";
+pub const OURIOS_STORAGE_BRIDGE_THREAD_CREATED_DESCRIPTION: &str =
+    "OS threads the storage bridge runtime started, workers and blocking-pool threads (#926).";
 
 /// `ourios.storage.bridge.thread.created` unit (UCUM).
 pub const OURIOS_STORAGE_BRIDGE_THREAD_CREATED_UNIT: &str = "{thread}";

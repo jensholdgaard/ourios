@@ -810,7 +810,7 @@ not block `validated` in the "we didn't finish" sense — it is a
   construction, or the corpus.
 
   **Decision:** `L4_COMPLETENESS_MARGIN = 0.90` (harness constant,
-  `crates/ourios-bench/tests/rfc0031_comparative.rs`) — Loki must
+  `crates/ourios-bench/tests/rfc0031_comparative/pickers.rs`) — Loki must
   capture at least 90% of a candidate's expected rows, **per
   `group_key`**, for the dispatch to accept the answer. This is real
   headroom (~2.3×) over the observed 3.9-4.4% loss band (runs

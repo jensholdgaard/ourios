@@ -31,7 +31,7 @@ superseded-by: —
 > forward-compat scenario (.8, via the colocated RFC 0005 reader tests) run in
 > the default `cargo test`; and RFC0013.6 (WAL stays local) is greened end to
 > end through the served binary in `ourios-server`
-> (`tests/rfc0013_6_wal_stays_local.rs`), which wires the `Store` into the
+> (`tests/it/rfc0013_6_wal_stays_local.rs`), which wires the `Store` into the
 > RFC 0014 data write path and asserts only Parquet/manifest objects reach the
 > store while the WAL `*.wal` segments stay on local disk. The **crate-shape**
 > open question resolved to a module, not a new crate (§3.7).

@@ -174,14 +174,17 @@ check "NOTES budget with only periodSeconds set" "10800s" \
 
 # The security surface is opt-in: a default install must render exactly what
 # it rendered before it existed. The chart/app version labels move with every
-# release, so they are dropped before the comparison. A deliberate change to
-# the default render regenerates the golden file:
+# release, so they are dropped before the comparison, and the default image
+# tag (the appVersion) is masked here and pinned by its own check below. A
+# deliberate change to the default render regenerates the golden file:
 #   UPDATE_GOLDEN=1 bash deploy/helm/render-tests.sh
 GOLDEN="$(dirname "${BASH_SOURCE[0]}")/testdata/default-render.yaml"
+APP_VERSION="$(sed -n 's/^appVersion: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CHART/Chart.yaml")"
 # Blank lines are dropped: Helm versions disagree on whether a blank line
 # precedes each `---` separator, and they carry no meaning in the manifests.
 default_render() {
-  helm template t "$CHART" | grep -v -e 'helm.sh/chart:' -e 'app.kubernetes.io/version:' -e '^$'
+  helm template t "$CHART" | grep -v -e 'helm.sh/chart:' -e 'app.kubernetes.io/version:' -e '^$' \
+    | sed "s#^\( *image: ghcr.io/jensholdgaard/ourios\):$APP_VERSION\$#\1:<appVersion>#"
 }
 if [[ -n "${UPDATE_GOLDEN:-}" ]]; then
   default_render > "$GOLDEN"
@@ -193,6 +196,23 @@ else
   default_render | diff -u "$GOLDEN" - | sed 's/^/      /' | head -40
   failures=$((failures + 1))
 fi
+
+# --- image tag and pod security ----------------------------------------------
+
+workload_images() {
+  helm template t "$CHART" "$@" \
+    | sed -n 's/^ *image: \(ghcr\.io\/jensholdgaard\/ourios:.*\)$/\1/p' | sort -u
+}
+check "the image tag defaults to the chart appVersion" \
+  "ghcr.io/jensholdgaard/ourios:$APP_VERSION" "$(workload_images)"
+check "image.tag overrides the appVersion" \
+  "ghcr.io/jensholdgaard/ourios:0.16.0-static" \
+  "$(workload_images --set image.tag=0.16.0-static)"
+for template in receiver-statefulset.yaml querier-deployment.yaml compactor-deployment.yaml; do
+  check "$template runs under the RuntimeDefault seccomp profile" "type: RuntimeDefault" \
+    "$(helm template t "$CHART" --show-only "templates/$template" \
+        | sed -n '/^ *seccompProfile:$/{n;s/^ *//p;}')"
+done
 
 # --- auth, TLS, MCP, OpenFGA -------------------------------------------------
 
@@ -488,6 +508,128 @@ check_fails "auth.tokens that is not a list is refused" "auth.tokens must be a l
 check_fails "a token whose tenants is not a list is refused" "must list at least one tenant" \
   --set 'auth.tokens[0].name=e' --set-string 'auth.tokens[0].tenants=a' \
   --set 'auth.tokens[0].secretKeyRef.name=s' --set 'auth.tokens[0].secretKeyRef.key=k'
+
+# --- promoted attributes, visibility, miner, encode workers -----------------
+
+promoted_args=(
+  --set 'storage.promotedAttributes.resource[0]=k8s.namespace.name'
+  --set 'storage.promotedAttributes.log[0]=gen_ai.conversation.id'
+  --set 'storage.promotedAttributes.log[1].key=http.response.status_code'
+  --set 'storage.promotedAttributes.log[1].type=i64'
+)
+# Every role reads the promoted set: the receiver writes the columns, the
+# compactor rewrites them and the querier prunes on them.
+for role in receiver querier compactor; do
+  check "promotedAttributes render into the $role config" \
+    'promoted_attributes:
+resource:
+- "k8s.namespace.name"
+log:
+- "gen_ai.conversation.id"
+- key: "http.response.status_code"
+type: "i64"' \
+    "$(role_config "$role" "${promoted_args[@]}" \
+        | sed -n '/^  promoted_attributes:/,/^[a-z]/p' | sed '$d' | sed 's/^ *//')"
+done
+check_fails "an unknown promotedAttributes scope fails render" \
+  "storage.promotedAttributes.resources: unknown scope" \
+  --set 'storage.promotedAttributes.resources[0]=k8s.namespace.name'
+check "promotedAttributes with only one list renders only that list" \
+  'promoted_attributes:
+log:
+- "user.hash"' \
+  "$(role_config querier --set 'storage.promotedAttributes.log[0]=user.hash' \
+      | sed -n '/^  promoted_attributes:/,/^[a-z]/p' | sed '$d' | sed 's/^ *//')"
+check "upgrade path: promotedAttributes map absent" "" \
+  "$(role_config receiver --set storage.promotedAttributes=null | grep 'promoted_attributes' || true)"
+check_fails "a promoted entry with an unknown field is refused" \
+  "storage.promotedAttributes.log[0] has an unknown field \"class\"" \
+  --set 'storage.promotedAttributes.log[0].key=a' --set 'storage.promotedAttributes.log[0].class=i64'
+check_fails "a promoted entry map without a key is refused" \
+  "storage.promotedAttributes.log[0].key is required" \
+  --set 'storage.promotedAttributes.log[0].type=i64'
+check_fails "a promoted list that is not a list is refused" \
+  "storage.promotedAttributes.resource must be a list" \
+  --set-string storage.promotedAttributes.resource=k8s.namespace.name
+
+vis_args=(
+  "${fga_args[@]}"
+  --set 'auth.openfga.visibility.objects[0].type=conversation'
+  --set 'auth.openfga.visibility.objects[0].column=attr.gen_ai.conversation.id'
+  --set 'auth.openfga.visibility.identities.userColumns[0]=attr.user.hash'
+  --set auth.openfga.visibility.selfPrincipalColumn=attr.user.hash
+  --set 'auth.openfga.visibility.contentColumns[0]=body'
+  --set auth.openfga.visibility.maxObjects=500
+  --set auth.openfga.visibility.listTimeoutMs=1000
+)
+check "openfga visibility renders under auth.openfga" \
+  'visibility:
+objects:
+- type: "conversation"
+column: "attr.gen_ai.conversation.id"
+identities:
+user_columns:
+- "attr.user.hash"
+self_principal_column: "attr.user.hash"
+content_columns:
+- "body"
+list_timeout_ms: 1000
+max_objects: 500' \
+  "$(role_config querier "${vis_args[@]}" \
+      | sed -n '/^    visibility:/,/^[a-z]/p' | sed '$d' | sed 's/^ *//')"
+check "openfga visibility is absent by default" "" \
+  "$(role_config querier "${fga_args[@]}" | grep 'visibility:' || true)"
+check "a bound visibility object gives the compactor the auth section" \
+  "$(role_config receiver "${vis_args[@]}" | sed -n '/^auth:/,/^receiver:/p' | sed '$d')" \
+  "$(role_config compactor "${vis_args[@]}" | sed -n '/^auth:/,/^compaction:/p' | sed '$d')"
+check "a bound visibility object gives the compactor the secret env" \
+  "OURIOS_AUTH_TOKEN_0 s/k" \
+  "$(helm template t "$CHART" --show-only templates/compactor-deployment.yaml "${vis_args[@]}" \
+      | sed -n '/^ *- name: OURIOS_/{N;N;N;N;s/^ *- name: \([A-Z0-9_]*\)\n *valueFrom:\n *secretKeyRef:\n *name: "\([^"]*\)"\n *key: "\([^"]*\)"$/\1 \2\/\3/p;}')"
+check "visibility without a bound object leaves the compactor without auth" "" \
+  "$(role_config compactor "${fga_args[@]}" \
+      --set auth.openfga.visibility.maxObjects=500 | grep '^auth:' || true)"
+check "visibility objects with openfga disabled leave the compactor without auth" "" \
+  "$(role_config compactor "${vis_args[@]}" --set auth.openfga.enabled=false | grep '^auth:' || true)"
+check "upgrade path: visibility map absent" "" \
+  "$(role_config querier "${fga_args[@]}" --set auth.openfga.visibility=null \
+      | grep 'visibility:' || true)"
+check_fails "a visibility object without a column is refused" \
+  "auth.openfga.visibility.objects[0].column is required" \
+  "${fga_args[@]}" --set 'auth.openfga.visibility.objects[0].type=conversation'
+check_fails "a non-integer visibility listTimeoutMs is refused" \
+  "auth.openfga.visibility.listTimeoutMs must be a positive integer" \
+  "${fga_args[@]}" --set-string auth.openfga.visibility.listTimeoutMs=2s
+
+check "miner dial renders into the receiver config only" \
+  'miner:
+upstream_templates: "observe"
+upstream_template_byte_limit: 4096
+upstream_association_limit: 0' \
+  "$(role_config receiver --set miner.upstreamTemplates=observe \
+      --set miner.upstreamTemplateByteLimit=4096 --set miner.upstreamAssociationLimit=0 \
+      | sed -n '/^miner:/,/^receiver:/p' | sed '$d' | sed 's/^ *//')"
+check "miner dial stays off the querier and compactor configs" "" \
+  "$(for role in querier compactor; do
+       role_config "$role" --set miner.upstreamTemplates=adopt | grep '^miner:' || true
+     done)"
+check "miner dial is absent by default" "" \
+  "$(role_config receiver | grep '^miner:' || true)"
+check "upgrade path: miner map absent" "" \
+  "$(role_config receiver --set miner=null | grep '^miner:' || true)"
+check_fails "an unknown miner.upstreamTemplates mode is refused" \
+  "miner.upstreamTemplates must be \"ignore\", \"observe\" or \"adopt\"" \
+  --set miner.upstreamTemplates=keep
+check_fails "a non-integer miner byte limit is refused" \
+  "miner.upstreamTemplateByteLimit must be a non-negative integer" \
+  --set-string miner.upstreamTemplateByteLimit=8k
+
+check "receiver.encodeWorkers renders" "encode_workers: 4" \
+  "$(role_config receiver --set receiver.encodeWorkers=4 | grep -o 'encode_workers: 4')"
+check "receiver.encodeWorkers is absent by default" "" \
+  "$(role_config receiver | grep 'encode_workers' || true)"
+check_fails "receiver.encodeWorkers 0 is refused" \
+  "receiver.encodeWorkers must be a positive integer" --set receiver.encodeWorkers=0
 
 check "helm test: an authenticated querier is probed over TCP, not an anonymous query" \
   "nc -z -w5 t-ourios-querier 4319" \

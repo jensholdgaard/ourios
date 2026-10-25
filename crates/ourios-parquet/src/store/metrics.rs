@@ -871,6 +871,56 @@ mod tests {
         );
     }
 
+    /// The full name of [`s3_bridge_threads_stay_flat_in_a_fresh_process`].
+    const S3_FRESH_PROCESS_TEST: &str =
+        "store::metrics::tests::s3_bridge_threads_stay_flat_in_a_fresh_process";
+
+    /// As [`sequential_bridged_calls_do_not_create_threads`], against S3.
+    #[test]
+    fn s3_calls_do_not_create_threads() {
+        run_alone(S3_FRESH_PROCESS_TEST);
+    }
+
+    /// Each S3 request on a new connection resolves the endpoint's host on
+    /// the bridge runtime's blocking pool. The endpoint is `localhost`, not
+    /// an address, and every response closes its connection, so every call
+    /// resolves. A concurrent warm-up grows the pool to its peak first;
+    /// after that, neither sequential calls nor further bursts of the same
+    /// width may start threads.
+    #[test]
+    #[ignore = "run alone by s3_calls_do_not_create_threads"]
+    fn s3_bridge_threads_stay_flat_in_a_fresh_process() {
+        const CALLS: usize = 200;
+        const BURST: usize = 32;
+        const BURSTS: usize = 3;
+        const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nETag: \"abc\"\r\n\
+             Last-Modified: Wed, 07 Oct 2026 11:00:00 GMT\r\nConnection: close\r\n\r\nv";
+        let burst = |store: &Store| {
+            std::thread::scope(|s| {
+                for _ in 0..BURST {
+                    s.spawn(|| store.get_bytes_blocking("k").expect("get"));
+                }
+            });
+        };
+        let harness = Harness::new();
+        let port = serve(CALLS + BURST * (BURSTS + 1), |_| Some(OK.to_owned()));
+        let cfg = s3_config(port).with_endpoint(format!("http://localhost:{port}"));
+        let store = Store::s3_with(cfg, harness.metrics.clone(), Tracing::Global).expect("s3");
+        burst(&store);
+        let before = harness.threads_created();
+        for _ in 0..CALLS {
+            store.get_bytes_blocking("k").expect("get");
+        }
+        for _ in 0..BURSTS {
+            burst(&store);
+        }
+        let created = harness.threads_created() - before;
+        assert!(
+            created <= f64::from(u32::try_from(4 * MAX_BRIDGE_WORKERS).expect("small")),
+            "{CALLS} S3 calls and {BURSTS} bursts after the warm-up created {created} threads"
+        );
+    }
+
     /// Run the ignored test `name` alone, in a child process of this test
     /// binary: the bridge runtime and its thread count are process-wide.
     fn run_alone(name: &str) {

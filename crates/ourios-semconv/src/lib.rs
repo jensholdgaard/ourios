@@ -1104,6 +1104,9 @@ pub const EVENT_OURIOS_GRAPH_BACKFILL_PROGRESS: &str = "ourios.graph.backfill.pr
 /// `ourios.querier.shutdown.error` log event name.
 pub const EVENT_OURIOS_QUERIER_SHUTDOWN_ERROR: &str = "ourios.querier.shutdown.error";
 
+/// `ourios.receiver.audit_sink.dropped` log event name.
+pub const EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED: &str = "ourios.receiver.audit_sink.dropped";
+
 /// `ourios.receiver.audit_sink.retained` log event name.
 pub const EVENT_OURIOS_RECEIVER_AUDIT_SINK_RETAINED: &str = "ourios.receiver.audit_sink.retained";
 

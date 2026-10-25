@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.16.1] - 2026-10-25
+
+### Security
+
+- tokio 1.54.1 for RUSTSEC-2026-0386 (#1087).
+- quinn-proto 0.11.18 for RUSTSEC-2026-0338 to -0342 (#1097). quinn-proto is in the lockfile only, not in any built binary.
+- RUSTSEC-2026-0387 (`crypto-bigint` via jsonwebtoken's p256/p384) is accepted as verify-only: Ourios only verifies JWT signatures with public keys (#1087).
+
+### Helm chart
+
+- The image tag now defaults to the chart's `appVersion` instead of `latest`, and pods run with a `RuntimeDefault` seccomp profile (#1098). Pin `image.tag` if you relied on `latest`.
+- New keys: `storage.promotedAttributes`, `auth.openfga.visibility` (which also gives the compactor its `auth` section), `miner.*` and `receiver.encodeWorkers` (#1093).
+
+### CI
+
+- Name the bench corpus dir after its tag and share the chart publish steps (#1089) (10a70d5)
+
+### Changed
+
+- Add a poison-recovering lock helper and stop shared sinks panicking (#1095) (2c16b27)
+
+### Chore
+
+- Pin ourios-semconv v0.3.23 for the audit-sink dropped event (#1108) (a49af3d)
+- Give the two bare clippy allows a reason (#1107) (157a414)
+- Drop the encode_audit_event stub and unused ingester deps (#1104) (6922aa1)
+
+### Documentation
+
+- Drop stale compaction-env and image-tag comments from the chart templates (#1100) (6d602d0)
+- Make the quickstart, docker and cookbook examples run on v0.16.0 (#1099) (0ed1cab)
+- Align hazards, glossary, verification and talk with the code (#1094) (95dc0cc)
+- Point stale test references at their current paths (3/3) (#1092) (1fc57fe)
+- Point stale test references at their current paths (2/3) (#1090) (83cfd44)
+- Point stale test references at their current paths (1/3) (#1088) (25b99c5)
+- Refresh readme, contributing and roadmap against current main (#1091) (2de2f51)
+
+### Fixed
+
+- Fail the sweep on a blocking-task panic and log audit drops via tracing (#1105) (9b1eb87)
+- Default the image tag to appVersion and set a runtimedefault seccomp profile (#1098) (9a56f67)
+- Render promoted attributes, openfga visibility, miner dial and encode workers (#1093) (83e3b6b)
+- Bump rmcp to 3.7.0 for the session-less post 400 fix (#1096) (05a6486)
+- Bump lockfile-only quinn-proto to 0.11.18 for rustsec-2026-0338..0342 (#1097) (abfa1ae)
+- Build the recovery bench root through one wal so rfc 0052 accepts it (#1085) (105d0d7)
+- Bump tokio for rustsec-2026-0386, accept verify-only rustsec-2026-0387 (#1087) (af2257c)
+
+
 ## [0.16.0] - 2026-10-23
 
 ### Behaviour change

@@ -927,7 +927,19 @@ async fn a_sweep_dying_mid_backlog_has_emitted_the_events_committed_before_it() 
     let sweep = tokio::spawn(sweep_once(target(&store), Box::new(sink))).await;
 
     // Assert
-    assert!(matches!(&sweep, Err(e) if e.is_panic()), "the sweep died");
+    assert!(
+        matches!(
+            &sweep,
+            Ok((
+                Err(IngestError::Task {
+                    error_type: "panic",
+                    ..
+                }),
+                ..
+            ))
+        ),
+        "the panic fails the sweep instead of the daemon task"
+    );
     let emitted: Vec<String> = audit.drain().iter().map(event_partition).collect();
     assert_eq!(emitted.len(), K, "{emitted:?}");
     let left =
@@ -1137,7 +1149,22 @@ async fn a_sweep_dying_in_post_commit_cleanup_has_recorded_the_partition() {
     .await;
 
     // Assert
-    assert!(matches!(&sweep, Err(e) if e.is_panic()), "the sweep died");
+    assert!(
+        matches!(
+            &sweep,
+            Ok((
+                Err(FailedSweep {
+                    error: IngestError::Task {
+                        error_type: "panic",
+                        ..
+                    },
+                    ..
+                }),
+                ..
+            ))
+        ),
+        "the panic fails the sweep instead of the daemon task"
+    );
     provider.force_flush().expect("flush");
     let rms = exporter.get_finished_metrics().expect("collect");
     let events: Vec<String> = audit.drain().iter().map(event_partition).collect();

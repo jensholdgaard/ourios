@@ -6974,20 +6974,20 @@ limitations under the License.
 
 Used by:
 
-- `ourios-bench` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-config` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-core` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-df-otel` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-ingester` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-miner` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-parquet` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-querier` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-semconv` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-server` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-serving` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-telemetry` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-testgen` 0.16.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-wal` 0.16.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-bench` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-config` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-core` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-df-otel` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-ingester` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-miner` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-parquet` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-querier` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-semconv` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-server` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-serving` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-telemetry` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-testgen` 0.16.1 — <https://github.com/jensholdgaard/ourios>
+- `ourios-wal` 0.16.1 — <https://github.com/jensholdgaard/ourios>
 - `allocator-api2` 0.2.21 — <https://github.com/zakarumych/allocator-api2>
 - `android_system_properties` 0.1.5 — <https://github.com/nical/android_system_properties>
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>
@@ -7033,8 +7033,8 @@ Used by:
 - `rand_xorshift` 0.5.0 — <https://github.com/rust-random/rngs>
 - `ref-cast-impl` 1.0.25 — <https://github.com/dtolnay/ref-cast>
 - `ref-cast` 1.0.25 — <https://github.com/dtolnay/ref-cast>
-- `rmcp-macros` 3.5.1 — <https://github.com/modelcontextprotocol/rust-sdk/>
-- `rmcp` 3.5.1 — <https://github.com/modelcontextprotocol/rust-sdk/>
+- `rmcp-macros` 3.7.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
+- `rmcp` 3.7.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
 - `rustls-platform-verifier-android` 0.2.0 — <https://github.com/rustls/rustls-platform-verifier>
 - `rustversion` 1.0.22 — <https://github.com/dtolnay/rustversion>
 - `ryu` 1.0.23 — <https://github.com/dtolnay/ryu>

@@ -59,7 +59,9 @@ use ourios_core::audit::{AuditEvent, AuditSink};
 use ourios_parquet::{AuditWriter, AuditWriterError, PartitionKey, Store, derive_audit_partition};
 use tokio::sync::Notify;
 
-use crate::metrics::{AuditSinkMetrics, FLUSH_OUTCOME_PERMANENT, FLUSH_OUTCOME_TRANSIENT};
+use crate::metrics::{
+    AuditSinkMetrics, ERROR_TYPE, FLUSH_OUTCOME_PERMANENT, FLUSH_OUTCOME_TRANSIENT,
+};
 
 /// Counts accumulated by one off-lock write pass, settled back into the sink
 /// under the lock afterwards.
@@ -79,6 +81,17 @@ struct FlushSummary {
 /// rather than wedge the partition behind it forever).
 fn is_transient_flush_error(err: &AuditWriterError) -> bool {
     matches!(err, AuditWriterError::Io { .. })
+}
+
+/// The `error.type` of a permanent flush error.
+fn permanent_error_type(err: &AuditWriterError) -> &'static str {
+    match err {
+        AuditWriterError::Io { .. } => "_OTHER",
+        AuditWriterError::Parquet(_) => "parquet",
+        AuditWriterError::Batch(_) => "batch",
+        AuditWriterError::PartitionMismatch { .. } => "partition_mismatch",
+        AuditWriterError::Poisoned => "poisoned",
+    }
 }
 
 /// Apply one partition write's outcome to the pass accumulators: success
@@ -102,7 +115,12 @@ fn route_partition_result(
         }
         Err(err) => {
             summary.permanent_errors = summary.permanent_errors.saturating_add(1);
-            eprintln!(
+            tracing::error!(
+                name: ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED,
+                {
+                    { ourios_semconv::OURIOS_TENANT } = partition.tenant_id.as_str(),
+                    { ERROR_TYPE } = permanent_error_type(&err),
+                },
                 "audit sink: dropping {} event(s) for tenant {:?} {:04}-{:02}-{:02} — \
                  permanent write error (not persisted): {err}",
                 batch.len(),
@@ -791,6 +809,83 @@ mod tests {
             summary.permanent_errors, 1,
             "unchanged by the transient path"
         );
+    }
+
+    /// The `(tenant, error.type)` of each dropped-partition event `run` logs.
+    fn dropped_events(run: impl FnOnce()) -> Vec<(String, String)> {
+        use std::sync::{Arc, Mutex, PoisonError};
+        use tracing_subscriber::prelude::*;
+
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                #[derive(Default)]
+                struct Fields((String, String));
+                impl tracing::field::Visit for Fields {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        match field.name() {
+                            ourios_semconv::OURIOS_TENANT => value.clone_into(&mut self.0.0),
+                            crate::metrics::ERROR_TYPE => value.clone_into(&mut self.0.1),
+                            _ => {}
+                        }
+                    }
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                }
+                if event.metadata().name()
+                    != ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED
+                {
+                    return;
+                }
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(fields.0);
+            }
+        }
+
+        let events: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, run);
+        events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The dropped-partition events one partition write's `result` logs.
+    fn dropped_events_for(result: Result<(), AuditWriterError>) -> Vec<(String, String)> {
+        let event = created_event("alpha", 2, "GET <*>");
+        let partition = ourios_parquet::derive_audit_partition(&event).expect("derive");
+        dropped_events(|| {
+            route_partition_result(
+                &mut FlushSummary::default(),
+                &mut Vec::new(),
+                &partition,
+                vec![event],
+                result,
+            );
+        })
+    }
+
+    #[test]
+    fn a_permanent_drop_emits_the_registered_dropped_event() {
+        let events = dropped_events_for(Err(AuditWriterError::Batch(
+            AuditBatchError::PreEpochTimestamp,
+        )));
+        assert_eq!(events, vec![("alpha".to_owned(), "batch".to_owned())]);
+    }
+
+    #[test]
+    fn a_transient_retain_emits_no_dropped_event() {
+        let events = dropped_events_for(Err(io_error()));
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

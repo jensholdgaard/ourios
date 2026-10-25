@@ -212,7 +212,7 @@ meaning: SeverityNumber is monotonic
 so `25` is "more severe than FATAL4 (24)", and clamping it to `0` turns the
 *most* severe record into the *least*-informative one. It is also doubly
 damaging because `severity_number` is a template-key component
-(`(severity_number, scope_name)`, `crates/ourios-miner/src/cluster.rs:1680`):
+(`(severity_number, scope_name)`, `crates/ourios-miner/src/cluster/mod.rs`):
 every out-of-range value collapses into the single UNSPECIFIED bucket,
 co-mingling distinct severities in mining.
 

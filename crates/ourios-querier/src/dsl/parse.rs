@@ -95,6 +95,8 @@ enum Tok {
     OrOr,
 }
 
+// One flat match arm per token class reads more clearly than a lexer
+// split across helpers that would each re-thread `i` and `out`.
 #[allow(clippy::too_many_lines)]
 fn tokenize(input: &str) -> Result<Vec<Tok>, DslError> {
     let bytes = input.as_bytes();

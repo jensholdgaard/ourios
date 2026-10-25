@@ -410,6 +410,7 @@ pub(super) fn hex_bytes(field: &Field, s: &str) -> Result<Vec<u8>, QueryError> {
     while i < raw.len() {
         let hi = (raw[i] as char).to_digit(16).ok_or_else(err)?;
         let lo = (raw[i + 1] as char).to_digit(16).ok_or_else(err)?;
+        // `hi` and `lo` are hex digits (< 16), so the byte fits in a u8.
         #[allow(clippy::cast_possible_truncation)]
         bytes.push(((hi << 4) | lo) as u8);
         i += 2;

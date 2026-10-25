@@ -50,6 +50,12 @@ pub enum IngestError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A blocking step of the sweep ended without a result: it panicked,
+    /// or the runtime cancelled it.
+    Task {
+        task: &'static str,
+        error_type: &'static str,
+    },
 }
 
 impl std::fmt::Display for IngestError {
@@ -60,6 +66,9 @@ impl std::fmt::Display for IngestError {
             // compaction read: …").
             Self::Compaction(e) => write!(f, "{e}"),
             Self::Io { op, path, source } => write!(f, "{op} {}: {source}", path.display()),
+            Self::Task { task, error_type } => {
+                write!(f, "{task} task ended without a result: {error_type}")
+            }
         }
     }
 }
@@ -69,6 +78,7 @@ impl std::error::Error for IngestError {
         match self {
             Self::Compaction(e) => Some(e),
             Self::Io { source, .. } => Some(source),
+            Self::Task { .. } => None,
         }
     }
 }
@@ -80,6 +90,7 @@ impl IngestError {
         match self {
             Self::Compaction(e) => compaction_error_type(e),
             Self::Io { .. } => "io",
+            Self::Task { error_type, .. } => error_type,
         }
     }
 }

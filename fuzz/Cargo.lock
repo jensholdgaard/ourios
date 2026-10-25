@@ -1400,7 +1400,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2434,11 +2434,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-config"
-version = "0.16.0"
+version = "0.16.1"
 
 [[package]]
 name = "ourios-core"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "blake3",
  "opentelemetry",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-df-otel"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "datafusion",
  "opentelemetry",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-ingester"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2498,11 +2498,9 @@ dependencies = [
  "ourios-wal",
  "prost",
  "rustls",
- "rustls-pki-types",
  "serde_json",
  "tokio",
  "tokio-rustls",
- "tokio-stream",
  "tonic",
  "tonic-types",
  "tower",
@@ -2512,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-miner"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "opentelemetry",
  "ourios-config",
@@ -2525,7 +2523,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-parquet"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2548,7 +2546,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-querier"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2574,11 +2572,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-semconv"
-version = "0.16.0"
+version = "0.16.1"
 
 [[package]]
 name = "ourios-serving"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "axum",
  "futures-core",
@@ -2601,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-telemetry"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "chrono",
  "opentelemetry",
@@ -2620,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-wal"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "crc32c",
  "ourios-core",
@@ -2865,9 +2863,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.17"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -2897,7 +2895,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3102,7 +3100,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3161,7 +3159,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3461,7 +3459,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3973,7 +3971,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

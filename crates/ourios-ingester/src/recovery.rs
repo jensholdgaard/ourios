@@ -815,9 +815,9 @@ impl FrameSink for DriverSink<'_> {
             FrameKind::TenantOtlpBatch => self.consume_batch(offset, payload)?,
             // The miner's regeneration is the only source of replayed
             // events (RFC 0052 §3.7): feeding a stored event as well
-            // would forward it twice. Nothing writes the kind yet
-            // (`encode_audit_event` is RFC 0008 §9's stub), and an
-            // encoder that lands must keep this arm or amend §3.7.
+            // would forward it twice. Nothing writes the kind yet (its
+            // encoder is RFC 0008 §9's open item), and an encoder that
+            // lands must keep this arm or amend §3.7.
             FrameKind::AuditEvent => {}
         }
         Ok(())

@@ -512,6 +512,7 @@ impl MinerCluster {
             .count();
         if overflow_count > 0 {
             rec.body = Some(raw.to_string());
+            #[allow(clippy::cast_possible_truncation)]
             let count = overflow_count as u64;
             self.params_overflow_total
                 .fetch_add(count, Ordering::Relaxed);

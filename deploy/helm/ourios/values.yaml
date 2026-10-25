@@ -1,9 +1,8 @@
 # Default values for the Ourios chart (object-storage-native, RFC 0019).
 #
 # "S3" here means the S3 API, NOT AWS specifically: the store works with AWS S3
-# and any S3-compatible object store — MinIO, Cloudflare R2, Hetzner Object
-# Storage, Ceph/RADOS Gateway, Google Cloud Storage via its S3 interop endpoint,
-# and so on. Point storage.s3.endpoint at a non-AWS provider (see below).
+# and any S3-compatible object store — MinIO, Cloudflare R2, Ceph/RADOS
+# Gateway, Google Cloud Storage via its S3 interop endpoint, and so on. Point storage.s3.endpoint at a non-AWS provider (see below).
 #
 # Ourios is one binary (`ourios-server`) with three roles. This chart deploys
 # them as three workloads sharing a data + audit store on object storage:
@@ -18,7 +17,8 @@
 # Configuration is delivered as an RFC 0020 YAML config file: the chart renders a
 # per-role ConfigMap, mounts it at /etc/ourios/config.yaml, and runs the binary
 # with --config (the file is authoritative). The settings below map onto that
-# file — the `OURIOS_*` names in parentheses are the equivalent config keys.
+# file. The `OURIOS_*` names in parentheses are the env-path equivalents of
+# those config keys; the binary ignores them under --config.
 # Object-store credentials are the exception: they are `${env:…}` references
 # resolved from a Secret via envFrom, never written into the file (see
 # storage.s3.existingSecret), and so are auth tokens (see auth below). OTEL_*
@@ -27,9 +27,10 @@
 image:
   repository: ghcr.io/jensholdgaard/ourios
   pullPolicy: IfNotPresent
-  # Image tag. Defaults to `latest` when empty — appVersion tracks the
-  # unreleased crate version (0.0.0), which is never published as an image.
-  # Pin a released tag (e.g. a `vX.Y.Z` build) in production.
+  # Image tag. Empty deploys the chart's appVersion, the ourios-server
+  # release the chart was published with, so a pinned chart version always
+  # deploys the same image. Set it to run another release or a variant
+  # (e.g. `0.16.0-static`).
   tag: ""
 
 imagePullSecrets: []
@@ -51,8 +52,8 @@ storage:
     # invalid store.
     bucket: ""
     # S3-compatible endpoint URL (OURIOS_S3_ENDPOINT). Set this for ANY non-AWS
-    # provider — e.g. MinIO (http://minio:9000), Cloudflare R2, Hetzner Object
-    # Storage, Ceph/RADOS Gateway, GCS S3-interop, LocalStack. Empty targets AWS
+    # provider — e.g. MinIO (http://minio:9000), Cloudflare R2, Ceph/RADOS
+    # Gateway, GCS S3-interop, LocalStack. Empty targets AWS
     # S3 at the regional endpoint.
     endpoint: ""
     # Bucket region. Optional here, but recommended: when set it drives both the
@@ -271,7 +272,7 @@ querier:
     #   value: deployment.environment.name=production,service.namespace=ourios
 
 # Background compactor (RFC 0009). The single sweeper: the receiver and querier
-# workloads set OURIOS_COMPACTION_ENABLED=0, so only this Deployment compacts.
+# configs set compaction.enabled: false, so only this Deployment compacts.
 # Pinned to one replica, rolled with the Recreate strategy so two compactors
 # never run at once (RFC0009.24; no leader election) — see the README
 # "Compactor topology" section.
@@ -476,6 +477,10 @@ podSecurityContext:
   fsGroup: 65532
   runAsNonRoot: true
   runAsUser: 65532
+  # The container runtime's default seccomp filter; Pod Security "restricted"
+  # requires it.
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   allowPrivilegeEscalation: false

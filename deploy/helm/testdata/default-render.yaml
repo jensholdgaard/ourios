@@ -180,9 +180,11 @@ spec:
         fsGroup: 65532
         runAsNonRoot: true
         runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: ourios-server
-          image: ghcr.io/jensholdgaard/ourios:latest
+          image: ghcr.io/jensholdgaard/ourios:<appVersion>
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -252,9 +254,11 @@ spec:
         fsGroup: 65532
         runAsNonRoot: true
         runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: ourios-server
-          image: ghcr.io/jensholdgaard/ourios:latest
+          image: ghcr.io/jensholdgaard/ourios:<appVersion>
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -339,9 +343,11 @@ spec:
         fsGroup: 65532
         runAsNonRoot: true
         runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: ourios-server
-          image: ghcr.io/jensholdgaard/ourios:latest
+          image: ghcr.io/jensholdgaard/ourios:<appVersion>
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

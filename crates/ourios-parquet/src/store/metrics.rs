@@ -539,7 +539,9 @@ mod tests {
     use super::{Caller, Metrics, Operation, SCOPE, StoreMetrics};
     use crate::store::client_span::Tracing;
     use crate::store::test_support::{fake_s3, s3_config, serve};
-    use crate::store::{MAX_BRIDGE_WORKERS, Store, StoreError, block_on_off_runtime};
+    use crate::store::{
+        MAX_BRIDGE_BLOCKING_THREADS, MAX_BRIDGE_WORKERS, Store, StoreError, block_on_off_runtime,
+    };
 
     /// Storage instruments of their own, exporting in memory.
     struct Harness {
@@ -918,6 +920,43 @@ mod tests {
         assert!(
             created <= f64::from(u32::try_from(4 * MAX_BRIDGE_WORKERS).expect("small")),
             "{CALLS} S3 calls and {BURSTS} bursts after the warm-up created {created} threads"
+        );
+    }
+
+    /// The full name of [`s3_burst_threads_stay_capped_in_a_fresh_process`].
+    const S3_BURST_TEST: &str =
+        "store::metrics::tests::s3_burst_threads_stay_capped_in_a_fresh_process";
+
+    /// As [`s3_calls_do_not_create_threads`], for a cold burst.
+    #[test]
+    fn a_cold_s3_burst_starts_a_bounded_number_of_threads() {
+        run_alone(S3_BURST_TEST);
+    }
+
+    /// A burst that arrives after the pool's idle threads have retired
+    /// resolves the endpoint once per new connection, all at once. The
+    /// pool's cap bounds the threads that burst can start, however wide it
+    /// is.
+    #[test]
+    #[ignore = "run alone by a_cold_s3_burst_starts_a_bounded_number_of_threads"]
+    fn s3_burst_threads_stay_capped_in_a_fresh_process() {
+        const BURST: usize = 64;
+        const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nETag: \"abc\"\r\n\
+             Last-Modified: Wed, 07 Oct 2026 11:00:00 GMT\r\nConnection: close\r\n\r\nv";
+        let harness = Harness::new();
+        let port = serve(BURST, |_| Some(OK.to_owned()));
+        let cfg = s3_config(port).with_endpoint(format!("http://localhost:{port}"));
+        let store = Store::s3_with(cfg, harness.metrics.clone(), Tracing::Global).expect("s3");
+        std::thread::scope(|s| {
+            for _ in 0..BURST {
+                s.spawn(|| store.get_bytes_blocking("k").expect("get"));
+            }
+        });
+        let created = harness.threads_created();
+        let cap = MAX_BRIDGE_WORKERS + MAX_BRIDGE_BLOCKING_THREADS;
+        assert!(
+            created <= f64::from(u32::try_from(cap).expect("small")),
+            "a {BURST}-wide burst started {created} threads, over the {cap} cap"
         );
     }
 

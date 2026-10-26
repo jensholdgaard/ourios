@@ -104,7 +104,9 @@ where
     let call = metrics.get().bridge_call(op);
     match bridge(fut) {
         Ok(result) => {
-            call.end(result.as_ref().err().map(metrics::store_error_type));
+            call.end(metrics::unexpected(
+                result.as_ref().err().map(metrics::store_error_type),
+            ));
             result
         }
         Err(payload) => {

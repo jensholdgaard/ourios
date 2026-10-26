@@ -39,9 +39,9 @@ mod s3;
 mod test_support;
 mod transport;
 
-#[cfg(test)]
-use bridge::MAX_BRIDGE_WORKERS;
 use bridge::block_on_off_runtime;
+#[cfg(test)]
+use bridge::{MAX_BRIDGE_BLOCKING_THREADS, MAX_BRIDGE_WORKERS};
 pub use client_span::QueryPhase;
 use client_span::Tracing;
 use metered::Backend;

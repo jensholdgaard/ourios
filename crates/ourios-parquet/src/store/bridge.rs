@@ -33,6 +33,7 @@ pub(super) fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .thread_name("ourios-store-bridge")
+            .max_blocking_threads(MAX_BRIDGE_BLOCKING_THREADS)
             .on_thread_start(metrics::bridge_thread_started)
             .thread_keep_alive(BLOCKING_THREAD_KEEP_ALIVE)
             // `enable_all` so the runtime carries the IO + time drivers the
@@ -53,6 +54,12 @@ pub(super) fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
 
 /// Upper bound on the bridge runtime's worker threads.
 pub(super) const MAX_BRIDGE_WORKERS: usize = 4;
+
+/// Upper bound on the bridge runtime's blocking pool. Each new S3
+/// connection resolves its host there, so a burst that lands after the
+/// idle threads have retired would otherwise start a thread per
+/// connection. Lookups and local file I/O past the cap queue briefly.
+pub(super) const MAX_BRIDGE_BLOCKING_THREADS: usize = 16;
 
 /// How long an idle blocking-pool thread of the bridge runtime lives. The
 /// local backend's file I/O and the S3 client's DNS lookups run on that pool,

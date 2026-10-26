@@ -102,7 +102,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
       # `--all-features` alone hides lints that fire only when a feature is
       # off (#803: clippy 1.98's `unused_async_trait_impl` on helpers whose
@@ -122,7 +122,7 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # The [workspace.lints.rustdoc] levels are the single source of
       # truth: the deny-level lints (broken intra-doc links etc.,
       # #124) fail this build on their own; no RUSTDOCFLAGS override,
@@ -140,12 +140,12 @@ jobs:
         run: .github/scripts/free-disk-space.sh
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # RFC 0028 slice 5: nextest schedules per-test processes in parallel
       # (12x the warm suite wall time locally — epic #382). Doctests are not
       # in nextest's model, so `cargo test --doc` keeps them covered — the
       # pair preserves the exact suite inventory (RFC0028.5).
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
@@ -188,7 +188,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # `--exact` with an explicit list (not bare `--ignored`) so the deferred
       # `rfc0013_8_reader_forward_compat_over_store` `todo!()` stub stays
       # un-run. The RFC 0019 Store-migration localstack tests join the list as
@@ -263,7 +263,7 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: >
           cargo test -p ourios-server --test it --
           --ignored --exact
@@ -280,7 +280,7 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # A real otelcol-contrib container exports OTLP to a served Ourios over
       # TLS + OIDC (Dex); the test asserts the lines land under the JWT tenant.
       # The RFC 0050 scenario runs the same collector's `drain` processor and
@@ -311,7 +311,7 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Module-qualified names (the #499 split moved these into
       # `interop`); a bare name here would match NOTHING and still exit
       # 0 — the trailing grep turns that silent no-op into a hard fail
@@ -336,7 +336,7 @@ jobs:
       # mdbook-mermaid: RFC diagrams are Mermaid (docs/rfcs/README.md).
       # The preprocessor is declared in book.toml, so the binary must be
       # on PATH or `mdbook build` fails with "preprocessor not found".
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: mdbook@0.5.2,mdbook-mermaid@0.17.0
       - run: mdbook build
@@ -464,7 +464,7 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: >
           cargo test -p ourios-server --test it --
           --ignored --exact
@@ -500,7 +500,7 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install weaver
         run: |
           set -euo pipefail
@@ -722,7 +722,7 @@ jobs:
       # schema, advisory handling) can't change under us when a new release
       # lands; bump deliberately (Renovate/manual) alongside any deny.toml
       # changes the new version needs.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-deny@0.19.8
       - run: cargo deny check
@@ -862,8 +862,8 @@ jobs:
         run: |
           rustup toolchain install
           rustup component add llvm-tools-preview
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
       # Collect once (runs the test suite under instrumentation), then

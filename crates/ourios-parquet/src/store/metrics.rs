@@ -44,6 +44,8 @@ pub(super) const ERROR_TYPE: &str = "error.type";
 pub(super) const OTHER: &str = "_OTHER";
 /// `error.type` for a call dropped before it completed.
 const CANCELLED: &str = "cancelled";
+/// `error.type` for a missing object.
+const NOT_FOUND: &str = "not_found";
 
 /// Threads the bridge runtime has started, workers and blocking-pool
 /// threads alike. A process-wide count, since the runtime is.
@@ -278,7 +280,7 @@ impl Metrics {
 pub(crate) fn error_type(e: &object_store::Error) -> &'static str {
     use object_store::Error;
     match e {
-        Error::NotFound { .. } => "not_found",
+        Error::NotFound { .. } => NOT_FOUND,
         Error::AlreadyExists { .. } => "already_exists",
         Error::Precondition { .. } => "precondition",
         Error::NotModified { .. } => "not_modified",
@@ -288,6 +290,42 @@ pub(crate) fn error_type(e: &object_store::Error) -> &'static str {
         Error::NotSupported { .. } => "not_supported",
         Error::NotImplemented { .. } => "not_implemented",
         _ => transport_kind(e).map_or(OTHER, http_error_kind),
+    }
+}
+
+/// Marks, on the `OTel` context, a read whose caller treats a missing object
+/// as an answer (a partition with no manifest yet), so a not-found records
+/// as success rather than as an error. The bridge carries the context to
+/// the metered layer.
+#[derive(Clone, Copy, Debug)]
+struct AbsenceExpected;
+
+/// Run `read` as one where a missing object is expected, mapping it to
+/// `None`.
+pub(super) fn absence_expected<T>(
+    read: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<Option<T>, StoreError> {
+    let _absence = opentelemetry::Context::current()
+        .with_value(AbsenceExpected)
+        .attach();
+    match read() {
+        Ok(found) => Ok(Some(found)),
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `error` as recorded: a not-found the caller expects is no error.
+pub(super) fn unexpected(error: Option<&'static str>) -> Option<&'static str> {
+    match error {
+        Some(NOT_FOUND)
+            if opentelemetry::Context::current()
+                .get::<AbsenceExpected>()
+                .is_some() =>
+        {
+            None
+        }
+        other => other,
     }
 }
 
@@ -451,7 +489,7 @@ impl Call {
 
     /// End the call with `result`.
     pub(super) fn end<T>(mut self, result: &object_store::Result<T>) {
-        self.finish(result.as_ref().err().map(error_type));
+        self.finish(unexpected(result.as_ref().err().map(error_type)));
     }
 
     fn finish(&mut self, error: Option<&'static str>) {
@@ -767,6 +805,86 @@ mod tests {
             harness
                 .points(semconv::OURIOS_STORAGE_LIST_OBJECTS)
                 .is_empty()
+        );
+    }
+
+    /// A read whose caller expects absence (a partition with no manifest
+    /// yet) answers `None`, and records as a success.
+    #[test]
+    fn an_expected_absence_is_not_an_error() {
+        let harness = Harness::new();
+        let store = harness.in_memory(Caller::Compaction);
+        assert!(store.get_blocking_opt("absent").expect("get").is_none());
+        assert!(
+            store
+                .get_with_modified_blocking_opt("absent")
+                .expect("get")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_with_etag_blocking_opt("absent")
+                .expect("get")
+                .is_none()
+        );
+
+        assert_eq!(
+            harness.operations(),
+            BTreeMap::from([(key("get", "compaction", None), 3)])
+        );
+        let bridged = harness.points(semconv::OURIOS_STORAGE_BRIDGE_DURATION);
+        assert!(
+            matches!(
+                bridged.as_slice(),
+                [p] if p.attribute("error.type").is_none() && p.count == 3
+            ),
+            "{bridged:?}"
+        );
+    }
+
+    /// As [`an_expected_absence_is_not_an_error`], over HTTP: the marker
+    /// rides the bridge to the metered layer. The S3 404 itself still
+    /// carries its status on the HTTP client duration.
+    #[test]
+    fn an_expected_s3_absence_is_not_an_operation_error() {
+        let port = fake_s3(vec![
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let harness = Harness::new();
+        let store = s3_store(&harness, port, Caller::Compaction);
+        assert!(
+            store
+                .get_with_etag_blocking_opt("manifest.json")
+                .expect("get")
+                .is_none()
+        );
+
+        assert_eq!(
+            harness.operations(),
+            BTreeMap::from([(key("get", "compaction", None), 1)])
+        );
+        let http = harness.points("http.client.request.duration");
+        assert!(
+            matches!(http.as_slice(), [p] if p.attribute("error.type") == Some("404")),
+            "{http:?}"
+        );
+    }
+
+    /// The marker is scoped to its read: a plain read of a missing object
+    /// afterwards is an error again.
+    #[test]
+    fn a_plain_read_after_an_expected_absence_still_errors() {
+        let harness = Harness::new();
+        let store = harness.in_memory(Caller::Compaction);
+        assert!(store.get_blocking_opt("absent").expect("get").is_none());
+        store.get_blocking("absent").expect_err("missing object");
+
+        assert_eq!(
+            harness.operations(),
+            BTreeMap::from([
+                (key("get", "compaction", None), 1),
+                (key("get", "compaction", Some("not_found")), 1),
+            ])
         );
     }
 

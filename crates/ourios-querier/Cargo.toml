@@ -183,7 +183,7 @@ serde-saphyr = { version = "=1.3.0", default-features = false, features = ["dese
 # Schema in the acceptance test. `default-features = false` drops the
 # reqwest/TLS remote-`$ref` resolver: the schema is self-contained
 # (local `$ref`s only), so no network resolver is needed.
-jsonschema = { version = "=0.58.6", default-features = false }
+jsonschema = { version = "=0.60.1", default-features = false }
 
 [lints]
 workspace = true

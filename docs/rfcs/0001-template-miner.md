@@ -2658,10 +2658,13 @@ name them directly per `[§3.1]` rather than spelling out a
 >   tenant or service resolution.
 >
 > Eviction removes the least recently updated pairs first, an eighth of
-> the budget at a time. While the number of concurrently active pairs
-> stays within seven eighths of the budget, a service that keeps
-> logging is never evicted. When more pairs are active, they evict each
-> other in turn: their gauges can be missing at collection time and
+> the budget at a time. A pair therefore survives every eviction while
+> fewer than seven eighths of the budget (3,584) other pairs have been
+> updated since its own last line. Pairs that stopped logging count
+> too until they are evicted, so a service that logs rarely can be
+> evicted by a stream of short-lived services even when few services
+> are active at once. Pairs evicted this way, or by too many
+> concurrently active pairs, lose their gauges at collection time and
 > their overflow counts restart, so per-service overflow detection is
 > lost for them. That is the price of a bounded state. The budget
 > should sit well above the expected number of active pairs, and an

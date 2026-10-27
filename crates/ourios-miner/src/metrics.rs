@@ -310,9 +310,16 @@ impl ServiceTallyMap {
         let (_, cutoff, _) = stamps.select_nth_unstable(evict - 1);
         let cutoff = *cutoff;
         for tallies in self.tenants.values_mut() {
+            let before = tallies.by_name.len();
             tallies
                 .by_name
                 .retain(|_, tally| tally.last_touched > cutoff);
+            // `retain` keeps the table's allocation; without shrinking, each
+            // tenant that once filled the budget would hold a peak-sized
+            // table after its services are gone.
+            if tallies.by_name.len() < before {
+                tallies.by_name.shrink_to_fit();
+            }
         }
         self.named -= evict;
     }
@@ -856,6 +863,22 @@ mod tests {
         }
         let back = map.tally_mut(&TenantId::new("t".to_owned()), Some("old"));
         assert_eq!(back.lines, 0);
+    }
+
+    #[test]
+    fn evicted_tenants_release_their_table_capacity() {
+        const BUDGET: usize = 64;
+        let mut map = ServiceTallyMap::with_budget(BUDGET);
+        for tenant in 0..20 {
+            for service in 0..BUDGET {
+                touch(&mut map, &format!("t{tenant}"), &format!("s{service}"));
+            }
+        }
+        let capacity: usize = map.iter().map(|(_, t)| t.by_name.capacity()).sum();
+        assert!(
+            capacity <= 4 * BUDGET,
+            "{capacity} table slots held for a budget of {BUDGET}"
+        );
     }
 
     #[test]

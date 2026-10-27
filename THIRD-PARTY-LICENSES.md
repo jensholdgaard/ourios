@@ -7909,7 +7909,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- `zstd-sys` 2.1.0+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
+- `zstd-sys` 2.1.2+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
 
 <details>
 <summary>Full license text</summary>

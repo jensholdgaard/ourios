@@ -51,7 +51,9 @@ ignore = [
     # `seekable` feature, which is off; RUSTSEC-2026-0403 is reached through
     # `stream::write::Decoder`, while parquet and our querier decode through
     # `stream::read::Decoder`, `decode_all` and the bulk API, which the
-    # advisory lists as unaffected. Remove when arrow moves to zstd 0.14.
+    # advisory lists as unaffected. Remove when arrow moves to zstd 0.14
+    # and our own `zstd = "0.13"` pins (ourios-querier, ourios-bench, fuzz)
+    # move with it.
     "RUSTSEC-2026-0391",
     "RUSTSEC-2026-0398",
     "RUSTSEC-2026-0403",

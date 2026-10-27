@@ -63,7 +63,9 @@ reason = "crypto-bigint 0.5 timing variability; reached only via jsonwebtoken ES
 # functions is called: nothing uses `with_context` context reuse, the `seekable`
 # feature is off, and decoding goes through `stream::read::Decoder`,
 # `decode_all` and the bulk API, which RUSTSEC-2026-0403 lists as unaffected.
-# Mirrors the reasoned `deny.toml` ignores. Remove when arrow moves to zstd 0.14.
+# Mirrors the reasoned `deny.toml` ignores. Remove when arrow moves to zstd 0.14
+# and our own `zstd = "0.13"` pins (ourios-querier, ourios-bench, fuzz) move
+# with it.
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0391"
 ignoreUntil = 2026-12-31

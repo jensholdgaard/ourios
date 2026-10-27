@@ -44,6 +44,8 @@ pub(super) const ERROR_TYPE: &str = "error.type";
 pub(super) const OTHER: &str = "_OTHER";
 /// `error.type` for a call dropped before it completed.
 const CANCELLED: &str = "cancelled";
+/// `error.type` for a missing object.
+const NOT_FOUND: &str = "not_found";
 
 /// Threads the bridge runtime has started, workers and blocking-pool
 /// threads alike. A process-wide count, since the runtime is.
@@ -278,7 +280,7 @@ impl Metrics {
 pub(crate) fn error_type(e: &object_store::Error) -> &'static str {
     use object_store::Error;
     match e {
-        Error::NotFound { .. } => "not_found",
+        Error::NotFound { .. } => NOT_FOUND,
         Error::AlreadyExists { .. } => "already_exists",
         Error::Precondition { .. } => "precondition",
         Error::NotModified { .. } => "not_modified",
@@ -288,6 +290,42 @@ pub(crate) fn error_type(e: &object_store::Error) -> &'static str {
         Error::NotSupported { .. } => "not_supported",
         Error::NotImplemented { .. } => "not_implemented",
         _ => transport_kind(e).map_or(OTHER, http_error_kind),
+    }
+}
+
+/// Marks, on the `OTel` context, a read whose caller treats a missing object
+/// as an answer (a partition with no manifest yet), so a not-found records
+/// as success rather than as an error. The bridge carries the context to
+/// the metered layer.
+#[derive(Clone, Copy, Debug)]
+struct AbsenceExpected;
+
+/// Run `read` as one where a missing object is expected, mapping it to
+/// `None`.
+pub(super) fn absence_expected<T>(
+    read: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<Option<T>, StoreError> {
+    let _absence = opentelemetry::Context::current()
+        .with_value(AbsenceExpected)
+        .attach();
+    match read() {
+        Ok(found) => Ok(Some(found)),
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `error` as recorded: a not-found the caller expects is no error.
+pub(super) fn unexpected(error: Option<&'static str>) -> Option<&'static str> {
+    match error {
+        Some(NOT_FOUND)
+            if opentelemetry::Context::current()
+                .get::<AbsenceExpected>()
+                .is_some() =>
+        {
+            None
+        }
+        other => other,
     }
 }
 
@@ -451,7 +489,7 @@ impl Call {
 
     /// End the call with `result`.
     pub(super) fn end<T>(mut self, result: &object_store::Result<T>) {
-        self.finish(result.as_ref().err().map(error_type));
+        self.finish(unexpected(result.as_ref().err().map(error_type)));
     }
 
     fn finish(&mut self, error: Option<&'static str>) {
@@ -539,7 +577,9 @@ mod tests {
     use super::{Caller, Metrics, Operation, SCOPE, StoreMetrics};
     use crate::store::client_span::Tracing;
     use crate::store::test_support::{fake_s3, s3_config, serve};
-    use crate::store::{MAX_BRIDGE_WORKERS, Store, StoreError, block_on_off_runtime};
+    use crate::store::{
+        MAX_BRIDGE_BLOCKING_THREADS, MAX_BRIDGE_WORKERS, Store, StoreError, block_on_off_runtime,
+    };
 
     /// Storage instruments of their own, exporting in memory.
     struct Harness {
@@ -770,6 +810,86 @@ mod tests {
         );
     }
 
+    /// A read whose caller expects absence (a partition with no manifest
+    /// yet) answers `None`, and records as a success.
+    #[test]
+    fn an_expected_absence_is_not_an_error() {
+        let harness = Harness::new();
+        let store = harness.in_memory(Caller::Compaction);
+        assert!(store.get_blocking_opt("absent").expect("get").is_none());
+        assert!(
+            store
+                .get_with_modified_blocking_opt("absent")
+                .expect("get")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_with_etag_blocking_opt("absent")
+                .expect("get")
+                .is_none()
+        );
+
+        assert_eq!(
+            harness.operations(),
+            BTreeMap::from([(key("get", "compaction", None), 3)])
+        );
+        let bridged = harness.points(semconv::OURIOS_STORAGE_BRIDGE_DURATION);
+        assert!(
+            matches!(
+                bridged.as_slice(),
+                [p] if p.attribute("error.type").is_none() && p.count == 3
+            ),
+            "{bridged:?}"
+        );
+    }
+
+    /// As [`an_expected_absence_is_not_an_error`], over HTTP: the marker
+    /// rides the bridge to the metered layer. The S3 404 itself still
+    /// carries its status on the HTTP client duration.
+    #[test]
+    fn an_expected_s3_absence_is_not_an_operation_error() {
+        let port = fake_s3(vec![
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let harness = Harness::new();
+        let store = s3_store(&harness, port, Caller::Compaction);
+        assert!(
+            store
+                .get_with_etag_blocking_opt("manifest.json")
+                .expect("get")
+                .is_none()
+        );
+
+        assert_eq!(
+            harness.operations(),
+            BTreeMap::from([(key("get", "compaction", None), 1)])
+        );
+        let http = harness.points("http.client.request.duration");
+        assert!(
+            matches!(http.as_slice(), [p] if p.attribute("error.type") == Some("404")),
+            "{http:?}"
+        );
+    }
+
+    /// The marker is scoped to its read: a plain read of a missing object
+    /// afterwards is an error again.
+    #[test]
+    fn a_plain_read_after_an_expected_absence_still_errors() {
+        let harness = Harness::new();
+        let store = harness.in_memory(Caller::Compaction);
+        assert!(store.get_blocking_opt("absent").expect("get").is_none());
+        store.get_blocking("absent").expect_err("missing object");
+
+        assert_eq!(
+            harness.operations(),
+            BTreeMap::from([
+                (key("get", "compaction", None), 1),
+                (key("get", "compaction", Some("not_found")), 1),
+            ])
+        );
+    }
+
     #[test]
     fn concurrent_bridged_calls_are_active_until_they_return() {
         const CALLS: usize = 8;
@@ -868,6 +988,93 @@ mod tests {
         assert!(
             created < 1.0,
             "a call after an idle gap created {created} threads"
+        );
+    }
+
+    /// The full name of [`s3_bridge_threads_stay_flat_in_a_fresh_process`].
+    const S3_FRESH_PROCESS_TEST: &str =
+        "store::metrics::tests::s3_bridge_threads_stay_flat_in_a_fresh_process";
+
+    /// As [`sequential_bridged_calls_do_not_create_threads`], against S3.
+    #[test]
+    fn s3_calls_do_not_create_threads() {
+        run_alone(S3_FRESH_PROCESS_TEST);
+    }
+
+    /// Each S3 request on a new connection resolves the endpoint's host on
+    /// the bridge runtime's blocking pool. The endpoint is `localhost`, not
+    /// an address, and every response closes its connection, so every call
+    /// resolves. A concurrent warm-up grows the pool to its peak first;
+    /// after that, neither sequential calls nor further bursts of the same
+    /// width may start threads.
+    #[test]
+    #[ignore = "run alone by s3_calls_do_not_create_threads"]
+    fn s3_bridge_threads_stay_flat_in_a_fresh_process() {
+        const CALLS: usize = 200;
+        const BURST: usize = 32;
+        const BURSTS: usize = 3;
+        const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nETag: \"abc\"\r\n\
+             Last-Modified: Wed, 07 Oct 2026 11:00:00 GMT\r\nConnection: close\r\n\r\nv";
+        let burst = |store: &Store| {
+            std::thread::scope(|s| {
+                for _ in 0..BURST {
+                    s.spawn(|| store.get_bytes_blocking("k").expect("get"));
+                }
+            });
+        };
+        let harness = Harness::new();
+        let port = serve(CALLS + BURST * (BURSTS + 1), |_| Some(OK.to_owned()));
+        let cfg = s3_config(port).with_endpoint(format!("http://localhost:{port}"));
+        let store = Store::s3_with(cfg, harness.metrics.clone(), Tracing::Global).expect("s3");
+        burst(&store);
+        let before = harness.threads_created();
+        for _ in 0..CALLS {
+            store.get_bytes_blocking("k").expect("get");
+        }
+        for _ in 0..BURSTS {
+            burst(&store);
+        }
+        let created = harness.threads_created() - before;
+        assert!(
+            created <= f64::from(u32::try_from(4 * MAX_BRIDGE_WORKERS).expect("small")),
+            "{CALLS} S3 calls and {BURSTS} bursts after the warm-up created {created} threads"
+        );
+    }
+
+    /// The full name of [`s3_burst_threads_stay_capped_in_a_fresh_process`].
+    const S3_BURST_TEST: &str =
+        "store::metrics::tests::s3_burst_threads_stay_capped_in_a_fresh_process";
+
+    /// As [`s3_calls_do_not_create_threads`], for a cold burst.
+    #[test]
+    fn a_cold_s3_burst_starts_a_bounded_number_of_threads() {
+        run_alone(S3_BURST_TEST);
+    }
+
+    /// A burst that arrives after the pool's idle threads have retired
+    /// resolves the endpoint once per new connection, all at once. The
+    /// pool's cap bounds the threads that burst can start, however wide it
+    /// is.
+    #[test]
+    #[ignore = "run alone by a_cold_s3_burst_starts_a_bounded_number_of_threads"]
+    fn s3_burst_threads_stay_capped_in_a_fresh_process() {
+        const BURST: usize = 64;
+        const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nETag: \"abc\"\r\n\
+             Last-Modified: Wed, 07 Oct 2026 11:00:00 GMT\r\nConnection: close\r\n\r\nv";
+        let harness = Harness::new();
+        let port = serve(BURST, |_| Some(OK.to_owned()));
+        let cfg = s3_config(port).with_endpoint(format!("http://localhost:{port}"));
+        let store = Store::s3_with(cfg, harness.metrics.clone(), Tracing::Global).expect("s3");
+        std::thread::scope(|s| {
+            for _ in 0..BURST {
+                s.spawn(|| store.get_bytes_blocking("k").expect("get"));
+            }
+        });
+        let created = harness.threads_created();
+        let cap = MAX_BRIDGE_WORKERS + MAX_BRIDGE_BLOCKING_THREADS;
+        assert!(
+            created <= f64::from(u32::try_from(cap).expect("small")),
+            "a {BURST}-wide burst started {created} threads, over the {cap} cap"
         );
     }
 

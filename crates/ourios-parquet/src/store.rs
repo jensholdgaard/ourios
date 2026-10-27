@@ -39,9 +39,9 @@ mod s3;
 mod test_support;
 mod transport;
 
-#[cfg(test)]
-use bridge::MAX_BRIDGE_WORKERS;
 use bridge::block_on_off_runtime;
+#[cfg(test)]
+use bridge::{MAX_BRIDGE_BLOCKING_THREADS, MAX_BRIDGE_WORKERS};
 pub use client_span::QueryPhase;
 use client_span::Tracing;
 use metered::Backend;
@@ -951,11 +951,7 @@ impl Store {
     /// # Errors
     /// As [`Self::get_blocking`], except a not-found object yields `Ok(None)`.
     pub fn get_blocking_opt(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        match self.get_blocking(key) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e),
-        }
+        metrics::absence_expected(|| self.get_blocking(key))
     }
 
     /// Blocking [`Self::put_if_absent`] for the sync storage call sites.
@@ -1079,13 +1075,11 @@ impl Store {
         key: &str,
     ) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        match self.bridge(Operation::Get, async move {
-            store.get_with_modified(&key).await
-        }) {
-            Ok(got) => Ok(Some(got)),
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e),
-        }
+        metrics::absence_expected(|| {
+            self.bridge(Operation::Get, async move {
+                store.get_with_modified(&key).await
+            })
+        })
     }
 
     /// Blocking [`Self::get_with_etag`], mapping a missing object to `None`
@@ -1099,14 +1093,12 @@ impl Store {
         key: &str,
     ) -> Result<Option<EtaggedBytes>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        match self.bridge(
-            Operation::Get,
-            async move { store.get_with_etag(&key).await },
-        ) {
-            Ok(pair) => Ok(Some(pair)),
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e),
-        }
+        metrics::absence_expected(|| {
+            self.bridge(
+                Operation::Get,
+                async move { store.get_with_etag(&key).await },
+            )
+        })
     }
 
     /// Blocking [`Self::put_if_match`] for the sync storage call sites.

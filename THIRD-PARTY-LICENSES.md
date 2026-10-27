@@ -7691,9 +7691,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- `zstd-safe` 8.1.0 — <https://github.com/gyscos/zstd-rs>
-- `zstd-sys` 2.1.1+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
-- `zstd` 0.14.2 — <https://github.com/gyscos/zstd-rs>
+- `zstd-safe` 8.2.0 — <https://github.com/gyscos/zstd-rs>
+- `zstd-sys` 2.1.2+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
+- `zstd` 0.14.3 — <https://github.com/gyscos/zstd-rs>
 
 <details>
 <summary>Full license text</summary>

@@ -705,12 +705,14 @@ direction and the primary obligation lives in those other RFCs.
 >
 > > **Amendment (2026-10-27, #1122, maintainer-approved) — bounded
 > > tallies.** The Given is read within §6.8's tally budget: the
-> > gauges are guaranteed for every `(tenant, service)` pair the miner
-> > currently tracks. The scenario gains:
+> > miner computes the gauges for every `(tenant, service)` pair it
+> > currently tracks, and the SDK exports them subject to its
+> > per-instrument cardinality limit (the tests stay below it). The
+> > scenario gains:
 > > - **And** the miner never tracks more named pairs than the budget,
 > >   whatever the number of distinct `service.name` values ingested
 > > - **And** when the budget is reached, the least recently updated
-> >   pairs are evicted first
+> >   pairs are evicted first, an eighth of the budget at a time
 > > - **And** an evicted pair that logs again restarts from an empty
 > >   window rather than resuming its old one
 > > - **And** each gauge value matches the corresponding quantile of
@@ -2628,7 +2630,9 @@ name them directly per `[§3.1]` rather than spelling out a
 >
 > - A miner keeps at most a fixed budget of named `(tenant, service)`
 >   tallies across all its tenants (default 4,096). Inserting past the
->   budget evicts the least recently updated tallies.
+>   budget evicts the least recently updated eighth of the budget in
+>   one pass, so a flood of new names costs an amortised O(1) per
+>   insert.
 > - The bound is on Ourios's telemetry state only. It is not a
 >   per-tenant cap on `service.name`, and ingest, storage, the tenant
 >   model and every counter and histogram are unchanged. A tenant stays
@@ -2646,16 +2650,22 @@ name them directly per `[§3.1]` rather than spelling out a
 >   sets fold into one `otel.metric.overflow=true` series without
 >   tenant or service resolution.
 >
-> Eviction removes the least recently active pairs first. While the
-> number of concurrently active pairs stays within the budget, a
-> service that keeps logging is never evicted, so it keeps its gauges
-> and stays covered by the §6.5 / H2.2 per-service overflow alert. When
-> more pairs than the budget are active at once, they evict each other
-> in turn: their gauges can be missing at collection time and their
-> overflow counts restart, so per-service overflow detection is lost
-> for them. That is the price of a bounded state. The budget should
-> sit above the expected number of active pairs, and an eviction
-> count (a follow-up registry metric) makes the churn visible.
+> Eviction removes the least recently active pairs first, an eighth of
+> the budget at a time. While the number of concurrently active pairs
+> stays within seven eighths of the budget, a service that keeps
+> logging is never evicted. When more pairs are active, they evict each
+> other in turn: their gauges can be missing at collection time and
+> their overflow counts restart, so per-service overflow detection is
+> lost for them. That is the price of a bounded state. The budget
+> should sit well above the expected number of active pairs, and an
+> eviction count (a follow-up registry metric) makes the churn visible.
+>
+> A tracked pair is covered by the §6.5 / H2.2 per-service overflow
+> alert only if its gauge series is also exported. The SDK's
+> per-instrument cardinality limit applies to the observable gauges
+> too, and service-less tenant series count against it although they
+> sit outside the budget. A pair past that limit folds into the
+> `otel.metric.overflow=true` series without any eviction.
 
 The histogram bucket boundaries are tuned to straddle the decision
 boundary at 1.0 (see §6.3): default buckets

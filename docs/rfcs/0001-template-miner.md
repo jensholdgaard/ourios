@@ -713,6 +713,10 @@ direction and the primary obligation lives in those other RFCs.
 > >   pairs are evicted first
 > > - **And** an evicted pair that logs again restarts from an empty
 > >   window rather than resuming its old one
+> > - **And** each gauge value matches the corresponding quantile of
+> >   the pair's current window, the samples since the pair was last
+> >   admitted, rather than of the cumulative histogram, which keeps
+> >   every sample across an eviction
 > > - **And** lines without a `service.name` do not count toward the
 > >   budget
 >
@@ -2635,14 +2639,23 @@ name them directly per `[§3.1]` rather than spelling out a
 >   the utilization ratio.
 > - Lines without a `service.name` share one slot per tenant, outside
 >   the budget.
-> - The `ourios.miner.confidence` histogram stays the source of truth
->   for every pair, evicted or not.
+> - Every confidence measurement is still recorded on the
+>   `ourios.miner.confidence` histogram, evicted pair or not. The
+>   histogram keeps a per-pair distribution only while the SDK's
+>   per-instrument cardinality limit allows: past it, excess attribute
+>   sets fold into one `otel.metric.overflow=true` series without
+>   tenant or service resolution.
 >
-> Eviction removes the least recently active pairs first, so a service
-> that keeps logging keeps its gauges and stays covered by the §6.5 /
-> H2.2 per-service overflow alert. Exported series are separately
-> bounded by the OTel SDK's per-instrument cardinality limit, which
-> folds the excess into an `otel.metric.overflow=true` series.
+> Eviction removes the least recently active pairs first. While the
+> number of concurrently active pairs stays within the budget, a
+> service that keeps logging is never evicted, so it keeps its gauges
+> and stays covered by the §6.5 / H2.2 per-service overflow alert. When
+> more pairs than the budget are active at once, they evict each other
+> in turn: their gauges can be missing at collection time and their
+> overflow counts restart, so per-service overflow detection is lost
+> for them. That is the price of a bounded state. The budget should
+> sit above the expected number of active pairs, and an eviction
+> count (a follow-up registry metric) makes the churn visible.
 
 The histogram bucket boundaries are tuned to straddle the decision
 boundary at 1.0 (see §6.3): default buckets

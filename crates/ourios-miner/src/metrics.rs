@@ -402,9 +402,9 @@ struct MinerMetricsState {
 /// quantile over a bounded ring of the most recent
 /// [`RESERVOIR_CAP`] samples per `(tenant, service)` — small,
 /// allocation-bounded, and correct over its window, with no sketch
-/// approximation error. The `confidence` histogram remains the
-/// §6.8 source of truth; the two gauges are named in-process views
-/// per RFC0001.8. A future contract change could instead make p50/p01
+/// approximation error. The gauges are quantiles of this window, not
+/// of the `confidence` histogram, which records every sample
+/// independently and survives tally eviction. A future contract change could instead make p50/p01
 /// backend-derived quantiles over the exported `confidence` histogram
 /// (independent of the now-landed dotted-semconv naming); if so, this
 /// in-process reservoir is replaced under that change's own review.

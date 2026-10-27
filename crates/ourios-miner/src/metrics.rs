@@ -17,7 +17,8 @@
 //! so the state must be maintained to serve a collection that may
 //! arrive at any time — but it is bounded: the hot-path update clones
 //! a key only on first sight of a `(tenant, service)` pair (see
-//! [`tally_mut`]) and the reservoir is capped at [`RESERVOIR_CAP`].
+//! [`ServiceTallyMap::tally_mut`]), the named tallies are capped at
+//! [`SERVICE_TALLY_BUDGET`] and each reservoir at [`RESERVOIR_CAP`].
 //!
 //! # Metric names and attributes
 //!
@@ -206,38 +207,114 @@ fn set_tenant(map: &mut HashMap<TenantId, u64>, tenant: &TenantId, value: u64) {
     }
 }
 
-/// Borrow the `(tenant, service)` tally for a mutable update,
-/// allocating owned keys only on the first sight of the pair.
+/// Named `(tenant, service)` tallies one miner keeps across all its
+/// tenants. `service.name` comes from the ingested data, so the count is
+/// bounded here, by our own telemetry state, never by a per-tenant cap on
+/// the data model.
+const SERVICE_TALLY_BUDGET: usize = 4_096;
+
+/// Every `(tenant, service)` tally behind the ratio and quantile gauges,
+/// bounded to a budget of named tallies across all tenants.
 ///
-/// The hot path — a `(tenant, service)` already in flight — clones
-/// nothing: the outer probe is `get_mut(&TenantId)` (no clone) and the
-/// `Some(name)` inner probe is `get_mut(name)` keyed on a borrowed
-/// `&str`. Only the cold first-insert path owns a key (the prior code
-/// cloned the tenant *and* the service on every line). A `None` service
-/// — a line whose source carried no `service.name` — lands in the
-/// dedicated [`ServiceTallies::no_service`] slot, attributed to the
-/// tenant alone (`ourios.service` omitted, see [`service_attrs`]).
-fn tally_mut<'a>(
-    by_service: &'a mut HashMap<TenantId, ServiceTallies>,
-    tenant: &TenantId,
-    service: Option<&str>,
-) -> &'a mut ServiceTally {
-    // `contains_key` releases its borrow before the follow-up `get_mut`
-    // / `entry`, sidestepping the get-then-insert borrow-checker
-    // limitation while still cloning a key only on first insert.
-    if !by_service.contains_key(tenant) {
-        by_service.insert(tenant.clone(), ServiceTallies::default());
+/// Each touch stamps the tally with a logical clock. Inserting past the
+/// budget evicts the least recently touched eighth in one pass, so a
+/// flood of distinct names costs an amortised O(1) per insert rather than
+/// a scan per line. An evicted service's gauges stop until it logs again
+/// and then restart from an empty window. Service-less slots are one per
+/// tenant and sit outside the budget.
+struct ServiceTallyMap {
+    tenants: HashMap<TenantId, ServiceTallies>,
+    named: usize,
+    clock: u64,
+    budget: usize,
+}
+
+impl Default for ServiceTallyMap {
+    fn default() -> Self {
+        Self::with_budget(SERVICE_TALLY_BUDGET)
     }
-    let tallies = by_service
-        .get_mut(tenant)
-        .unwrap_or_else(|| unreachable!("inserted above when absent"));
-    match service {
-        None => &mut tallies.no_service,
-        Some(name) if tallies.by_name.contains_key(name) => tallies
-            .by_name
-            .get_mut(name)
-            .unwrap_or_else(|| unreachable!("contains_key was true")),
-        Some(name) => tallies.by_name.entry(name.to_owned()).or_default(),
+}
+
+impl ServiceTallyMap {
+    fn with_budget(budget: usize) -> Self {
+        Self {
+            tenants: HashMap::new(),
+            named: 0,
+            clock: 0,
+            budget: budget.max(1),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&TenantId, &ServiceTallies)> {
+        self.tenants.iter()
+    }
+
+    /// Borrow the `(tenant, service)` tally for a mutable update,
+    /// allocating owned keys only on the first sight of the pair.
+    ///
+    /// The hot path — a `(tenant, service)` already in flight — clones
+    /// nothing: the outer probe is `get_mut(&TenantId)` and the inner
+    /// probe is `get_mut(name)` keyed on a borrowed `&str`. A `None`
+    /// service — a line whose source carried no `service.name` — lands in
+    /// the dedicated [`ServiceTallies::no_service`] slot, attributed to
+    /// the tenant alone (`ourios.service` omitted, see [`service_attrs`]).
+    fn tally_mut(&mut self, tenant: &TenantId, service: Option<&str>) -> &mut ServiceTally {
+        self.clock += 1;
+        let now = self.clock;
+        let is_new = match service {
+            Some(name) => self
+                .tenants
+                .get(tenant)
+                .is_none_or(|t| !t.by_name.contains_key(name)),
+            None => false,
+        };
+        if is_new && self.named >= self.budget {
+            self.evict_least_recent();
+        }
+        // `contains_key` releases its borrow before the follow-up
+        // `get_mut` / `entry`, sidestepping the get-then-insert
+        // borrow-checker limitation while still cloning a key only on
+        // first insert.
+        if !self.tenants.contains_key(tenant) {
+            self.tenants
+                .insert(tenant.clone(), ServiceTallies::default());
+        }
+        let tallies = self
+            .tenants
+            .get_mut(tenant)
+            .unwrap_or_else(|| unreachable!("inserted above when absent"));
+        let tally = match service {
+            None => &mut tallies.no_service,
+            Some(name) if !is_new => tallies
+                .by_name
+                .get_mut(name)
+                .unwrap_or_else(|| unreachable!("is_new was false")),
+            Some(name) => {
+                self.named += 1;
+                tallies.by_name.entry(name.to_owned()).or_default()
+            }
+        };
+        tally.last_touched = now;
+        tally
+    }
+
+    /// Drop the least recently touched eighth of the named tallies.
+    /// Clock stamps are unique, so exactly that many go.
+    fn evict_least_recent(&mut self) {
+        let mut stamps: Vec<u64> = self
+            .tenants
+            .values()
+            .flat_map(|t| t.by_name.values().map(|tally| tally.last_touched))
+            .collect();
+        let evict = (self.budget / 8).clamp(1, stamps.len());
+        let (_, cutoff, _) = stamps.select_nth_unstable(evict - 1);
+        let cutoff = *cutoff;
+        for tallies in self.tenants.values_mut() {
+            tallies
+                .by_name
+                .retain(|_, tally| tally.last_touched > cutoff);
+        }
+        self.named -= evict;
     }
 }
 
@@ -281,6 +358,8 @@ struct ServiceTally {
     lines: u64,
     overflow_lines: u64,
     confidence: Reservoir,
+    /// [`ServiceTallyMap`] clock stamp of the last update.
+    last_touched: u64,
 }
 
 /// Process state the observable-gauge callbacks read at collection
@@ -297,7 +376,7 @@ struct MinerMetricsState {
     /// `no_service` slot for lines whose source carried no
     /// `service.name` — those still count toward the tenant, attributed
     /// without a service (`ourios.service` omitted, see [`service_attrs`]).
-    by_service: HashMap<TenantId, ServiceTallies>,
+    by_service: ServiceTallyMap,
     /// Per-tenant template count, mirrored from the cluster so the
     /// `ourios.miner.template.count` observable gauge can report it
     /// without borrowing the cluster.
@@ -322,16 +401,12 @@ struct MinerMetricsState {
 /// backend-derived quantiles over the exported `confidence` histogram
 /// (independent of the now-landed dotted-semconv naming); if so, this
 /// in-process reservoir is replaced under that change's own review.
+///
+/// The window grows on demand rather than preallocating the cap, so a
+/// long tail of quiet services costs a few samples each, not 8 KiB.
+#[derive(Default)]
 struct Reservoir {
     samples: VecDeque<f64>,
-}
-
-impl Default for Reservoir {
-    fn default() -> Self {
-        Self {
-            samples: VecDeque::with_capacity(RESERVOIR_CAP),
-        }
-    }
 }
 
 impl Reservoir {
@@ -491,7 +566,7 @@ impl MinerMetrics {
             let mut st = lock_recovering(&self.state);
             let first_sight = !st.body_lines.contains_key(tenant);
             bump_tenant(&mut st.body_lines, tenant);
-            tally_mut(&mut st.by_service, tenant, service).lines += 1;
+            st.by_service.tally_mut(tenant, service).lines += 1;
             first_sight
         };
         if first_sight {
@@ -537,7 +612,8 @@ impl MinerMetrics {
         self.confidence
             .record(confidence, &service_attrs(tenant, service));
         let mut st = lock_recovering(&self.state);
-        tally_mut(&mut st.by_service, tenant, service)
+        st.by_service
+            .tally_mut(tenant, service)
             .confidence
             .observe(confidence);
     }
@@ -582,7 +658,7 @@ impl MinerMetrics {
         self.params_overflow_total
             .add(count, &service_attrs(tenant, service));
         let mut st = lock_recovering(&self.state);
-        tally_mut(&mut st.by_service, tenant, service).overflow_lines += 1;
+        st.by_service.tally_mut(tenant, service).overflow_lines += 1;
     }
 
     /// Record one parse-failure line (§6.8 `ourios.miner.parse_failures`).
@@ -720,8 +796,78 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Reservoir, ratio, service_of};
+    use std::collections::BTreeSet;
+
+    use super::{Reservoir, ServiceTallyMap, ratio, service_of};
     use ourios_core::otlp::{AnyValue, KeyValue as OtlpKeyValue, any_value};
+    use ourios_core::tenant::TenantId;
+
+    fn named(map: &ServiceTallyMap) -> BTreeSet<(String, String)> {
+        map.iter()
+            .flat_map(|(tenant, tallies)| {
+                tallies
+                    .by_name
+                    .keys()
+                    .map(|name| (tenant.as_str().to_owned(), name.clone()))
+            })
+            .collect()
+    }
+
+    fn touch(map: &mut ServiceTallyMap, tenant: &str, service: &str) {
+        map.tally_mut(&TenantId::new(tenant.to_owned()), Some(service))
+            .lines += 1;
+    }
+
+    #[test]
+    fn service_tallies_never_exceed_the_budget() {
+        let mut map = ServiceTallyMap::with_budget(16);
+        for i in 0..1_000 {
+            touch(&mut map, &format!("t{}", i % 3), &format!("s{i}"));
+            assert!(map.named <= 16, "{} tallies after {i} inserts", map.named);
+            assert_eq!(map.named, named(&map).len());
+        }
+    }
+
+    #[test]
+    fn eviction_drops_the_least_recently_touched_services() {
+        let mut map = ServiceTallyMap::with_budget(16);
+        for i in 0..16 {
+            touch(&mut map, "t", &format!("s{i}"));
+        }
+        touch(&mut map, "t", "s0");
+        touch(&mut map, "t", "new");
+
+        let left = named(&map);
+        for gone in ["s1", "s2"] {
+            assert!(!left.contains(&("t".into(), gone.into())), "{gone} kept");
+        }
+        for kept in ["s0", "s3", "s15", "new"] {
+            assert!(left.contains(&("t".into(), kept.into())), "{kept} evicted");
+        }
+        assert_eq!(map.named, 15);
+    }
+
+    #[test]
+    fn an_evicted_service_restarts_from_an_empty_tally() {
+        let mut map = ServiceTallyMap::with_budget(8);
+        touch(&mut map, "t", "old");
+        for i in 0..8 {
+            touch(&mut map, "t", &format!("s{i}"));
+        }
+        let back = map.tally_mut(&TenantId::new("t".to_owned()), Some("old"));
+        assert_eq!(back.lines, 0);
+    }
+
+    #[test]
+    fn service_less_slots_sit_outside_the_budget() {
+        let mut map = ServiceTallyMap::with_budget(1);
+        touch(&mut map, "t0", "only");
+        for i in 0..100 {
+            map.tally_mut(&TenantId::new(format!("t{i}")), None).lines += 1;
+        }
+        assert_eq!(named(&map).len(), 1);
+        assert_eq!(map.named, 1);
+    }
 
     #[test]
     fn reservoir_nearest_rank_quantiles() {

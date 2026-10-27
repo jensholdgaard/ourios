@@ -56,3 +56,25 @@ reason = "rsa Marvin side-channel needs RSA private-key ops; Ourios only verifie
 id = "RUSTSEC-2026-0387"
 ignoreUntil = 2026-12-31
 reason = "crypto-bigint 0.5 timing variability; reached only via jsonwebtoken ES256/ES384 verify with public JWKS keys, no secret operand; no fixed version reachable (jsonwebtoken pins p256 ^0.13); mirrors deny.toml"
+
+# reason: zstd 0.13 / zstd-safe 7 advisories (RUSTSEC-2026-0391, -0398, -0403)
+# are fixed only in the zstd 0.14 / zstd-safe 8.2 major lines, and parquet and
+# arrow-ipc 59 (pinned by datafusion 55) require zstd ^0.13. None of the affected
+# functions is called: nothing uses `with_context` context reuse, the `seekable`
+# feature is off, and decoding goes through `stream::read::Decoder`,
+# `decode_all` and the bulk API, which RUSTSEC-2026-0403 lists as unaffected.
+# Mirrors the reasoned `deny.toml` ignores. Remove when arrow moves to zstd 0.14.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0391"
+ignoreUntil = 2026-12-31
+reason = "zstd with_context reuses an abandoned stream's state; nothing calls with_context; no fixed version reachable (parquet/arrow-ipc 59 pin zstd ^0.13); mirrors deny.toml"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0398"
+ignoreUntil = 2026-12-31
+reason = "zstd-safe Seekable::decompress set_len overflow; the seekable feature is off; no fixed version reachable (parquet/arrow-ipc 59 pin zstd ^0.13); mirrors deny.toml"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0403"
+ignoreUntil = 2026-12-31
+reason = "zstd-safe legacy-frame decompress_stream via stream::write::Decoder; only read::Decoder, decode_all and bulk are used, which are unaffected; no fixed version reachable (parquet/arrow-ipc 59 pin zstd ^0.13); mirrors deny.toml"

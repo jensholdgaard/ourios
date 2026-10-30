@@ -19,7 +19,7 @@ default:
     @just --list
 
 # Run the full §6.6 verification suite. Bails on first failure.
-check: fmt-check clippy test book
+check: fmt-check clippy test book agents-citations
     @echo "All checks passed."
 
 # Format check (CI-style; doesn't modify files).
@@ -41,6 +41,11 @@ test:
 # Build the mdBook documentation. Output: book/.
 book:
     mdbook build
+
+# Fail when a cited `AGENTS.md §N` / `CLAUDE.md §N` section no longer
+# exists (RFC0057.4). CI runs the same script in the `book` job.
+agents-citations:
+    .github/scripts/check-agents-citations.sh
 
 # Serve the mdBook with live reload at http://localhost:3000.
 book-serve:

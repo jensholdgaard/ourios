@@ -340,6 +340,10 @@ jobs:
         with:
           tool: mdbook@0.5.2,mdbook-mermaid@0.17.0
       - run: mdbook build
+      # AGENTS.md section numbers are frozen (RFC 0057 §3.1); fail on a
+      # citation that names a section it no longer has (RFC0057.4).
+      - name: AGENTS.md section citations resolve
+        run: .github/scripts/check-agents-citations.sh
 
   # Validate the OTel semantic-conventions registry (metric/attribute
   # names, units, instruments) with `weaver registry check`, and prove

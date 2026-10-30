@@ -25,16 +25,9 @@
 /GEMINI.md
 /.gemini/
 
-# Claude Code runtime artefacts (per-session PID / lock files). The
-# `.claude/` tree carries tracked content (`.claude/skills/` slash-
-# command definitions, the personal `settings.local.json`), but the
-# scheduled-task lock file is per-machine ephemera that leaked into
-# PR #62 once and shouldn't again.
-/.claude/scheduled_tasks.lock
-# Per-machine permission allowlist — same leak class (swept into a
-# PR by `git add -A` once); the tracked `.claude/` content above is
-# unaffected.
-/.claude/settings.json
+# Per-tool agent state (Claude Code settings, locks, skill links created by
+# .agents/setup.sh) is local; nothing under .claude/ is tracked.
+/.claude/
 
 # Cargo.lock is NOT ignored — Ourios is a binary (CLAUDE.md §1) and its
 # lockfile is part of the reproducible-build contract.

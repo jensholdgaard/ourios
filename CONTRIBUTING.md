@@ -7,6 +7,24 @@ Thanks for your interest! ourios is design-first and pre-release.
   MSRV is 1.94, set as `rust-version` in `Cargo.toml`).
 - Install [`just`](https://github.com/casey/just) and run `just --list` to see tasks.
 
+## AI coding agents
+`AGENTS.md` is the project context for every agent, and `.agents/skills/` holds
+the shared skills. The repository tracks nothing tool-specific. Codex, GitHub
+Copilot, Cursor, Jules and Claude Code (v2.1.277 and later) read `AGENTS.md` as
+is. To wire up the rest, run once per checkout, or as a cloud agent's setup
+command:
+
+```sh
+sh .agents/setup.sh   # or: just agents-setup
+```
+
+It links each skill into `.claude/skills/` for Claude Code and writes
+`.gemini/settings.json` so Gemini CLI loads `AGENTS.md`. Both are local and
+gitignored, and rerunning the script is safe. If you keep a local `CLAUDE.md` or
+`CLAUDE.local.md`, start it with `@AGENTS.md`; otherwise Claude Code reads it
+instead of `AGENTS.md`. With such an import, a Claude Code session started below
+the repository root prompts once to approve loading `AGENTS.md`.
+
 ## Before opening a PR
 - `cargo fmt --all`
 - `cargo clippy --all-targets --all-features -- -D warnings`

@@ -47,6 +47,11 @@ book:
 agents-citations:
     .github/scripts/check-agents-citations.sh
 
+# Create the local, gitignored per-tool bridges (Claude Code skill links,
+# Gemini CLI settings) for AGENTS.md and .agents/skills/ (RFC 0057 §3.8).
+agents-setup:
+    sh .agents/setup.sh
+
 # Serve the mdBook with live reload at http://localhost:3000.
 book-serve:
     mdbook serve

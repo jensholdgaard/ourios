@@ -3,5 +3,4 @@
 # on them belong upstream, not in our review threads.
 reviews:
   path_filters:
-    - "!.agents/**"
-    - "!.claude/skills/**"
+    - "!.agents/skills/openfga/**"

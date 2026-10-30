@@ -105,6 +105,7 @@ mod file_set;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
+mod listed_sizes;
 #[cfg(test)]
 mod stale_resolution_tests;
 mod stats;
@@ -1370,6 +1371,7 @@ mod tests {
                     Call::List(key)
                     | Call::ListDelimited(key)
                     | Call::Get(key)
+                    | Call::Head(key)
                     | Call::GetRanges(key) => key.starts_with("audit/"),
                 })
                 .collect()
@@ -1433,6 +1435,28 @@ mod tests {
                 audit_keys >= 5,
                 "every day's audit file is listed: {audit_keys}"
             );
+        }
+
+        /// #1115: file-set resolution already listed every data file's size,
+        /// so the scan reads the data files without a `HEAD` per file.
+        #[tokio::test]
+        async fn a_data_query_heads_no_listed_data_file() {
+            let tmp = tempfile::tempdir().expect("temp");
+            let (querier, counter) = seeded(tmp.path());
+
+            querier.run(windowed(999)).await.expect("query");
+
+            let calls = counter.calls();
+            let scan_reads = calls
+                .iter()
+                .filter(|c| matches!(c, Call::Get(key) | Call::GetRanges(key) if key.starts_with("data/")))
+                .count();
+            assert!(scan_reads > 0, "the scan reads the data file: {calls:?}");
+            let heads: Vec<&Call> = calls
+                .iter()
+                .filter(|c| matches!(c, Call::Head(key) if key.starts_with("data/")))
+                .collect();
+            assert!(heads.is_empty(), "{heads:?}");
         }
     }
 }

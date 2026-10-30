@@ -45,8 +45,8 @@ Text fallback (for `helm show readme` in a terminal):
 
 Only the data/audit/manifest live on object storage. The **WAL is always a
 local durable PVC, never object storage**: a batch is acknowledged only after
-it is fsynced to the WAL, and object storage is the source of truth once the
-WAL is flushed (RFC 0008).
+it is fsynced to the WAL. Object storage becomes the source of truth for those
+records once the Parquet writer has checkpointed them there (RFC 0008).
 
 Diagram source: `docs/topology.py` in the repo checkout (regeneration
 instructions in its docstring). The image URL above is pinned to the

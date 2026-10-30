@@ -63,7 +63,7 @@ storage:
     # provider's region, or a placeholder like "us-east-1" if it has none.
     region: ""
     # Optional key prefix within the bucket (OURIOS_S3_PREFIX). Per-tenant
-    # prefixes live below this at the data layer (RFC 0046) — do not
+    # prefixes live below this at the data layer (RFC 0013) — do not
     # encode a tenant here.
     prefix: ""
     # Object-store credentials. NEVER set keys here as plaintext — give the name

@@ -10,7 +10,7 @@
 //! - The `body` column chunk's `dictionary_page_offset` is unset.
 //!
 //! The three clauses are RFC0005.8's normative "Then" trio,
-//! anchoring CLAUDE.md §3.2 ("Drain assumes parameters are short,
+//! anchoring AGENTS.md §3.2 ("Drain assumes parameters are short,
 //! variable bits. Reality: ... Unbounded values destroy Parquet's
 //! dictionary encoding and bloat files.") to a Parquet-metadata
 //! check the implementer can run by hand against `parquet-tools meta`.

@@ -3,7 +3,7 @@
 //!
 //! A snapshot is a **rebuildable recovery-acceleration cache, not
 //! durable state** — the WAL is the durable truth
-//! (`CLAUDE.md §3.4`). It exists only to shorten cold-start replay; a lost,
+//! (`AGENTS.md §3.4`). It exists only to shorten cold-start replay; a lost,
 //! absent, or corrupt snapshot is never a data-loss event, it
 //! degrades to a full WAL replay.
 //!

@@ -317,7 +317,7 @@ impl BufferedParquetWriter {
     /// footer and any subsequent reader can open it. The store `put`
     /// is not `fsync`-ed, though — a host crash between the put and
     /// the OS's next page-cache flush could lose the file.
-    /// Crash-survival durability is the WAL's domain (`CLAUDE.md`
+    /// Crash-survival durability is the WAL's domain (`AGENTS.md`
     /// §3.4 "WAL-before-ack"); the Parquet writer is the storage tier
     /// and assumes its records are recoverable via WAL replay after a
     /// crash.

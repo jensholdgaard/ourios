@@ -1,18 +1,18 @@
 # RFCs
 
-> Referenced from `CLAUDE.md` §5.1. This document is the minimum
+> Referenced from `AGENTS.md` §5.1. This document is the minimum
 > viable RFC process for Ourios. It will grow as the project does.
 
 ## When an RFC is required
 
-Per `CLAUDE.md` §5.1, an RFC precedes implementation for any change
+Per `AGENTS.md` §5.1, an RFC precedes implementation for any change
 that touches:
 
-- An architectural pillar (`CLAUDE.md` §2).
-- An invariant (`CLAUDE.md` §3).
-- A hazard (`CLAUDE.md` §4 / `docs/hazards.md`).
-- The on-disk Parquet schema (`CLAUDE.md` §3.5).
-- A new crate (`CLAUDE.md` §7).
+- An architectural pillar (`AGENTS.md` §2).
+- An invariant (`AGENTS.md` §3).
+- A hazard (`AGENTS.md` §4 / `docs/hazards.md`).
+- The on-disk Parquet schema (`AGENTS.md` §3.5).
+- A new crate (`AGENTS.md` §7).
 
 Bug fixes, dependency bumps, and internal refactors do not need RFCs.
 When in doubt, assume RFC.
@@ -34,7 +34,7 @@ rfc: NNNN
 title: Short descriptive title
 status: drafted | specified | red | green | validated | accepted | rejected | superseded
 author: Name <email>
-drafting-assistance: Claude   # omit if no LLM drafted
+drafting-assistance: Claude   # free text naming the AI tool (e.g. Codex); omit if none drafted
 created: YYYY-MM-DD
 supersedes: —                 # or RFC NNNN
 superseded-by: —              # or RFC NNNN
@@ -62,11 +62,11 @@ Every RFC has at least:
    an id of the form `H1.1`, `§3.4.2`, or `RFC<NNNN>.<m>`, referenced
    from the test code so the mapping is greppable. See
    `docs/verification.md` §2.
-6. **Testing strategy** — mapped to `CLAUDE.md` §6.2; references the
+6. **Testing strategy** — mapped to `AGENTS.md` §6.2; references the
    §5 scenario ids and names the technique (`proptest`, corpus,
    `criterion`) for each.
 7. **Open questions** — everything unresolved, as a checklist.
-8. **References** — paper citations, related RFCs, `CLAUDE.md`
+8. **References** — paper citations, related RFCs, `AGENTS.md`
    sections constrained.
 
 Additional sections are welcome when they clarify. Do not pad for the

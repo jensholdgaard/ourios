@@ -15,7 +15,7 @@ use ourios_miner::tree::OwnedToken;
 
 use crate::snapshots::{Templates, template_of};
 
-/// RFC0015.10 — `CLAUDE.md` §3.1: a line attached to a template agrees with
+/// RFC0015.10 — `AGENTS.md` §3.1: a line attached to a template agrees with
 /// that template's literal tokens position by position; only wildcard slots
 /// vary. Two lines on one template therefore agree everywhere outside the
 /// wildcards, which is what a merge across a semantic boundary breaks.
@@ -34,14 +34,14 @@ pub fn assert_no_silent_merge(
     let tokens = match tokenize(line) {
         Ok(tokenized) => tokenized.tokens,
         Err(e) => panic!(
-            "RFC0015.10 / CLAUDE.md §3.1: record {index}: a line the tokenizer rejects ({e}) \
+            "RFC0015.10 / AGENTS.md §3.1: record {index}: a line the tokenizer rejects ({e}) \
              was attached to template {key:?}"
         ),
     };
     assert_eq!(
         tokens.len(),
         template.len(),
-        "RFC0015.10 / CLAUDE.md §3.1: record {index}: {} tokens attached to the {}-token template {key:?}",
+        "RFC0015.10 / AGENTS.md §3.1: record {index}: {} tokens attached to the {}-token template {key:?}",
         tokens.len(),
         template.len(),
     );
@@ -49,14 +49,14 @@ pub fn assert_no_silent_merge(
         if let OwnedToken::Fixed(literal) = slot {
             assert_eq!(
                 token, literal,
-                "RFC0015.10 / CLAUDE.md §3.1: record {index}: token {position} differs from the literal \
+                "RFC0015.10 / AGENTS.md §3.1: record {index}: token {position} differs from the literal \
                  of template {key:?} — a line attached to a template whose literals it does not share",
             );
         }
     }
 }
 
-/// RFC0015.10 — `CLAUDE.md` §3.1 across versions: a widening only ever turns
+/// RFC0015.10 — `AGENTS.md` §3.1 across versions: a widening only ever turns
 /// a literal into a wildcard. A literal that changes into a different literal,
 /// a wildcard that narrows back, or a template that changes length between
 /// versions would silently re-key every row already stamped with the older
@@ -89,16 +89,16 @@ fn assert_version_step(
     assert_eq!(
         older.len(),
         newer.len(),
-        "RFC0015.10 / CLAUDE.md §3.1: template {id} changed length from v{old_version} to v{new_version}",
+        "RFC0015.10 / AGENTS.md §3.1: template {id} changed length from v{old_version} to v{new_version}",
     );
     for (position, (before, after)) in older.iter().zip(newer).enumerate() {
         match (before, after) {
             (OwnedToken::Fixed(a), OwnedToken::Fixed(b)) if a != b => panic!(
-                "RFC0015.10 / CLAUDE.md §3.1: template {id} v{old_version}→v{new_version} replaced \
+                "RFC0015.10 / AGENTS.md §3.1: template {id} v{old_version}→v{new_version} replaced \
                  literal {a:?} with {b:?} at token {position} — a merge that rewrites a literal"
             ),
             (OwnedToken::Wildcard, OwnedToken::Fixed(b)) => panic!(
-                "RFC0015.10 / CLAUDE.md §3.1: template {id} v{old_version}→v{new_version} narrowed \
+                "RFC0015.10 / AGENTS.md §3.1: template {id} v{old_version}→v{new_version} narrowed \
                  the wildcard at token {position} back to literal {b:?}"
             ),
             _ => {}

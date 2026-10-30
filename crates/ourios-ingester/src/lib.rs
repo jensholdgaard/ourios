@@ -1,4 +1,4 @@
-//! `ourios-ingester` — the ingester role (`CLAUDE.md` §1, §7).
+//! `ourios-ingester` — the ingester role (`AGENTS.md` §1, §7).
 //!
 //! The ingester accepts OTLP logs, mines templates, writes them
 //! durably (WAL-before-ack), lands Parquet in object storage, and runs
@@ -14,7 +14,7 @@
 //!   WAL-before-ack), [`receiver::commit`] (group-commit fsync),
 //!   [`receiver::http`] (OTLP/HTTP listener), and [`receiver::grpc`]
 //!   (OTLP/gRPC `LogsService`).
-//! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
+//! - **WAL-before-ack** (RFC 0008 / `AGENTS.md` §3.4) — durability
 //!   before acknowledgement, via `ourios-wal`. Wired into the ingest
 //!   path by [`receiver::pipeline`]: every non-empty batch is appended +
 //!   fsync'd before its ack (RFC0003.1). The startup side is

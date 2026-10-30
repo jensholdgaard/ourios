@@ -18,7 +18,7 @@ path = "src/lib.rs"
 # exporter live (RFC 0001 §6.8 "Export architecture").
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 # The SDK: MeterProvider + periodic reader (metrics), LoggerProvider +
-# batch processor (logs — the CLAUDE.md §6.3 dogfooding path: Ourios's
+# batch processor (logs — the AGENTS.md §6.3 dogfooding path: Ourios's
 # own logs ship as the OTel Logs signal), and TracerProvider + batch span
 # processor (traces — RFC 0038, request-scoped self-tracing). `rt-tokio`
 # drives the periodic/batch export on the tokio runtime the server runs.

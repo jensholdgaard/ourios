@@ -2,7 +2,7 @@
 //! recursive-descent parser implementing the §7 grammar exactly, producing
 //! the shared [`Query`] IR. Errors are the Ourios-owned [`DslError`] and cite
 //! the offending token/clause — never a `datafusion`/`arrow`/SQL term
-//! (hazard `CLAUDE.md` §4.6).
+//! (hazard `AGENTS.md` §4.6).
 
 use super::DslError;
 use super::ir::{

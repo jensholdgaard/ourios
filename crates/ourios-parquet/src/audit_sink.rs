@@ -22,7 +22,7 @@ use crate::store::Store;
 /// `emit` is infallible per the [`AuditSink`] contract, so a write
 /// failure increments [`Self::write_failures`] rather than propagating
 /// — surfaced through that counter until the logging / metrics
-/// bootstrap can report it (`CLAUDE.md` §6.3).
+/// bootstrap can report it (`AGENTS.md` §6.3).
 #[derive(Debug)]
 pub struct ParquetAuditSink {
     store: Store,

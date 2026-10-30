@@ -1,5 +1,5 @@
 //! The buffering audit sink exports its `OpenTelemetry` instruments (issue
-//! #302 / `CLAUDE.md` §6.3). A dedicated test binary: `init_in_memory` installs the
+//! #302 / `AGENTS.md` §6.3). A dedicated test binary: `init_in_memory` installs the
 //! **global** meter provider, so this must not share a process with another
 //! provider-installing test (the colocated `metrics.rs` compaction test).
 

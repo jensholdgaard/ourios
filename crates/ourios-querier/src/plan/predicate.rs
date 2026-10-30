@@ -193,7 +193,7 @@ pub(super) fn compile_comparison(
 /// and element-wise equality of the stored `params`/`separators` against
 /// the values the literal implies. Params are single whitespace-free
 /// tokens by construction, so element equality *is* byte-identical
-/// reconstruction equality (`CLAUDE.md` §3.3).
+/// reconstruction equality (`AGENTS.md` §3.3).
 pub(super) fn body_equality(
     plan: &BodyEqualityPlan,
     literal: &str,

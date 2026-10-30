@@ -51,7 +51,7 @@ fn record(body_kind: BodyKind) -> MinedRecord {
 
 /// Scenario RFC0017.3 — a stored clean-path (`Faithful`-eligible) row, rendered
 /// via the derived registry tokens, equals the originally-ingested line
-/// byte-for-byte (CLAUDE.md §3.3 bit-identical invariant), and the row's
+/// byte-for-byte (AGENTS.md §3.3 bit-identical invariant), and the row's
 /// `Reconstruction` marker is `Faithful`.
 /// See `docs/rfcs/0017-template-registry-query-rendering.md` §5.
 #[test]

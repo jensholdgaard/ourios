@@ -177,7 +177,7 @@ async fn rfc0010_3_event_type_scoping_excludes_non_widenings() {
     assert_eq!(rows[0].widening_count, 1);
 }
 
-/// Scenario RFC0010.4 — Tenant isolation (CLAUDE.md §3.7).
+/// Scenario RFC0010.4 — Tenant isolation (AGENTS.md §3.7).
 /// See `docs/rfcs/0010-audit-stream-queries.md` §5.
 ///
 /// Tenant X and tenant Y both have qualifying events in the same window;
@@ -342,7 +342,7 @@ fn rfc0010_8_no_sql_or_datafusion_leakage() {
     }
 }
 
-/// Tenant-isolation backstop (RFC0010.4 / `CLAUDE.md` §3.7): an audit file that
+/// Tenant-isolation backstop (RFC0010.4 / `AGENTS.md` §3.7): an audit file that
 /// symlinks outside the tenant's canonical `audit/tenant_id=…` root is refused,
 /// mirroring the log-query path's guard — a drift query must never resolve into
 /// another tenant's (or an out-of-tree) audit events. Under RFC 0019 the local
@@ -385,7 +385,7 @@ async fn drift_rejects_audit_file_escaping_tenant_root() {
 }
 
 /// Tenant isolation across a **string-prefix sibling** (RFC0010.4 /
-/// `CLAUDE.md` §3.7 / RFC0019.5): querying `acme` must never read `acmex`'s
+/// `AGENTS.md` §3.7 / RFC0019.5): querying `acme` must never read `acmex`'s
 /// events, even though `tenant_id=acme` is a string prefix of `tenant_id=acmex`.
 /// On the local walk this holds because the walk is rooted at the exact
 /// `audit/tenant_id=acme/` directory; on S3 the segment-wise prefix scope of

@@ -142,7 +142,7 @@ fn widen(n: usize) -> u64 {
 
 /// Phase 1 of the sort: the decoded-row buffer and, once it has
 /// overflowed the budget, the sorted runs spilled to local scratch
-/// (scratch is cache, not truth — `CLAUDE.md` §3.6; the `TempDir`
+/// (scratch is cache, not truth — `AGENTS.md` §3.6; the `TempDir`
 /// tears the runs down when the compaction call ends, success or
 /// error).
 ///

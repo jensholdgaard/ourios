@@ -540,7 +540,7 @@ pub struct ResultsFile {
     pub miner_stats: Option<MinerStats>,
 }
 
-/// The miner's §3.1 diagnostic counters (CLAUDE.md §3.1), snapshotted into
+/// The miner's §3.1 diagnostic counters (AGENTS.md §3.1), snapshotted into
 /// the results so a corpus analysis (e.g. the v8 kafka `NO_TEMPLATE` datum,
 /// §9.12) reads them directly instead of reconstructing them by hand.
 /// Read-only, additive; not a gate.

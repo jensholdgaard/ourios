@@ -5,7 +5,7 @@
 //! **replace** `rfc0008_6_rotation_failure_quiesces_the_wal`, whose
 //! "even after the underlying condition clears" assertion is the
 //! contract §3.3 changes. That replacement needs explicit approval
-//! (`CLAUDE.md` §6.2) and lands with slice C, not here: the original
+//! (`AGENTS.md` §6.2) and lands with slice C, not here: the original
 //! stays untouched while the RFC is red.
 
 use std::path::{Path, PathBuf};

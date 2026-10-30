@@ -2,7 +2,7 @@
 //!
 //! The cross-cutting invariant: **a mined record must never become
 //! query-visible (published to the data store) before its template's audit
-//! event is durable in the audit stream** (`CLAUDE.md` §3.3, strengthened to
+//! event is durable in the audit stream** (`AGENTS.md` §3.3, strengthened to
 //! hold under concurrency and the inline size trigger).
 //!
 //! The miner emits a line's template audit event *and* its record within one

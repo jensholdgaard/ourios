@@ -165,7 +165,7 @@ fn rfc0004_3_no_invariant_breaking_field_exists_on_miner_config() {
     //   - accept_lossy_reconstruction
     //
     // A PR proposing any of those triggers a `meta:` RFC against
-    // CLAUDE.md §3, not a runtime toggle.
+    // AGENTS.md §3, not a runtime toggle.
     let cfg = MinerConfig::default();
     let MinerConfig {
         similarity_threshold: _,

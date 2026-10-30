@@ -26,7 +26,7 @@
 //! byte-equal its token, a wildcard captures its token verbatim —
 //! so a successful alignment's `(params, separators)` interleaved
 //! with the template is the body, byte for byte. That is invariant
-//! §3.3 (`CLAUDE.md`) holding by construction rather than by
+//! §3.3 (`AGENTS.md`) holding by construction rather than by
 //! re-check; the property tests in `tests/it/rfc0050_properties.rs`
 //! pin it corpus-wide (RFC0050.4).
 

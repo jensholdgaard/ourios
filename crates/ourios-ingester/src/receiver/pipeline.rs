@@ -4,7 +4,7 @@
 //! durability and templating: a decoded `ExportLogsServiceRequest` is
 //! fanned out per tenant, the whole export is appended as one
 //! `FrameKind::OtlpBatch` frame and **fsync'd before any ack**
-//! (`CLAUDE.md` §3.4 / RFC0003.1), and only then are the records handed
+//! (`AGENTS.md` §3.4 / RFC0003.1), and only then are the records handed
 //! to the miner (§6.5 step ordering). An empty batch takes the
 //! fast path: success with no WAL write (RFC0003.12).
 //!

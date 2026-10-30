@@ -861,7 +861,7 @@ pub(crate) fn audit_table_urls(
             .collect(),
         // Remote keys imply the S3 backend, so `backend` is `Remote` here (it is
         // what produced these keys); a `Local` is an internal invariant
-        // violation, surfaced rather than unwrapped (no panics, `CLAUDE.md` §6).
+        // violation, surfaced rather than unwrapped (no panics, `AGENTS.md` §6).
         audit_scan::AuditFiles::Remote(keys) => {
             let StoreRef::Remote(store) = backend else {
                 return Err(QueryError::Storage {

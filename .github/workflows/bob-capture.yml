@@ -10,7 +10,7 @@ name: Capture Software Bill of Behaviour (one-off)
 # never fires automatically (no push/PR/schedule trigger), matching the
 # dispatch-only precedent in pages.yml. This is an exploration, not a
 # supply-chain gate: nothing here is required for a release, and nothing
-# about it belongs in CLAUDE.md hazards/invariants.
+# about it belongs in AGENTS.md hazards/invariants.
 on:
   workflow_dispatch:
 

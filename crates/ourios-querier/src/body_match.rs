@@ -10,7 +10,7 @@
 //! is settled at scan time against the candidates — but only ever inside
 //! row groups the candidate `template_id`s admit, which is what keeps
 //! the arm prunable. Soundness of the whole inversion rests on the
-//! `CLAUDE.md` §3.3 bit-identical reconstruction invariant.
+//! `AGENTS.md` §3.3 bit-identical reconstruction invariant.
 
 use ourios_miner::tokenize::tokenize;
 use ourios_miner::tree::OwnedToken;

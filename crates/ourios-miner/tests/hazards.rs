@@ -930,7 +930,7 @@ fn h5_2_type_expansion_increments_version_and_emits_template_type_expanded() {
 /// Property: for every record `r` emitted by the miner across
 /// the committed `testdata/corpus/` where `r.lossy_flag = false`,
 /// `reconstruct(r, &template_at_emit_time) == r.ingested_bytes`
-/// byte-for-byte (the §3.3 invariant — `CLAUDE.md` §3.3 /
+/// byte-for-byte (the §3.3 invariant — `AGENTS.md` §3.3 /
 /// RFC 0001 §6.6).
 ///
 /// **Template-version snapshotting.** A widening (§6.4) mints a

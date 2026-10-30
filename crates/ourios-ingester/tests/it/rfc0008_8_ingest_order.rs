@@ -1,5 +1,5 @@
 //! RFC0008.8 — concurrent ingest preserves WAL-append order at the miner.
-//! See `docs/rfcs/0008-wal.md` §5 + `CLAUDE.md` §3.4.
+//! See `docs/rfcs/0008-wal.md` §5 + `AGENTS.md` §3.4.
 //!
 //! Batched fsync makes `ingest` concurrent (the whole point — fold N
 //! fsyncs into one window). But the miner must still see records in

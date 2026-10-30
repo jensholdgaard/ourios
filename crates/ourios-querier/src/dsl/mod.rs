@@ -11,7 +11,7 @@
 //! form is a YAML-safe scalar (RFC0002.10).
 //!
 //! No `datafusion`/`arrow`/SQL type or message crosses this surface — the
-//! whole point of the DSL (hazard `CLAUDE.md` §4.6). Errors are the
+//! whole point of the DSL (hazard `AGENTS.md` §4.6). Errors are the
 //! Ourios-owned [`DslError`].
 
 pub mod ir;
@@ -43,7 +43,7 @@ pub(crate) use parse::{
 /// An error from parsing the logs DSL (either front-end). Hand-rolled (no
 /// `thiserror`, matching the repo's `QueryError`/`TokenizeError` style); the
 /// message cites the offending token/clause and never names a
-/// `datafusion`/`arrow`/SQL construct (hazard `CLAUDE.md` §4.6 / RFC0002.8).
+/// `datafusion`/`arrow`/SQL construct (hazard `AGENTS.md` §4.6 / RFC0002.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DslError {
     message: String,

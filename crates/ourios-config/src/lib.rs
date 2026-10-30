@@ -7,20 +7,20 @@
 //!
 //! Defaults satisfy RFC 0001 §3.1.1 (similarity threshold) and
 //! §3.2.1 (per-parameter byte limit). Values outside the
-//! `CLAUDE.md` §3.2 ceiling are rejected by [`MinerConfig::try_new`]
+//! `AGENTS.md` §3.2 ceiling are rejected by [`MinerConfig::try_new`]
 //! per RFC 0001 §3.2.2 — initialisation fails before the miner
 //! ever serves the offending tenant.
 //!
 //! **Tunables vs invariants (RFC 0004).** Every field on
 //! [`MinerConfig`] is a *tunable* — globally settable, overridable
 //! per tenant, validated at construction. The set is closed: each
-//! field below sits *inside* a `CLAUDE.md` §3 invariant rather
+//! field below sits *inside* a `AGENTS.md` §3 invariant rather
 //! than against one. The non-tunable invariants (widening + audit,
 //! `severity_number` in the template key, body retention on the
 //! §6.3 lossy zone, bit-identical reconstruction, per-tenant
 //! mining) live in the algorithm itself and never appear as
 //! fields here. Adding a field that touches those areas requires
-//! a `meta:` RFC against `CLAUDE.md` §3 — see RFC 0004 §3.5.
+//! a `meta:` RFC against `AGENTS.md` §3 — see RFC 0004 §3.5.
 
 #![deny(unsafe_code)]
 
@@ -57,7 +57,7 @@ use std::fmt;
 pub struct MinerConfig {
     /// `simSeq` cutoff `s ∈ (0, 1]` for the clean-attach branch
     /// (RFC 0001 §3.3, §6.3). The project default is `0.7` per
-    /// `CLAUDE.md` §3.1; lowering the *default* requires an RFC.
+    /// `AGENTS.md` §3.1; lowering the *default* requires an RFC.
     /// Programmatic instantiation accepts any value in `(0, 1]`.
     pub similarity_threshold: f32,
 
@@ -90,7 +90,7 @@ pub struct MinerConfig {
     pub similarity_floor: f32,
 
     /// Per-parameter byte limit (post-masking). Values above
-    /// `CLAUDE.md` §3.2's 1 KiB ceiling are rejected by
+    /// `AGENTS.md` §3.2's 1 KiB ceiling are rejected by
     /// [`MinerConfig::try_new`].
     pub param_byte_limit: u32,
 
@@ -150,7 +150,7 @@ pub struct MinerConfig {
     /// tokenisation or alignment so no work is proportional to an
     /// unbounded attribute. Default `8192`. `0` disables all
     /// upstream-template handling (observe and adopt alike).
-    /// Sits inside `CLAUDE.md` §3.2's cardinality invariant, same
+    /// Sits inside `AGENTS.md` §3.2's cardinality invariant, same
     /// as [`param_byte_limit`][Self::param_byte_limit].
     pub upstream_template_byte_limit: u32,
 
@@ -176,7 +176,7 @@ pub enum UpstreamTemplates {
     Adopt,
 }
 
-/// Per-`CLAUDE.md` §3.2: the project ceiling on configurable
+/// Per-`AGENTS.md` §3.2: the project ceiling on configurable
 /// parameter byte limits. Above this requires an RFC.
 pub const PARAM_BYTE_LIMIT_CEILING: u32 = 1024;
 
@@ -207,7 +207,7 @@ pub enum MinerConfigError {
     /// degrade silently).
     ParamByteLimitZero,
     /// The supplied per-parameter byte limit exceeds the
-    /// `CLAUDE.md` §3.2 ceiling of [`PARAM_BYTE_LIMIT_CEILING`].
+    /// `AGENTS.md` §3.2 ceiling of [`PARAM_BYTE_LIMIT_CEILING`].
     ParamByteLimitTooLarge(u32),
     /// The supplied prefix depth exceeds the RFC 0001 §6.1
     /// ceiling of [`PREFIX_DEPTH_CEILING`].

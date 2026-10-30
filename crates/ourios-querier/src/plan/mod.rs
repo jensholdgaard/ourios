@@ -3,7 +3,7 @@
 //!
 //! This module is the bridge between the surface-independent IR and pillar
 //! #3 (`DataFusion`). It is **internal**: no `datafusion`/`arrow`/SQL type
-//! crosses a public boundary (hazard `CLAUDE.md` §4.6 / RFC0002.3); the only
+//! crosses a public boundary (hazard `AGENTS.md` §4.6 / RFC0002.3); the only
 //! public entry is [`Querier::run_query`](crate::Querier::run_query), which
 //! returns the Ourios-owned [`QueryResult`](crate::QueryResult) /
 //! [`QueryError`].

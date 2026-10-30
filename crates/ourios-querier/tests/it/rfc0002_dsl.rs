@@ -383,7 +383,7 @@ fn rfc0002_2_string_and_structured_surfaces_agree() {
 }
 
 /// Engine/SQL tokens that must never surface in an operator-facing query
-/// error (hazard `CLAUDE.md` §4.6), matched case-insensitively.
+/// error (hazard `AGENTS.md` §4.6), matched case-insensitively.
 const ENGINE_LEAK_TOKENS: &[&str] = &[
     "datafusion",
     "arrow",
@@ -793,7 +793,7 @@ async fn rfc0002_6_attr_not_equal_requires_present_key() {
 /// Scenario RFC0002.6 (compile-time column-type rejections) — regex on a
 /// non-text column and a string function on a binary id column are rejected
 /// at compile with a specific, leak-free error. See
-/// `docs/rfcs/0002-query-dsl.md` §5 / hazard `CLAUDE.md` §4.6.
+/// `docs/rfcs/0002-query-dsl.md` §5 / hazard `AGENTS.md` §4.6.
 #[tokio::test]
 async fn rfc0002_6_non_text_operators_rejected() {
     use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
@@ -1097,7 +1097,7 @@ fn round_trip_property() {
 #[test]
 fn rfc0002_8_malformed_query_specific_error() {
     // Engine/SQL tokens that must never surface in a user-facing DSL error
-    // (hazard `CLAUDE.md` §4.6 / RFC0002.3). Lowercase — we scan the
+    // (hazard `AGENTS.md` §4.6 / RFC0002.3). Lowercase — we scan the
     // lowercased message.
     const LEAK_TOKENS: &[&str] = &[
         "datafusion",
@@ -1304,7 +1304,7 @@ async fn rfc0002_9_resolves_to_expands_via_alias_map() {
 /// `ParquetAuditSink`, and the querier DERIVES tenant `T`'s map from
 /// storage at compile time. `resolves_to(A)` returns A ∪ {B} while
 /// bare `template_id == A` stays exactly A, and the assertion under
-/// `T` is invisible to `T2`'s derived map (`CLAUDE.md` §3.7).
+/// `T` is invisible to `T2`'s derived map (`AGENTS.md` §3.7).
 #[tokio::test]
 async fn rfc0002_9_storage_backed_resolves_to_expands_via_derived_map() {
     use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, at, simple, write_all, write_audit};
@@ -2062,7 +2062,7 @@ async fn rfc0002_12_count_by_matches_naive_oracle() {
 }
 
 /// Regression for RFC0002.12 — the row-level tenant backstop in
-/// `execute_aggregate` (`CLAUDE.md` §3.7), not merely directory-level
+/// `execute_aggregate` (`AGENTS.md` §3.7), not merely directory-level
 /// partitioning, excludes a foreign-tenant row.
 ///
 /// `write_all` places every record under *its own* tenant's partition

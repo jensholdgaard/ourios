@@ -4,7 +4,7 @@
 //! RFC 0005 Parquet store — scoped to the tenant's partition directory,
 //! with `template_id` / `time_unix_nano` column filters (RFC 0005
 //! §3.3/§3.6) — and returns results **without** leaking `DataFusion`
-//! or SQL through the public API (hazard `CLAUDE.md` §4.6). It needs
+//! or SQL through the public API (hazard `AGENTS.md` §4.6). It needs
 //! neither the WAL nor the receiver.
 //!
 //! - **Logs DSL** (RFC 0002) — [`dsl`] holds the string parser and the
@@ -221,7 +221,7 @@ fn aggregate_frame(
     agg: &plan::Aggregate,
     tenant: &TenantId,
 ) -> Result<datafusion::dataframe::DataFrame, QueryError> {
-    // Row-level tenant backstop (`CLAUDE.md` §3.7), mirroring the drift
+    // Row-level tenant backstop (`AGENTS.md` §3.7), mirroring the drift
     // aggregation: the scan is scoped to the tenant's partition prefix,
     // but an aggregation returns group *values* and has no per-row
     // check like `collect_records`' — a misplaced row under the prefix
@@ -311,7 +311,7 @@ impl Backend {
 /// Parquet + audit store through the `ourios-parquet` [`Store`] seam,
 /// so the same engine targets a local-filesystem store (dev / test /
 /// the regression guard) or an S3-compatible bucket (production,
-/// `CLAUDE.md` §3.6).
+/// `AGENTS.md` §3.6).
 ///
 /// The backend (local vs S3) drives the hybrid scan: a local backend addresses
 /// files by absolute local path and walks `std::fs` (unchanged from before
@@ -508,7 +508,7 @@ impl Querier {
     /// Compile a parsed DSL [`Query`](dsl::Query) IR (RFC 0002) to the
     /// `DataFusion` execution layer and run it against the tenant's RFC 0005
     /// store, returning the matching row count + pruning stats — without
-    /// leaking `DataFusion`/arrow/SQL (hazard `CLAUDE.md` §4.6 / RFC0002.3).
+    /// leaking `DataFusion`/arrow/SQL (hazard `AGENTS.md` §4.6 / RFC0002.3).
     ///
     /// `now_unix_nano` is the wall-clock reference the relative `range(...)`
     /// bounds (`-1h`, `now`) and the default window resolve against; the
@@ -676,7 +676,7 @@ impl Querier {
 
     /// Execute a RFC 0010 `drift` query against the tenant's RFC 0005 `audit/`
     /// stream and return the per-template [`DriftRow`]s + pruning stats —
-    /// without leaking `DataFusion`/arrow/SQL (hazard `CLAUDE.md` §4.6 /
+    /// without leaking `DataFusion`/arrow/SQL (hazard `AGENTS.md` §4.6 /
     /// RFC0010.8).
     ///
     /// Drift is the audit-stream sibling of [`run_query`](Self::run_query): it
@@ -1064,7 +1064,7 @@ impl Querier {
                 ..CollectedRecords::default()
             });
         }
-        // Row-level tenant backstop (`CLAUDE.md` §3.7 / RFC 0005 §3.9
+        // Row-level tenant backstop (`AGENTS.md` §3.7 / RFC 0005 §3.9
         // row-vs-path): the scan is scoped to the tenant's partition prefix
         // (and, on the local backend, canonical-path-checked under it), but a
         // misplaced / corrupt Parquet file could still carry a row for another

@@ -10,7 +10,7 @@
 //! - ZSTD level 3 compression on every column.
 //! - Dictionary encoding **on** globally, **off** explicitly
 //!   per-column for every §3.6 row marked `Dictionary = no`:
-//!   `body` (the [`CLAUDE.md`] §3.2 cardinality invariant —
+//!   `body` (the [`AGENTS.md`] §3.2 cardinality invariant —
 //!   bodies are unbounded by design; dict on `body` is the
 //!   failure mode), `attributes` (JSON `BYTE_ARRAY`, high
 //!   entropy), `trace_id` / `span_id` (16- and 8-byte
@@ -34,7 +34,7 @@
 //!   `trace_id` / `span_id` (RFC 0031 L3 exact-id lookup — random
 //!   ids defeat min/max statistics), and every promoted column.
 //!
-//! [`CLAUDE.md`]: ../../../../CLAUDE.md
+//! [`AGENTS.md`]: ../../../../AGENTS.md
 
 use std::fmt;
 use std::io;
@@ -242,7 +242,7 @@ impl ClusterKeys {
 /// **The atomic publish is logical, not crash-durable.** The store
 /// put is not `fsync`-ed; a host crash between the put and the OS's
 /// next page-cache flush could lose the file. Crash-survival
-/// durability is the WAL's domain (`CLAUDE.md` §3.4
+/// durability is the WAL's domain (`AGENTS.md` §3.4
 /// "WAL-before-ack"); see [`Writer::close`]'s rustdoc for the full
 /// reasoning.
 pub struct Writer {
@@ -581,7 +581,7 @@ impl Writer {
     /// store `put` is not `fsync`-ed, though — a host crash between
     /// the put and the OS's next page-cache flush could lose the
     /// file. Crash-survival durability is the WAL's domain
-    /// (`CLAUDE.md` §3.4 "WAL-before-ack"); the Parquet writer is the
+    /// (`AGENTS.md` §3.4 "WAL-before-ack"); the Parquet writer is the
     /// storage tier and assumes its records are recoverable via WAL
     /// replay after a crash.
     ///
@@ -903,7 +903,7 @@ fn writer_properties(
 
     // §3.6 `Dictionary = no` overrides. The RFC's §3.6 table
     // names every column that opts out; this loop is the
-    // exhaustive set. `body` carries `CLAUDE.md` §3.2's
+    // exhaustive set. `body` carries `AGENTS.md` §3.2's
     // cardinality invariant load-bearing rationale (bodies are
     // unbounded by design); the others are either high-entropy
     // (`attributes`, `trace_id`, `span_id`) or non-text numeric

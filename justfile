@@ -2,7 +2,7 @@
 #
 # Run `just` (no args) to see all available recipes.
 # `just check` is the one-command pre-merge gate that mirrors
-# `CLAUDE.md` §6.6 ("Forced verification before done").
+# `AGENTS.md` §6.6 ("Forced verification before done").
 #
 # Install on macOS: `brew install just`
 # Install elsewhere: https://github.com/casey/just#packages
@@ -19,7 +19,7 @@ default:
     @just --list
 
 # Run the full §6.6 verification suite. Bails on first failure.
-check: fmt-check clippy test book
+check: fmt-check clippy test book agents-citations
     @echo "All checks passed."
 
 # Format check (CI-style; doesn't modify files).
@@ -41,6 +41,16 @@ test:
 # Build the mdBook documentation. Output: book/.
 book:
     mdbook build
+
+# Fail when a cited `AGENTS.md §N` / `AGENTS.md §N` section no longer
+# exists (RFC0057.4). CI runs the same script in the `book` job.
+agents-citations:
+    .github/scripts/check-agents-citations.sh
+
+# Create the local, gitignored per-tool bridges (Claude Code skill links,
+# Gemini CLI settings) for AGENTS.md and .agents/skills/ (RFC 0057 §3.8).
+agents-setup:
+    sh .agents/setup.sh
 
 # Serve the mdBook with live reload at http://localhost:3000.
 book-serve:
@@ -273,7 +283,7 @@ dogfood-env:
     #!/usr/bin/env bash
     cat <<'ENV'
     export OTEL_LOGS_EXPORTER=otlp
-    export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only (CLAUDE.md §1)
+    export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only (AGENTS.md §1)
     export OTEL_TRACES_EXPORTER=otlp
     # http/protobuf, matching docs/guides/agent-telemetry.md — the broadly
     # compatible default (not every source speaks OTLP/gRPC).

@@ -77,7 +77,7 @@ pub fn decode_protobuf(bytes: &[u8]) -> Result<ExportLogsServiceRequest, DecodeE
 ///
 /// The returned `bool` is `true` when only the lenient retry parsed
 /// the payload — threaded to the `ourios.ingest.json.lenient`
-/// attribute on `ourios.ingest.batches` (`CLAUDE.md` §6.3: the
+/// attribute on `ourios.ingest.batches` (`AGENTS.md` §6.3: the
 /// operator signal for upstream-rejected-but-valid payloads, and the
 /// shim-dormancy signal once the upstream fix ships).
 ///

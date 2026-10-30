@@ -71,7 +71,7 @@ pub enum ManifestError {
     /// partition directory via `..`). A reader joins entries onto the
     /// partition dir, so accepting such a name would let a manifest
     /// point a query at files outside the tenant's partition —
-    /// breaking tenant isolation (`CLAUDE.md` §3.7 / RFC0007.5). Bad
+    /// breaking tenant isolation (`AGENTS.md` §3.7 / RFC0007.5). Bad
     /// manifests fail loudly rather than silently mis-resolving.
     InvalidFilename(String),
     /// A file name appears more than once. The compactor joins each

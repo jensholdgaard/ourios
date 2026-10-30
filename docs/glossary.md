@@ -18,7 +18,7 @@ can answer "did this template silently change yesterday?" See
 ingested log line, either Ourios can reproduce the exact original
 byte sequence from what it stored, or the row carries
 `lossy_flag = true`. Never an in-between. Tested as a *property
-test* against the corpus. See `CLAUDE.md` §3.3, `hazards.md` H7.
+test* against the corpus. See `AGENTS.md` §3.3, `hazards.md` H7.
 
 **Body.** The free-form text content of a log record. In OTel terms,
 the `body` field of a `LogRecord`. In Ourios storage, the body is
@@ -90,7 +90,7 @@ and mints a clean fresh leaf; it is not a parse failure.
 
 **Fsync.** The POSIX call that forces buffered writes to durable
 storage. The *WAL* fsyncs before acknowledging an OTLP batch. See
-H3, `CLAUDE.md` §3.4.
+H3, `AGENTS.md` §3.4.
 
 **Hazard.** A named failure mode that, if not actively mitigated,
 silently corrupts data or destroys the project's value
@@ -166,7 +166,7 @@ looks like OTTL but behaves differently would mislead OTTL users.
 **Parquet.** The Apache columnar file format Ourios uses for
 on-disk storage. Per-column compression, predicate pushdown via
 min/max statistics, bloom filters, page indexes. The on-disk truth
-of the system; local disk is cache and *WAL* only. See `CLAUDE.md`
+of the system; local disk is cache and *WAL* only. See `AGENTS.md`
 §§2.1, 3.6.
 
 **Params.** The variable parts of a log line that the *miner*
@@ -177,7 +177,7 @@ extracts when matching a *template*. Bounded per-parameter to
 example because minting would exceed the tenant's template ceiling
 (`template_ceiling`, RFC 0023) or an empty or over-long line. The
 row is stored with its original *body* and no template, and
-`ourios.miner.parse_failures` (`parse_failures_total` in `CLAUDE.md`
+`ourios.miner.parse_failures` (`parse_failures_total` in `AGENTS.md`
 §3.1) increments with an `ourios.miner.parse_failure.reason`. A line
 below the *floor* is no longer a parse failure (RFC 0001 §6.3,
 amended 2026-10-23).
@@ -192,7 +192,7 @@ mechanism by which predicate queries beat `zstdcat | grep` (B1).
 randomly-generated inputs (typically via `proptest`). In Ourios:
 *reconstruction* is always a property test; the parser
 round-trips; the miner's tree operations preserve invariants. See
-`CLAUDE.md` §6.2.
+`AGENTS.md` §6.2.
 
 **Querier.** The Ourios role that accepts queries (over the *DSL*),
 plans them through DataFusion, scans Parquet, and returns results.
@@ -251,7 +251,7 @@ string — RFC 0001 rejects content hashing as a tenant-isolation leak.
 **Template tree.** The Drain parse tree, scoped per *tenant*. Its
 shape is `root → length group → token-prefix nodes (depth d) →
 leaf log groups`. **(Ourios)** — Drain assumes one tree; we keep
-one per tenant (`CLAUDE.md` §3.7).
+one per tenant (`AGENTS.md` §3.7).
 
 **Template version.** A monotonic integer that bumps when a
 template's representation changes (e.g. token order, new wildcard).
@@ -262,11 +262,11 @@ the alias mechanism. See *drift*, RFC 0001 §6.7.
 environment. Every code path that touches data takes a `tenant_id`;
 every Parquet file is partitioned by tenant; every template tree is
 scoped per tenant. Multi-tenancy is *not bolted on*
-(`CLAUDE.md` §3.7).
+(`AGENTS.md` §3.7).
 
 **Thesis-gate.** A benchmark goal whose failure on representative
 corpora invalidates an *architectural pillar* — meaning the
-response is an RFC to revisit `CLAUDE.md` §2, not a tuning sprint.
+response is an RFC to revisit `AGENTS.md` §2, not a tuning sprint.
 The four gating thesis-gates (B1, B2, C1, C2) are catalogued in
 `docs/benchmarks.md` §7; A1 keeps its `[THESIS]` tag but is a
 recorded diagnostic since RFC 0011.
@@ -274,7 +274,7 @@ recorded diagnostic since RFC 0011.
 **Threshold (`st`).** The Drain similarity cutoff above which a
 line is assigned to an existing *log group* rather than opening a
 new one. Ourios default ≥ 0.7; values below 0.7 require an RFC
-(H1, `CLAUDE.md` §3.1).
+(H1, `AGENTS.md` §3.1).
 
 **Token-prefix node.** Drain's intermediate tree level: branches on
 the value of the line's first N tokens (depth `d`, paper default
@@ -290,4 +290,4 @@ to the OTLP client. The ingester writes the records to *Parquet*
 separately; once the publication barrier checkpoints past a segment,
 housekeeping reclaims it (RFC 0052). The crash-recovery test SIGKILLs the ingester
 mid-batch and asserts no acknowledged data is lost. See H3,
-`CLAUDE.md` §3.4.
+`AGENTS.md` §3.4.

@@ -2,7 +2,7 @@
 //!
 //! The ingest front door (OTLP logs over gRPC/HTTP), the Drain-derived
 //! mining pipeline, and the WAL-before-ack durability path
-//! (`CLAUDE.md` §3.4, RFC 0008) live here, grown one §8 group at a time
+//! (`AGENTS.md` §3.4, RFC 0008) live here, grown one §8 group at a time
 //! as the `tests/rfc0003_*` acceptance tests go green.
 //!
 //! Landed so far:

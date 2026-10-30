@@ -1,7 +1,7 @@
 ---
 rfc: 0057
 title: "meta: move CLAUDE.md to AGENTS.md so every AI coding agent gets the same project context"
-status: specified
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-27
@@ -11,16 +11,14 @@ superseded-by: —
 
 # RFC 0057 — meta: move CLAUDE.md to AGENTS.md
 
-> **Status note. Enacted (2026-10-30); `accepted` once the follow-up
-> lands.** Maintainer-approved on 2026-10-30, and the same day
-> `CLAUDE.md` moved to `AGENTS.md` and the §3.4 wording was applied. During review of the enacting PR the
-> maintainer amended the design (§3.8): the repository tracks only
-> `AGENTS.md` and `.agents/`, so there is no `CLAUDE.md` stub, no
-> `.gemini/settings.json` and, after the follow-up, no `.claude/`.
+> **Status note. Accepted (2026-10-30).** Maintainer-approved and
+> enacted on 2026-10-30: `CLAUDE.md` moved to `AGENTS.md` and the §3.4
+> wording was applied. During review of the enacting PR the maintainer
+> amended the design (§3.8): the repository tracks only `AGENTS.md` and
+> `.agents/`, with no `CLAUDE.md` stub, `.gemini/` or `.claude/`.
 > Per-tool bridges are local and created by `.agents/setup.sh`. The §3.7
-> follow-up (citations, `.claude/` removal, setup script, citation guard)
-> lands in a separate PR. That PR marks this RFC `accepted`, once
-> RFC0057.4 and RFC0057.6, which depend on its guard and script, pass.
+> follow-up landed the same day, with RFC0057.4 and RFC0057.6 enforced by
+> CI steps in the `book` job.
 
 > **This is a `meta:` RFC.** It proposes a change to `CLAUDE.md`, whose
 > footer declares it load-bearing: *"further changes require a `meta:`
@@ -490,7 +488,9 @@ and the citation rule (§3.3).
    `docs/talks/` and `CHANGELOG.md`. In those, `CLAUDE.md §N` is an
    alias for the same section, as `AGENTS.md`'s footer states. The
    section numbers are unchanged, and the RFC0057.4 guard checks both
-   spellings.
+   spellings. `crates/ourios-miner/src/cluster/mod.rs` also keeps the
+   alias, because it carries a CodeScene refactoring goal that a
+   comment-only edit cannot meet; its next refactor switches it.
 
 ## 4. Alternatives considered
 

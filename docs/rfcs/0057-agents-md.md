@@ -1,7 +1,7 @@
 ---
 rfc: 0057
 title: "meta: move CLAUDE.md to AGENTS.md so every AI coding agent gets the same project context"
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-27
@@ -10,6 +10,11 @@ superseded-by: —
 ---
 
 # RFC 0057 — meta: move CLAUDE.md to AGENTS.md
+
+> **Status note. Maintainer-approved (2026-10-30); enactment pending.** The
+> open questions in §7 are resolved as recorded there. The move lands in a
+> separate PR from a fresh session (§8.5), and the RFC becomes `accepted`
+> when that PR merges, as RFC 0012 did.
 
 > **This is a `meta:` RFC.** It proposes a change to `CLAUDE.md`, whose
 > footer declares it load-bearing: *"further changes require a `meta:`
@@ -519,33 +524,42 @@ as an open question rather than required, since it is new CI surface.
 
 ## 7. Open questions
 
-- [ ] **Maintainer approval (majority)**, per `CLAUDE.md`'s footer.
-- [ ] **CI guard for citations.** Add a `just`/CI step running
+- [x] **Maintainer approval (majority)**, per `CLAUDE.md`'s footer.
+      *Resolved (2026-10-30):* Approved by the maintainer on 2026-10-30.
+- [x] **CI guard for citations.** Add a `just`/CI step running
       RFC0057.4's check so a future renumbering fails the build? It
       would make §3.1's freeze enforceable rather than a convention.
-- [ ] **Trailer wording.** §3.4.7 lets each tool emit its own
+      *Resolved (2026-10-30):* Yes: the enacting PR adds a `just`/CI step that runs RFC0057.4's check.
+- [x] **Trailer wording.** §3.4.7 lets each tool emit its own
       `Co-Authored-By:` trailer. Should the project instead require one
       fixed form (e.g. the tool's product name and a no-reply address),
       so the history is greppable across tools?
-- [ ] **`drafting-assistance:` values.** Free text naming the tool, or
+      *Resolved (2026-10-30):* Each tool emits its own `Co-Authored-By:` trailer, as §3.4.7 proposes; no fixed form.
+- [x] **`drafting-assistance:` values.** Free text naming the tool, or
       a short fixed list? `docs/rfcs/README.md`'s front-matter example
       (`drafting-assistance: Claude   # omit if no LLM drafted`) is
       updated in the follow-up either way.
-- [ ] **Gemini CLI setting.** Commit `.gemini/settings.json`
+      *Resolved (2026-10-30):* Free text naming the tool.
+- [x] **Gemini CLI setting.** Commit `.gemini/settings.json`
       (recommended, §3.6) or document the user-level setting in
       `CONTRIBUTING.md` instead?
-- [ ] **Unverified rows.** Cursor and Jules support rests on secondary
+      *Resolved (2026-10-30):* Commit `.gemini/settings.json`, as §3.6 recommends.
+- [x] **Unverified rows.** Cursor and Jules support rests on secondary
       sources (§3.6); the enacting PR's author re-checks
       `cursor.com/docs` and `jules.google/docs`.
-- [ ] **`rfc-check` location.** Move it to `.agents/skills/rfc-check/`
+      *Resolved (2026-10-30):* Unchanged: the enacting PR's author re-checks the Cursor and Jules docs.
+- [x] **`rfc-check` location.** Move it to `.agents/skills/rfc-check/`
       with a `.claude/skills/rfc-check` symlink, matching the vendored
       OpenFGA skill (§3.5), or leave it in `.claude/skills/`?
-- [ ] **Subdirectory sessions.** Claude Code sessions started below the
+      *Resolved (2026-10-30):* Move it to `.agents/skills/rfc-check/` with a `.claude/skills/rfc-check` symlink, matching the vendored OpenFGA skill.
+- [x] **Subdirectory sessions.** Claude Code sessions started below the
       repository root will prompt once to load the imported `AGENTS.md`
       (§3.2). Acceptable, or document it in `CONTRIBUTING.md`?
-- [ ] **Stub-only rule.** Is "the stub stays one line; Claude-specific
+      *Resolved (2026-10-30):* Acceptable; document the one-time prompt in `CONTRIBUTING.md`.
+- [x] **Stub-only rule.** Is "the stub stays one line; Claude-specific
       text needs a `meta:` RFC" (§3.2) the right bar, or should small
       Claude Code notes be allowed below the import without one?
+      *Resolved (2026-10-30):* Keep it: the stub stays one line, and Claude-specific text needs a `meta:` RFC.
 
 ## 8. References
 

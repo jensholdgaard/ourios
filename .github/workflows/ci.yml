@@ -351,7 +351,8 @@ jobs:
           sh .agents/setup.sh
           test -L .claude/skills/rfc-check && test -f .claude/skills/rfc-check/SKILL.md
           grep -q 'AGENTS\.md' .gemini/settings.json
-          test -z "$(sh .agents/setup.sh)"
+          rerun=$(sh .agents/setup.sh)
+          test -z "$rerun"
           test -z "$(git status --porcelain)"
 
   # Validate the OTel semantic-conventions registry (metric/attribute

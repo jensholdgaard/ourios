@@ -47,7 +47,7 @@ pub enum ScanSchema {
 }
 
 /// A lowered query's logical plan, opaque so no `DataFusion` type crosses
-/// the crate boundary (hazard `CLAUDE.md` §4.6).
+/// the crate boundary (hazard `AGENTS.md` §4.6).
 #[derive(Debug, PartialEq)]
 pub struct LoweredPlan(LogicalPlan);
 

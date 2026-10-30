@@ -55,7 +55,7 @@ fn literal_widening_seeds_slot_types_with_str_for_pre_widen_and_line() {
 
 #[test]
 fn mask_tag_transition_at_typed_wildcard_emits_type_expanded() {
-    // CLAUDE.md §3.1 regression for mask-tag type transitions
+    // AGENTS.md §3.1 regression for mask-tag type transitions
     // at a wildcard slot.
     //
     // Setup: the fresh leaf carries a Wildcard at position 2
@@ -349,7 +349,7 @@ fn slot_types_are_aligned_by_wildcard_ordinal_not_template_position() {
 
 #[test]
 fn silent_merge_across_mask_tag_types_is_audited_not_silent() {
-    // Regression for the CLAUDE.md §3.1 violation that closed
+    // Regression for the AGENTS.md §3.1 violation that closed
     // PR #32. Two lines differing only by mask-tag type at a
     // position beyond `prefix_depth` (default 2) MUST produce
     // an audit signal, not a silent merge.

@@ -1,4 +1,4 @@
-//! `ourios-server` — the Ourios binary (`CLAUDE.md` §1, §7).
+//! `ourios-server` — the Ourios binary (`AGENTS.md` §1, §7).
 //!
 //! It boots OpenTelemetry (the OTLP push `MeterProvider`, RFC 0001 §6.8) and,
 //! unless `OURIOS_COMPACTION_ENABLED` is set falsey, runs the **background
@@ -22,7 +22,7 @@
 //! configuration and bare `OURIOS_*` env vars do not override it; both paths
 //! resolve the same [`ServerConfig`] through the same `build_*` validators.
 //!
-//! Logs are dogfooded (`CLAUDE.md` §6.3): everything after the telemetry
+//! Logs are dogfooded (`AGENTS.md` §6.3): everything after the telemetry
 //! bootstrap logs through `tracing`, which `ourios-telemetry` bridges to an
 //! `OTel` log record pushed over OTLP — Ourios's own logs travel the same
 //! protocol its users' logs arrive on — with a human-readable copy on stderr.
@@ -49,7 +49,7 @@ use ourios_server::config::resolve::{
 use ourios_telemetry::TelemetryConfig;
 use tracing::Instrument as _;
 
-/// Ourios log-storage server (`CLAUDE.md` §1).
+/// Ourios log-storage server (`AGENTS.md` §1).
 ///
 /// Configuration is read from the `--config` file (RFC 0020) when given,
 /// otherwise from `OURIOS_*` environment variables.

@@ -2,7 +2,7 @@
 //!
 //! When a masked-parameter value's byte length exceeds the
 //! configured limit (default 256 B, ceiling 1 KiB per
-//! `CLAUDE.md` §3.2), the [`Param`] slot is replaced with an
+//! `AGENTS.md` §3.2), the [`Param`] slot is replaced with an
 //! `Overflow` marker carrying `(length: u32, sha256_prefix: [u8;
 //! 8])`. The marker preserves enough information for
 //! equality-shaped queries ("find rows where this exact long

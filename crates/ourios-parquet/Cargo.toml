@@ -71,7 +71,7 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # RFC 0036 §3.2 sorted-run scratch: spilled runs live in a `TempDir` on
 # local disk for the duration of one compaction call (cache, not truth —
-# CLAUDE.md §3.6; the drop guard reclaims them on success and error alike).
+# AGENTS.md §3.6; the drop guard reclaims them on success and error alike).
 tempfile = "=3.27.0"
 # Object-store and bridge metrics (#923/#926) through the OTel API only; the
 # SDK and exporter live in ourios-telemetry (the RFC 0001 §6.8 API/SDK
@@ -101,7 +101,7 @@ ourios-miner = { path = "../ourios-miner" }
 # columns to Utf8View/BinaryView and prove the shared decoder reads both.
 arrow-cast = { version = "=60.0.0", default-features = false }
 # Property tests for the compaction row-conservation invariant
-# (RFC0009.2 / CLAUDE.md §6.2 — invariants get a property test).
+# (RFC0009.2 / AGENTS.md §6.2 — invariants get a property test).
 proptest = "=1.12.0"
 # Async runtime for the RFC 0013 `Store` round-trip tests (the I/O surface is
 # async via `object_store`). `rt-multi-thread` so the S3 integration tests'

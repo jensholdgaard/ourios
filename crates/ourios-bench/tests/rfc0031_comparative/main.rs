@@ -13,7 +13,7 @@
 //! Placement note: the comparative harness lives in `ourios-bench`
 //! for now (extending the RFC 0006 harness) rather than a new crate,
 //! keeping the §7 "new crate vs `bench/` harness" question open — a
-//! new crate is a `CLAUDE.md` §7 architectural commitment and is not
+//! new crate is a `AGENTS.md` §7 architectural commitment and is not
 //! made here.
 //!
 //! The primary gate metric throughout is **bytes read from object
@@ -466,7 +466,7 @@ fn rfc0031_8_l7_ingest_throughput_parity() {
         "RFC0031.8 — OTLP replay driver feeding both systems to steady \
          state on the same hardware: ourios.ingest_throughput >= \
          loki.ingest_throughput / F_L7. The WAL-before-ack invariant \
-         (CLAUDE.md §3.4) is NOT relaxed to obtain the number — Ourios \
+         (AGENTS.md §3.4) is NOT relaxed to obtain the number — Ourios \
          throughput is measured with durable acks and the config \
          proving it is recorded"
     );

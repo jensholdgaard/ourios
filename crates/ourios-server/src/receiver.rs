@@ -85,7 +85,7 @@ const BARRIER_TICK: Duration = SINK_MAX_BUFFER_AGE;
 /// hard cap — `emit` never drops; under sustained store-unavailability the
 /// buffer is retained and may transiently exceed this, exactly like the record
 /// sink (dropping would lose template events the WAL can't re-mine past the
-/// snapshot gate — `CLAUDE.md` §3.3). Generous by default — a buffered audit
+/// snapshot gate — `AGENTS.md` §3.3). Generous by default — a buffered audit
 /// event is small and the normal driver is the cadence, not this signal.
 const AUDIT_SINK_CEILING_EVENTS: usize = 100_000;
 
@@ -216,7 +216,7 @@ fn count_step_panic(coordinator: &PublishCoordinator, join_error: &tokio::task::
 /// the audit sink, then the record sink, then write the per-tenant miner
 /// snapshot **only if both sinks fully drained**.
 ///
-/// This is the no-loss invariant (`CLAUDE.md` §3.4) extended to the audit
+/// This is the no-loss invariant (`AGENTS.md` §3.4) extended to the audit
 /// stream (issue #302). A flush retains any partition whose store write failed
 /// (the WAL is the durability of record, so a flush failure is non-fatal).
 /// Writing the snapshot anyway would advance the miner's snapshot horizon past
@@ -225,7 +225,7 @@ fn count_step_panic(coordinator: &PublishCoordinator, join_error: &tokio::task::
 /// a fresh sink. For records that is data loss; for the audit stream it is a
 /// permanently-empty body on a clean row (`derive_template_registry` would lack
 /// the row's `template_created` event, so reconstruction falls back to the
-/// empty retained `body` — `CLAUDE.md` §3.3). Skipping the snapshot instead
+/// empty retained `body` — `AGENTS.md` §3.3). Skipping the snapshot instead
 /// degrades the next start to a fuller replay (which re-mines + re-emits both
 /// the un-flushed records *and* their template events, and retries the flush),
 /// never loss. Best-effort, like every RFC 0001 §6.9 cadence point; `cadence`
@@ -402,7 +402,7 @@ pub struct ReceiverConfig {
     pub wal: WalConfig,
     /// The data store (RFC 0013/0019), opened by the server — local or S3. The
     /// data write path (RFC 0014) flushes Parquet through it; the WAL stays
-    /// under `wal.root` on local disk regardless (RFC0013.6 / `CLAUDE.md`
+    /// under `wal.root` on local disk regardless (RFC0013.6 / `AGENTS.md`
     /// §3.4, §3.6 — the WAL is never on object storage).
     pub store: Store,
     /// The RFC 0022 promoted attribute set every flushed data file projects
@@ -590,8 +590,8 @@ fn latch_on_panic(epochs: &BarrierEpochs, cut: impl FnOnce() -> CutOutcome) {
 /// same cadence points. The audit sink carries the miner's `template_created` /
 /// `template_widened` / `template_type_expanded` events to the RFC 0005 §3.7
 /// audit Parquet stream; without it the querier's read-time registry is empty
-/// and a clean row's body renders empty (`CLAUDE.md` §3.3). The WAL stays under
-/// `wal.root` on local disk regardless (RFC0013.6 / `CLAUDE.md` §3.6).
+/// and a clean row's body renders empty (`AGENTS.md` §3.3). The WAL stays under
+/// `wal.root` on local disk regardless (RFC0013.6 / `AGENTS.md` §3.6).
 ///
 /// The audit sink is built first so the record sink can take an **audit
 /// barrier** (issue #302 fix #2), so a partition is never put to the store
@@ -688,7 +688,7 @@ fn build_barrier(
 /// capture a cut at the rotation `mark`, which the barrier then publishes
 /// and snapshots only if both sinks drained (the no-loss invariant). The
 /// hook fires before the new segment's first record reaches the miner, so the
-/// buffers hold exactly the sealed segment's data (RFC0014.3/.5, `CLAUDE.md`
+/// buffers hold exactly the sealed segment's data (RFC0014.3/.5, `AGENTS.md`
 /// §3.4).
 ///
 /// **Capture-only** (RFC 0052 §3.1). It runs on the request path, inside
@@ -1552,7 +1552,7 @@ mod tests {
 
     #[test]
     fn flush_then_snapshot_skips_the_snapshot_when_the_sink_cannot_drain() {
-        // The no-loss guard (`CLAUDE.md` §3.4): when the store rejects writes,
+        // The no-loss guard (`AGENTS.md` §3.4): when the store rejects writes,
         // the records stay buffered (durable in the WAL) and the snapshot is
         // skipped, so the miner's horizon can't advance past un-flushed data
         // and recovery will re-mine them.
@@ -2806,7 +2806,7 @@ mod tests {
     /// `template_created` / `template_widened` events reach the audit stream and
     /// the read-time registry (RFC 0017 `derive_template_registry`) can render a
     /// clean, high-confidence row's body bit-for-bit — rather than the empty
-    /// retained `body` a clean row carries (`CLAUDE.md` §3.3). Before the fix the
+    /// retained `body` a clean row carries (`AGENTS.md` §3.3). Before the fix the
     /// registry was empty, so every clean row rendered empty + `RetainedVerbatim`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receiver_persists_template_audit_so_clean_rows_reconstruct() {

@@ -1,12 +1,12 @@
 # Benchmarks
 
-> Referenced from `CLAUDE.md` §6.2 ("regressions block merges") and from
+> Referenced from `AGENTS.md` §6.2 ("regressions block merges") and from
 > `docs/rfcs/0001-template-miner.md` §8. Flat-file, living document,
 > parallel to `docs/hazards.md`. Updated with measured results as they
 > come in.
 
 This document is an **honesty contract with ourselves**. The thesis
-(`CLAUDE.md` §2) claims that Parquet + Drain-derived template mining +
+(`AGENTS.md` §2) claims that Parquet + Drain-derived template mining +
 DataFusion beats the naive alternative of byte-level compression over
 flat text. That claim is falsifiable. This file lists the measurements
 that would falsify it.
@@ -35,7 +35,7 @@ Every goal below carries two labels.
 
 - **Scope** — `thesis-gate`, `tuning-goal`, or `diagnostic`.
   - A `thesis-gate` failing on representative corpora means a pillar
-    (`CLAUDE.md` §2) is wrong. The response is an RFC, not a sprint.
+    (`AGENTS.md` §2) is wrong. The response is an RFC, not a sprint.
   - A `tuning-goal` failing means the design is sound but the
     implementation needs work. The response is a PR.
   - A `diagnostic` is measured and recorded but gates nothing — it
@@ -131,7 +131,7 @@ codecs run.
 - **Falsifier**: if any representative corpus yields ≤ 2× improvement
   over zstd-alone, the template-mining pillar is not pulling its
   weight on that class of logs. Open an RFC.
-- **Why recorded** (diagnostic, not a bar): `CLAUDE.md` §2 pillar #2
+- **Why recorded** (diagnostic, not a bar): `AGENTS.md` §2 pillar #2
   describes a **logical** 50–200× reduction (lines → `(template_id,
   params)`) whose payoff is query pruning (B1/B2), *not* on-disk bytes vs
   a byte codec. A1 tracks the on-disk ratio as the columnar queryability
@@ -168,7 +168,7 @@ exploit structure the tree extracted.
 - **Falsifier**: if Ourios is not materially faster than the zstdcat
   pipeline on predicate queries, DataFusion + Parquet statistics are
   not delivering on the "skip row groups via footer reads" pillar
-  (`CLAUDE.md` §2.1). Open an RFC.
+  (`AGENTS.md` §2.1). Open an RFC.
 - **Instruments**: B1 is proven *structurally* (deterministically)
   by `ourios-querier`'s `rfc0007_1_*` tests. The `criterion` bench
   `crates/ourios-bench/benches/b1.rs` adds the *wall-clock* ratio:
@@ -202,7 +202,7 @@ exploit structure the tree extracted.
   whether the corpus is 10 GiB or 10 TiB*.
 - **Falsifier**: if template-exact queries scan proportionally to
   corpus size, template mining is buying compression but not query
-  locality — the inverted-index collapse thesis (`CLAUDE.md` §2) is
+  locality — the inverted-index collapse thesis (`AGENTS.md` §2) is
   wrong in practice. Open an RFC.
 - **Instruments**: B2 is proven *structurally* (deterministically)
   by `ourios-querier`'s `rfc0007_2_*` test — for a fixed result the
@@ -256,7 +256,7 @@ every run.
   `reconstruct(template, params)` equals the ingested bytes exactly.
 - **Target**: **100.000%**.
 - **Falsifier**: a single row that reconstructs wrong without a lossy
-  flag is a violation of `CLAUDE.md` §3.3 and a blocker, not a
+  flag is a violation of `AGENTS.md` §3.3 and a blocker, not a
   benchmark regression. Accompanied by: the lossy-flagged fraction
   should be ≤ 5% on structured corpora, ≤ 20% on heterogeneous ones,
   as a quality signal (not a gate).
@@ -305,7 +305,7 @@ every run.
 - **Metric**: fraction of rows where any `params` slot hit the 256 B
   limit.
 - **Target**: ≤ **1%** on representative corpora, per
-  `CLAUDE.md` §3.2.
+  `AGENTS.md` §3.2.
 - **Falsifier (tuning sense)**: if >1% on a common archetype, either
   the limit is too tight for that workload or a masking rule is
   missing. The response is tuning, not an RFC.
@@ -320,7 +320,7 @@ the above matters.
 > **Recast per-node (RFC 0034; enacted 2026-07-21).** D1's original
 > metric was `lines/second/core` — an axis the architecture
 > deliberately serializes twice (sequential per-tenant mining — the
-> `CLAUDE.md` §3.7-scoped trees assign ids first-seen, which must
+> `AGENTS.md` §3.7-scoped trees assign ids first-seen, which must
 > match WAL-order replay, RFC 0001 §3.5.3; and the single durable WAL
 > stream, §3.4) and one that contradicted
 > D1's own per-node falsifier (§9.19–§9.21). The must-win below is
@@ -334,7 +334,7 @@ the above matters.
 - **Metric**: lines/second sustained **per node** on
   `baseline-8vcpu-32gib`, multi-tenant load (`soak --tenants N` with
   N = cores) through one shared WAL/commit stream, with WAL fsync
-  batched at 100 ms (the `CLAUDE.md` §3.4 default).
+  batched at 100 ms (the `AGENTS.md` §3.4 default).
 - **Target**: the asserting run offers exactly **100 000 lines/s per
   node** and must achieve ≥ **99% of offered** (the single acceptance
   rule — pacing loss up to 1% is within the bar), with **p99
@@ -376,7 +376,7 @@ the above matters.
 - **Metric**: number of Parquet files per tenant per day after
   background compaction has settled.
 - **Target**: file sizes cluster in the **256 MiB–2 GiB** band per
-  `CLAUDE.md` §4 / hazard 4. Fewer than **5%** of files below 128 MiB
+  `AGENTS.md` §4 / hazard 4. Fewer than **5%** of files below 128 MiB
   at steady state.
 - **Why**: the small-file problem is a named hazard, not a nice-to-have.
 
@@ -417,7 +417,7 @@ The five `[THESIS]`-tagged goals, consolidated:
 corpus, that is a corpus-specific tuning RFC. If **two or more**
 thesis-gates fail on **any** representative corpus, that is a
 pillar-level RFC — we pause implementation and revisit
-`CLAUDE.md` §2 before continuing.
+`AGENTS.md` §2 before continuing.
 
 This escalation rule is the point of the whole document. The worst
 failure mode for a greenfield project is shipping something whose
@@ -428,9 +428,9 @@ ourselves without noticing.
 ## 8. What is deliberately out of scope
 
 - **SIEM-style full-text search latency** — explicitly out of scope
-  (`CLAUDE.md` §1).
+  (`AGENTS.md` §1).
 - **Cross-tenant aggregation queries** — tenancy is isolation-first
-  (`CLAUDE.md` §3.7). Aggregations that cross tenants are an RFC
+  (`AGENTS.md` §3.7). Aggregations that cross tenants are an RFC
   topic, not a benchmark.
 - **LLM-based parser comparisons** — interesting, deferred. Listed
   in RFC 0001 §7 as an alternative. Benchmarking it would be a
@@ -474,7 +474,7 @@ Reviewers: a PR that materially affects the hot path must either
 (a) cite the benchmark result and its delta against the relevant
 goal, or (b) explain why the hot-path effect is bounded below
 measurability. "I did not run the benchmarks" is a PR rejection, per
-`CLAUDE.md` §6.6.
+`AGENTS.md` §6.6.
 
 <!-- BENCH-RESULTS:BEGIN (managed by `ourios-bench --update-benchmarks-md`; do not edit by hand) -->
 
@@ -539,7 +539,7 @@ rests on query performance (B1/B2), not on beating a byte codec.
 **C1 — reconstruction (target: 100% bit-identical or flagged lossy).
 PASS** at every size: 1.0 reconstruct rate, ~1.1% of records
 flagged lossy (structured/`kvlist` bodies) and retained verbatim
-per `CLAUDE.md` §3.3.
+per `AGENTS.md` §3.3.
 
 **C2 — template-count convergence (target: sub-linear). PASS
 (supportive).** Templates grew 282 → 429 → 722 → 1322 while
@@ -1243,7 +1243,7 @@ dedicated RFC.
 ### 9.13 Results — 2026-07-12 (indicative, `ci-runner`) — RFC 0031 comparative program vs Grafana Loki (runs #8–#18)
 
 **Purpose.** The first recorded numbers for the RFC 0031 comparative
-program — Ourios against Grafana Loki, the incumbent `CLAUDE.md` §1
+program — Ourios against Grafana Loki, the incumbent `AGENTS.md` §1
 defines the project against. These are the §7 **calibration inputs**
 the RFC's open questions ask for, not gate verdicts: the `L`-gate
 margins are the RFC's *proposed* values (`M_L1..M_L4 = 10`,
@@ -1773,7 +1773,7 @@ in-flight bound (a 512-batch semaphore in the load loop, #558) sets
 the *latency* (512 batches × 1,000 lines ÷ 86k lines/s ≈ 6 s) while the plateau itself is the pipeline's *service rate* —
 raising the permit count would lengthen the queue, not the
 throughput, because the per-tenant miner hand-off is in-order and
-sequential by design (`CLAUDE.md` §3.7 per-tenant trees; the
+sequential by design (`AGENTS.md` §3.7 per-tenant trees; the
 least-common-mechanism choice's deliberate flip side). Stated
 carefully: **≈ 86k lines/s is the observed single-tenant ceiling
 under this probe configuration** (batch 1,000, 8 workers, this
@@ -1884,7 +1884,7 @@ retained by the maintainer outside the repository (gitignored local
 **passes**: 0.08% pacing loss at the bar rate is achieved ≈ offered,
 which *is* the below-saturation proof, and the p99 (153.63 ms) is
 measured over that same run, inside the 200 ms bar. The p50 rides
-the 100 ms group-commit window (the `CLAUDE.md` §3.4 batch default)
+the 100 ms group-commit window (the `AGENTS.md` §3.4 batch default)
 — ack latency at this rate is floored by batched fsync, not
 queue-bound. The 723.70 ms max is a tail spike outside the bar's
 percentile; the bar is p99, and it holds. One honesty note: the

@@ -303,7 +303,11 @@ async fn resolve_in_phase(
     counts.record(span);
     match (resolved?, backend) {
         (LiveSet::Urls(urls), _) => Ok(urls),
-        (LiveSet::Keys(keys), Backend::Remote(store)) => object_store_urls(ctx, store, &keys),
+        (LiveSet::Keys(keys), Backend::Remote(store)) => object_store_urls(
+            ctx,
+            store,
+            keys.iter().map(|(key, size)| (key.as_str(), *size)),
+        ),
         // Keys come only from the remote branch of `resolve_live_set`,
         // which read this same backend; surfaced rather than unwrapped.
         (LiveSet::Keys(_), Backend::Local(_)) => Err(QueryError::Storage {
@@ -313,11 +317,11 @@ async fn resolve_in_phase(
 }
 
 /// The blocking half of [`resolve_data_urls`]: finished table URLs on
-/// the local backend, store keys on S3 (their URLs need the query's
-/// `SessionContext`, which stays on the async side).
+/// the local backend, store keys with their listed sizes on S3 (their URLs
+/// need the query's `SessionContext`, which stays on the async side).
 pub(super) enum LiveSet {
     Urls(Vec<ListingTableUrl>),
-    Keys(Vec<String>),
+    Keys(Vec<(String, Option<u64>)>),
 }
 
 /// Resolve the tenant's live data files for [`resolve_data_urls`] —
@@ -377,7 +381,9 @@ enum Canonical {
 /// under the tenant's `prefix` through the [`Store`] seam (RFC 0019 §3.3),
 /// honouring partition-level time pruning + the RFC 0009 §3.4 per-partition
 /// manifest. Returns store-relative keys (the same key space `Store::get`/`put`
-/// take), addressed as object-store URLs by the caller.
+/// take), addressed as object-store URLs by the caller, each with the size its
+/// listing reported (`None` for a file the manifest names but the listing did
+/// not return).
 ///
 /// Every listing is segment-wise prefix-scoped to this tenant (RFC0019.5) and
 /// comes back in lexicographic order. With no window the whole prefix is listed
@@ -399,7 +405,7 @@ pub(super) fn resolve_live_keys(
     prefix: &str,
     window: Option<(u64, u64)>,
     tally: &mut Tally<'_>,
-) -> Result<Vec<String>, QueryError> {
+) -> Result<Vec<(String, Option<u64>)>, QueryError> {
     let keys = match window {
         Some(window) => window_listing(store, prefix, window, &mut tally.counts)?,
         None => list_recursive(store, prefix, &mut tally.counts)?,
@@ -626,13 +632,14 @@ fn manifest_error(key: &str, e: &ManifestError) -> QueryError {
 /// range, and resolve each remaining one through its manifest or the glob
 /// fallback. `keys` must hold every key of each partition it touches — a
 /// partition's manifest counts only when it is in the same listing. The
-/// manifest reads are accounted into `tally`.
+/// manifest reads are accounted into `tally`. Each live key carries its listed
+/// size, as [`resolve_live_keys`] returns it.
 fn live_keys_from_listing(
     store: &Store,
     keys: &[(String, u64)],
     window: Option<(u64, u64)>,
     tally: &mut Tally<'_>,
-) -> Result<Vec<String>, QueryError> {
+) -> Result<Vec<(String, Option<u64>)>, QueryError> {
     // Group keys by partition directory (the key up to its last `/`).
     let mut by_partition: std::collections::BTreeMap<&str, Vec<(&str, u64)>> =
         std::collections::BTreeMap::new();
@@ -676,7 +683,17 @@ fn live_keys_from_listing(
             format!("{dir}/{name}")
         }));
     }
-    Ok(live)
+    let sizes: HashMap<&str, u64> = keys
+        .iter()
+        .map(|(key, size)| (key.as_str(), *size))
+        .collect();
+    Ok(live
+        .into_iter()
+        .map(|key| {
+            let size = sizes.get(key.as_str()).copied();
+            (key, size)
+        })
+        .collect())
 }
 
 /// One partition's live files under the RFC 0009 §3.4 live-set rule, as the
@@ -770,20 +787,14 @@ fn canonical_file_urls(
 /// symlinks, so there is no canonical-path escape to backstop here (the §3.7
 /// row-level backstop in the consumers stays). De-duplicates keys so a manifest
 /// naming the same file twice can't double-count its rows.
-pub(super) fn object_store_urls(
+///
+/// A key's listed size, when it has one, answers `DataFusion`'s per-file
+/// `HEAD` without a request ([`crate::listed_sizes`], #1115).
+pub(super) fn object_store_urls<'k>(
     ctx: &SessionContext,
     store: &Store,
-    keys: &[String],
+    keys: impl IntoIterator<Item = (&'k str, Option<u64>)>,
 ) -> Result<Vec<ListingTableUrl>, QueryError> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse(STORE_URL)
-        .map_err(storage_err)?;
-    ctx.register_object_store(
-        store_url.as_ref(),
-        crate::fetch_count::counted(ctx, store.object_store()),
-    );
     // `Store::object_store()` is the RAW backend (prefix NOT applied), whereas
     // `list_blocking`/`get_blocking` operate in the store-relative key space
     // under `Store::prefix()` (the `OURIOS_S3_PREFIX` root). So the URLs handed
@@ -796,15 +807,34 @@ pub(super) fn object_store_urls(
         .map(|p| p.as_ref().to_owned())
         .collect();
     let mut seen = std::collections::HashSet::new();
-    let mut urls = Vec::with_capacity(keys.len());
-    for key in keys {
-        if seen.insert(key.clone()) {
-            urls.push(
-                ListingTableUrl::parse(object_store_url_for_key(&prefix, key))
-                    .map_err(storage_err)?,
-            );
+    let mut urls = Vec::new();
+    // Keyed by the parsed URL's own path, which is what `DataFusion` heads.
+    let mut sizes = HashMap::new();
+    for (key, size) in keys {
+        if seen.insert(key) {
+            let url = ListingTableUrl::parse(object_store_url_for_key(&prefix, key))
+                .map_err(storage_err)?;
+            if let Some(size) = size {
+                sizes.insert(url.prefix().clone(), size);
+            }
+            urls.push(url);
         }
     }
+    if urls.is_empty() {
+        return Ok(urls);
+    }
+    let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse(STORE_URL)
+        .map_err(storage_err)?;
+    let raw = store.object_store();
+    let backend: Arc<dyn datafusion::object_store::ObjectStore> = if sizes.is_empty() {
+        raw
+    } else {
+        Arc::new(crate::listed_sizes::ListedSizes::new(raw, sizes))
+    };
+    ctx.register_object_store(
+        store_url.as_ref(),
+        crate::fetch_count::counted(ctx, backend),
+    );
     Ok(urls)
 }
 
@@ -861,14 +891,14 @@ pub(crate) fn audit_table_urls(
             .collect(),
         // Remote keys imply the S3 backend, so `backend` is `Remote` here (it is
         // what produced these keys); a `Local` is an internal invariant
-        // violation, surfaced rather than unwrapped (no panics, `CLAUDE.md` §6).
+        // violation, surfaced rather than unwrapped (no panics, `AGENTS.md` §6).
         audit_scan::AuditFiles::Remote(keys) => {
             let StoreRef::Remote(store) = backend else {
                 return Err(QueryError::Storage {
                     detail: "internal: S3 audit URLs reached with a local backend".to_string(),
                 });
             };
-            object_store_urls(ctx, store, keys)
+            object_store_urls(ctx, store, keys.iter().map(|key| (key.as_str(), None)))
         }
     }
 }
@@ -919,6 +949,21 @@ mod tests {
     use crate::test_support::{Call, CountingStore};
 
     const TENANT_PREFIX: &str = "data/tenant_id=a";
+
+    /// [`resolve_live_keys`] without the listed sizes, for the tests that
+    /// assert which keys are live.
+    fn live_keys(
+        store: &Store,
+        prefix: &str,
+        window: Option<(u64, u64)>,
+        tally: &mut Tally<'_>,
+    ) -> Result<Vec<String>, QueryError> {
+        resolve_live_keys(store, prefix, window, tally).map(keys_only)
+    }
+
+    fn keys_only(live: Vec<(String, Option<u64>)>) -> Vec<String> {
+        live.into_iter().map(|(key, _)| key).collect()
+    }
 
     /// A half-open `[start, end)` query window in UTC nanoseconds.
     type Window = (u64, u64);
@@ -1075,6 +1120,7 @@ mod tests {
             window,
             &mut Tally::new(&crate::fetch_count::FetchCounter::default()),
         )
+        .map(keys_only)
         .expect("resolve")
     }
 
@@ -1091,7 +1137,7 @@ mod tests {
         let in_window_hour = hour_prefix(2026, 4, 2, 10);
 
         // Act
-        let live = resolve_live_keys(
+        let live = live_keys(
             &wrapped,
             TENANT_PREFIX,
             Some(window),
@@ -1120,7 +1166,7 @@ mod tests {
                 Call::ListDelimited(prefix) => {
                     assert!(ancestors.contains(prefix), "{prefix} in {calls:?}");
                 }
-                Call::Get(_) | Call::GetRanges(_) => {}
+                Call::Get(_) | Call::Head(_) | Call::GetRanges(_) => {}
             }
         }
         assert!(
@@ -1147,7 +1193,7 @@ mod tests {
         let window = (ns("2025-01-01T00:00"), ns("2025-03-02T06:00"));
 
         // Act
-        let live = resolve_live_keys(
+        let live = live_keys(
             &wrapped,
             TENANT_PREFIX,
             Some(window),
@@ -1241,7 +1287,7 @@ mod tests {
             ("no window", None, &[]),
         ];
         for (name, window, skipped) in cases {
-            let walked = resolve_live_keys(
+            let walked = live_keys(
                 &store,
                 TENANT_PREFIX,
                 window,
@@ -1296,7 +1342,7 @@ mod tests {
             })
             .collect();
             local.sort_unstable();
-            let mut remote = resolve_live_keys(
+            let mut remote = live_keys(
                 &store,
                 TENANT_PREFIX,
                 window,
@@ -1323,7 +1369,7 @@ mod tests {
             Some((0, u64::MAX)),
             Some((ns("2026-04-02T10:00"), ns("2026-04-02T11:00"))),
         ] {
-            let live = resolve_live_keys(
+            let live = live_keys(
                 &store,
                 TENANT_PREFIX,
                 window,
@@ -1481,8 +1527,8 @@ mod tests {
 
         let local = resolve_live_files(&tenant, None, &mut Tally::new(&fetched)).expect("local");
         let store = Store::local(tmp.path()).expect("local store");
-        let keyed = resolve_live_keys(&store, TENANT_PREFIX, None, &mut Tally::new(&fetched))
-            .expect("store");
+        let keyed =
+            live_keys(&store, TENANT_PREFIX, None, &mut Tally::new(&fetched)).expect("store");
 
         let expected = [NAMED_OUTPUT, "late.parquet"];
         assert_eq!(sorted_names(&local), expected, "local resolver");
@@ -1533,8 +1579,8 @@ mod tests {
         let fetched = crate::fetch_count::FetchCounter::default();
 
         // Act
-        let live = resolve_live_keys(&store, TENANT_PREFIX, None, &mut Tally::new(&fetched))
-            .expect("resolve");
+        let live =
+            live_keys(&store, TENANT_PREFIX, None, &mut Tally::new(&fetched)).expect("resolve");
 
         // Assert
         let expected: Vec<_> = (0..12)
@@ -1567,7 +1613,7 @@ mod tests {
         let (store, _) = manifested_partitions(tmp.path(), 8, Some(broken.clone()));
 
         // Act
-        let result = resolve_live_keys(
+        let result = live_keys(
             &store,
             TENANT_PREFIX,
             None,
@@ -1613,7 +1659,7 @@ mod tests {
     ) -> (Result<Vec<String>, QueryError>, super::ResolutionCounts) {
         let fetched = crate::fetch_count::FetchCounter::default();
         let mut tally = Tally::new(&fetched);
-        let live = resolve_live_keys(store, TENANT_PREFIX, window, &mut tally);
+        let live = live_keys(store, TENANT_PREFIX, window, &mut tally);
         (live, tally.counts)
     }
 

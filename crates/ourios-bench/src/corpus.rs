@@ -29,7 +29,7 @@
 //!   route — "the MVP bench reads OTLP from the on-disk corpus,
 //!   bypassing this component entirely" — pending the
 //!   `ourios-wal` crate (without which a live receiver would
-//!   violate CLAUDE.md §3.4 WAL-before-ack).
+//!   violate AGENTS.md §3.4 WAL-before-ack).
 //!
 //! Both formats may coexist in the same directory; the walker
 //! dispatches by extension. `total_files` and `raw_bytes` cover

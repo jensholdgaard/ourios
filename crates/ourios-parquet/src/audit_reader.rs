@@ -1167,7 +1167,7 @@ mod tests {
     /// the documented deferral ("hard error until a real new variant
     /// lands"); kinds 4–5 were that variant, so the deferral is
     /// resolved and the old assertion is exactly the behaviour the
-    /// amendment removes (`CLAUDE.md` §6.2).
+    /// amendment removes (`AGENTS.md` §6.2).
     /// Epic #745 wave 0 regression: the audit decode accepts
     /// `Utf8View` string columns exactly as the data path does
     /// (RFC 0021 §3.1 single-decode posture). Before the shared

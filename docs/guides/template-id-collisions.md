@@ -134,7 +134,7 @@ discarded tenant re-minting after its WAL was reclaimed:
   binds more than one text. Rows carrying it (query 3) render against
   whichever binding the registry folds last. The other binding's
   original lines are still available wherever the body was retained
-  (CLAUDE.md §3.1 and §3.3), but rendered output for those rows is
+  (AGENTS.md §3.1 and §3.3), but rendered output for those rows is
   ambiguous. Record the affected time range from `first_observed` and
   `last_observed`, and open an issue if the data matters.
 - **Only query 2 has rows:** ids repeat across tenants, but rendering is

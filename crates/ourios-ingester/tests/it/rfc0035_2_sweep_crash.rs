@@ -10,7 +10,7 @@
 //! companion arm in `ourios-server`
 //! (`rfc0035_2_rotation_stamp_waits_for_the_sweeps_in_flight_publish`)
 //! proves no `wal_high_water` stamp can land *during* the window to
-//! foreclose that replay. Together: no acked-data loss (`CLAUDE.md` §3.4).
+//! foreclose that replay. Together: no acked-data loss (`AGENTS.md` §3.4).
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;

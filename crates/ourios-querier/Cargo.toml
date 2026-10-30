@@ -13,7 +13,7 @@ name = "ourios_querier"
 path = "src/lib.rs"
 
 [dependencies]
-# `TenantId` for the per-request tenant scope (CLAUDE.md §3.7).
+# `TenantId` for the per-request tenant scope (AGENTS.md §3.7).
 ourios-core = { path = "../ourios-core" }
 # RFC 0017 §3.2/§3.3 — the read-time template registry stores
 # `tree::OwnedToken`s (parsed from the audit stream's canonical template

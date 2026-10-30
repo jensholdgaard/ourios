@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.16.2] - 2026-10-30
+
+### Security
+
+- **RUSTSEC-2026-0410** (`zstd-sys`): bumped to 2.1.2.
+- **RUSTSEC-2026-0391, -0398, -0403** (`zstd` 0.13, `zstd-safe` 7): waived as unreachable. parquet and arrow-ipc 59.3.1, pinned through DataFusion 55, require `zstd` 0.13, and none of the affected functions is called (#1124). The waivers expire on 2026-12-31; remove them when arrow moves to `zstd` 0.14.
+
+### Chore
+
+- Update quay.io/kubescape/prometheus-exporter docker tag to v0.2.27 (#1114) (01f99af)
+- Update quay.io/kubescape/operator docker tag to v0.2.197 (#1113) (db621a4)
+- Update github-actions (#1111) (0c61859)
+- Pin ourios-semconv v0.3.24 for the bridge thread-count wording (#1110) (e04eaed)
+
+### Documentation
+
+- Agents-only repo, local setup script, agents.md citations (rfc 0057) (#1130) (d5676dd)
+- Record the agents-only amendment and the enactment (e3b0412)
+- Make agents.md agent-neutral (rfc 0057) (9cdd772)
+- Move claude.md to agents.md (rfc 0057) (1b3b0a8)
+- Record maintainer approval and resolve the open questions (#1128) (f05751e)
+- Cite rfcs instead of claude.md in the published chart (#1127) (c1119c4)
+- Bound the per-service gauge tallies (§6.8, RFC0001.8) (#1126) (c2862dd)
+
+### Fixed
+
+- Bound the per-service metric tallies (#1123) (50d11c7)
+- Bump zstd-sys and waive unreachable zstd 0.13 advisories (#1124) (7bf3e8f)
+- Record an expected absence as success, not not_found (#1121) (b0d634c)
+- Cap the bridge runtime's blocking pool (#1120) (804219f)
+
+### Performance
+
+- Answer the per-file head from the resolving listing (#1131) (99c9637)
+
+### Tests
+
+- Cover bridge thread reuse on the s3 backend (#1109) (f599b11)
+
 ## [0.16.1] - 2026-10-25
 
 ### Security

@@ -4,7 +4,7 @@
 //! RFC 0005 Parquet store — scoped to the tenant's partition directory,
 //! with `template_id` / `time_unix_nano` column filters (RFC 0005
 //! §3.3/§3.6) — and returns results **without** leaking `DataFusion`
-//! or SQL through the public API (hazard `CLAUDE.md` §4.6). It needs
+//! or SQL through the public API (hazard `AGENTS.md` §4.6). It needs
 //! neither the WAL nor the receiver.
 //!
 //! - **Logs DSL** (RFC 0002) — [`dsl`] holds the string parser and the
@@ -105,6 +105,7 @@ mod file_set;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
+mod listed_sizes;
 #[cfg(test)]
 mod stale_resolution_tests;
 mod stats;
@@ -221,7 +222,7 @@ fn aggregate_frame(
     agg: &plan::Aggregate,
     tenant: &TenantId,
 ) -> Result<datafusion::dataframe::DataFrame, QueryError> {
-    // Row-level tenant backstop (`CLAUDE.md` §3.7), mirroring the drift
+    // Row-level tenant backstop (`AGENTS.md` §3.7), mirroring the drift
     // aggregation: the scan is scoped to the tenant's partition prefix,
     // but an aggregation returns group *values* and has no per-row
     // check like `collect_records`' — a misplaced row under the prefix
@@ -311,7 +312,7 @@ impl Backend {
 /// Parquet + audit store through the `ourios-parquet` [`Store`] seam,
 /// so the same engine targets a local-filesystem store (dev / test /
 /// the regression guard) or an S3-compatible bucket (production,
-/// `CLAUDE.md` §3.6).
+/// `AGENTS.md` §3.6).
 ///
 /// The backend (local vs S3) drives the hybrid scan: a local backend addresses
 /// files by absolute local path and walks `std::fs` (unchanged from before
@@ -508,7 +509,7 @@ impl Querier {
     /// Compile a parsed DSL [`Query`](dsl::Query) IR (RFC 0002) to the
     /// `DataFusion` execution layer and run it against the tenant's RFC 0005
     /// store, returning the matching row count + pruning stats — without
-    /// leaking `DataFusion`/arrow/SQL (hazard `CLAUDE.md` §4.6 / RFC0002.3).
+    /// leaking `DataFusion`/arrow/SQL (hazard `AGENTS.md` §4.6 / RFC0002.3).
     ///
     /// `now_unix_nano` is the wall-clock reference the relative `range(...)`
     /// bounds (`-1h`, `now`) and the default window resolve against; the
@@ -676,7 +677,7 @@ impl Querier {
 
     /// Execute a RFC 0010 `drift` query against the tenant's RFC 0005 `audit/`
     /// stream and return the per-template [`DriftRow`]s + pruning stats —
-    /// without leaking `DataFusion`/arrow/SQL (hazard `CLAUDE.md` §4.6 /
+    /// without leaking `DataFusion`/arrow/SQL (hazard `AGENTS.md` §4.6 /
     /// RFC0010.8).
     ///
     /// Drift is the audit-stream sibling of [`run_query`](Self::run_query): it
@@ -1064,7 +1065,7 @@ impl Querier {
                 ..CollectedRecords::default()
             });
         }
-        // Row-level tenant backstop (`CLAUDE.md` §3.7 / RFC 0005 §3.9
+        // Row-level tenant backstop (`AGENTS.md` §3.7 / RFC 0005 §3.9
         // row-vs-path): the scan is scoped to the tenant's partition prefix
         // (and, on the local backend, canonical-path-checked under it), but a
         // misplaced / corrupt Parquet file could still carry a row for another
@@ -1370,6 +1371,7 @@ mod tests {
                     Call::List(key)
                     | Call::ListDelimited(key)
                     | Call::Get(key)
+                    | Call::Head(key)
                     | Call::GetRanges(key) => key.starts_with("audit/"),
                 })
                 .collect()
@@ -1433,6 +1435,28 @@ mod tests {
                 audit_keys >= 5,
                 "every day's audit file is listed: {audit_keys}"
             );
+        }
+
+        /// #1115: file-set resolution already listed every data file's size,
+        /// so the scan reads the data files without a `HEAD` per file.
+        #[tokio::test]
+        async fn a_data_query_heads_no_listed_data_file() {
+            let tmp = tempfile::tempdir().expect("temp");
+            let (querier, counter) = seeded(tmp.path());
+
+            querier.run(windowed(999)).await.expect("query");
+
+            let calls = counter.calls();
+            let scan_reads = calls
+                .iter()
+                .filter(|c| matches!(c, Call::Get(key) | Call::GetRanges(key) if key.starts_with("data/")))
+                .count();
+            assert!(scan_reads > 0, "the scan reads the data file: {calls:?}");
+            let heads: Vec<&Call> = calls
+                .iter()
+                .filter(|c| matches!(c, Call::Head(key) if key.starts_with("data/")))
+                .collect();
+            assert!(heads.is_empty(), "{heads:?}");
         }
     }
 }

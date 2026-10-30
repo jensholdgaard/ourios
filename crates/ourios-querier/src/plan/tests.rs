@@ -337,7 +337,7 @@ fn validate_rejects_limit_alongside_count() {
     assert!(v("true | count by service").is_ok());
 }
 
-/// Property tests (CLAUDE.md §6.2) for the §6.3 amendment's planner
+/// Property tests (AGENTS.md §6.2) for the §6.3 amendment's planner
 /// invariants: pin detection ([`pinned_template_id`]) and the `by`-list
 /// rules ([`validate_group_terms`], reached here through the real
 /// [`validate`] entry point). Each generated case is checked against an

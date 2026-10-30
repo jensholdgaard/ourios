@@ -135,7 +135,7 @@ says how we get from here to there.
 
 **MVP for Ourios is thesis-proving, not production-ready.**
 
-The thesis (`CLAUDE.md` §2) claims that Parquet + Drain-derived
+The thesis (`AGENTS.md` §2) claims that Parquet + Drain-derived
 template mining + DataFusion collapses the inverted index, the
 compression layer, the storage tier, and the query engine into
 one stack of off-the-shelf parts plus thin glue. That claim is
@@ -157,14 +157,14 @@ critical path as short and honest as possible.
 **Four** gating `[THESIS]` goals in
 [`benchmarks.md`](./benchmarks.md) define MVP-done. Hitting all
 four on a representative corpus means the thesis holds; missing
-any of them means a pillar (`CLAUDE.md` §2) is wrong and a PR
+any of them means a pillar (`AGENTS.md` §2) is wrong and a PR
 won't fix it — an RFC will.
 
 | Gate | What it measures | Why it matters |
 |---|---|---|
 | **B1** | Predicate-pushdown query latency on time/template/tenant filters | Pillar 1 (footer reads + min/max stats skip row groups) actually skips |
 | **B2** | Template-exact query latency (`where template_id = X`) | Pillar 2's `template_id` column is a usable index, not a curiosity |
-| **C1** | Bit-identical reconstruction rate over the corpus | The hardest invariant (`CLAUDE.md` §3.3) holds in practice, not just in unit tests |
+| **C1** | Bit-identical reconstruction rate over the corpus | The hardest invariant (`AGENTS.md` §3.3) holds in practice, not just in unit tests |
 | **C2** | Template-count convergence (Drain finds a small, stable number of templates) | Pillar 2 (template mining) extracts the structure we believed was there |
 
 **A1** (end-to-end compression vs. zstd-alone) *was* a fifth gating
@@ -263,7 +263,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0054 | Publish unwind safety | `drafted` |
 | 0055 | Publication frontiers and tenant settlement | `drafted` |
 | 0056 | Audit-sink durability on permanent write failure (RFC 0005 amendment) | `drafted` |
-| 0057 | meta: move CLAUDE.md to AGENTS.md | `drafted` |
+| 0057 | meta: move CLAUDE.md to AGENTS.md | **`accepted`** |
 | 0058 | Query resource limits | `drafted` |
 | 0059 | Durable template-id allocation (RFC 0001 amendment) | `green` |
 | 0060 | Background template-map refresh | `red` — RFC0060.8's weaver live-check is the one open stub |
@@ -346,8 +346,7 @@ substantially done. What's actually open:
 - **RFC 0060** (background template-map refresh) is `red`, with the
   RFC0060.8 weaver live-check open. **RFC 0058** (query resource
   limits) is `drafted`.
-- RFC 0049 (agent delegation, the `act` claim) is `specified`; RFC 0057
-  (`meta:` CLAUDE.md → AGENTS.md) is `drafted`.
+- RFC 0049 (agent delegation, the `act` claim) is `specified`.
 - Scattered §7/§9 open items on already-`green`/`accepted` RFCs (e.g.
   the recurring D1/D2 soak cadence now that the harness has shipped
   (§9.19/§9.23); RFC 0021's phase 2b and the `collect_statistics`
@@ -482,7 +481,7 @@ records what shipped and what's still genuinely open.
 | **Query DSL** (RFC 0002) | Raw SQL through DataFusion serves the bench; DSL is operator UX | **Landed** — RFC 0002 `accepted`, including the `param(n)`/`bucket(width)` aggregation amendment |
 | **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | **Partially landed** — authentication + enforced tenant binding (RFC 0026), out-of-band tenancy where the credential names the tenant and the data never does (RFC 0046, superseding RFC 0045), ReBAC graph-fed visibility inside a tenant (RFC 0047), and the tenant id grammar, erasure and backfill surfaces (RFC 0048) are all `accepted`; rate-limit/eviction/lifecycle orchestration is still open, tied to an operator-console RFC that hasn't been drafted (RFC 0001 §9). RFC 0058 (`drafted`) covers query resource limits only, not ingest rate limits |
 | **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | **Landed** — two-role binary with TLS/mTLS (RFC 0030) + OIDC (RFC 0029); S3-native Helm chart shipped and deploy-validated on kind |
-| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Landed** (the plugin half) — **RFC 0041 `accepted`** (`green` 2026-07-27): three plugins (`Datasource`, `LogQuery`, `TimeSeriesQuery`) shipped in the dedicated `ourios-perses-plugin` repository, and the committed FinOps dashboard (RFC0041.6, `examples/perses/`) rendered unmodified against the live dogfood capture. Both hosts were spiked and measured first. The RFC0041.5 deferral closed with v0.6.0, and the Grafana datasource shipped in its own repository. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
+| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `AGENTS.md` §1's "Not a managed service" line | **Landed** (the plugin half) — **RFC 0041 `accepted`** (`green` 2026-07-27): three plugins (`Datasource`, `LogQuery`, `TimeSeriesQuery`) shipped in the dedicated `ourios-perses-plugin` repository, and the committed FinOps dashboard (RFC0041.6, `examples/perses/`) rendered unmodified against the live dogfood capture. Both hosts were spiked and measured first. The RFC0041.5 deferral closed with v0.6.0, and the Grafana datasource shipped in its own repository. CRDs/operator still requires a `meta:` RFC against `AGENTS.md` §1 first, no commitment to land |
 
 **Note on OTLP scope (historical).** The pre-amendment roadmap
 listed "OTLP receiver (gRPC + HTTP)" as a single post-MVP item.

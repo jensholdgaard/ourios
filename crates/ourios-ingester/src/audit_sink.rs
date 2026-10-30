@@ -5,14 +5,14 @@
 //! §3.1) synchronously from `MinerCluster::ingest`, which runs on the
 //! receiver's async request path. The querier's read-time template registry
 //! (RFC 0017 `derive_template_registry`) folds those events to reconstruct a
-//! clean row's body bit-for-bit (`CLAUDE.md` §3.3); without them a clean,
+//! clean row's body bit-for-bit (`AGENTS.md` §3.3); without them a clean,
 //! high-confidence row — whose `body` column is intentionally empty — renders
 //! to nothing.
 //!
 //! [`ourios_parquet::ParquetAuditSink`] persists one Parquet file per event
 //! with a blocking store write inside `emit`, so wiring it into the receiver
 //! would both stall the request path on store latency and spray one tiny
-//! object per template event (hazard `CLAUDE.md` §4 #4, the small-file
+//! object per template event (hazard `AGENTS.md` §4 #4, the small-file
 //! problem). This sink instead mirrors the RFC 0014 record sink
 //! ([`crate::record_sink::ParquetRecordSink`]): [`AuditSink::emit`] only
 //! buffers (a cheap, request-path-safe push), and the blocking store I/O
@@ -185,7 +185,7 @@ pub struct BufferingAuditSink {
     flush_errors_transient: u64,
     flush_errors_permanent: u64,
     derive_errors: u64,
-    /// RFC 0001 §6.8 / `CLAUDE.md` §6.3 instruments; no-op without a provider.
+    /// RFC 0001 §6.8 / `AGENTS.md` §6.3 instruments; no-op without a provider.
     metrics: AuditSinkMetrics,
 }
 

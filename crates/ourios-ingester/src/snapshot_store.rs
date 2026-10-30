@@ -2,7 +2,7 @@
 //! (RFC 0001 §6.9: the snapshot is a rebuildable
 //! recovery-acceleration cache, not durable state — local disk is
 //! legitimate because nothing the snapshot accelerates outlives the
-//! WAL horizon, `CLAUDE.md` §3.6).
+//! WAL horizon, `AGENTS.md` §3.6).
 //!
 //! One `<tenant>.snap` file per tenant under the snapshots root
 //! (`<wal_root>/snapshots/`). The tenant id is percent-encoded into

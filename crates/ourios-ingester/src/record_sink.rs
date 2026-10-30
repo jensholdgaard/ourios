@@ -13,12 +13,12 @@
 //! failure retains the buffer and may transiently exceed it rather than
 //! stalling ingest (see [`FlushConfig::ceiling_bytes`]).
 //!
-//! Records reach the sink only after the WAL is durable (`CLAUDE.md` §3.4), so
+//! Records reach the sink only after the WAL is durable (`AGENTS.md` §3.4), so
 //! a buffer is a bounded accelerator, never the durability of record: a crash
 //! re-mines the un-flushed tail from the WAL. A flush failure therefore retains
 //! the buffer (counted, retried on the next trigger) rather than dropping data.
 //! Buffers are keyed by [`PartitionKey`], which carries `tenant_id`, so they
-//! are tenant-scoped by construction (`CLAUDE.md` §3.7).
+//! are tenant-scoped by construction (`AGENTS.md` §3.7).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -195,7 +195,7 @@ pub struct ParquetRecordSink {
     /// Audit-durability barrier (issue #302 fix #2): run before any *inline*
     /// publish (size trigger / ceiling) to flush the audit sink to durability
     /// first, returning whether it fully drained. A record must not be published
-    /// before its template event is durable (`CLAUDE.md` §3.3); the inline
+    /// before its template event is durable (`AGENTS.md` §3.3); the inline
     /// publish runs under the miner lock, so the barrier flush + the publish are
     /// atomic w.r.t. ingest. `None` (the RFC 0014 default + the record-sink unit
     /// tests) leaves the inline publish unconstrained.
@@ -1077,7 +1077,7 @@ impl SharedParquetSink {
     /// buffered (so `flush_all` cannot cover them) nor durable until their
     /// off-lock `write_ordered` completes, and a mark stamped across that
     /// window makes recovery skip the WAL frames that are their only
-    /// surviving copy — acked-data loss (`CLAUDE.md` §3.4). When this
+    /// surviving copy — acked-data loss (`AGENTS.md` §3.4). When this
     /// returns, every such snapshot is either durable in the store or
     /// requeued into the buffers (where the caller's flush covers it), and
     /// the caller's miner exclusivity keeps the count at zero until the
@@ -1130,7 +1130,7 @@ impl SharedParquetSink {
     /// Lock the sink, recovering a poisoned mutex. A poison means a past panic
     /// while a flush was in flight; the buffer + counters remain structurally
     /// consistent (the WAL is the durability of record), so recovering the
-    /// inner sink is safer than panicking the ingest path (`CLAUDE.md` §3.4,
+    /// inner sink is safer than panicking the ingest path (`AGENTS.md` §3.4,
     /// and the same posture `receiver` takes on the miner mutex).
     fn lock(&self) -> std::sync::MutexGuard<'_, ParquetRecordSink> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)

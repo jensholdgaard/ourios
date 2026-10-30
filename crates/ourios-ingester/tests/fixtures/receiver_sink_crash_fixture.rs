@@ -13,7 +13,7 @@
 //! acknowledged), asserts the batch is **un-flushed** (the store is still
 //! empty), prints `READY`, and parks. The parent kills it after `READY`;
 //! only the WAL is durable, so recovery must reconstruct the batch from it
-//! (RFC0014.5 / `CLAUDE.md` §3.4).
+//! (RFC0014.5 / `AGENTS.md` §3.4).
 //!
 //! `window` selects where the acked records sit at crash time:
 //! - `buffer` (default): in the in-memory flush buffer (RFC0014.5).

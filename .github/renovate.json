@@ -127,7 +127,7 @@
         "rust"
       ],
       "groupName": "rust toolchain",
-      "description": "rust-toolchain.toml pins an exact Rust version (CLAUDE.md \u00a76.1) so a new release cannot break CI overnight, as Rust 1.99 did through the unpinned stable channel with a deprecation and a new clippy lint (#901). The rust-toolchain manager proposes each release as a PR instead, so its new lints are fixed there. The image builders' rust:<version>-bookworm base is grouped in because COPY . . brings the toolchain file into the build, and a mismatched base makes rustup download the pinned version mid-build. CI jobs install whatever the toolchain file names, so nothing else needs bumping."
+      "description": "rust-toolchain.toml pins an exact Rust version (AGENTS.md \u00a76.1) so a new release cannot break CI overnight, as Rust 1.99 did through the unpinned stable channel with a deprecation and a new clippy lint (#901). The rust-toolchain manager proposes each release as a PR instead, so its new lints are fixed there. The image builders' rust:<version>-bookworm base is grouped in because COPY . . brings the toolchain file into the build, and a mismatched base makes rustup download the pinned version mid-build. CI jobs install whatever the toolchain file names, so nothing else needs bumping."
     }
   ]
 }

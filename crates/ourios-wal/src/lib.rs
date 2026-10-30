@@ -261,7 +261,7 @@ pub struct WalConfig {
     pub root: PathBuf,
     /// `wal_batch_window_ms` — bounds time between first
     /// `append` and corresponding `sync`. Default `100` per
-    /// CLAUDE.md §3.4 / §6.3.
+    /// AGENTS.md §3.4 / §6.3.
     pub batch_window_ms: u64,
     /// `wal_segment_size_bytes` — segment rotation cap.
     /// Default `128 MiB`; lower bound
@@ -2445,7 +2445,7 @@ pub enum CorruptionReason {
 #[cfg(test)]
 mod tests {
     //! Colocated unit tests for the `Wal::open` helpers per
-    //! CLAUDE.md §6.2 (unit tests next to the code for
+    //! AGENTS.md §6.2 (unit tests next to the code for
     //! anything non-trivial). End-to-end coverage of `open`
     //! lives in `tests/open.rs`; this module pins the smaller
     //! helper-level contracts so a regression caught at this

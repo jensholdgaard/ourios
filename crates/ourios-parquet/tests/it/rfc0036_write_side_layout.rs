@@ -713,7 +713,7 @@ fn sorting_declared_per_row_group(bytes: &[u8]) -> Vec<bool> {
 /// exercised here (that is RFC0036.1/.3) — this pins that the reader is
 /// inert to the declaration. That is the no-migration proof: §3.4's
 /// `sorting_columns` is pure footer
-/// metadata with no schema change (`CLAUDE.md` §3.5), so the reader —
+/// metadata with no schema change (`AGENTS.md` §3.5), so the reader —
 /// which is driven entirely by the column schema and never consults the
 /// sort declaration — is inert to its presence or absence. Old files read
 /// without error or special-casing because none is needed.

@@ -4,7 +4,7 @@
 //! same OTLP corpus (see `docs/rfcs/0031-comparative-evaluation-loki.md`).
 //! It lives in `ourios-bench` — extending the RFC 0006 harness — rather
 //! than a new crate, keeping the §7 "new crate vs `bench/`" question open
-//! (a new crate is a `CLAUDE.md` §7 architectural commitment).
+//! (a new crate is a `AGENTS.md` §7 architectural commitment).
 //!
 //! Landed so far (the equivalence-harness slice, RFC0031.1 logic half):
 //! the **result-set equivalence** comparator. A latency or bytes
@@ -2387,7 +2387,7 @@ mod tests {
     }
 
     /// Property tests for [`compare_aggregations_within_margin`]'s
-    /// invariants (CLAUDE.md §6.2: the comparator is an invariant-bearing
+    /// invariants (AGENTS.md §6.2: the comparator is an invariant-bearing
     /// piece, so it gets property tests; issue #538 item 1). Every
     /// example-based margin test above pins a specific historical shape
     /// (runs #17/#19, the review counterexamples); these properties pin

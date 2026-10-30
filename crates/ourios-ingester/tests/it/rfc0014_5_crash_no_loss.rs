@@ -1,7 +1,7 @@
 //! RFC0014.5 — No acknowledged-data loss across a crash with a non-empty
 //! flush buffer. See `docs/rfcs/0014-ingest-write-path.md` §5.
 //!
-//! A real-process crash that extends the RFC 0008 harness (`CLAUDE.md` §6.2):
+//! A real-process crash that extends the RFC 0008 harness (`AGENTS.md` §6.2):
 //! `receiver_sink_crash_fixture` ingests one batch (append + fsync = acked)
 //! through the full pipeline — miner → [`ParquetRecordSink`] — with a
 //! never-flush config, so the records sit in the in-memory buffer, durable
@@ -77,7 +77,7 @@ fn all_rows(root: &Path) -> Vec<MinedRecord> {
 
 /// Scenario RFC0014.5 — No acknowledged-data loss: a crash with a non-empty
 /// buffer loses nothing — WAL replay re-mines every un-flushed acknowledged
-/// record (`CLAUDE.md` §3.4).
+/// record (`AGENTS.md` §3.4).
 /// See `docs/rfcs/0014-ingest-write-path.md` §5.
 #[test]
 fn rfc0014_5_no_acknowledged_data_loss() {

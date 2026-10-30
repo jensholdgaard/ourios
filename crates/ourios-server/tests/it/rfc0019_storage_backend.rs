@@ -308,7 +308,7 @@ fn query_json(response: &str) -> serde_json::Value {
 
 /// The reconstructed `body.line` text of every returned record, sorted, after
 /// asserting each row reconstructed *faithfully* from its template. A clean,
-/// high-confidence row's `body` column is empty by design (`CLAUDE.md` §3.1);
+/// high-confidence row's `body` column is empty by design (`AGENTS.md` §3.1);
 /// it renders bit-for-bit only because the receiver now persists the miner's
 /// `template_created` / `template_widened` audit events for the read-time
 /// registry (issue #302). Before that fix every clean row rendered an empty
@@ -395,7 +395,7 @@ fn has_extension(path: &Path, ext: &str) -> bool {
     path.extension().is_some_and(|e| e == ext)
 }
 
-/// Scenario RFC0019.2 — the WAL stays local under the S3 backend (`CLAUDE.md`
+/// Scenario RFC0019.2 — the WAL stays local under the S3 backend (`AGENTS.md`
 /// §3.6, extends RFC0013.6). With `OURIOS_STORAGE_BACKEND=s3` and a local
 /// `OURIOS_WAL_ROOT`, ingesting one batch lands the flushed Parquet in the S3
 /// bucket while the `*.wal` segments stay on local disk and never reach an
@@ -525,7 +525,7 @@ async fn rfc0019_3_ingest_query_end_to_end_on_s3() {
     // RFC0019.3 acceptance: the query returns the rows with pruning stats — "the
     // same result the local backend produces." With the receiver persisting the
     // miner's template audit events (issue #302), each clean row also
-    // reconstructs its original line bit-for-bit out of S3 (`CLAUDE.md` §3.3).
+    // reconstructs its original line bit-for-bit out of S3 (`AGENTS.md` §3.3).
     assert_eq!(
         json["rows"], 3,
         "the three ingested rows round-trip out of S3: {json}",
@@ -627,7 +627,7 @@ async fn rfc0019_4_compaction_operates_on_s3() {
     terminate_and_assert_clean(child).await;
 }
 
-/// Scenario RFC0019.5 — tenant isolation on S3 (`CLAUDE.md` §3.7).
+/// Scenario RFC0019.5 — tenant isolation on S3 (`AGENTS.md` §3.7).
 /// See `docs/rfcs/0019-storage-backend-selection.md` §5.
 ///
 /// Two tenants ingest distinct rows on the same bucket; querying one tenant

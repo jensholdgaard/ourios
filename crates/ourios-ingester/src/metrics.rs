@@ -28,7 +28,7 @@ mod compaction;
 
 pub use compaction::CompactionMetrics;
 
-/// Ingest-path instruments (RFC 0014 §6.3 / `CLAUDE.md` §3.4): throughput
+/// Ingest-path instruments (RFC 0014 §6.3 / `AGENTS.md` §3.4): throughput
 /// plus the WAL-before-ack durability latency. Built once per pipeline on
 /// the global `ourios.ingest` meter; recording is a no-op when no provider
 /// is installed (RFC 0001 §6.8 API/SDK split). The counters carry the
@@ -523,7 +523,7 @@ pub const FLUSH_OUTCOME_TRANSIENT: &str = "transient";
 /// partition behind it (issue #302).
 pub const FLUSH_OUTCOME_PERMANENT: &str = "permanent";
 
-/// Audit-sink instruments (issue #302 / `CLAUDE.md` §6.3): the miner's
+/// Audit-sink instruments (issue #302 / `AGENTS.md` §6.3): the miner's
 /// template-audit write path, mirroring [`SinkMetrics`]. Built once per sink on
 /// the global `ourios.audit_sink` meter; recording is a no-op when no provider
 /// is installed (RFC 0001 §6.8 API/SDK split).

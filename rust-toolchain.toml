@@ -1,5 +1,5 @@
 [toolchain]
-# Pinned per CLAUDE.md §6.1 ("Rust stable, pinned in rust-toolchain.toml.
+# Pinned per AGENTS.md §6.1 ("Rust stable, pinned in rust-toolchain.toml.
 # MSRV documented."). This file is the source of truth for the toolchain
 # used by every contributor, by CI, and by the image builds. An exact
 # version, not `stable`, so a new Rust release (and the lints it brings)

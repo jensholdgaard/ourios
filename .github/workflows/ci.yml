@@ -1,6 +1,6 @@
 name: CI
 
-# Mirrors the verification list in CLAUDE.md §6.6. Runs on every PR
+# Mirrors the verification list in AGENTS.md §6.6. Runs on every PR
 # and push to main. Cargo jobs operate on the workspace Cargo.toml at
 # repo root (currently empty `members = []` until the first crate lands;
 # cargo handles this cleanly).
@@ -340,6 +340,20 @@ jobs:
         with:
           tool: mdbook@0.5.2,mdbook-mermaid@0.17.0
       - run: mdbook build
+      # AGENTS.md section numbers are frozen (RFC 0057 §3.1); fail on a
+      # citation that names a section it no longer has (RFC0057.4).
+      - name: AGENTS.md section citations resolve
+        run: .github/scripts/check-agents-citations.sh
+      # RFC0057.6: the local agent bridges are created, gitignored, and a
+      # rerun changes nothing.
+      - name: .agents/setup.sh is idempotent and leaves no tracked change
+        run: |
+          sh .agents/setup.sh
+          test -L .claude/skills/rfc-check && test -f .claude/skills/rfc-check/SKILL.md
+          grep -q 'AGENTS\.md' .gemini/settings.json
+          rerun=$(sh .agents/setup.sh)
+          test -z "$rerun"
+          test -z "$(git status --porcelain)"
 
   # Validate the OTel semantic-conventions registry (metric/attribute
   # names, units, instruments) with `weaver registry check`, and prove
@@ -781,7 +795,7 @@ jobs:
   # absent from `ci-success`'s `needs`, and `continue-on-error` makes
   # a coverage hiccup neutral, so it never blocks a merge. Coverage
   # surfaces untested branches/error arms; the percentage is
-  # intentionally not a threshold — per CLAUDE.md §6.2 tests are
+  # intentionally not a threshold — per AGENTS.md §6.2 tests are
   # specifications, not a number to game (a `--fail-under` gate would
   # pressure toward shallow tests). `cargo test` (above) remains the
   # real gate. The lcov + HTML report are uploaded as a build artifact.

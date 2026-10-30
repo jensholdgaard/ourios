@@ -230,7 +230,7 @@ fn observe_body_retention(state: &MinerMetricsState, obs: &dyn AsyncInstrument<f
 }
 
 fn observe_params_overflow(state: &MinerMetricsState, obs: &dyn AsyncInstrument<f64>) {
-    for (tenant, tallies) in &state.by_service {
+    for (tenant, tallies) in state.by_service.iter() {
         for (service, tally) in tallies.iter() {
             obs.observe(
                 ratio(tally.overflow_lines, tally.lines),
@@ -244,7 +244,7 @@ fn observe_params_overflow(state: &MinerMetricsState, obs: &dyn AsyncInstrument<
 type ConfidenceWindow = (TenantId, Option<String>, Vec<f64>);
 
 fn confidence_windows(state: &MinerMetricsState, out: &mut Vec<ConfidenceWindow>) {
-    for (tenant, tallies) in &state.by_service {
+    for (tenant, tallies) in state.by_service.iter() {
         for (service, tally) in tallies.iter() {
             out.push((
                 tenant.clone(),

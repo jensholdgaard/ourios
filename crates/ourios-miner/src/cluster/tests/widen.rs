@@ -10,7 +10,7 @@ use crate::cluster::plan::{apply_widening, find_widening_positions, would_be_deg
 /// distinct leaves collapse to a single template with a
 /// `<*>` at position 3.
 ///
-/// Per `CLAUDE.md` §6.2 ("Tests are specifications") this
+/// Per `AGENTS.md` §6.2 ("Tests are specifications") this
 /// contract change is explicit, not silent: the old test
 /// asserted *distinct ids*, the new one asserts *same id +
 /// audit event*. PR review must acknowledge the swap.

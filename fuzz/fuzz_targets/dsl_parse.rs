@@ -31,7 +31,7 @@
 //! - lowering returns exactly validation's rejection, and lowers what
 //!   validation accepts to a plan or an `InvalidQuery`. A `Storage` error
 //!   there is a `DataFusion` planning error the compiler let through:
-//!   hazard `CLAUDE.md` §4.6, the engine deciding what the DSL accepts,
+//!   hazard `AGENTS.md` §4.6, the engine deciding what the DSL accepts,
 //!   reported to the user as a failed storage read;
 //! - the canonical re-parse validates and lowers to the same verdict and
 //!   an equal plan: lowering is a function of the query alone.
@@ -68,7 +68,7 @@ fn round_trip(scenario: &str, statement: &Statement) -> Statement {
 fn assert_dsl_error(scenario: &str, query: &Query, error: &QueryError) {
     assert!(
         matches!(error, QueryError::InvalidQuery { .. }),
-        "RFC0015.15 / CLAUDE.md §4.6 ({scenario}): {query:?} is rejected with {error:?}, \
+        "RFC0015.15 / AGENTS.md §4.6 ({scenario}): {query:?} is rejected with {error:?}, \
          not the DSL's own InvalidQuery",
     );
 }

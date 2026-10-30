@@ -233,7 +233,7 @@ fn rfc0014_4_bounded_memory() {
 // like the scenarios above.
 
 /// Scenario RFC0014.6 — Tenant isolation: a flush produces an object holding
-/// only one tenant's rows; no buffer or flush crosses tenants (`CLAUDE.md` §3.7).
+/// only one tenant's rows; no buffer or flush crosses tenants (`AGENTS.md` §3.7).
 /// See `docs/rfcs/0014-ingest-write-path.md` §5.
 #[test]
 fn rfc0014_6_tenant_isolation() {

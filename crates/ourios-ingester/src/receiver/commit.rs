@@ -1,6 +1,6 @@
 //! The §3.4 group-commit coordinator — windowed batched fsync.
 //!
-//! `CLAUDE.md` §3.4 makes batching the *caller's* job: the WAL exposes
+//! `AGENTS.md` §3.4 makes batching the *caller's* job: the WAL exposes
 //! `append` and `sync` separately and stays single-writer + synchronous
 //! (RFC 0008 §3.1 / §6.3). This layer turns N concurrent per-request
 //! appends into **one** fsync per window — "batch up to

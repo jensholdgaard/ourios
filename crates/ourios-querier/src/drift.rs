@@ -5,11 +5,11 @@
 //! [`DriftQuery`](crate::dsl::DriftQuery) IR to a `DataFusion` plan
 //! (`Filter` → `Aggregate` → `Sort`, RFC 0010 §6.3/§6.6) and collects the
 //! result into [`DriftRow`]s. Like the log path, no `datafusion`/`arrow`/SQL
-//! type crosses a public boundary (hazard `CLAUDE.md` §4.6 / RFC0010.8) — the
+//! type crosses a public boundary (hazard `AGENTS.md` §4.6 / RFC0010.8) — the
 //! SQL in RFC 0001 §6.7 / RFC 0010 §6.3 is anchored programmatically, never
 //! exposed.
 //!
-//! Tenancy (RFC0010.4 / `CLAUDE.md` §3.7) is a prefix scope: the scan is scoped
+//! Tenancy (RFC0010.4 / `AGENTS.md` §3.7) is a prefix scope: the scan is scoped
 //! to the executing tenant's `audit/tenant_id=<enc>/` prefix, so no other
 //! tenant's events are reachable (RFC0019.5 — the listing is segment-wise
 //! prefix-scoped). The window drives a day-granularity `year/month/day`
@@ -123,7 +123,7 @@ pub(crate) async fn run_drift(
         return Ok(DriftResult::default());
     }
 
-    // The base frame arrives tenant-scoped (the `CLAUDE.md` §3.7
+    // The base frame arrives tenant-scoped (the `AGENTS.md` §3.7
     // row-level guard lives in `audit_dataframe`).
     let (ctx, base) = audit_dataframe(backend, &files, tenant).await?;
 
@@ -216,7 +216,7 @@ fn apply_adoptions(rows: &mut [DriftRow], adopted: &std::collections::HashSet<u6
 /// limited to the tenant's `audit/tenant_id=…` prefix (and, on
 /// local, the canonical-path walk), but the aggregations here have
 /// no per-row backstop like the alias / registry folds, so the
-/// row-level `tenant_id = <tenant>` guard (`CLAUDE.md` §3.7) is
+/// row-level `tenant_id = <tenant>` guard (`AGENTS.md` §3.7) is
 /// applied at this shared data-access boundary — every consumer
 /// inherits it rather than re-remembering it.
 async fn audit_dataframe(
@@ -257,7 +257,7 @@ async fn adopted_template_ids(
     if files.is_empty() {
         return Ok((std::collections::HashSet::new(), QueryStats::default(), 0));
     }
-    // Tenant-scoped by `audit_dataframe` (`CLAUDE.md` §3.7).
+    // Tenant-scoped by `audit_dataframe` (`AGENTS.md` §3.7).
     let (ctx, base) = audit_dataframe(backend, &files, tenant).await?;
     let filtered = base
         .filter(

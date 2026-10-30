@@ -8,7 +8,7 @@
 # them as three workloads sharing a data + audit store on object storage:
 #   - receiver  — OTLP log ingest, a StatefulSet with a per-replica WAL PVC
 #                 (the WAL is ALWAYS a local durable volume, never object storage;
-#                 CLAUDE.md §3.4 WAL-before-ack / §3.6 object storage is truth);
+#                 WAL-before-ack, RFC 0008);
 #   - querier   — the logs-DSL query API, a stateless Deployment that scales
 #                 independently and reads the store (no PVC);
 #   - compactor — the always-on background compactor, a singleton Deployment.
@@ -63,7 +63,7 @@ storage:
     # provider's region, or a placeholder like "us-east-1" if it has none.
     region: ""
     # Optional key prefix within the bucket (OURIOS_S3_PREFIX). Per-tenant
-    # prefixes live below this at the data layer (CLAUDE.md §3.7) — do not
+    # prefixes live below this at the data layer (RFC 0013) — do not
     # encode a tenant here.
     prefix: ""
     # Object-store credentials. NEVER set keys here as plaintext — give the name
@@ -181,7 +181,7 @@ receiver:
   service:
     type: ClusterIP
   # The write-ahead log (OURIOS_WAL_ROOT). ALWAYS a local durable PVC — never
-  # S3, never emptyDir (CLAUDE.md §3.4/§3.6). Each replica gets its own.
+  # S3, never emptyDir (WAL-before-ack, RFC 0008). Each replica gets its own.
   wal:
     mountPath: /var/lib/ourios/wal
     size: 2Gi
@@ -301,8 +301,8 @@ compactor:
     #   value: deployment.environment.name=production,service.namespace=ourios
 
 # Ourios's own self-telemetry: the OTLP endpoint every signal it emits is
-# exported to. That is three signals, not just the meter — metrics
-# (CLAUDE.md §6.3), logs, and, since RFC 0038/0039/0040, traces (request-scoped
+# exported to. That is three signals, not just the meter — metrics, logs,
+# and, since RFC 0038/0039/0040, traces (request-scoped
 # spans on ingest/query/MCP/sweep, continuing an inbound caller's trace, with
 # DataFusion operator spans under a query).
 #

@@ -11,7 +11,7 @@ and the `diagrams` package:
     python deploy/helm/ourios/docs/topology.py
 
 This diagram lives with the chart (outside the `docs/` mdBook tree), so the
-mdBook diagram conventions (`CLAUDE.md` §6.7: Mermaid for RFCs, SVG for
+mdBook diagram conventions (`docs/rfcs/README.md`: Mermaid for RFCs, SVG for
 lectures) do not apply; the chart README embeds the rendered PNG. Keep this
 script in sync with the chart when the topology changes.
 """

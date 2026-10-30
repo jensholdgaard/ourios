@@ -18,6 +18,13 @@
 
 .env
 
+# Per-tool agent context stays local; AGENTS.md is the only tracked one
+# (RFC 0057). A local CLAUDE.md should import it with `@AGENTS.md`.
+/CLAUDE.md
+/CLAUDE.local.md
+/GEMINI.md
+/.gemini/
+
 # Claude Code runtime artefacts (per-session PID / lock files). The
 # `.claude/` tree carries tracked content (`.claude/skills/` slash-
 # command definitions, the personal `settings.local.json`), but the

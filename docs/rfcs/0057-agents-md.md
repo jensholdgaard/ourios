@@ -11,10 +11,16 @@ superseded-by: —
 
 # RFC 0057 — meta: move CLAUDE.md to AGENTS.md
 
-> **Status note. Maintainer-approved (2026-10-30); enactment pending.** The
-> open questions in §7 are resolved as recorded there. The move lands in a
-> separate PR from a fresh session (§8.5), and the RFC becomes `accepted`
-> when that PR merges, as RFC 0012 did.
+> **Status note. Enacted (2026-10-30); `accepted` once the follow-up
+> lands.** Maintainer-approved on 2026-10-30, and the same day
+> `CLAUDE.md` moved to `AGENTS.md` and the §3.4 wording was applied. During review of the enacting PR the
+> maintainer amended the design (§3.8): the repository tracks only
+> `AGENTS.md` and `.agents/`, so there is no `CLAUDE.md` stub, no
+> `.gemini/settings.json` and, after the follow-up, no `.claude/`.
+> Per-tool bridges are local and created by `.agents/setup.sh`. The §3.7
+> follow-up (citations, `.claude/` removal, setup script, citation guard)
+> lands in a separate PR. That PR marks this RFC `accepted`, once
+> RFC0057.4 and RFC0057.6, which depend on its guard and script, pass.
 
 > **This is a `meta:` RFC.** It proposes a change to `CLAUDE.md`, whose
 > footer declares it load-bearing: *"further changes require a `meta:`
@@ -25,6 +31,11 @@ superseded-by: —
 > way.
 
 ## 1. Summary
+
+> **Superseded by §3.8** (maintainer amendment, 2026-10-30): no stub is
+> tracked, and `AGENTS.md` and `.agents/` are the only agent context the
+> repository tracks; citations outside historical RFCs are rewritten,
+> while historical RFCs keep `CLAUDE.md §N` as a defined alias.
 
 The project context every contributor's agent must read lives in
 `CLAUDE.md`, a file name that is Claude Code's default and only an
@@ -92,6 +103,8 @@ section (e.g. a future §8.6), never inserted.
 
 ### 3.2 The CLAUDE.md stub
 
+> **Superseded by §3.8** (maintainer amendment, 2026-10-30): no stub is tracked; Claude Code reads `AGENTS.md` natively.
+
 After the move, a new `CLAUDE.md` is created containing exactly:
 
 ```markdown
@@ -134,6 +147,8 @@ reintroduce the split this RFC removes. Changes to the stub fall under
 the same `meta:` rule as `AGENTS.md` (§3.4.9).
 
 ### 3.3 Citations are not rewritten
+
+> **Superseded by §3.8** (maintainer amendment, 2026-10-30): without the stub, citations outside historical RFCs are rewritten; historical RFCs keep `CLAUDE.md §N` as a defined alias.
 
 Measured on `main` at `d8c8208` (2026-09-27):
 
@@ -270,6 +285,8 @@ RFC and majority maintainer approval."*
 
 ### 3.5 Skills: `.claude/skills/` stays where it is
 
+> **Superseded by §3.8** (maintainer amendment, 2026-10-30): all skills live in `.agents/skills/`; `.claude/skills/` becomes a local, generated path.
+
 The repository already has two skill locations:
 
 - `.agents/skills/openfga/` — the vendored OpenFGA skill, the real
@@ -328,6 +345,8 @@ accepted and the file is not edited.
 
 ### 3.6 Per-tool support
 
+> **Superseded by §3.8** (maintainer amendment, 2026-10-30): the Gemini CLI setting below is written locally by `.agents/setup.sh`, not committed. The table and its findings stand.
+
 Checked 2026-09-27. Where the vendor's documentation site was
 unreachable from the drafting environment, the vendor's own
 documentation or source on GitHub was read instead; rows marked
@@ -358,8 +377,13 @@ the vendors' own documentation on 2026-10-30.
   `{"context":{"fileName":["AGENTS.md","CONTEXT.md","GEMINI.md"]}}`
   [Gemini-md]. The enacting PR adds a project-level
   `.gemini/settings.json` containing only
-  `{"context":{"fileName":["AGENTS.md"]}}`: a pointer, not a copy of
-  any rule, so it cannot drift. If the maintainer prefers no Gemini
+  `{"context":{"fileName":["AGENTS.md","GEMINI.md"]}}`: a pointer, not
+  a copy of any rule, so it cannot drift. `GEMINI.md` stays in the list
+  because the project setting replaces the user-level one and the name
+  also selects the global context file: with `AGENTS.md` alone, a
+  contributor's own `~/.gemini/GEMINI.md` would stop loading in this
+  repository. Listing the name adds no repository file; RFC0057.6 still
+  forbids a committed `GEMINI.md`. If the maintainer prefers no Gemini
   file in the repo, the enacting PR must instead add one sentence to
   `CONTRIBUTING.md` giving Gemini CLI users that exact setting for their
   user-level `~/.gemini/settings.json` (§7). One of the two is
@@ -427,6 +451,47 @@ changed at the time). All of these resolve through the stub.
 >   sessions started below the repository root prompt once to load the
 >   imported `AGENTS.md` (§3.2).
 
+### 3.8 Amendment: only `AGENTS.md` and `.agents/` are tracked
+
+*Maintainer decision during review of the enacting PR (2026-10-30).*
+The repository stays agent-agnostic: the only agent context it tracks is
+`AGENTS.md` and the `.agents/` directory. Per-tool files are each
+contributor's local business. This supersedes the stub (§3.2), the
+committed Gemini setting (§3.6), the `.claude/skills/` symlinks (§3.5)
+and the citation rule (§3.3).
+
+1. **Not tracked, and gitignored:** `/CLAUDE.md`, `/CLAUDE.local.md`,
+   `/GEMINI.md`, `/.gemini/` and (in the follow-up, once its skills
+   have moved) `/.claude/`.
+2. **Claude Code** reads `AGENTS.md` natively when no `CLAUDE.md` or
+   `CLAUDE.local.md` is in or above the working directory (v2.1.277 and
+   later) [CC-mem], so a clean checkout needs nothing. A contributor who
+   keeps a local `CLAUDE.md` or `CLAUDE.local.md` must start it with
+   `@AGENTS.md`; otherwise Claude Code reads that file *instead of*
+   `AGENTS.md`.
+3. **Skills** all live in `.agents/skills/<name>/`, both project skills
+   (`rfc-check`) and vendored ones (`openfga`, pinned by
+   `skills-lock.json`).
+4. **Onboarding.** `.agents/setup.sh` creates the local bridges. It is
+   POSIX `sh`, idempotent, and never overwrites a file it did not create.
+   It links each `.agents/skills/<name>` into `.claude/skills/<name>` and
+   writes `.gemini/settings.json` with
+   `{"context":{"fileName":["AGENTS.md","GEMINI.md"]}}` unless one
+   already exists; an existing file whose `context.fileName` omits
+   `AGENTS.md` is left alone and reported, with the entry to add. `GEMINI.md` stays in that list because a project-level
+   `context.fileName` replaces the user-level one and also names the
+   global context file; without it, a contributor's own
+   `~/.gemini/GEMINI.md` stops loading. Remote and cloud agents run the
+   same script as their environment's setup command. Tools that read
+   `AGENTS.md` natively (Codex, Copilot, Cursor, Jules; §3.6) need
+   nothing.
+5. **Citations.** The follow-up rewrites `CLAUDE.md §N` to `AGENTS.md §N`
+   everywhere except the historical RFC files (`docs/rfcs/NNNN-*.md`),
+   `docs/talks/` and `CHANGELOG.md`. In those, `CLAUDE.md §N` is an
+   alias for the same section, as `AGENTS.md`'s footer states. The
+   section numbers are unchanged, and the RFC0057.4 guard checks both
+   spellings.
+
 ## 4. Alternatives considered
 
 **Keep `CLAUDE.md`, add `AGENTS.md` as a copy.** Two load-bearing files
@@ -481,11 +546,11 @@ RFC 0012's. Each carries a runnable check.
 > - **And** the numbered pillar list in §2 and hazard list in §4 have
 >   the same item count as before (so §2.1, §2.2 and §4.6 still resolve)
 
-> **Scenario RFC0057.3 — the stub imports AGENTS.md and Claude Code
-> loads it.**
+> **Scenario RFC0057.3 — Claude Code loads AGENTS.md with no CLAUDE.md
+> (amended by §3.8).**
 > - **Given** the enacted repository
-> - **When** `cat CLAUDE.md` is run
-> - **Then** its entire content is the single line `@AGENTS.md`
+> - **When** `git ls-files CLAUDE.md CLAUDE.local.md` is run
+> - **Then** it prints nothing
 > - **And** in a fresh Claude Code session at the repo root, `/memory`
 >   (or asking the agent to quote §3.4's first rule) shows `AGENTS.md`'s
 >   content loaded
@@ -504,24 +569,23 @@ RFC 0012's. Each carries a runnable check.
 > - **Given** the enacting PR's second commit
 > - **When** its diff against the first is reviewed
 > - **Then** every hunk in `AGENTS.md` corresponds to an item in
->   §3.4.1–§3.4.9, and the only other change is the new `CLAUDE.md`
->   stub of §3.2, plus exactly one Gemini CLI route from §3.6: a new
->   `.gemini/settings.json`, or the one-sentence setting added to
->   `CONTRIBUTING.md`
+>   §3.4.1–§3.4.9 (the §7 tree and footer as amended by §3.8), and
+>   the commit touches no other file
 > - **And** `grep -niE 'claude|anthropic' AGENTS.md` matches only the
->   footer's history, §7's `.claude/` and `CLAUDE.md` stub lines, §8's
->   parenthetical examples, and §9's example trailer / header
+>   footer's history, §8's parenthetical examples, and §9's example
+>   trailer / header
 
 > **Scenario RFC0057.6 — no per-tool copies.**
 > - **Given** the enacted repository
 > - **When** `git ls-files` is searched for
->   `.github/copilot-instructions.md`, `GEMINI.md`, `.cursorrules` and
->   `.cursor/rules/`
-> - **Then** none exists
-> - **And** exactly one Gemini CLI route from §3.6 exists: either
->   `.gemini/settings.json` parses as JSON whose `context.fileName`
->   names `AGENTS.md` and holds no rule text, or `CONTRIBUTING.md`
->   contains that `context.fileName` setting for the user-level file
+>   `.github/copilot-instructions.md`, `GEMINI.md`, `.cursorrules`,
+>   `.cursor/rules/`, `CLAUDE.md`, `CLAUDE.local.md`, `.gemini/` and
+>   (after the §3.7 follow-up) `.claude/`
+> - **Then** none exists (amended by §3.8)
+> - **And** `.agents/setup.sh`, run twice from a clean checkout, links
+>   every `.agents/skills/<name>` under `.claude/skills/`, writes a
+>   `.gemini/settings.json` whose `context.fileName` names `AGENTS.md`,
+>   leaves `git status` clean, and changes nothing on the second run
 
 > **Scenario RFC0057.7 — the book still builds.**
 > - **Given** the enacted repository

@@ -488,7 +488,9 @@ and the citation rule (§3.3).
    `docs/talks/` and `CHANGELOG.md`. In those, `CLAUDE.md §N` is an
    alias for the same section, as `AGENTS.md`'s footer states. The
    section numbers are unchanged, and the RFC0057.4 guard checks both
-   spellings.
+   spellings. `crates/ourios-miner/src/cluster/mod.rs` also keeps the
+   alias, because it carries a CodeScene refactoring goal that a
+   comment-only edit cannot meet; its next refactor switches it.
 
 ## 4. Alternatives considered
 

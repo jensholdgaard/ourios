@@ -39,12 +39,24 @@ done
 # Gemini CLI reads AGENTS.md only when context.fileName lists it. GEMINI.md
 # stays in the list: the project value replaces the user one, and it also
 # names the global context file (~/.gemini/GEMINI.md).
-if [ ! -e .gemini/settings.json ]; then
+# jq checks the exact entry; without it (or for JSON with comments, which jq
+# rejects) the quoted name is the closest a shell can get.
+lists_agents_md() {
+  if command -v jq >/dev/null 2>&1 && jq empty "$1" >/dev/null 2>&1; then
+    jq -e '.context.fileName | if type == "array" then index("AGENTS.md") != null else . == "AGENTS.md" end' "$1" >/dev/null
+  else
+    grep -q '"AGENTS\.md"' "$1"
+  fi
+}
+settings=.gemini/settings.json
+if [ -L "$settings" ] && [ ! -e "$settings" ]; then
+  say "$settings is a dangling link; left as is"
+elif [ ! -e "$settings" ]; then
   mkdir -p .gemini
-  printf '{"context":{"fileName":["AGENTS.md","GEMINI.md"]}}\n' > .gemini/settings.json
-  say "wrote .gemini/settings.json"
-elif ! grep -q 'AGENTS\.md' .gemini/settings.json; then
-  say ".gemini/settings.json does not list AGENTS.md in context.fileName; add it"
+  printf '{"context":{"fileName":["AGENTS.md","GEMINI.md"]}}\n' > "$settings"
+  say "wrote $settings"
+elif ! lists_agents_md "$settings"; then
+  say "$settings does not list AGENTS.md in context.fileName; add it"
 fi
 
 # A local CLAUDE.md or CLAUDE.local.md makes Claude Code read it instead of

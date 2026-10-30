@@ -1,7 +1,7 @@
 ---
 rfc: 0057
 title: "meta: move CLAUDE.md to AGENTS.md so every AI coding agent gets the same project context"
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-27
@@ -10,6 +10,11 @@ superseded-by: —
 ---
 
 # RFC 0057 — meta: move CLAUDE.md to AGENTS.md
+
+> **Status note. Maintainer-approved (2026-10-30); enactment pending.** The
+> open questions in §7 are resolved as recorded there. The move lands in a
+> separate PR from a fresh session (§8.5), and the RFC becomes `accepted`
+> when that PR merges, as RFC 0012 did.
 
 > **This is a `meta:` RFC.** It proposes a change to `CLAUDE.md`, whose
 > footer declares it load-bearing: *"further changes require a `meta:`
@@ -26,7 +31,7 @@ The project context every contributor's agent must read lives in
 optional fallback elsewhere (GitHub Copilot accepts it; Codex and
 Gemini CLI do not read it). This RFC moves it, with `git mv`, to
 `AGENTS.md`, the open convention that Codex and GitHub Copilot read
-natively and that Cursor and Jules are reported to read (§3.6).
+natively and that Cursor and Jules read (§3.6).
 Every section number stays the same. `CLAUDE.md` becomes a one-line stub that imports
 `AGENTS.md`, so Claude Code sessions load the same text as today and the
 575 existing `CLAUDE.md` citations (507 of them `CLAUDE.md §N`) keep
@@ -290,6 +295,13 @@ read one. The directories **do not move**, because:
    it is left as an open question (§7) rather than bundled into a
    `meta:` change.
 
+> **Resolved (2026-10-30).** `rfc-check` follows the installer pattern:
+> its files move to `.agents/skills/rfc-check/` with a
+> `.claude/skills/rfc-check` symlink. The move lands in the §3.7
+> follow-up PR, not the enacting PR, so RFC0057.5 is unchanged. The
+> enacting PR's §7 tree already covers it (real files under
+> `.agents/skills/`, symlinks under `.claude/skills/`).
+
 `AGENTS.md` names both paths in §7's tree; no other section gains
 text. The tree for §3.4.3 is:
 
@@ -320,7 +332,8 @@ Checked 2026-09-27. Where the vendor's documentation site was
 unreachable from the drafting environment, the vendor's own
 documentation or source on GitHub was read instead; rows marked
 **unverified** rest on secondary sources and must be re-checked by the
-enacting PR's author.
+enacting PR's author. The Cursor and Jules rows were re-checked against
+the vendors' own documentation on 2026-10-30.
 
 | Tool | Reads root `AGENTS.md` | Reads `CLAUDE.md` | Own file needed? | Caveats |
 |---|---|---|---|---|
@@ -328,15 +341,15 @@ enacting PR's author.
 | OpenAI Codex CLI | Yes, natively; `AGENTS.override.md` takes precedence; files concatenated from the git root down to the working directory [Codex-src] | No | No | `project_doc_max_bytes` default 32 768; excess is truncated [Codex-cfg] |
 | GitHub Copilot (coding agent, code review) | Yes, anywhere in the tree, nearest file wins [GH-instr] | Yes, "alternatively", a single root `CLAUDE.md` or `GEMINI.md` [GH-instr] | No; `.github/copilot-instructions.md` is optional | Code review lists `AGENTS.md` as a shared-rules source [GH-review] |
 | Gemini CLI | **Only if configured** via `context.fileName` [Gemini-md] | No | **Yes, a setting** (below) | Default context file is `GEMINI.md` |
-| Cursor | Yes, root and nested (**unverified**, secondary sources) | Unconfirmed | No | `cursor.com/docs` unreachable when drafted |
-| Jules | Yes, root (**unverified**, secondary sources) | Not stated | No | `jules.google` unreachable when drafted |
+| Cursor | Yes, root and nested; nested files combine with parent ones, the more specific taking precedence [Cursor-rules] | Not stated | No | Re-checked 2026-10-30 |
+| Jules | Yes, root: "Jules now automatically looks for a file named AGENTS.md in the root of your repository" [Jules-docs] | Not stated | No | Re-checked 2026-10-30 |
 
 **Consequences for Ourios.**
 
 - **No `.github/copilot-instructions.md`, no `.cursor/rules/`, no
   `GEMINI.md`.** Copilot and Codex read `AGENTS.md` directly (verified).
-  Cursor and Jules are reported to (unverified); if the enacting PR's
-  re-check finds either does not, this RFC is amended before it
+  Cursor and Jules do too (re-checked 2026-10-30). Had the re-check
+  found either did not, this RFC is amended before it
   reaches `specified` to name that tool's pointer file and add it to
   RFC0057.5 and RFC0057.6; the enacting PR adds no file those
   scenarios do not list.
@@ -400,6 +413,19 @@ Explicitly **not** in the follow-up: `docs/rfcs/NNNN-*.md` (historical),
 `codecov.yml`, `rust-toolchain.toml`, `.gitignore`, `.bestpractices.json`
 and `docs/SUMMARY.md`'s RFC 0012 entry (its title names the file it
 changed at the time). All of these resolve through the stub.
+
+> **Amendment (2026-10-30, maintainer-approved).** The §7 resolutions
+> add three items to this follow-up PR, which keeps the enacting PR
+> within RFC0057.5:
+> - **`rfc-check` move** (§3.5): `git mv` its files to
+>   `.agents/skills/rfc-check/` and leave a `.claude/skills/rfc-check`
+>   symlink.
+> - **Citation guard** (§6): a `just` recipe and a step in an existing
+>   CI workflow that run RFC0057.4's check and fail when a cited
+>   `AGENTS.md §N` or `CLAUDE.md §N` section no longer exists.
+> - **`CONTRIBUTING.md`**: one sentence noting that Claude Code
+>   sessions started below the repository root prompt once to load the
+>   imported `AGENTS.md` (§3.2).
 
 ## 4. Alternatives considered
 
@@ -517,35 +543,48 @@ A CI check for RFC0057.4 (fail when a cited section number stops
 existing) would protect the frozen numbering permanently; it is listed
 as an open question rather than required, since it is new CI surface.
 
+> **Resolved (2026-10-30).** The guard is required. It lands in the
+> §3.7 follow-up PR, after the enacting PR, so RFC0057.5's scope for
+> the enacting PR is unchanged.
+
 ## 7. Open questions
 
-- [ ] **Maintainer approval (majority)**, per `CLAUDE.md`'s footer.
-- [ ] **CI guard for citations.** Add a `just`/CI step running
+- [x] **Maintainer approval (majority)**, per `CLAUDE.md`'s footer.
+      *Resolved (2026-10-30):* Approved by the maintainer on 2026-10-30.
+- [x] **CI guard for citations.** Add a `just`/CI step running
       RFC0057.4's check so a future renumbering fails the build? It
       would make §3.1's freeze enforceable rather than a convention.
-- [ ] **Trailer wording.** §3.4.7 lets each tool emit its own
+      *Resolved (2026-10-30):* Yes, in the §3.7 follow-up PR (see §6).
+- [x] **Trailer wording.** §3.4.7 lets each tool emit its own
       `Co-Authored-By:` trailer. Should the project instead require one
       fixed form (e.g. the tool's product name and a no-reply address),
       so the history is greppable across tools?
-- [ ] **`drafting-assistance:` values.** Free text naming the tool, or
+      *Resolved (2026-10-30):* Each tool emits its own `Co-Authored-By:` trailer, as §3.4.7 proposes; no fixed form.
+- [x] **`drafting-assistance:` values.** Free text naming the tool, or
       a short fixed list? `docs/rfcs/README.md`'s front-matter example
       (`drafting-assistance: Claude   # omit if no LLM drafted`) is
       updated in the follow-up either way.
-- [ ] **Gemini CLI setting.** Commit `.gemini/settings.json`
+      *Resolved (2026-10-30):* Free text naming the tool.
+- [x] **Gemini CLI setting.** Commit `.gemini/settings.json`
       (recommended, §3.6) or document the user-level setting in
       `CONTRIBUTING.md` instead?
-- [ ] **Unverified rows.** Cursor and Jules support rests on secondary
+      *Resolved (2026-10-30):* Commit `.gemini/settings.json`, as §3.6 recommends.
+- [x] **Unverified rows.** Cursor and Jules support rests on secondary
       sources (§3.6); the enacting PR's author re-checks
       `cursor.com/docs` and `jules.google/docs`.
-- [ ] **`rfc-check` location.** Move it to `.agents/skills/rfc-check/`
+      *Resolved (2026-10-30):* Re-checked against `cursor.com/docs` and `jules.google/docs`: both read `AGENTS.md`, so no pointer file is needed (§3.6).
+- [x] **`rfc-check` location.** Move it to `.agents/skills/rfc-check/`
       with a `.claude/skills/rfc-check` symlink, matching the vendored
       OpenFGA skill (§3.5), or leave it in `.claude/skills/`?
-- [ ] **Subdirectory sessions.** Claude Code sessions started below the
+      *Resolved (2026-10-30):* Move it, with a symlink, in the §3.7 follow-up PR (see §3.5).
+- [x] **Subdirectory sessions.** Claude Code sessions started below the
       repository root will prompt once to load the imported `AGENTS.md`
       (§3.2). Acceptable, or document it in `CONTRIBUTING.md`?
-- [ ] **Stub-only rule.** Is "the stub stays one line; Claude-specific
+      *Resolved (2026-10-30):* Acceptable; the §3.7 follow-up PR documents it in `CONTRIBUTING.md`.
+- [x] **Stub-only rule.** Is "the stub stays one line; Claude-specific
       text needs a `meta:` RFC" (§3.2) the right bar, or should small
       Claude Code notes be allowed below the import without one?
+      *Resolved (2026-10-30):* Keep it: the stub stays one line, and Claude-specific text needs a `meta:` RFC.
 
 ## 8. References
 
@@ -572,6 +611,10 @@ as an open question rather than required, since it is new CI surface.
   `github/docs`, `content/copilot/concepts/agents/code-review.md`).
 - **[Gemini-md]** Gemini CLI, *GEMINI.md files*:
   <https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/gemini-md.md>.
+- **[Cursor-rules]** Cursor Docs, *Rules*:
+  <https://cursor.com/docs/context/rules> (read 2026-10-30).
+- **[Jules-docs]** Jules documentation: <https://jules.google/docs>
+  (read 2026-10-30).
 - **AGENTS.md convention**: <https://agents.md>. Released by OpenAI in
   2025 and since donated to the Linux Foundation's Agentic AI
   Foundation (secondary sources; the site was unreachable when this RFC

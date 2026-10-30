@@ -130,7 +130,7 @@ fuzzing = []
 # that pins which prefixes a windowed query lists (with `async-trait` and
 # `futures` from the normal dependencies). Already in the tree via
 # ourios-parquet / DataFusion.
-object_store = { version = "=0.13.2", default-features = false }
+object_store = { version = "=0.14.2", default-features = false }
 # Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
 ourios-config = { path = "../ourios-config" }
 # RFC0033.7 (`tests/rfc0033_7_observability.rs`) — the in-memory metrics
@@ -173,9 +173,9 @@ testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # the same arrow/parquet version the whole workspace shares, so
 # `Cargo.lock` carries one copy (RFC 0021 retired the pre-upgrade
 # cross-version handoff).
-parquet = { version = "=59.3.1", default-features = false, features = ["arrow"] }
-arrow-array = { version = "=59.3.1", default-features = false }
-arrow-schema = { version = "=59.3.1", default-features = false }
+parquet = { version = "=60.0.0", default-features = false, features = ["arrow"] }
+arrow-array = { version = "=60.0.0", default-features = false }
+arrow-schema = { version = "=60.0.0", default-features = false }
 # RFC0002.10 — proves the canonical β serialisation survives a YAML
 # scalar round-trip (the Perses-embedding guarantee). Test-only.
 serde-saphyr = { version = "=1.3.0", default-features = false, features = ["deserialize", "serialize"] }

@@ -703,6 +703,27 @@ direction and the primary obligation lives in those other RFCs.
 >   same-attributed histogram (computed in-process on a short
 >   ticker per §6.8)
 >
+> > **Amendment (2026-10-27, #1122, maintainer-approved) — bounded
+> > tallies.** The Given is read within §6.8's tally budget: the
+> > miner computes the gauges for every `(tenant, service)` pair it
+> > currently tracks, and the SDK exports them subject to its
+> > per-instrument cardinality limit (the tests stay below it). The
+> > scenario gains:
+> > - **And** the miner never tracks more named pairs than the budget,
+> >   whatever the number of distinct `service.name` values ingested
+> > - **And** when admitting a new pair would exceed the budget, the
+> >   least recently updated pairs are evicted first, an eighth of the
+> >   budget at a time; a pair is updated by every line the miner
+> >   records for it
+> > - **And** an evicted pair that logs again restarts from an empty
+> >   window rather than resuming its old one
+> > - **And** each gauge value matches the corresponding quantile of
+> >   the pair's current window, the samples since the pair was last
+> >   admitted, rather than of the cumulative histogram, which keeps
+> >   every sample across an eviction
+> > - **And** lines without a `service.name` do not count toward the
+> >   budget
+>
 > *(The dotted-semconv rename landed in the 2026-06-08 amendment; the
 > open fork is whether `confidence.p50` / `confidence.p01` become
 > backend-derived quantiles over the exported histogram rather than
@@ -2601,6 +2622,61 @@ recomputation. The gauges exist so alerting rules and runbooks can
 name them directly per `[§3.1]` rather than spelling out a
 `histogram_quantile(...)` expression at every reference.
 
+> **Amendment (2026-10-27, #1122, maintainer-approved) — bounded
+> per-service tallies.** The in-process state behind the per-`(tenant,
+> service)` gauges (`confidence.p50`, `confidence.p01` and
+> `params.overflow.utilization`) is bounded. `ourios.service` comes from
+> the ingested data, so without a bound that state grows with every
+> distinct `service.name` a source emits, which is §3.2's cardinality
+> hazard applied to our own telemetry.
+>
+> - A miner keeps at most a fixed budget of named `(tenant, service)`
+>   tallies across all its tenants: 4,096, not configurable (a
+>   configuration key is a follow-up). A pair is updated by every line
+>   the miner records for it. When admitting a new pair would exceed
+>   the budget, the least recently updated eighth of the budget (512
+>   pairs) is evicted in one pass, so a flood of new names costs an
+>   amortised O(1) per insert.
+> - The bound is on Ourios's telemetry state only. It is not a
+>   per-tenant cap on `service.name`, and ingest, storage, the tenant
+>   model and every counter and histogram are unchanged. A tenant stays
+>   independent of any attribute in its data.
+> - An evicted pair's gauges stop being reported until the pair is
+>   seen again. They then restart from an empty window: a fresh
+>   reservoir for the quantiles, and fresh line and overflow counts for
+>   the utilization ratio. The gauges are therefore quantiles of the
+>   pair's bounded reservoir window, not of the histogram: this
+>   replaces the "source of truth" sentence above, the matching clause
+>   of RFC0001.8 and the §8 test-plan wording.
+> - Lines without a `service.name` share one slot per tenant, outside
+>   the budget.
+> - Every confidence measurement is still recorded on the
+>   `ourios.miner.confidence` histogram, evicted pair or not. The
+>   histogram keeps a per-pair distribution only while the SDK's
+>   per-instrument cardinality limit allows: past it, excess attribute
+>   sets fold into one `otel.metric.overflow=true` series without
+>   tenant or service resolution.
+>
+> Eviction removes the least recently updated pairs first, an eighth of
+> the budget at a time. A pair therefore survives every eviction while
+> fewer than seven eighths of the budget (3,584) other pairs have been
+> updated since its own last line. Pairs that stopped logging count
+> too until they are evicted, so a service that logs rarely can be
+> evicted by a stream of short-lived services even when few services
+> are active at once. Pairs evicted this way, or by too many
+> concurrently active pairs, lose their gauges at collection time and
+> their overflow counts restart, so per-service overflow detection is
+> lost for them. That is the price of a bounded state. The budget
+> should sit well above the expected number of active pairs, and an
+> eviction count (a follow-up registry metric) makes the churn visible.
+>
+> A tracked pair is covered by the §6.5 / H2.2 per-service overflow
+> alert only if its gauge series is also exported. The SDK's
+> per-instrument cardinality limit applies to the observable gauges
+> too, and service-less tenant series count against it although they
+> sit outside the budget. A pair past that limit folds into the
+> `otel.metric.overflow=true` series without any eviction.
+
 The histogram bucket boundaries are tuned to straddle the decision
 boundary at 1.0 (see §6.3): default buckets
 `[0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0, +Inf]`.
@@ -3114,6 +3190,12 @@ resolves bidirectionally between RFC and tests.
   > - The unit test pinning `ourios.miner.confidence`'s boundaries
   >   pins the amended list, and a recorded `1.0` lands in the
   >   `(0.999, 1.0]` bucket.
+
+  > **Amendment (2026-10-27, #1122, maintainer-approved).** The gauges
+  > track quantiles of each pair's bounded reservoir window (§6.8,
+  > bounded per-service tallies), not the cumulative histogram's. The
+  > tally budget and its eviction order are covered by unit tests in
+  > `ourios-miner`'s metrics module.
 
 - **Data-model contract tests**: small unit tests against the
   `template_id` query semantics that RFC 0002's DSL compiles to.

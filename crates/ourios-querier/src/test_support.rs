@@ -27,6 +27,8 @@ pub(crate) enum Call {
     ListDelimited(String),
     /// A `get_opts` of the key (whole object or a range).
     Get(String),
+    /// A `get_opts` asking only for the key's metadata (`HEAD`).
+    Head(String),
     /// A `get_ranges` of the key.
     GetRanges(String),
 }
@@ -110,7 +112,12 @@ impl ObjectStore for CountingStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        self.record(Call::Get(location.to_string()));
+        let key = location.to_string();
+        self.record(if options.head {
+            Call::Head(key)
+        } else {
+            Call::Get(key)
+        });
         self.inner.get_opts(location, options).await
     }
 

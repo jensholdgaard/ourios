@@ -13,7 +13,7 @@
 //! (`process.memory.usage`, `process.cpu.time`, …), so memory and CPU
 //! pressure show up in Ourios's own telemetry before the kernel acts on it.
 //!
-//! **Logs are dogfooded** (CLAUDE.md §6.3): [`init`] also builds an OTLP
+//! **Logs are dogfooded** (AGENTS.md §6.3): [`init`] also builds an OTLP
 //! `SdkLoggerProvider` and installs a `tracing` subscriber whose
 //! [`OpenTelemetryTracingBridge`] turns every `tracing::info!`/`warn!`/
 //! `error!` event into an `OTel` log record pushed over OTLP — Ourios's
@@ -339,7 +339,7 @@ type BoxedLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry
 /// `tracing` output is not Ourios's own signal. Two reasons, both wanting the
 /// crate silenced in the exported stream:
 ///
-/// - **Telemetry-induced-telemetry loop guard** (`CLAUDE.md` §6.3): the OTLP
+/// - **Telemetry-induced-telemetry loop guard** (`AGENTS.md` §6.3): the OTLP
 ///   exporters are themselves tonic/hyper clients, so their own events **and
 ///   spans** must be muted, or every export would generate more telemetry to
 ///   export.
@@ -641,7 +641,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         None
     };
 
-    // Logs (CLAUDE.md §6.3 dogfooding): `tracing` events → OTel log
+    // Logs (AGENTS.md §6.3 dogfooding): `tracing` events → OTel log
     // records → the OTLP batch exporter. The batch (not simple)
     // processor is load-bearing — a simple/synchronous export deadlocks
     // inside tonic request contexts. Built *before* the meter provider is

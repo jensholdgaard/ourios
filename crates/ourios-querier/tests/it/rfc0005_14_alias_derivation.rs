@@ -192,7 +192,7 @@ async fn cross_file_same_timestamp_tiebreak_retract_first() {
     assert_eq!(resolves_to_a_rows(bucket.path(), "T").await, 3);
 }
 
-/// RFC0005.14 — tenant isolation at the storage layer (`CLAUDE.md`
+/// RFC0005.14 — tenant isolation at the storage layer (`AGENTS.md`
 /// §3.7; RFC0001.14): tenant T2's alias events on disk contribute
 /// nothing to T's derived map — the derivation scans only T's
 /// `audit/tenant_id=T/` partition root.
@@ -225,7 +225,7 @@ async fn second_tenants_alias_events_never_fold_into_the_derived_map() {
 /// `audit/tenant_id=EVIL` is a symlink into another tenant's subtree,
 /// canonicalizing it as the trust anchor would make every foreign file
 /// pass the per-file `starts_with` backstop. The scan anchors trust at
-/// the bucket root instead and fails loudly (`CLAUDE.md` §3.7). Under
+/// the bucket root instead and fails loudly (`AGENTS.md` §3.7). Under
 /// RFC 0019 the local audit scan keeps this canonicalizing `std::fs` walk
 /// (the hybrid's local branch), so the trust-anchor backstop is preserved.
 #[cfg(unix)]

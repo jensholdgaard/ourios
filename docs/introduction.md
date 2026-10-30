@@ -59,6 +59,6 @@ on-disk schema can still move: treat everything as pre-1.0.
   background rather than the specification.
 
 Contributions, RFC discussion, and push-back on the invariants are all
-welcome — `CONTRIBUTING.md` and `CLAUDE.md` in the repository root
+welcome — `CONTRIBUTING.md` and `AGENTS.md` in the repository root
 carry the governing conventions, including the project's intentionally
 fully AI-assisted development process under human maintainer review.

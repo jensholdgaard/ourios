@@ -11,7 +11,7 @@
 # issues directly instead of using GitHub's search index (which lags behind
 # issue creation, so two consecutive failing runs could each believe they were
 # the first and file duplicates), and there is no auto-fix tier — `clippy --fix`
-# cannot make the judgement calls pedantic lints require (CLAUDE.md §6.4).
+# cannot make the judgement calls pedantic lints require (AGENTS.md §6.4).
 #
 # Usage: ci-hygiene-issue.sh <signature> <result> <title>
 #   <signature>  stable key identifying the tracking issue, e.g. `clippy`

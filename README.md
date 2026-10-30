@@ -186,7 +186,7 @@ possible future RFC, and until it runs we claim nothing about it.
 One binary, three roles — **receiver**, **querier**, and the background
 **compactor**. Two orderings are load-bearing: a batch is fsync'd to the
 WAL **before** it is acknowledged and before the miner touches it
-(WAL-before-ack, [`CLAUDE.md`](CLAUDE.md) §3.4), and object storage is
+(WAL-before-ack, [`AGENTS.md`](AGENTS.md) §3.4), and object storage is
 the source of truth — in the S3-backed topology local disk holds only
 the WAL and caches (§3.6).
 
@@ -413,7 +413,7 @@ Ourios is also an experiment in how software gets built: development is
 **intentionally fully AI-assisted** (Claude), with a human maintainer
 owning direction, review, and every merge. AI-authored commits carry
 `Co-Authored-By` trailers and clear the same CI, review, and RFC bar as
-any human contribution — see [`CLAUDE.md`](CLAUDE.md) §9 and the
+any human contribution — see [`AGENTS.md`](AGENTS.md) §9 and the
 "tests are specifications" discipline in §6.2 for how the known failure
 modes are handled.
 

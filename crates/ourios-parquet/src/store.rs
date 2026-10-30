@@ -280,7 +280,7 @@ pub enum StoreConfig {
     /// Local-filesystem backend rooted at the path (dev / test / CI).
     Local(std::path::PathBuf),
     /// S3 / S3-compatible backend — the data + audit store on object storage
-    /// (`CLAUDE.md` §3.6, the production source of truth).
+    /// (`AGENTS.md` §3.6, the production source of truth).
     S3(S3Config),
 }
 

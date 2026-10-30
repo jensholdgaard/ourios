@@ -19,7 +19,7 @@ pub(super) enum Base<'e> {
 }
 
 /// Commit `manifest` to `key` in `store` with the backend-appropriate atomic
-/// swap (CLAUDE.md §3.5 / RFC0009.3 — no torn read either way):
+/// swap (AGENTS.md §3.5 / RFC0009.3 — no torn read either way):
 ///
 /// - **First commit (any backend):** a create-if-absent conditional PUT
 ///   ([`Manifest::publish_cas`] with no `ETag`); a peer that created the

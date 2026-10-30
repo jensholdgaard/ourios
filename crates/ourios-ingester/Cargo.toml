@@ -27,7 +27,7 @@ doctest = false
 # tests/rfc0014_5_crash_no_loss.rs — mirrors receiver_crash_fixture but wires
 # the miner to a ParquetRecordSink, so the acked-but-un-flushed records sit in
 # the volatile buffer at crash time and recovery must rebuild them from the WAL
-# (RFC0014.5 / CLAUDE.md §3.4).
+# (RFC0014.5 / AGENTS.md §3.4).
 [[bin]]
 name = "receiver_sink_crash_fixture"
 path = "tests/fixtures/receiver_sink_crash_fixture.rs"
@@ -81,7 +81,7 @@ async-trait = "=0.1.92"
 # Structured per-connection handshake-failure logs on the TLS listeners.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The ingest pipeline's WAL-before-ack durability (RFC 0003 §6.5 /
-# CLAUDE.md §3.4): append the OtlpBatch frame + fsync before acking.
+# AGENTS.md §3.4): append the OtlpBatch frame + fsync before acking.
 ourios-wal = { path = "../ourios-wal" }
 # The Drain-derived template miner the pipeline hands per-tenant records
 # to after they are durable (RFC 0003 §6.5 step 5).
@@ -135,7 +135,7 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 tower = { version = "0.5", default-features = false }
 http = { version = "1", default-features = false, features = ["std"] }
 # gzip decode for OTLP/HTTP `Content-Encoding: gzip` (an OTLP MUST,
-# RFC0003.13). Pure-Rust backend — no zlib C dependency (CLAUDE.md).
+# RFC0003.13). Pure-Rust backend — no zlib C dependency (AGENTS.md).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # gRPC transport (RFC 0003 §6.2): the `LogsService` server. `codegen` for
 # the generated `#[async_trait]` + `Request`/`Response`/`Status`; no

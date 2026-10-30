@@ -58,7 +58,7 @@ pub struct AuditCtx<'a> {
 }
 
 impl AuditCtx<'_> {
-    /// RFC0015.1 — `CLAUDE.md` §3.1 "every merge emits an audit event with
+    /// RFC0015.1 — `AGENTS.md` §3.1 "every merge emits an audit event with
     /// old + new templates" (RFC 0001 H1.3), checked against what one ingest
     /// actually did to the tree, given everything the audit sink received
     /// during it:
@@ -95,19 +95,19 @@ impl AuditCtx<'_> {
         let orphans: Vec<u64> = by_id.into_keys().collect();
         assert!(
             orphans.is_empty(),
-            "RFC0015.1 / CLAUDE.md §3.1: line {}: template events for ids {orphans:?}, which have no leaf",
+            "RFC0015.1 / AGENTS.md §3.1: line {}: template events for ids {orphans:?}, which have no leaf",
             self.index,
         );
     }
 
-    /// RFC0015.1 — `CLAUDE.md` §3.1 / §3.7: an audit event names the tenant
+    /// RFC0015.1 — `AGENTS.md` §3.1 / §3.7: an audit event names the tenant
     /// whose ingest caused it (RFC 0001 H1.3). Checked on every drained event,
     /// before any grouping drops the field.
     fn assert_events_name_tenant(&self, events: &[AuditEvent]) {
         for event in events {
             assert!(
                 event.tenant_id == *self.tenant,
-                "RFC0015.1 / CLAUDE.md §3.1/§3.7: line {}: audit event {:?} names tenant {:?}, but the \
+                "RFC0015.1 / AGENTS.md §3.1/§3.7: line {}: audit event {:?} names tenant {:?}, but the \
                  ingest that emitted it was tenant {:?}",
                 self.index,
                 event.payload,
@@ -195,7 +195,7 @@ impl LeafAudit<'_> {
         );
         assert!(
             version == 1 && audited,
-            "RFC0015.1 / CLAUDE.md §3.1: line {}: new template {} (v{version}, {expected:?}) must be \
+            "RFC0015.1 / AGENTS.md §3.1: line {}: new template {} (v{version}, {expected:?}) must be \
              audited by exactly one `Created` event with its tokens; got {:?}",
             self.index,
             self.id,
@@ -211,13 +211,13 @@ impl LeafAudit<'_> {
         for change in self.changes {
             let step = version_step(change).unwrap_or_else(|| {
                 panic!(
-                    "RFC0015.1 / CLAUDE.md §3.1: line {}: template {} already existed but got {change:?}",
+                    "RFC0015.1 / AGENTS.md §3.1: line {}: template {} already existed but got {change:?}",
                     self.index, self.id,
                 )
             });
             assert!(
                 step.0 == version && step.1 == version + 1 && step.2 == template,
-                "RFC0015.1 / CLAUDE.md §3.1: line {}: template {} event {change:?} does not continue \
+                "RFC0015.1 / AGENTS.md §3.1: line {}: template {} event {change:?} does not continue \
                  from v{version} {template:?}",
                 self.index,
                 self.id,
@@ -231,7 +231,7 @@ impl LeafAudit<'_> {
         let new_tokens = &self.after.tokens;
         assert!(
             typed.tokens == *new_tokens,
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {}: replaying the declared widenings on the \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {}: replaying the declared widenings on the \
              leaf before the ingest gives {:?}, but the leaf after it is {new_tokens:?} — a token \
              changed that no audit event declares",
             self.index,
@@ -240,7 +240,7 @@ impl LeafAudit<'_> {
         );
         assert!(
             typed.slot_types == self.after.slot_types,
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {}: replaying the declared widenings and \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {}: replaying the declared widenings and \
              type expansions gives slot types {:?}, but the leaf after the ingest has {:?} — a slot \
              type changed that no audit event declares",
             self.index,
@@ -251,7 +251,7 @@ impl LeafAudit<'_> {
         let expected = format_template(new_tokens);
         assert!(
             version == new_version && template == expected,
-            "RFC0015.1 / CLAUDE.md §3.1: line {}: template {} moved v{old_version}→v{new_version} \
+            "RFC0015.1 / AGENTS.md §3.1: line {}: template {} moved v{old_version}→v{new_version} \
              ({expected:?}) but its audit events only account for v{old_version}→v{version} \
              ({template:?}) — a merge without its audit event",
             self.index,
@@ -300,7 +300,7 @@ impl LeafAudit<'_> {
         let printed = format_template(&typed.tokens);
         assert_eq!(
             &printed, new_template,
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} event {change:?} does not match its declared \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {} event {change:?} does not match its declared \
              positions applied to the typed template",
             self.index, self.id,
         );
@@ -309,7 +309,7 @@ impl LeafAudit<'_> {
     fn replay_widening(&self, typed: &mut LeafState, positions: &[u16]) {
         assert!(
             positions.windows(2).all(|pair| pair[0] < pair[1]),
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} declares positions_widened {positions:?}, \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {} declares positions_widened {positions:?}, \
              which is not strictly increasing",
             self.index,
             self.id,
@@ -331,14 +331,14 @@ impl LeafAudit<'_> {
             .count();
         let line_type = self.line_types.get(position).copied().unwrap_or_else(|| {
             panic!(
-                "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} widened position {position}, which the \
+                "RFC0015.10 / AGENTS.md §3.1: line {}: template {} widened position {position}, which the \
                  line has no token at",
                 self.index, self.id,
             )
         });
         assert!(
             ordinal <= typed.slot_types.len(),
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} has {} slot types for more wildcards — \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {} has {} slot types for more wildcards — \
              slot types out of step with the template",
             self.index,
             self.id,
@@ -356,7 +356,7 @@ impl LeafAudit<'_> {
         indices.dedup();
         assert!(
             !slots.is_empty() && indices.len() == slots.len(),
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion declares {slots:?}: it must \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {} type expansion declares {slots:?}: it must \
              name at least one slot, each at most once",
             self.index,
             self.id,
@@ -376,14 +376,14 @@ impl LeafAudit<'_> {
             .get_mut(usize::from(*slot_index))
             .unwrap_or_else(|| {
                 panic!(
-                    "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion names slot \
+                    "RFC0015.10 / AGENTS.md §3.1: line {}: template {} type expansion names slot \
                      {slot_index}, which does not exist",
                     self.index, self.id,
                 )
             });
         assert!(
             !added_types.is_empty(),
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion of slot {slot_index} adds \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {} type expansion of slot {slot_index} adds \
              no type",
             self.index,
             self.id,
@@ -391,7 +391,7 @@ impl LeafAudit<'_> {
         for &added in added_types {
             assert!(
                 !slot.contains(added),
-                "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion of slot {slot_index} \
+                "RFC0015.10 / AGENTS.md §3.1: line {}: template {} type expansion of slot {slot_index} \
                  adds {added:?}, which the slot already had",
                 self.index,
                 self.id,
@@ -403,14 +403,14 @@ impl LeafAudit<'_> {
     fn widen_typed(&self, typed: &mut [OwnedToken], position: usize) {
         let token = typed.get_mut(position).unwrap_or_else(|| {
             panic!(
-                "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} declares widened position {position} \
+                "RFC0015.10 / AGENTS.md §3.1: line {}: template {} declares widened position {position} \
                  past its end",
                 self.index, self.id,
             )
         });
         assert!(
             matches!(token, OwnedToken::Fixed(_)),
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} declares position {position} widened, \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {} declares position {position} widened, \
              but it was already a wildcard",
             self.index,
             self.id,
@@ -418,7 +418,7 @@ impl LeafAudit<'_> {
         *token = OwnedToken::Wildcard;
     }
 
-    /// RFC0015.10 — `CLAUDE.md` §3.1 for every link of the chain, including
+    /// RFC0015.10 — `AGENTS.md` §3.1 for every link of the chain, including
     /// versions no emitted row was stamped with: a widening turns exactly its
     /// declared positions into wildcards and changes nothing else; a type
     /// expansion changes no token at all.
@@ -436,7 +436,7 @@ impl LeafAudit<'_> {
                 ..
             } => assert_eq!(
                 old_template, new_template,
-                "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion changed its tokens",
+                "RFC0015.10 / AGENTS.md §3.1: line {}: template {} type expansion changed its tokens",
                 self.index, self.id,
             ),
             _ => {}
@@ -452,14 +452,14 @@ impl LeafAudit<'_> {
         assert_eq!(
             old_tokens.len(),
             new_tokens.len(),
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} widening {old:?} → {new:?} changed length",
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {} widening {old:?} → {new:?} changed length",
             self.index,
             self.id,
         );
         let declared: Vec<usize> = positions.iter().map(|&p| usize::from(p)).collect();
         assert!(
             !declared.is_empty() && declared.iter().all(|&p| new_tokens.get(p) == Some(&"<*>")),
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} widening {old:?} → {new:?} declares \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {} widening {old:?} → {new:?} declares \
              positions {positions:?} that are not all wildcards afterwards",
             self.index,
             self.id,
@@ -473,7 +473,7 @@ impl LeafAudit<'_> {
             .collect();
         assert!(
             changed.iter().all(|p| declared.contains(p)),
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} widening {old:?} → {new:?} changed \
+            "RFC0015.10 / AGENTS.md §3.1: line {}: template {} widening {old:?} → {new:?} changed \
              positions {changed:?}, outside its declared {positions:?} — a merge that rewrites a literal",
             self.index,
             self.id,

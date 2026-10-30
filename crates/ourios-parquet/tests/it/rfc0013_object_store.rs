@@ -303,7 +303,7 @@ async fn rfc0013_4_manifest_swap_via_conditional_put() {
 }
 
 /// Scenario RFC0013.5 — operations in tenant X's context address only X's key
-/// sub-prefix; no read/write touches tenant Y's keys (`CLAUDE.md` §3.7).
+/// sub-prefix; no read/write touches tenant Y's keys (`AGENTS.md` §3.7).
 /// See `docs/rfcs/0013-object-storage.md` §5.
 #[test]
 fn rfc0013_5_tenant_isolation_across_prefix() {

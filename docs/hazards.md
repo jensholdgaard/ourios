@@ -1,6 +1,6 @@
 # Hazards
 
-> Referenced from `CLAUDE.md` §4 ("Before any change to the hot path,
+> Referenced from `AGENTS.md` §4 ("Before any change to the hot path,
 > re-read `docs/hazards.md`") and §10 ("When in doubt: 1. Read
 > `docs/hazards.md`"). This document is the load-bearing reading for
 > any hot-path reviewer. Each hazard names a specific failure mode,
@@ -20,7 +20,7 @@
   cannot be silenced without an RFC. They exist precisely so the
   failure mode is visible *before* it corrupts data.
 
-Hazards map onto invariants in `CLAUDE.md` §3. Hazards describe what
+Hazards map onto invariants in `AGENTS.md` §3. Hazards describe what
 goes wrong; invariants describe what we promised. They are two faces
 of the same constraint.
 
@@ -55,7 +55,7 @@ operator never knows.
   the old template, the new template, tenant, timestamp, and reason.
 
 **Detection.** All metrics carry `ourios.tenant`; some also carry
-`ourios.service`. The `CLAUDE.md` §3.1 short names map to the emitted
+`ourios.service`. The `AGENTS.md` §3.1 short names map to the emitted
 instruments as shown in brackets.
 - `merges_total` (`ourios.miner.merges` counter): spike on stable
   input → service-version change *or* threshold drift.
@@ -75,7 +75,7 @@ binary has no per-tenant miner settings and a fixed masking rule set
 code change to the miner defaults or masking rules. A spike across
 many tenants on a stable corpus is a policy question — RFC.
 
-**See also.** `CLAUDE.md` §3.1; `docs/rfcs/0001-template-miner.md`
+**See also.** `AGENTS.md` §3.1; `docs/rfcs/0001-template-miner.md`
 §§6.3–6.4; `docs/benchmarks.md` C2 (template count convergence),
 C3 (merge rate).
 
@@ -116,7 +116,7 @@ per-parameter byte limit above guards the *string* path only. A structured (non-
 `gen_ai.input.messages` array, any `AnyValue` kvlist/array — is
 retained **whole** as canonical JSON in the `body` column and is **not**
 capped: truncating it would violate the bit-identical-reconstruction
-invariant (`CLAUDE.md` §3.3). Crucially, this hazard's failure mode —
+invariant (`AGENTS.md` §3.3). Crucially, this hazard's failure mode —
 dictionary-encoding collapse — does not apply to `body`: the Parquet
 writer **disables the dictionary on the `body` column by design**
 (`crates/ourios-parquet/src/writer.rs` §3.6 — bodies are unbounded and
@@ -133,7 +133,7 @@ repo; RFC 0036's write-side row-group/file sizing bounds the on-disk
 footprint. The fix for an oversized structured body is at the emitter
 (redaction/truncation before export), not a store-side cap.
 
-**See also.** `CLAUDE.md` §3.2, §3.3; RFC 0001 §6.5; RFC 0037;
+**See also.** `AGENTS.md` §3.2, §3.3; RFC 0001 §6.5; RFC 0037;
 benchmarks C4.
 
 ---
@@ -177,7 +177,7 @@ the data was accepted; we have lost data we promised to keep.
 faster storage. Ack-without-fsync ever observed in code review → P0
 bug, hotfix path.
 
-**See also.** `CLAUDE.md` §3.4; RFC 0008 (WAL design); RFC 0052;
+**See also.** `AGENTS.md` §3.4; RFC 0008 (WAL design); RFC 0052;
 benchmark D2 (compaction keeps up).
 
 ---
@@ -220,7 +220,7 @@ logs" and lose faith in the backend.
 compaction tuning. Sustained small-file emission across the cluster
 → ingest-scaling block, RFC.
 
-**See also.** `CLAUDE.md` §4 hazard 4; benchmarks D3.
+**See also.** `AGENTS.md` §4 hazard 4; benchmarks D3.
 
 ---
 
@@ -255,7 +255,7 @@ volume and misdiagnoses it as an outage.
 aliases or cycles) → revisit alias semantics, RFC. Drift correlated
 with deploys → expected; not an alert.
 
-**See also.** `CLAUDE.md` §3.5; RFC 0001 §6.7; RFC 0010 (drift
+**See also.** `AGENTS.md` §3.5; RFC 0001 §6.7; RFC 0010 (drift
 queries over the audit stream).
 
 ---
@@ -292,7 +292,7 @@ intended to sign.
 Recurring temptation in implementation → tighten the API boundary,
 move shared helpers behind a non-exported module.
 
-**See also.** `CLAUDE.md` §4 hazard 6; RFC 0002.
+**See also.** `AGENTS.md` §4 hazard 6; RFC 0002.
 
 ---
 
@@ -329,7 +329,7 @@ Whitespace-capture state machine becomes a complexity sink →
 simplify by retaining more bodies; the storage cost is real but
 acceptable, lying to the user is not.
 
-**See also.** `CLAUDE.md` §3.3; RFC 0001 §6.6; benchmarks C1.
+**See also.** `AGENTS.md` §3.3; RFC 0001 §6.6; benchmarks C1.
 
 ---
 
@@ -353,7 +353,7 @@ re-architecture of its durability layer.
 
 **Mitigation.**
 - *Currently:* not a concern. Ourios does not replicate at ingest.
-  Per `CLAUDE.md` §3.4, durability is per-ingester fsync on the
+  Per `AGENTS.md` §3.4, durability is per-ingester fsync on the
   WAL; per §3.6, object storage is the long-term truth.
   Replication, if introduced later, is "in addition to the WAL,
   not instead of it."
@@ -385,7 +385,7 @@ this hazard. Time-window dedup proposed → block, redirect to a
 content-keyed approach. Storage multiplier > 1.05 on a single-
 replica deployment → P0 investigation, something is double-writing.
 
-**See also.** `CLAUDE.md` §3.4 (WAL durability), §3.6 (object
+**See also.** `AGENTS.md` §3.4 (WAL durability), §3.6 (object
 storage as truth). Cautionary tale: Grafana Loki's 2026
 re-architecture replacing replicate-at-ingest with
 Kafka-as-durability (InfoQ news, April 2026).
@@ -405,4 +405,4 @@ hold:
   committed RFC.
 
 A new hazard is added via a `meta:` RFC, the same path as changes
-to `CLAUDE.md` §3 invariants.
+to `AGENTS.md` §3 invariants.

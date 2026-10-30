@@ -2,7 +2,7 @@
 #
 # Run `just` (no args) to see all available recipes.
 # `just check` is the one-command pre-merge gate that mirrors
-# `CLAUDE.md` §6.6 ("Forced verification before done").
+# `AGENTS.md` §6.6 ("Forced verification before done").
 #
 # Install on macOS: `brew install just`
 # Install elsewhere: https://github.com/casey/just#packages
@@ -42,7 +42,7 @@ test:
 book:
     mdbook build
 
-# Fail when a cited `AGENTS.md §N` / `CLAUDE.md §N` section no longer
+# Fail when a cited `AGENTS.md §N` / `AGENTS.md §N` section no longer
 # exists (RFC0057.4). CI runs the same script in the `book` job.
 agents-citations:
     .github/scripts/check-agents-citations.sh
@@ -283,7 +283,7 @@ dogfood-env:
     #!/usr/bin/env bash
     cat <<'ENV'
     export OTEL_LOGS_EXPORTER=otlp
-    export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only (CLAUDE.md §1)
+    export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only (AGENTS.md §1)
     export OTEL_TRACES_EXPORTER=otlp
     # http/protobuf, matching docs/guides/agent-telemetry.md — the broadly
     # compatible default (not every source speaks OTLP/gRPC).

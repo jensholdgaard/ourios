@@ -1,4 +1,4 @@
-//! RFC 0001 §5.2 — Invariants. Acceptance criteria for CLAUDE.md §3.1,
+//! RFC 0001 §5.2 — Invariants. Acceptance criteria for AGENTS.md §3.1,
 //! §3.2, §3.3, §3.5, §3.7. Each `#[test]` carries the scenario id in its
 //! doc comment so `grep -R "§3.1.1" .` resolves bidirectionally between
 //! the RFC and the tests (`docs/verification.md` §2.3).

@@ -364,7 +364,7 @@ impl<'a> ResolvedAuditSet<'a> {
     /// Stream every [`AuditEvent`] in this resolved set to `visit`, in SCAN
     /// order — (file path lexicographic, within-file row index), the order
     /// the §3.7.1 timestamp sort uses as its tiebreak — applying the
-    /// **row-level tenant backstop** (`CLAUDE.md` §3.7 / RFC 0005 §3.9
+    /// **row-level tenant backstop** (`AGENTS.md` §3.7 / RFC 0005 §3.9
     /// row-vs-path): the listing/walk is already tenant-scoped, so a row
     /// claiming another tenant is a corrupt or foreign file — fail loudly
     /// rather than fold (or silently drop) it. A local file is read with

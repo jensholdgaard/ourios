@@ -1,7 +1,7 @@
 //! The query IR — the single core both front-ends (the string DSL and the
 //! structured JSON surface) parse into (RFC 0002 §6.4). Typed enums mirror
 //! the §7 grammar exactly; no `datafusion`/`arrow`/SQL type appears here
-//! (hazard `CLAUDE.md` §4.6).
+//! (hazard `AGENTS.md` §4.6).
 
 /// A top-level statement — either a log-record query (the RFC 0002
 /// `predicate { | stage }` pipeline) or a RFC 0010 `drift` query over the

@@ -3,7 +3,7 @@
 # or `CLAUDE.md §N` section that AGENTS.md no longer has (RFC0057.4).
 #
 # AGENTS.md section numbers are frozen (RFC 0057 §3.1) and hundreds of files
-# cite them, many through the `CLAUDE.md` stub that imports AGENTS.md. A
+# cite them; historical RFCs still use the old `CLAUDE.md §N` spelling. A
 # citation resolves to an `## N.` / `### N.M` heading, or to item M of the
 # numbered list in §2 (pillars) or §4 (hazards), e.g. `§2.1`, `§4.6`.
 set -euo pipefail

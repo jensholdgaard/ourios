@@ -5,7 +5,7 @@
 //!
 //! - a **string** body renders from its versioned template tokens (looked up
 //!   in the read-time registry) + params + separators — bit-identical when the
-//!   row is clean (`CLAUDE.md` §3.3), or the retained `body` verbatim when the
+//!   row is clean (`AGENTS.md` §3.3), or the retained `body` verbatim when the
 //!   row is lossy / a parse failure / not in the registry;
 //! - a **structured** body (`body_kind = Structured` — any non-`String` OTLP
 //!   `AnyValue`: kvlist / array *and* scalars like int / bool / bytes) is
@@ -29,7 +29,7 @@ use crate::TemplateRegistry;
 /// One returned query row — a faithful OTLP `LogRecord` (RFC 0017 §3.4).
 ///
 /// Every field is Ourios-owned (no `arrow` / `DataFusion` / SQL type crosses
-/// this boundary — hazard `CLAUDE.md` §4.6 / RFC0017.7); `KeyValue` / `AnyValue`
+/// this boundary — hazard `AGENTS.md` §4.6 / RFC0017.7); `KeyValue` / `AnyValue`
 /// are the `opentelemetry-proto` types Ourios already re-exports through
 /// `ourios_core::otlp`, not engine types. It mirrors the stored
 /// [`MinedRecord`] field-for-field over the OTLP `LogRecord` set (RFC 0005 §3.2),

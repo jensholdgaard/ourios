@@ -110,4 +110,4 @@ driver certifies origin.
   runs git-cliff over the conventional commit messages on `main`, so your commit
   message (or squashed PR title) is your changelog entry.
 
-See `CLAUDE.md` for architecture context and `CODE_OF_CONDUCT.md` for community expectations.
+See `AGENTS.md` for architecture context and `CODE_OF_CONDUCT.md` for community expectations.

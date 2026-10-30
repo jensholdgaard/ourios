@@ -26,7 +26,7 @@
 //!   tree before and after (§3.1 "every merge emits an audit event", RFC 0001
 //!   H1.3); checked after each ingest against an observable audit sink.
 //!
-//! Every violation panics with a greppable `RFC0015.N / CLAUDE.md §3.x`
+//! Every violation panics with a greppable `RFC0015.N / AGENTS.md §3.x`
 //! message, which libFuzzer reports as a crash.
 
 use libfuzzer_sys::fuzz_target;

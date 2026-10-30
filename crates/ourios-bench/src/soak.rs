@@ -3,7 +3,7 @@
 //!
 //! Drives the **real** ingest path in-process — OTLP export →
 //! [`IngestPipeline`] → group-commit WAL fsync (100 ms window,
-//! `CLAUDE.md` §3.4) → miner → Parquet record sink on a local [`Store`]
+//! `AGENTS.md` §3.4) → miner → Parquet record sink on a local [`Store`]
 //! over a tempdir — at a paced target rate, while a sampler interleaves
 //! manual compaction sweeps ([`run_sweep`]) and records the WAL +
 //! compaction backlog over time.

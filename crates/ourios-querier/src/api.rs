@@ -19,7 +19,7 @@ use super::*;
 pub struct QueryRequest {
     /// Tenant whose data the query is scoped to. Enforced
     /// structurally — the querier only ever reads under this
-    /// tenant's partition directory (`CLAUDE.md` §3.7; RFC0007.5).
+    /// tenant's partition directory (`AGENTS.md` §3.7; RFC0007.5).
     pub tenant: TenantId,
     /// Optional `[start, end)` bounds over the **effective** timestamp
     /// (`effective_time_unix_nano`, falling back to `time_unix_nano` for

@@ -332,7 +332,7 @@ pub(crate) fn pick_trace_pair(corpus_dir: &std::path::Path) -> Option<(String, u
 pub(crate) struct TemplatePair {
     pub(crate) template_id: u64,
     /// The template's constant text: contained in every one of the
-    /// template's rows (bit-identical reconstruction, `CLAUDE.md` §3.3)
+    /// template's rows (bit-identical reconstruction, `AGENTS.md` §3.3)
     /// and — validated against the corpus — in NO other line, so the two
     /// queries select identical row sets.
     pub(crate) needle: String,
@@ -487,7 +487,7 @@ pub(crate) fn eligible_template_candidates<'a>(
 /// - the count of corpus lines containing the needle equals the
 ///   template's row count (an Ourios count query, `template_id == N`,
 ///   no limit) — every template row contains its constant text
-///   (bit-identical reconstruction, `CLAUDE.md` §3.3), so count-equality
+///   (bit-identical reconstruction, `AGENTS.md` §3.3), so count-equality
 ///   proves the needle selects exactly the template's rows and nothing
 ///   else;
 /// - every RENDERED template row actually contains the needle — the

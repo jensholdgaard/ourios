@@ -2,18 +2,18 @@
 
 > **Status:** active. This document is the process spec. The two
 > amendments recorded at the bottom of this file — to
-> `docs/rfcs/README.md` and `CLAUDE.md` — have been applied: the RFC
+> `docs/rfcs/README.md` and `CLAUDE.md` (now `AGENTS.md`) — have been applied: the RFC
 > process now carries the five-stage maturity model and the §5
-> *Acceptance criteria* section, and `CLAUDE.md` has §5.6
+> *Acceptance criteria* section, and `AGENTS.md` has §5.6
 > *Verification process*. Those sections are kept as the record of
 > what changed and why.
 
 ## What this doc is for
 
-The Ourios docs already define invariants (`CLAUDE.md` §3), hazards
+The Ourios docs already define invariants (`AGENTS.md` §3), hazards
 (`docs/hazards.md`), per-RFC testing strategies (RFC §6 — see §2.5),
 thesis-gates (`docs/benchmarks.md`), and the project's testing
-discipline (`CLAUDE.md` §6.2). What is missing is the **described
+discipline (`AGENTS.md` §6.2). What is missing is the **described
 process** that connects them: how a contributor (human or agent) takes
 a §3 invariant or an H-x hazard, turns it into reviewable acceptance
 criteria, turns those into red tests, drives them green, and gates an
@@ -54,7 +54,7 @@ on the third (`RFC`). An RFC enumerates the invariants and hazards it
 touches in its §1 *Summary*; reviewers verify the enumeration is
 exhaustive at the *Drafted → Specified* gate.
 
-**Invariant → RFC.** A `CLAUDE.md` §3 invariant is a project-level
+**Invariant → RFC.** A `AGENTS.md` §3 invariant is a project-level
 promise. Until an RFC operationalises it, the invariant is a known
 debt. §4 *Entry points* describes the three doors into this chain.
 
@@ -80,7 +80,7 @@ spec.
 
 **Red tests → Green tests.** Implementation lands; each stub becomes a
 real test that passes; unit, property, and corpus tests cover the
-scenario as `CLAUDE.md` §6.2 dictates. The *Green* gate confirms every
+scenario as `AGENTS.md` §6.2 dictates. The *Green* gate confirms every
 §5 acceptance criterion has a matching passing test.
 
 **Green tests → Validated.** The thesis-gates in `benchmarks.md` §7
@@ -110,7 +110,7 @@ And` pattern:
 
 The format is the markdown the project already uses, not Gherkin. We
 do not adopt `.feature` files, cucumber-rs, or any other BDD tooling:
-the test code is Rust (`CLAUDE.md` §6.2), and the scenario lives in
+the test code is Rust (`AGENTS.md` §6.2), and the scenario lives in
 the RFC where reviewers are already reading. A second source of truth
 — a `.feature` file checked separately — would drift, and the tooling
 does not pay for itself at our scale.
@@ -123,7 +123,7 @@ at a glance:
 - `H<n>.<m>` — hazard-rooted; `H1.1` is the first scenario defending
   hazard H1.
 - `§3.<n>.<m>` — invariant-rooted; `§3.4.2` is the second scenario
-  defending `CLAUDE.md` §3.4 (WAL-before-ack).
+  defending `AGENTS.md` §3.4 (WAL-before-ack).
 - `RFC<NNNN>.<m>` — RFC-internal; reserved for scenarios that defend
   an RFC's own design decisions, not a numbered invariant or hazard.
   Example: `RFC0001.3` for a Drain3-extension behaviour that is not
@@ -207,7 +207,7 @@ gate to *Specified* is a peer reviewer saying "yes, this design is
 what we want — now write down the contract."
 
 **Specified.** §5 *Acceptance criteria* is filled. Every invariant in
-`CLAUDE.md` §3 and every hazard in `hazards.md` that the RFC touches
+`AGENTS.md` §3 and every hazard in `hazards.md` that the RFC touches
 has at least one numbered scenario. §6 *Testing strategy* references
 those scenarios and names the technique (`proptest`, corpus,
 `criterion`) for each. The reviewer asks one question: *could a
@@ -257,7 +257,7 @@ stub with a matching id, the stub is tagged `#[ignore]`, and
 
 **Green.** Implementation lands. Every stub becomes a real test;
 unit, property, and corpus tests cover their scenarios as
-`CLAUDE.md` §6.2 dictates. `cargo test --all-features` passes. The
+`AGENTS.md` §6.2 dictates. `cargo test --all-features` passes. The
 reviewer confirms each §5 criterion now resolves to a passing test
 (the greppability contract makes this mechanical). No performance
 claim is made yet.
@@ -330,7 +330,7 @@ loop developers already know.
 
 The same machinery, three doors:
 
-- **Invariant entry** — an item in `CLAUDE.md` §3. The criteria live
+- **Invariant entry** — an item in `AGENTS.md` §3. The criteria live
   in the RFC that operationalises that invariant; if no RFC yet exists
   for the relevant subsystem, the invariant is a known debt and the
   next RFC for that subsystem must address it.
@@ -358,13 +358,13 @@ the performance owner.
 A concrete trace of the chain in §1, against an artefact that already
 exists. RFC 0001 *Template miner* was `status: draft` when this example
 was written; it has since moved through every maturity stage and is
-`accepted`. Its operationalisation of `CLAUDE.md` §3.1 *No silent template
+`accepted`. Its operationalisation of `AGENTS.md` §3.1 *No silent template
 merges* and `hazards.md` H1 *Template miner correctness* is the first
 place this process gets to bite on real material.
 
 ### 6.1 Invariant → RFC
 
-`CLAUDE.md` §3.1 promises:
+`AGENTS.md` §3.1 promises:
 
 > A template merge that crosses semantic boundaries (e.g. merging
 > "user logged in" with "user logged out" because they share token
@@ -412,7 +412,7 @@ The *Specified* gate adds a new §5 to RFC 0001:
 
 Three scenarios cover §3.1's three rules: do not merge across
 semantics, retain bodies on low confidence, audit every widening.
-Reviewers ratify that this is exhaustive against `CLAUDE.md` §3.1 and
+Reviewers ratify that this is exhaustive against `AGENTS.md` §3.1 and
 H1; they do not catalogue every edge-case test the implementation
 will write.
 
@@ -497,7 +497,7 @@ needs to be redrawn before more code is written on top of it.
 ## 7. What this doc is *not*
 
 - Not test-tooling guidance — `proptest`, `criterion`, etc. live in
-  `CLAUDE.md` §6.2.
+  `AGENTS.md` §6.2.
 - Not a coverage policy — Ourios is a correctness project; line
   coverage is the wrong metric.
 - Not an agent-instruction file — agents follow it because it is

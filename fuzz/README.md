@@ -102,8 +102,8 @@ sys.stdout.buffer.write(b"".join(struct.pack("<H",len(b))+b for b in bodies))' \
 ## Triage a crash
 
 1. Reproduce: `cargo +nightly-2026-06-01 fuzz run <target> fuzz/artifacts/<target>/crash-…`.
-   The panic message names the invariant (`RFC0015.N / CLAUDE.md §3.x`).
+   The panic message names the invariant (`RFC0015.N / AGENTS.md §3.x`).
 2. Minimise: `cargo +nightly-2026-06-01 fuzz tmin <target> fuzz/artifacts/<target>/crash-…`.
 3. Commit the minimised input as `fuzz/seeds/<target>/regression_<issue>_<n>`,
-   then fix the bug. The seed stays forever (RFC 0015 §3.5, `CLAUDE.md` §6.2);
+   then fix the bug. The seed stays forever (RFC 0015 §3.5, `AGENTS.md` §6.2);
    a run must never pass by removing it.

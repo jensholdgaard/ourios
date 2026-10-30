@@ -1011,7 +1011,7 @@ pub mod lenient_json {
 
     /// [`from_slice`], also reporting WHICH path parsed: `true` means
     /// the direct parse failed and the lenient retry succeeded — the
-    /// observability hook (`CLAUDE.md` §6.3) that lets the receiver
+    /// observability hook (`AGENTS.md` §6.3) that lets the receiver
     /// count lenient decodes (`ourios.ingest.json.lenient` on the
     /// batches counter) so operators see upstream-rejected-but-valid
     /// payloads arriving, and so the shim's dormancy is visible once

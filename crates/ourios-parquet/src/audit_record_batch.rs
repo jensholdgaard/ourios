@@ -909,7 +909,7 @@ mod tests {
     /// rejection is retired now that the `alias_*` columns exist, so
     /// the writer maps kinds 4–5 instead of erroring. The old test's
     /// assertion ("alias events are not persistable") is exactly the
-    /// behaviour the amendment removes (`CLAUDE.md` §6.2).
+    /// behaviour the amendment removes (`AGENTS.md` §6.2).
     #[test]
     fn alias_events_build_a_batch_with_kinds_4_and_5() {
         use arrow_array::cast::AsArray;

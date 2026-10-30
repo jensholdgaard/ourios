@@ -9,7 +9,7 @@ project spaces.
 
 1. **Contributions are judged on their merit.** Code, designs, RFCs, and
    reviews stand or fall on technical quality, correctness, and fit with the
-   project's stated direction ([`CLAUDE.md`](CLAUDE.md),
+   project's stated direction ([`AGENTS.md`](AGENTS.md),
    [`docs/rfcs/`](docs/rfcs/)). Nothing about the contributor is a factor.
 2. **Keep it professional.** Disagree with ideas, not people. Keep discussion
    on the work. Personal attacks, harassment, and deliberate disruption are

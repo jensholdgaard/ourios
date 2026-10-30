@@ -1,4 +1,4 @@
-//! Ingest write-path wall-clock benches (`CLAUDE.md` §6.2 hot paths:
+//! Ingest write-path wall-clock benches (`AGENTS.md` §6.2 hot paths:
 //! OTLP → WAL, WAL → Parquet). Supportive, **indicative** evidence — run on
 //! the CI runner first (see the `bench-on-ci-runner-first` discipline); the
 //! authoritative baseline-hardware numbers are a separate, opt-in run.

@@ -31,7 +31,7 @@ env:
   TENANT: ourios-smoke
   S3_BUCKET: ourios-smoke
   # The log line we ingest and expect the querier to reconstruct bit-identically
-  # from its template + params (CLAUDE.md §3.3; the #302 audit-event fix).
+  # from its template + params (AGENTS.md §3.3; the #302 audit-event fix).
   LOG_BODY: user 1 logged in
 
 jobs:
@@ -188,7 +188,7 @@ jobs:
           for _ in $(seq 1 30); do if (echo > /dev/tcp/127.0.0.1/4319) >/dev/null 2>&1; then break; fi; sleep 1; done
           # Succeed only once the row is back AND its body reconstructs to the
           # ingested line — exercises the full path (audit template events →
-          # read-time registry → bit-identical render; CLAUDE.md §3.3 / #302),
+          # read-time registry → bit-identical render; AGENTS.md §3.3 / #302),
           # not just that a row exists. Audit events flush before the data (the
           # sink's audit barrier), so a visible row implies a derivable registry.
           rows=0; line=""; recon=""

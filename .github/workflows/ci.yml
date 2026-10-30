@@ -1,6 +1,6 @@
 name: CI
 
-# Mirrors the verification list in CLAUDE.md §6.6. Runs on every PR
+# Mirrors the verification list in AGENTS.md §6.6. Runs on every PR
 # and push to main. Cargo jobs operate on the workspace Cargo.toml at
 # repo root (currently empty `members = []` until the first crate lands;
 # cargo handles this cleanly).
@@ -785,7 +785,7 @@ jobs:
   # absent from `ci-success`'s `needs`, and `continue-on-error` makes
   # a coverage hiccup neutral, so it never blocks a merge. Coverage
   # surfaces untested branches/error arms; the percentage is
-  # intentionally not a threshold — per CLAUDE.md §6.2 tests are
+  # intentionally not a threshold — per AGENTS.md §6.2 tests are
   # specifications, not a number to game (a `--fail-under` gate would
   # pressure toward shallow tests). `cargo test` (above) remains the
   # real gate. The lcov + HTML report are uploaded as a build artifact.

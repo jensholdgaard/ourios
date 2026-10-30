@@ -1,6 +1,6 @@
 //! Tenant identity for the multi-tenant miner.
 //!
-//! `[CLAUDE.md §3.7]`: every code path that touches data takes a
+//! `[AGENTS.md §3.7]`: every code path that touches data takes a
 //! tenant id. This module ships the type; routing, storage, and
 //! per-tenant state live in the consuming crates.
 

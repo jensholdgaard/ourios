@@ -381,7 +381,7 @@ fn run_bench(cli: Cli) -> Result<ExitCode, BenchError> {
         let failed = c1.non_lossy_total - c1.non_lossy_reconstruct_ok;
         eprintln!(
             "ourios-bench: C1 FAILED — {failed} of {} non-lossy row(s) did not reconstruct \
-                 byte-for-byte (RFC 0006 §3.4.2 / CLAUDE.md §3.3)",
+                 byte-for-byte (RFC 0006 §3.4.2 / AGENTS.md §3.3)",
             c1.non_lossy_total,
         );
         // RFC0006.2: emit each failing row's template id /

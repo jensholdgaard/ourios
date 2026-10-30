@@ -1465,7 +1465,7 @@ fn abstains(artifact_bytes: u64, acquisition_bytes: u64) -> bool {
 /// next write-through). The frontier check mirrors the `Manifest`
 /// filename validation: entries must be tenant-root-relative `*.parquet`
 /// keys, so a hostile artifact cannot name paths outside the tenant's
-/// audit subtree (`CLAUDE.md` §3.7).
+/// audit subtree (`AGENTS.md` §3.7).
 fn validate(raw: &TemplateMapJson) -> Result<(), String> {
     validate_registry(&raw.registry)?;
     validate_frontier(&raw.folded_files)?;

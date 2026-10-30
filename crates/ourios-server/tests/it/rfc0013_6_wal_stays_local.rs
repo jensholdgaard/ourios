@@ -7,7 +7,7 @@
 //! The assertion is the separation the scenario names: only Parquet (and, when
 //! compaction runs, `manifest.json`) objects land under `bucket_root`; the WAL
 //! `*.wal` segments stay under `wal_root` and never reach the store
-//! (`CLAUDE.md` §3.4 — local disk is cache + WAL; §3.6 — object storage is the
+//! (`AGENTS.md` §3.4 — local disk is cache + WAL; §3.6 — object storage is the
 //! source of truth for the Parquet, not the WAL).
 //!
 //! Unix-only: graceful shutdown is driven by `kill -TERM`, like the colocated
@@ -119,7 +119,7 @@ async fn terminate_cleanly(child: &mut tokio::process::Child) {
 }
 
 /// Scenario RFC0013.6 — with an object-storage backend, only data/audit/manifest
-/// objects reach the store; the WAL stays on local disk (`CLAUDE.md` §3.4).
+/// objects reach the store; the WAL stays on local disk (`AGENTS.md` §3.4).
 /// See `docs/rfcs/0013-object-storage.md` §5.
 #[tokio::test]
 async fn rfc0013_6_wal_stays_local() {

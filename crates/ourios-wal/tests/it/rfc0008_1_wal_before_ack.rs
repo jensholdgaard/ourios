@@ -14,7 +14,7 @@
 //! paths. A read-only WAL root won't fault `append`/`sync` (the
 //! bytes are already in the page cache), and a real `fdatasync`
 //! fault needs OS-level fault injection, which this crate's
-//! `#![deny(unsafe_code)]` (CLAUDE.md §6.1) and the no-external-
+//! `#![deny(unsafe_code)]` (AGENTS.md §6.1) and the no-external-
 //! harness scope put out of reach. The unit under test is the
 //! gate: an ack is permitted iff *both* `append` and `sync`
 //! returned `Ok`. The append-fault arm exercises a genuine

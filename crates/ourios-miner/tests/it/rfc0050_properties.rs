@@ -161,7 +161,7 @@ proptest! {
     /// (adopted, mined, parse failure), the emitted row either
     /// reconstructs to the original bytes from its registry
     /// template or falls back to its retained body — never a
-    /// silent in-between (CLAUDE.md §3.3).
+    /// silent in-between (AGENTS.md §3.3).
     #[test]
     fn adopt_ingest_never_breaks_reconstruction(
         template in ".{1,60}",

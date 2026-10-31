@@ -640,7 +640,7 @@ mod time;
 // The split keeps one module surface: the children reach the parent's
 // items (and each other's, re-exported here) exactly as before the
 // RFC-sized file was cut along its section markers (epic #745 wave 3).
-use attr_value::{attr_value, canonical_value};
+use attr_value::{attr_cmp, canonical_value};
 #[allow(clippy::wildcard_imports)] // sibling re-glue after the file split
 use group::*;
 pub(crate) use group::{group_exprs, scalar_agg_expr};

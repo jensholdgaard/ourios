@@ -652,9 +652,7 @@ pub(super) fn numeric_attr_match(
 /// canonical-JSON `column`. A `LIKE` on the stored key/value pair (`==`),
 /// or on the key with any value of `value`'s type (`!=`), is a cheap
 /// prefilter. It also matches the pair nested inside another attribute's
-/// map value, so [`attr_value`] then confirms that the first top-level
-/// `key` holds `value` (`==`), or a different value of the same type
-/// (`!=`; a missing key never matches).
+/// map value, so [`attr_cmp`] then decides on the first top-level `key`.
 fn json_arm(
     column: &str,
     key: &str,
@@ -666,27 +664,17 @@ fn json_arm(
     };
     let expected = canonical_value(value).map_err(|e| not_encodable("value", e.to_string()))?;
     let quoted_key = serde_json::to_string(key).map_err(|e| not_encodable("key", e.to_string()))?;
-    let pair_prefix = format!("{{\"key\":{quoted_key},\"value\":");
-    let top_level = attr_value(col(column), key);
-    if eq {
-        let pair = format!("{pair_prefix}{expected}}}");
-        let candidate = col(column).like(lit(format!("%{}%", like_escape(&pair))));
-        return Ok(candidate.and(top_level.eq(lit(expected))));
-    }
     // `{"stringValue":` / `{"intValue":`: the start of every value of this type.
     let type_prefix = expected
         .find(':')
         .map_or(expected.as_str(), |i| &expected[..=i]);
-    let candidate = col(column).like(lit(format!(
-        "%{}%",
-        like_escape(&format!("{pair_prefix}{type_prefix}"))
-    )));
-    let same_type = top_level
-        .clone()
-        .like(lit(format!("{}%", like_escape(type_prefix))));
-    Ok(candidate
-        .and(same_type)
-        .and(top_level.not_eq(lit(expected))))
+    let pattern = if eq {
+        format!("{{\"key\":{quoted_key},\"value\":{expected}}}")
+    } else {
+        format!("{{\"key\":{quoted_key},\"value\":{type_prefix}")
+    };
+    let candidate = col(column).like(lit(format!("%{}%", like_escape(&pattern))));
+    Ok(candidate.and(attr_cmp(col(column), key, &expected, eq)))
 }
 
 /// The RFC 0022 promoted column name for an attribute key: the literal DSL

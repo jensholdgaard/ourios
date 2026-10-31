@@ -561,19 +561,53 @@ async fn complex_values_and_nested_pairs_take_the_json_arm_top_level_only() {
     ] {
         let bucket = TempDir::new().expect("temp");
         write_all_with_promoted(bucket.path(), &records, &promoted);
-        let q = Querier::new(bucket.path());
-        let label = format!("promoted log keys {:?}", promoted.log_keys());
+        // Only the string row ever matches.
+        assert_counts(
+            &Querier::new(bucket.path()),
+            &promoted,
+            &[
+                (r#"attr.k == "x""#, 1),
+                (r#"attr.k != "x""#, 0),
+                (r#"attr.k == "y""#, 0),
+                (r#"attr.k != "y""#, 1),
+            ],
+        )
+        .await;
+    }
+}
+
+/// Duplicate top-level keys (not valid OTLP) compare the first occurrence,
+/// as the promoted projection does.
+#[tokio::test]
+async fn a_duplicate_top_level_key_compares_its_first_occurrence() {
+    let records = records_with_log_attrs(vec![vec![kv("k", "x"), kv("k", "y")]]);
+    for promoted in [
+        PromotedAttributes::new([], ["k".to_string()]),
+        PromotedAttributes::default(),
+    ] {
+        let bucket = TempDir::new().expect("temp");
+        write_all_with_promoted(bucket.path(), &records, &promoted);
+        assert_counts(
+            &Querier::new(bucket.path()),
+            &promoted,
+            &[
+                (r#"attr.k == "x""#, 1),
+                (r#"attr.k == "y""#, 0),
+                (r#"attr.k != "x""#, 0),
+                (r#"attr.k != "y""#, 1),
+            ],
+        )
+        .await;
+    }
+}
+
+async fn assert_counts(q: &Querier, promoted: &PromotedAttributes, cases: &[(&str, u64)]) {
+    for &(src, expected) in cases {
         assert_eq!(
-            count(&q, r#"attr.k == "x""#).await,
-            1,
-            "{label}: the string row only"
-        );
-        assert_eq!(count(&q, r#"attr.k != "x""#).await, 0, "{label}");
-        assert_eq!(count(&q, r#"attr.k == "y""#).await, 0, "{label}");
-        assert_eq!(
-            count(&q, r#"attr.k != "y""#).await,
-            1,
-            "{label}: the string row only"
+            count(q, src).await,
+            expected,
+            "{src} with promoted log keys {:?}",
+            promoted.log_keys()
         );
     }
 }

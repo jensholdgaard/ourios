@@ -223,6 +223,7 @@ mod tests {
     use ourios_core::otlp::AnyValue;
 
     use super::*;
+    use ourios_core::otlp::{ArrayValue, KeyValueList};
 
     fn kv_str(key: &str, value: &str) -> KeyValue {
         KeyValue {
@@ -348,6 +349,36 @@ mod tests {
         assert_eq!(i64_value(&kv_int("k", 42)), Some(42));
         assert_eq!(i64_value(&kv_double("k", 42.0)), None);
         assert_eq!(i64_value(&kv_str("k", "42")), None);
+    }
+
+    /// Complex values (#1134) project `NULL` in every class, so a query
+    /// answers them from the canonical JSON (RFC 0022 §3.3).
+    #[test]
+    fn complex_and_empty_values_project_null_in_every_class() {
+        let values = [
+            Some(any_value::Value::KvlistValue(KeyValueList {
+                values: vec![kv_str("k", "x")],
+            })),
+            Some(any_value::Value::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(any_value::Value::IntValue(1)),
+                }],
+            })),
+            Some(any_value::Value::BytesValue(b"x".to_vec())),
+            None,
+        ];
+        for value in values {
+            let kv = KeyValue {
+                key: "k".into(),
+                value: Some(AnyValue {
+                    value: value.clone(),
+                }),
+                ..Default::default()
+            };
+            assert_eq!(string_value(&kv), None, "{value:?}");
+            assert_eq!(i64_value(&kv), None, "{value:?}");
+            assert_eq!(f64_value(&kv), None, "{value:?}");
+        }
     }
 
     #[test]

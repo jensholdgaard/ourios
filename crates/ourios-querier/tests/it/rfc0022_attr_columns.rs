@@ -509,3 +509,101 @@ async fn rfc0022_7_promoted_set_drift_unions_cleanly() {
     // the /cart rows in the {}/{a} files read NULL and silently non-match.
     assert_eq!(count(&q, r#"attr.http.route >= "/cart""#).await, 1);
 }
+
+fn kv_value(key: &str, value: Option<AvValue>) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue { value }),
+        ..Default::default()
+    }
+}
+
+fn kvlist(entries: Vec<KeyValue>) -> AvValue {
+    AvValue::KvlistValue(ourios_core::otlp::KeyValueList { values: entries })
+}
+
+/// One record per log-attribute list, a second apart.
+fn records_with_log_attrs(lists: Vec<Vec<KeyValue>>) -> Vec<MinedRecord> {
+    (0u64..)
+        .zip(lists)
+        .map(|(i, attrs)| {
+            rec_with_attrs("a", TS0 + i * 1_000, vec![kv("service.name", "api")], attrs)
+        })
+        .collect()
+}
+
+/// RFC 0022 §3.1/§3.3 for complex values (#1134). A map, array, bytes or
+/// empty value under the key projects `NULL`, so the comparison falls to
+/// the JSON arm, which compares string values only. And the arm matches
+/// the top-level key only: the same key/value pair nested inside another
+/// attribute's map is not `attr.k`.
+#[tokio::test]
+async fn complex_values_and_nested_pairs_take_the_json_arm_top_level_only() {
+    let nested_pair = kvlist(vec![kv("k", "x")]);
+    let records = records_with_log_attrs(vec![
+        vec![kv("k", "x")],
+        vec![kv_value("k", Some(nested_pair.clone()))],
+        vec![kv_value(
+            "k",
+            Some(AvValue::ArrayValue(ourios_core::otlp::ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(AvValue::StringValue("x".into())),
+                }],
+            })),
+        )],
+        vec![kv_value("k", Some(AvValue::BytesValue(b"x".to_vec())))],
+        vec![kv_value("k", None)],
+        vec![kv_value("outer", Some(nested_pair))],
+    ]);
+    for promoted in [
+        PromotedAttributes::new([], ["k".to_string()]),
+        PromotedAttributes::default(),
+    ] {
+        let bucket = TempDir::new().expect("temp");
+        write_all_with_promoted(bucket.path(), &records, &promoted);
+        let q = Querier::new(bucket.path());
+        let label = format!("promoted log keys {:?}", promoted.log_keys());
+        assert_eq!(
+            count(&q, r#"attr.k == "x""#).await,
+            1,
+            "{label}: the string row only"
+        );
+        assert_eq!(count(&q, r#"attr.k != "x""#).await, 0, "{label}");
+        assert_eq!(count(&q, r#"attr.k == "y""#).await, 0, "{label}");
+        assert_eq!(
+            count(&q, r#"attr.k != "y""#).await,
+            1,
+            "{label}: the string row only"
+        );
+    }
+}
+
+/// The RFC 0042 integer JSON arm (pre-amendment files and non-int values)
+/// matches the top-level key only, like the string arm.
+#[tokio::test]
+async fn integer_json_arm_ignores_a_nested_pair() {
+    let records = records_with_log_attrs(vec![
+        vec![kv_int("n", 3)],
+        vec![kv_value("outer", Some(kvlist(vec![kv_int("n", 3)])))],
+        vec![kv("n", "3")],
+    ]);
+    let bucket = TempDir::new().expect("temp");
+    // Written without promotion, read under an i64 promotion of `n`: every
+    // cell is NULL, so both comparisons answer from the JSON arm alone.
+    write_all_with_promoted(bucket.path(), &records, &PromotedAttributes::default());
+    let typed = PromotedAttributes::new_typed(
+        [],
+        [ourios_parquet::PromotedKey {
+            key: "n".into(),
+            class: ourios_parquet::PromotedClass::I64,
+        }],
+    );
+    write_all_with_promoted(
+        bucket.path(),
+        &records_with_log_attrs(vec![vec![kv("other", "z")]]),
+        &typed,
+    );
+    let q = Querier::new(bucket.path());
+    assert_eq!(count(&q, "attr.n == 3").await, 1, "the top-level int only");
+    assert_eq!(count(&q, "attr.n != 4").await, 1, "the top-level int only");
+}

@@ -7,6 +7,7 @@
 
 #[allow(clippy::wildcard_imports)] // parent glue after the file split
 use super::*;
+use ourios_core::otlp::any_value;
 
 /// The result of compiling a predicate against a known schema.
 pub(super) enum PredExpr {
@@ -544,31 +545,7 @@ pub(super) fn attr_match(
             return Ok(PredExpr::Filter(expr));
         }
     };
-    // The canonical JSON fragment for this key/value pair. `serde_json`'s
-    // string escaping is deterministic, so building the needle with the same
-    // serializer the writer uses keeps it byte-aligned with stored rows.
-    let needle_value = serde_json::to_string(v).map_err(|e| QueryError::InvalidQuery {
-        detail: format!("attribute value is not encodable: {e}"),
-    })?;
-    let needle_key = serde_json::to_string(key).map_err(|e| QueryError::InvalidQuery {
-        detail: format!("attribute key is not encodable: {e}"),
-    })?;
-    let fragment = format!("{{\"key\":{needle_key},\"value\":{{\"stringValue\":{needle_value}}}}}");
-    let value_match = col(column).like(lit(format!("%{}%", like_escape(&fragment))));
-    let json = if eq {
-        // `==` matches when the key is present with this exact string value.
-        value_match
-    } else {
-        // `!=` must require the key PRESENT with a *different* value: a row
-        // missing the key does not match. The presence guard matches the key
-        // with any string value, then we exclude the exact value above.
-        // Without the guard, `NOT LIKE` is also true for absent keys, which
-        // diverges from the missing-field "no match" semantics used
-        // everywhere else.
-        let key_present = format!("{{\"key\":{needle_key},\"value\":{{\"stringValue\":");
-        let presence = col(column).like(lit(format!("%{}%", like_escape(&key_present))));
-        presence.and(not(value_match))
-    };
+    let json = json_arm(column, key, eq, any_value::Value::StringValue(v.clone()))?;
     let Some(p) = promoted else {
         return Ok(PredExpr::Filter(json));
     };
@@ -664,24 +641,40 @@ pub(super) fn numeric_attr_match(
                 // mismatched files never match — documented consequence.
                 return Ok(PredExpr::Filter(typed));
             };
-            // The canonical stored fragment for an integer attribute:
-            // {"key":"<k>","value":{"intValue":"<decimal>"}}.
-            let needle_key = serde_json::to_string(key).map_err(|e| QueryError::InvalidQuery {
-                detail: format!("attribute key is not encodable: {e}"),
-            })?;
-            let fragment = format!("{{\"key\":{needle_key},\"value\":{{\"intValue\":\"{i}\"}}}}");
-            let value_match = col(column).like(lit(format!("%{}%", like_escape(&fragment))));
-            let json = if eq {
-                value_match
-            } else {
-                let key_present = format!("{{\"key\":{needle_key},\"value\":{{\"intValue\":\"");
-                let presence = col(column).like(lit(format!("%{}%", like_escape(&key_present))));
-                presence.and(not(value_match))
-            };
+            let json = json_arm(column, key, eq, any_value::Value::IntValue(i))?;
             Ok(PredExpr::Filter(typed.or(p.is_null().and(json))))
         }
         CmpOp::Ord(ord) => Ok(PredExpr::Filter(ord_expr(p, ord, typed_lit))),
     }
+}
+
+/// The JSON arm of an `==` / `!=` attribute comparison against the
+/// canonical-JSON `column`. A `LIKE` on the stored key/value pair (`==`),
+/// or on the key with any value of `value`'s type (`!=`), is a cheap
+/// prefilter. It also matches the pair nested inside another attribute's
+/// map value, so [`attr_cmp`] then decides on the first top-level `key`.
+fn json_arm(
+    column: &str,
+    key: &str,
+    eq: bool,
+    value: any_value::Value,
+) -> Result<Expr, QueryError> {
+    let not_encodable = |what: &str, e: String| QueryError::InvalidQuery {
+        detail: format!("attribute {what} is not encodable: {e}"),
+    };
+    let expected = canonical_value(value).map_err(|e| not_encodable("value", e.to_string()))?;
+    let quoted_key = serde_json::to_string(key).map_err(|e| not_encodable("key", e.to_string()))?;
+    // `{"stringValue":` / `{"intValue":`: the start of every value of this type.
+    let type_prefix = expected
+        .find(':')
+        .map_or(expected.as_str(), |i| &expected[..=i]);
+    let pattern = if eq {
+        format!("{{\"key\":{quoted_key},\"value\":{expected}}}")
+    } else {
+        format!("{{\"key\":{quoted_key},\"value\":{type_prefix}")
+    };
+    let candidate = col(column).like(lit(format!("%{}%", like_escape(&pattern))));
+    Ok(candidate.and(attr_cmp(col(column), key, &expected, eq)))
 }
 
 /// The RFC 0022 promoted column name for an attribute key: the literal DSL

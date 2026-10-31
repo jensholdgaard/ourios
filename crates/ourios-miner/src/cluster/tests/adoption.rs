@@ -173,6 +173,58 @@ fn rfc0050_2_adoption_uses_the_upstream_string() {
     }
 }
 
+/// A complex value under `log.record.template` (#1134) reads as absent,
+/// even under `Adopt`, and complex values under other keys do not touch
+/// keying: the records mine exactly as their unannotated twins.
+#[test]
+fn complex_attribute_values_do_not_participate_in_keying() {
+    use ourios_core::otlp::{ArrayValue, KeyValue, KeyValueList};
+    let t = TenantId::new("tenant-x");
+    let kv = |key: &str, value: AvValue| KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue { value: Some(value) }),
+        ..Default::default()
+    };
+    let nested_template = AvValue::KvlistValue(KeyValueList {
+        values: vec![kv(
+            LOG_RECORD_TEMPLATE_ATTR,
+            AvValue::StringValue("user <*> logged in".to_string()),
+        )],
+    });
+    let complex = |body: &str| {
+        let mut record = string_record(&t, body);
+        record.attributes = vec![
+            kv(LOG_RECORD_TEMPLATE_ATTR, nested_template.clone()),
+            kv(
+                "list",
+                AvValue::ArrayValue(ArrayValue {
+                    values: vec![AnyValue {
+                        value: Some(AvValue::BytesValue(vec![0, 1])),
+                    }],
+                }),
+            ),
+            kv("outer", nested_template.clone()),
+        ];
+        record
+    };
+    let mut complex_run = MinerCluster::new(adopt_config());
+    let mut plain_run = MinerCluster::new(adopt_config());
+    for body in ["user alice logged in", "user bob logged in"] {
+        assert_eq!(
+            complex_run.ingest(&complex(body)),
+            plain_run.ingest(&string_record(&t, body)),
+        );
+    }
+    assert!(
+        complex_run.adopted_templates_for(&t).is_empty(),
+        "nothing adopted"
+    );
+    assert_eq!(
+        complex_run.templates_for(&t).len(),
+        plain_run.templates_for(&t).len()
+    );
+}
+
 #[test]
 fn rfc0050_3_mixed_stream_adopts_and_mines_side_by_side() {
     let t = TenantId::new("tenant-x");

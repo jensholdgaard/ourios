@@ -23,8 +23,9 @@ superseded-by: —
 ## 1. Summary
 
 Both OTLP listeners enforce a single configurable request-size limit,
-`receiver.max_request_bytes`. Its default is the WAL frame ceiling,
-16 MiB. A gRPC Export over the limit, whether it is over before or after
+`receiver.max_request_bytes`. Its default sits 4 KiB below the WAL
+frame ceiling (16 MiB − 4 KiB), so a request the listener accepts always
+fits one WAL frame. A gRPC Export over the limit, whether it is over before or after
 decompression, gets `RESOURCE_EXHAUSTED` with no `RetryInfo`, which the
 OTLP spec defines as non-retryable. An HTTP Export over the limit gets
 `413`, as it does today. A batch that passes the limit but still exceeds
@@ -82,17 +83,35 @@ every `ReceiverSection` field) sets the maximum Export body size in
 bytes. The limit is measured after decompression, and also on the wire
 bytes. The value is shared by both listeners.
 
-- **Default `16777216` (16 MiB) = `ourios_wal::MAX_FRAME_BYTES`.** One
-  Export becomes one WAL frame (`TenantBatch::encode(tenant,
-  request.encode_to_vec())`, `receiver/pipeline.rs`), so a larger limit
-  would only move the rejection from the listener to the WAL append,
-  after the whole request had been decoded into memory. This is a
+- **Default `16773120` (16 MiB − 4 KiB, `ourios_wal::MAX_FRAME_BYTES -
+  4096`).** One Export becomes one WAL frame (`TenantBatch::encode(tenant,
+  request.encode_to_vec())`, `receiver/pipeline.rs`), so a limit above the
+  frame ceiling would only move the rejection from the listener to the
+  WAL append, after the whole request had been decoded into memory. The
+  frame adds a tenant prefix of at most 130 bytes (a `u16` length plus a
+  tenant of up to `MAX_TENANT_BYTES` = 128). Re-encoding a decoded
+  protobuf request does not make it larger than the bytes it was decoded
+  from (prost drops unknown fields and writes minimal encodings), and the
+  protobuf form of an OTLP/JSON body is smaller than the JSON. So 4 KiB
+  covers the wrap with room for a future prefix change without moving
+  the config number, and a request at the limit does not reach
+  `TooLarge`, which stays the backstop. This is a
   documented deviation from the spec's RECOMMENDED 64 MiB default.
   RECOMMENDED is a SHOULD-level clause; §4 says why the frame ceiling is
   not raised to meet it.
-- **Validation:** `1 ..= MAX_FRAME_BYTES`. Zero, or a value over the
-  frame ceiling, is a config error at startup that names the field and
-  the ceiling. It is never silently clamped.
+- **Validation:** `1 ..= 16773120`; the default is also the ceiling, so
+  an operator can only lower it. Zero, or a value over the ceiling, is a
+  config error at startup that names the field and the ceiling. It is
+  never silently clamped.
+- **Helm:** the chart exposes the field through `extraEnv`, not a
+  dedicated value key. The rendered receiver config carries
+  `max_request_bytes: "${env:OURIOS_RECEIVER_MAX_REQUEST_BYTES:-}"`, the
+  form the S3 credentials already use; setting that variable in
+  `receiver.extraEnv` sets the limit, and leaving it unset renders an
+  empty value, which reads as unset and takes the default. The chart
+  runs the binary with `--config`, which reads no bare env var, so the
+  rendered reference is what makes `extraEnv` work. `values.yaml`
+  documents the variable next to `encodeWorkers`.
 - This is a transport bound, not an invariant knob (RFC 0004 §3.3). It
   bounds memory per request and touches no §3 invariant. The WAL's frame
   ceiling stays the hard backstop.
@@ -122,7 +141,7 @@ bytes. The value is shared by both listeners.
 ### 3.3 HTTP: unchanged `413`, shared limit
 
 `HttpConfig::max_body_bytes` is set from `receiver.max_request_bytes`
-(its default rises from 4 MiB to 16 MiB). The `DefaultBodyLimit` and
+(its default rises from 4 MiB to 16 MiB − 4 KiB). The `DefaultBodyLimit` and
 gunzip-bound paths and their `413` stay as they are, and `TooLarge`
 stays `413` (RFC 0018 §3.2, unchanged for HTTP).
 
@@ -197,12 +216,15 @@ and rejected over the other.
 ## 5. Acceptance criteria
 
 > **Scenario RFC0061.1 — the limit is configurable and validated**
-> - **Given** `receiver.max_request_bytes` unset, set to `8388608`, set
->   to `0`, and set to `MAX_FRAME_BYTES + 1`
+> - **Given** `receiver.max_request_bytes` unset, set to the empty
+>   string, set to `8388608`, set to `0`, and set to `16773121`
 > - **When** the server resolves its config
-> - **Then** the resolved limits are 16 MiB and 8 MiB for the first
->   two, and the last two fail startup with an error naming the field
->   and the ceiling
+> - **Then** the resolved limits are `16773120`, `16773120` and
+>   `8388608` for the first three, and the last two fail startup with an
+>   error naming the field and the ceiling
+> - **And** the Helm chart's rendered receiver config resolves to
+>   `8388608` with `OURIOS_RECEIVER_MAX_REQUEST_BYTES=8388608` in
+>   `receiver.extraEnv`, and to the default without it
 
 > **Scenario RFC0061.2 — an over-limit gRPC Export is non-retryable `RESOURCE_EXHAUSTED`**
 > - **Given** a running gRPC listener with a configured limit `L`
@@ -223,9 +245,10 @@ and rejected over the other.
 
 > **Scenario RFC0061.4 — at-limit Exports are accepted on both transports**
 > - **Given** a configured limit `L`
-> - **When** a gRPC and an HTTP Export just under `L` (and under the WAL
->   frame once tenant-wrapped) are sent
-> - **Then** both are acked and their records are readable after flush
+> - **When** a gRPC and an HTTP Export of exactly `L` bytes are sent
+>   under a 128-byte tenant, with `L` at the default
+> - **Then** both are acked (neither reaches `AppendError::TooLarge`)
+>   and their records are readable after flush
 
 > **Scenario RFC0061.5 — HTTP uses the shared limit**
 > - **Given** `receiver.max_request_bytes = L`
@@ -236,7 +259,8 @@ and rejected over the other.
 ## 6. Testing strategy
 
 - RFC0061.1: config resolution unit tests in `ourios-server/src/config`,
-  next to the existing `ReceiverSection` substitution tests.
+  next to the existing `ReceiverSection` substitution tests; the Helm
+  arm in the chart's existing render tests.
 - RFC0061.2, .4, .5: integration tests in `ourios-ingester/tests/it`
   (beside `http_transport_errors.rs`) driving a real tonic client and
   the axum router. The three gRPC arms of .2 also extend RFC0003.11's
@@ -251,14 +275,12 @@ and rejected over the other.
 
 ## 7. Open questions
 
-- [ ] Is a 16 MiB default right, or should it sit somewhat below the
-  frame ceiling so that the tenant-wrap overhead never sends a
-  just-under-limit batch to the `TooLarge` path? The client sees the
-  same code either way, so this is cosmetic. Leaning toward 16 MiB for a
-  round, documented number.
-- [ ] Should the Helm chart surface `receiver.max_request_bytes`, or is
-  `extraEnv` + `${env:VAR}` enough (the standing chart convention)?
-  Leaning toward the latter.
+- [x] Default at the frame ceiling or slightly below? **Resolved
+  (maintainer, 2026-10-31): below**, at 16 MiB − 4 KiB, so an accepted
+  request never reaches `TooLarge` (§3.1).
+- [x] A Helm value key or `extraEnv`? **Resolved (maintainer,
+  2026-10-31): `extraEnv`**, through a rendered `${env:…:-}` reference
+  (§3.1).
 
 ## 8. References
 

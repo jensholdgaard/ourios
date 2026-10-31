@@ -99,6 +99,16 @@ bytes. The value is shared by both listeners.
   documented deviation from the spec's RECOMMENDED 64 MiB default.
   RECOMMENDED is a SHOULD-level clause; §4 says why the frame ceiling is
   not raised to meet it.
+- **The limit is on the request, not the frame.** For protobuf (gRPC,
+  OTLP/HTTP protobuf) the decompressed request and the frame payload are
+  the same bytes give or take the tenant prefix. An OTLP/JSON body is
+  larger than the protobuf it becomes (hex ids, base64 bytes, field
+  names), so a JSON Export over the limit can be one whose protobuf would
+  have fitted a frame. That is deliberate: the limit bounds what a
+  listener buffers and parses per request, which for JSON is the JSON,
+  and the spec defines the limit on the request body. A JSON producer
+  that hits it splits its batches or switches to protobuf, as OTLP
+  already recommends.
 - **Validation:** `1 ..= 16773120`; the default is also the ceiling, so
   an operator can only lower it. Zero, or a value over the ceiling, is a
   config error at startup that names the field and the ceiling. It is
@@ -210,8 +220,11 @@ tonic upgrade that changes it fails CI rather than drifting silently.
 
 **Separate limits per transport.** Both carry the same
 `ExportLogsServiceRequest` into the same WAL frame, so different limits
-would only create a case where a batch is accepted over one transport
-and rejected over the other.
+would only create a case where a protobuf batch is accepted over one
+transport and rejected over the other. A higher limit for OTLP/JSON
+alone would admit some JSON batches whose protobuf fits a frame, at the
+cost of buffering more per request and a second number to document; not
+worth it while protobuf is the format producers default to.
 
 ## 5. Acceptance criteria
 

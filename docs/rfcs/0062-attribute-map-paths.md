@@ -85,8 +85,7 @@ so a path never enters one.
 
 `attr["a.b.c"]` resolves the same way as `attr.a.b.c`. The DSL's
 bracket form exists for keys a bare identifier cannot spell (RFC 0002
-§6.1), and the IR does not record which form was used (§7 asks whether
-it should).
+§6.1), and the IR does not record which form was used (§7).
 
 ### 3.2 Where the rule applies
 
@@ -98,9 +97,12 @@ it should).
   promoted key (RFC 0042 §3.4) uses the same rule.
 - **Promoted keys.** The promoted column still projects the literal
   top-level key only (RFC 0022 §3.1); nothing on the write side
-  changes. The two-arm form stays exact under rule 1: a non-`NULL` cell
-  means the literal key is present, so it is the answer; a `NULL` cell
-  falls through to the JSON arm, which applies the full rule.
+  changes. For string and `i64` keys the two-arm form stays exact under
+  rule 1: a non-`NULL` cell means the literal key is present, so it is
+  the answer; a `NULL` cell falls through to the JSON arm, which applies
+  the full rule. An `f64` key has no JSON arm (RFC 0042 §3.4: JSON text
+  has no canonical float form), so a double only reachable by a path
+  never matches its `==` or `!=`; this RFC does not change that.
 - **Not covered:** ordering and regex compile against the promoted
   column alone (RFC 0022 §3.3), so a value only reachable by a path
   never matches them, the same documented non-match as for
@@ -134,10 +136,14 @@ no stack, so value depth is not limited by the lookup.
   values by RFC 0062 §3.1. The same for `resource.<key>`.
 - **RFC 0022 §3.3.** The JSON arm `J` compares the value `resolve`
   (RFC 0062 §3.1) yields, instead of the top-level key's value.
-- **RFC 0002 §6.6.** This alters result sets, so it is a major grammar
-  version. It only adds rows: a record holding the literal key answers
-  exactly as before, and only a record without it can newly match. §7
-  asks how to handle the deprecation window that section requires.
+- **RFC 0002 §6.6.** This alters result sets, so it is grammar
+  **v2.0**. A record holding the literal key answers exactly as before.
+  For a record without it, an `==` or `!=` comparison can newly be true,
+  never newly false. A query is not always monotone in its comparisons,
+  though: `not (attr.user.id == "u7")` stops matching a record that
+  holds only `user = {id: "u7"}`. So a saved query that negates an
+  attribute comparison can lose rows. §7 records how the deprecation
+  window is handled.
 
 ### 3.5 Invariants and hazards
 
@@ -167,9 +173,11 @@ with a path-resolving version of it:
 | promoted keys | 19.4 ms | +0.5–0.8% |
 
 The extra cost comes from the extra `LIKE` patterns and from the rows
-that now match. #1137's final version moved the top-level baseline to
-within 5% of `main` for `==` and 40% for `!=`. RFC0062.6 re-measures
-this RFC against that baseline.
+that now match. #1137's final version moved the top-level baseline,
+against `main`'s plain `LIKE`, to +5% for `http.route ==` (25.2 vs
+24.1 ms), +47% for `http.route !=` (41.2 vs 28.0 ms) and +89% for
+`user.id !=` (49.6 vs 26.3 ms). RFC0062.6 re-measures this RFC against
+that baseline.
 
 ## 4. Alternatives considered
 
@@ -216,6 +224,9 @@ available as an additive form later.
 >   `user = [{id: "u7"}]` and a record without `user`
 > - **When** `attr.user.id == "u7"` and `attr.user.id != "u8"` run
 > - **Then** neither matches any of them
+> - **And** with `m.n` promoted as `f64`, a record holding only
+>   `m = {n: 1.5}` matches neither `attr.m.n == 1.5` nor
+>   `attr.m.n != 2.0` (no JSON arm, RFC 0042 §3.4)
 
 > **Scenario RFC0062.4 — resource attributes and `service`**
 > - **Given** a record whose resource holds `service = {name: "api"}`
@@ -254,14 +265,16 @@ available as an additive form later.
 
 ## 7. Open questions
 
-- [ ] RFC 0002 §6.6 asks for a deprecation window and a documented
-  migration for a result-set change. Since this change only adds rows,
-  the suggestion is to record it as grammar v2.0 with a `feat(querier)!`
-  commit and a cookbook note, and no window. Maintainer to decide.
-- [ ] Should `attr["a.b"]` stay literal-only, as the Collector's stanza
-  field syntax reads brackets, so a user can opt out of path
-  resolution? That needs the IR to record the form. The suggestion is
-  no: rule 1 already makes the literal key win.
+- [x] RFC 0002 §6.6's deprecation window and migration. **Resolved
+  (maintainer, 2026-10-31): no window.** The change ships as grammar
+  v2.0 with a `feat(querier)!` commit and a `BREAKING CHANGE` footer.
+  The query cookbook documents the rule and the one way a saved query
+  can lose rows: a negated attribute comparison on a record that holds
+  the value only under a map (§3.4).
+- [x] Should `attr["a.b"]` stay literal-only, as an opt-out from path
+  resolution? **Resolved (maintainer, 2026-10-31): no.** Both forms
+  resolve by §3.1; rule 1 already makes the literal key win, and the IR
+  keeps one form.
 
 ## 8. References
 

@@ -141,9 +141,11 @@ no stack, so value depth is not limited by the lookup.
   For a record without it, an `==` or `!=` comparison can newly be true,
   never newly false. A query is not always monotone in its comparisons,
   though: `not (attr.user.id == "u7")` stops matching a record that
-  holds only `user = {id: "u7"}`. So a saved query that negates an
-  attribute comparison can lose rows. §7 records how the deprecation
-  window is handled.
+  holds only `user = {id: "u7"}`. Nor is a limited result:
+  `attr.user.id == "u7" | sort ts desc | limit 1` can return a newer
+  map-only record in place of the older literal-key one. So a saved
+  query that negates an attribute comparison, or that sorts and limits,
+  can lose rows. §7 records how the deprecation window is handled.
 
 ### 3.5 Invariants and hazards
 
@@ -192,9 +194,11 @@ write time; it can follow this RFC, whose rule it would reuse.
 §6.1 says today. It leaves map-shaped records unreachable by name,
 which the maintainer chose not to accept (#1134).
 
-**Try every split, not just the longest head first.** `a.b.c` has
-2ⁿ⁻¹ readings; trying them all only changes the answer when more than
-one resolves, which the longest-head order already makes deterministic.
+**Match any reading that resolves, not the first.** §3.1 already tries
+the splits in turn, longest head first, and stops at the first that
+resolves. `a.b.c` has 2ⁿ⁻¹ readings; comparing against every resolved
+value instead would let one key equal two different values and make
+`!=` ambiguous, so the first resolved value is the answer.
 
 **A separate path syntax** (`attr.user/id`, or chained brackets
 `attr["user"]["id"]` as OTTL writes it). Unambiguous, but every user
@@ -268,9 +272,10 @@ available as an additive form later.
 - [x] RFC 0002 §6.6's deprecation window and migration. **Resolved
   (maintainer, 2026-10-31): no window.** The change ships as grammar
   v2.0 with a `feat(querier)!` commit and a `BREAKING CHANGE` footer.
-  The query cookbook documents the rule and the one way a saved query
-  can lose rows: a negated attribute comparison on a record that holds
-  the value only under a map (§3.4).
+  The query cookbook documents the rule and the two ways a saved query
+  can lose rows (§3.4): a negated attribute comparison on a record that
+  holds the value only under a map, and a sorted, limited query whose
+  newly matching records displace the ones it returned before.
 - [x] Should `attr["a.b"]` stay literal-only, as an opt-out from path
   resolution? **Resolved (maintainer, 2026-10-31): no.** Both forms
   resolve by §3.1; rule 1 already makes the literal key win, and the IR

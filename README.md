@@ -310,8 +310,15 @@ query that same tenant with the logs DSL:
 curl -s http://localhost:4319/v1/query \
   -H 'X-Ourios-Tenant: checkout' \
   -H 'Content-Type: text/plain' \
-  -d 'severity >= error | count by template_id | sort count desc | limit 10'
+  -d 'severity >= error | count by template_id'
 ```
+
+That returns one row per log template with its count. New records become
+queryable once the receiver flushes them to Parquet, within about five and
+a half minutes on a quiet tenant (the quickstart guide shows how to see
+them sooner). `sort` and `limit` after an aggregation are part of the
+[query DSL](docs/rfcs/0002-query-dsl.md) but not implemented by the
+querier yet.
 
 The [quickstart guide](docs/guides/quickstart.md) walks this end to end,
 [configuration](docs/guides/configuration.md) covers the

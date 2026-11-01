@@ -328,8 +328,8 @@ testing and without membership change.
 The shape, replacing §6.2–§6.4:
 - **Storage:** `RaftLogStorage` over RFC 0008 segments; frame kind
   `0x04` carries the Raft log id `(term, index)` where §6.3 has
-  `(epoch, seq)`; the vote goes in the per-group file §6.4 calls the
-  epoch file.
+  `(epoch, seq)`; votes go in one group-committed vote log per node
+  (§4.7, §6.1).
 - **Transport:** `RaftNetworkV2` over tonic with RFC 0030 mTLS.
 - **Checkpoint:** a metadata-only snapshot `{index, term, Parquet
   manifest reference}`; purging follows it, and a lagging follower
@@ -373,7 +373,8 @@ runs and one parallel run:
   frames that replay honours, fsynced before they return, so the WAL
   needs no tail-truncate primitive. The vote lives in its own fsynced
   file (tmp, fsync, rename, directory fsync), because segment
-  reclamation could delete it from the WAL.
+  reclamation could delete it from the WAL; §4.7 found that a file per
+  group does not scale and replaces it with one vote log per node.
 - **A snapshot at the Parquet checkpoint: pass.** A snapshot at index
   11 with applied at 21 is accepted, applied state does not revert,
   purge stops at the snapshot, and a follower isolated through 20
@@ -496,7 +497,7 @@ another spike running; means were stable across repeats, p99s noisy.
   real knee is ours: each RFC 0008 WAL preallocates an 8.3 MiB RFC 0052
   reclaim sidecar sized for 1 024 tenants, so 512 per-group WALs would
   cost about 4.3 GiB of disk and memory per node before any data. A
-  128-group run with WALs did not finish and was not diagnosed.
+  128-group run with WALs did not finish; §4.7 diagnoses it.
   `openraft-multi` only shares connections; it changes none of this.
 - **Tail isolation (B23, B24).** Learners never sit in the ack path:
   with tail reads at saturation, ingest held its rate and ack p99
@@ -517,8 +518,50 @@ another spike running; means were stable across repeats, p99s noisy.
 **Consequences:** §6.1 sizes each group's WAL sidecar to the group
 instead of the node (coordinate with RFC 0052, whose sidecar geometry
 becomes a WAL setting); §6.7 batches read confirmations; §6.9 starts
-from `openraft`'s timeouts with the failover bound stated; the 128-group
-stall is diagnosed before `red`.
+from `openraft`'s timeouts with the failover bound stated.
+
+### 4.7 Many-groups stall diagnosis
+
+The 128-group run in §4.6 that never finished was reproduced on the
+same laptop (2026-11-01) and diagnosed. It is ours, not `openraft`'s,
+and it changes the storage design.
+
+- **Cause: an election storm from blocking vote writes.** Persisting a
+  vote (§4.4's tmp file, fsync, rename and directory fsync) took about
+  17 ms and ran on the Raft runtime's worker threads. With 384 replicas
+  electing at once, four workers spent their time in `open` and
+  `fsync`, heartbeats and vote replies missed the 150–300 ms election
+  timeout, and elections restarted: about 190 vote requests a second
+  for 90 s with almost no appends and no group ever settling. A stack
+  sample showed the workers inside the vote write. 16 groups (48
+  replicas) stayed under the threshold, which is why §4.6's other runs
+  passed.
+- **Moving the write off the workers is not enough.** Run on the
+  blocking pool, 128 groups elected in about 6 s with plain `fsync`,
+  but each vote then waited about 0.3 s behind the others on the disk,
+  and with a drive-cache flush (`F_FULLFSYNC`, the durable option on
+  macOS) the storm returned: vote writes averaged about 1 s, the
+  slowest 14 s, and some group still had no leader after 26 s. A
+  control that skipped the fsync converged in under 1 s, confirming the
+  disk write as the bottleneck.
+- **One vote log per node, group-committed, fixes it.** All groups on a
+  node append their votes to one file, and every vote queued while an
+  fsync runs goes out in the next one, off the workers. With
+  drive-cache flushes, the 128-group cluster elected every leader, and
+  killing one of the three nodes (43 groups lost their leader at once)
+  gave the first ack on every new leader at 0.73 s median and 0.83 s
+  max, with 52 fsyncs for 187 vote writes. At 256 groups (86 at once)
+  it was 1.1 s median and 1.6 s max, with 103 fsyncs for 512 writes.
+  With plain `fsync`, 128 groups failed over in 0.48 s median, the same
+  as one group (§4.6), against 1.7 s with a file per group.
+- **The rest of the run's slowness was the sidecar.** Opening 384 WALs
+  took 9 s, all of it the 8.3 MiB RFC 0052 sidecar preallocation that
+  §6.1 already sizes per group.
+
+**Consequences:** §6.1 keeps votes in one group-committed log per node
+and requires that no storage operation block the Raft runtime's
+workers; RFC0065.27 tests a node failure with many groups; §6.9 adds
+the mass-failover time and vote-log batching as tuning signals.
 
 ## 5. Acceptance criteria
 
@@ -732,6 +775,16 @@ stall is diagnosed before `red`.
 > - **Then** `checkpoint.json` still names 200, the leader rejects the
 >   proposal, and a restarting tail replica restores from 200
 
+> **Scenario RFC0065.27 — a node failure with many groups fails over like one group (B7)**
+> - **Given** three voter nodes hosting 128 groups, durable fsync on,
+>   and every group led and acknowledging
+> - **When** one node is killed, so every group it led loses its leader
+>   at once
+> - **Then** every one of those groups acknowledges on a new leader
+>   within twice the single-group failover bound (§6.9), no group is
+>   left without a leader, and the node's vote log took fewer fsyncs
+>   than vote writes
+
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
@@ -780,6 +833,18 @@ stall is diagnosed before `red`.
   node-sized sidecar per group costs 8.3 MiB each (§4.6). The sidecar's
   tenant capacity becomes a `WalConfig` setting (coordinate with RFC
   0052).
+- **Votes are in one log per node, not per group (§4.7).** Every group
+  on a replica appends `(group, vote)` records to
+  `wal_root/votes.log`, and one fsync covers every vote queued while
+  the previous one ran (group commit); `save_vote` returns after its
+  record is fsynced. The log sits outside the group WALs, so segment
+  reclamation never touches it; it is rewritten (tmp, fsync, rename,
+  directory fsync) holding only each group's latest vote once it
+  passes a size threshold. Recovery takes the last record per group.
+- **No storage operation blocks the Raft runtime's workers.** Vote
+  writes, `sync`, truncation and purge markers run on the WAL's own
+  threads and complete through callbacks; a blocking call on a worker
+  thread caused §4.7's election storm.
 
 ### 6.2 The group record
 
@@ -1174,6 +1239,7 @@ signal that tunes it:
 | `tail_replicas` | 1 | tail call latency and saturation per tail replica |
 | Tail memory before local Parquet | the record sink's size and age triggers | tail replica memory, local file count and query bytes read |
 | Election and heartbeat timeouts | 50 ms heartbeat, 150–300 ms election: failover and tail gap about 1.8 × the election maximum, 0.55 s (§4.6) | failover time, spurious leadership changes |
+| Vote log | one per node, group-committed (§4.7): a node failure at 128 groups failed over in 0.5–0.8 s | failover time when a node's groups elect at once, vote-log fsync latency and votes per fsync |
 | Freshness target (B15) | under 1 s | ack-to-queryable latency, a new histogram on the tail path |
 
 The backlog bytes and age, flush and ingest throughput per group, and
@@ -1282,6 +1348,9 @@ from rows.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process
   cluster (ack latency with and without tail load; tail throughput with
   one and two tail replicas), indicative on the CI runner first.
+- RFC0065.27: the same in-process cluster with real per-group WALs and
+  the vote log on disk, durable fsync on, killing one node; indicative
+  on the CI runner first, with §4.7's runs as the baseline.
 - `criterion`: ack latency on the replicated backend against the local
   one, and the tail merge, before `validated`.
 

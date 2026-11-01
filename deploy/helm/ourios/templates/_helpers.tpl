@@ -719,7 +719,7 @@ disables compaction on the receiver/querier), so it must be enabled.
   value: {{ . | quote }}
 {{- end }}
 {{- with .Values.extraEnv }}
-{{- toYaml . }}
+{{ toYaml . }}
 {{- end }}
 {{- end }}
 

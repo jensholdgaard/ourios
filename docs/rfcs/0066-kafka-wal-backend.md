@@ -40,11 +40,10 @@ export once the broker has acknowledged its frame from every in-sync
 replica. Each tenant's frames go to one partition, chosen by a fixed
 hash, and each partition is mined by one receiver, chosen by its
 StatefulSet ordinal. Checkpoints and miner snapshots move to object
-storage, so a broker-backed receiver needs no persistent volume. The
-partition's owner also publishes the rows it has mined but not yet
-flushed to a second topic. The querier reads that tail and merges it
-with Parquet, so a record is queryable about a second after it is
-acked. Every row carries its log position, and that position is the
+storage, so a broker-backed receiver needs no persistent volume. Tail
+replicas consume the same partitions with RFC 0065's deterministic
+miner and serve the rows not yet in Parquet, exactly as RFC 0065 §6.7
+does, so a record is queryable about a second after it is acked. Every row carries its log position, and that position is the
 dedup key across redelivery, handoff and the flush boundary. The local
 backend stays the default and does not change.
 
@@ -99,8 +98,8 @@ receiver:
     kafka:
       brokers: "${env:OURIOS_RECEIVER_WAL_KAFKA_BROKERS}"  # comma-separated host:port
       topic: ourios-wal           # raw frames
-      tail_topic: ourios-tail     # mined rows (§3.8)
       produce_timeout_ms: 5000
+      max_backlog_bytes: 0        # per partition above its checkpoint; 0 = derived (§3.5)
       tls: { ... }                # client TLS; same leaves as RFC 0030's TlsSection
       sasl:
         mechanism: "${env:OURIOS_RECEIVER_WAL_KAFKA_SASL_MECHANISM:-}"  # PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
@@ -111,10 +110,12 @@ receiver:
 - `backend: local` is today's behaviour and requires `wal_root`.
   `backend: kafka` requires `brokers` and `topic`, and ignores
   `wal_root`. Anything else is a startup error naming the field.
-- Ourios does not create topics. At startup the receiver reads both
-  topics' metadata and fails startup if either is missing, if
-  `min.insync.replicas` is below 2 (§3.12), or if the partition
-  count differs from the one recorded in the store (§3.3).
+- Ourios does not create topics. At startup the receiver reads the
+  topic's metadata and fails startup if it is missing, if
+  `min.insync.replicas` is below 2 (§3.12), if `retention.ms` or
+  `retention.bytes` is not unlimited (Ourios reclaims by checkpoint,
+  §3.5), or if the partition count differs from the one recorded in
+  the store (§3.3).
 - The batch window (`wal_batch_window_ms`, RFC 0008 §6.9) keeps its
   meaning: the group-commit coordinator collects turns for up to that
   long and sends one produce request per partition.
@@ -202,14 +203,25 @@ succeeds, so the trait changes shape:
 - **The owner's loop**, per owned partition: fetch frames from its
   position, decode, mine, and emit to the record sink exactly as
   recovery does today (`ourios-ingester/src/recovery.rs`, the
-  `FrameSink` path), then publish the mined rows to the tail (§3.8).
+  `FrameSink` path). The owner is its partitions' flusher in RFC 0065
+  §6.5's sense; tail replicas mine the same partitions for the tail
+  (§3.8).
   The sink's size and age triggers (RFC 0014 §3.2, RFC 0063) are
   unchanged.
 - **Checkpoint.** RFC 0052's barrier runs per owned partition: cut at
-  the last consumed offset, publish everything buffered, then write
-  `<bucket>/wal/<topic>/<partition>/checkpoint.json` with that offset
-  and the barrier's wall-clock time. Every frame below the checkpoint
-  is in Parquet. Ourios never commits offsets to the broker.
+  the last consumed offset, publish everything buffered, write RFC 0065
+  §6.5's immutable cut-consistent bundle under
+  `<bucket>/wal/<topic>/<partition>/checkpoints/<offset>/`, then
+  publish the checkpoint **monotonically**:
+  `<bucket>/wal/<topic>/<partition>/checkpoint.json` changes only by
+  `put_if_match`, and a writer whose cut is not above the stored one
+  abandons its write; and the owner produces a **checkpoint record**
+  (the cut, the bundle's key) to the WAL partition itself. Every
+  consumer applies checkpoint records in offset order and ignores any
+  whose cut is not above the last it applied, so a delayed former owner
+  can neither move the store's checkpoint back nor make a replica
+  restore from a cut whose history is gone. Every frame below the
+  checkpoint is in Parquet. Ourios never commits offsets to the broker.
 - **Miner snapshots** move to `<bucket>/wal/<topic>/snapshots/<tenant>.snap`,
   written at the barrier as today (`recovery::write_folded_snapshots`).
   The snapshot's `wal_high_water` gains a broker variant
@@ -235,17 +247,24 @@ succeeds, so the trait changes shape:
   owners replaying one partition from one checkpoint then mine
   identical rows, whichever copy survives. An owner lease is still not
   required for correctness and is left out (§4).
-- **Reclamation** is the broker's retention; Ourios deletes nothing.
-  The journal's RFC 0052 rotation and housekeeping methods answer an
-  explicit "not applicable" on this backend instead of the trait's
-  fail-closed default, and `reclaim_state` reports the consumer lag.
-- **Retention gap.** If a partition's log start offset is above its
-  checkpoint, acked records were deleted before they reached Parquet.
-  The owner records an error event and
-  `ourios.ingest.batches{error.type="retention_gap"}`, then continues
-  from the log start; stopping would not bring the records back. The
-  docs require topic retention well above the barrier interval and
-  recommend alerting on consumer lag.
+- **Reclamation is checkpoint-controlled (RFC 0065 B25).** Time and
+  size retention are off (startup checks it), so the broker never
+  deletes a frame on its own. After a checkpoint record, the owner
+  deletes the partition below the checkpoint (`DeleteRecords`). During
+  a long object-store outage the checkpoint cannot advance, so nothing
+  is deleted, and once a partition's bytes above its checkpoint reach
+  `max_backlog_bytes` (default: the broker's free log capacity divided
+  among the partitions, read at startup) further exports to it get the
+  retryable rejection (B3), never a silent deletion. The journal's RFC
+  0052 rotation and housekeeping methods answer an explicit "not
+  applicable" on this backend, and `reclaim_state` reports the bytes
+  above the checkpoint.
+- **Retention gap** is then a misconfiguration: if a partition's log
+  start offset is above its checkpoint, someone changed retention or
+  deleted records. The owner records an error event and
+  `ourios.ingest.batches{error.type="retention_gap"}`, refuses to
+  advance past the gap until an operator acknowledges it with an
+  explicit CLI verb, and reports the tail unavailable for that range.
 
 ### 3.6 Position as the dedup key (H8)
 
@@ -279,56 +298,37 @@ producer without changing the frame.
 
 ### 3.8 The queryable tail
 
-The querier cannot mine raw frames: template ids are assigned by the
-owner's miner. So the owner publishes what it has mined.
+The tail is served exactly as RFC 0065 §6.7 serves it, with the WAL
+partition in place of the Raft log; there is no separate tail topic.
 
-- **The tail topic** has the same partition count and the same tenant
-  hash as the WAL topic. After mining a frame, the owner produces one
-  record to the tail: an Arrow IPC batch of the mined rows in the RFC
-  0005 §3.2 schema, the ingest-position columns included. Headers carry the
-  source offset range and the tenant.
-- **Audit before record holds in the tail.** A tail batch is produced
-  only after the template definitions its rows use are readable by the
-  querier: the batch carries every template first used in it
-  (`template_id`, `template_version`, tokens), in the shape the RFC 0033
-  map holds. This is the read-side form of RFC 0008 §6.4's rule.
-- **The querier's tail provider** is a DataFusion table beside the
-  Parquet listing (`ourios-querier/src/file_set.rs`), for one tenant:
-  1. read the WAL partition's high-water offset `h` (a `ListOffsets`
-     call) **at query start**, then the partition's checkpoint `c`,
-     which also records `tail_from`, the first tail offset whose source
-     offset is at or above `c` (the owner knows it when it produces that
-     batch, and the checkpoint is written only after it);
-  2. fetch the tail partition from `tail_from`, keep rows whose tenant
-     is the query's tenant and whose source offset is at or above `c`;
-     no timestamp is consulted, so owner clock skew cannot skip a batch;
-  3. **read barrier (B14):** wait, bounded, until the tail holds batches
-     through source offset `h − 1`; past the bound, report the tail as
-     unavailable (B17) rather than return what has arrived;
-  4. deduplicate by ingest position across Parquet and tail together,
-     choosing candidate files by overlapping position ranges in their
-     footer statistics, never by file name or time, exactly as RFC 0065
-     §6.7 step 4 does; this also removes two live Parquet copies of one
-     position left by a handoff (B16).
-- **Cost (B19).** Position dedup reads footer statistics of the files
-  the query already plans, and the position columns only from files
-  whose ranges overlap. The tail read is bounded by the records since
-  the checkpoint, however long that is (next bullet).
-- **Visibility.** The tail rows go through the same plan as Parquet
-  rows, so tenant predicates, conversation predicates and row masking
-  (RFC 0047) apply unchanged. The DSL is unchanged (H6).
-- **Freshness.** A record becomes queryable when its frame is mined and
-  its tail batch is acknowledged: typically well under a second after
-  the ack. RFC0066.7 states the test's allowance.
-- **Retention and long stalls (RFC 0065 B19, B25).** The tail topic's
-  retention is at least the WAL topic's, so a tail batch outlives every
-  record not yet in Parquet; the checkpoint cannot advance during an
-  object-store outage, so the tail grows with the backlog. If a query
-  finds the tail partition's log start above `tail_from` (retention set
-  too short, or a deleted topic), it reports the tail unavailable (B17)
-  and the owner rebuilds the missing tail by re-mining the WAL
-  partition from `c`; the tail is derived data. RFC0066.11 covers a
-  prolonged outage.
+- **Tail replicas** are a pool of receivers in tail mode (`tail_peers`,
+  `tail_replicas` per partition, chosen by rendezvous hashing as in RFC
+  0065 §6.1). Each consumes its partitions from the latest checkpoint
+  record, mines them with RFC 0065's deterministic miner and the
+  log-ordered id allocation of §3.5, and keeps the mined rows above the
+  checkpoint in memory and in local Parquet files, written by the same
+  writer as the store's. Those files are a cache on an ephemeral volume,
+  rebuilt by re-consuming the partition, so the receivers stay
+  stateless.
+- **Read barrier (B14).** A `Tail` call reads the partition's
+  high-water offset `h` (`ListOffsets`) when it arrives and answers once
+  the replica has mined through `h − 1`, or reports the tail
+  unavailable past a bound (B17).
+- **Cost (B19).** The replica prunes its local files by footer
+  statistics and returns only the query's tenant, range and predicates,
+  so a narrow query reads what it selects, not the backlog.
+- **Checkpoint without the store.** The replica holds the last
+  checkpoint record it applied, from the WAL partition, so it answers a
+  querier that cannot reach the store, including one that started
+  during the outage; unreachable historical Parquet is reported as
+  `parquet_unavailable`, as in RFC 0065 §6.7.
+- **The querier's merge** is RFC 0065 §6.7's: Parquet listing, `Tail`
+  from the checkpoint, then dedup by ingest position across the whole
+  input, with candidates chosen by overlapping position ranges in
+  footer statistics, never by file name or time.
+- **A lost tail replica** loses only a cache: its replacement consumes
+  from the checkpoint record and serves once it has mined through the
+  high-water.
 
 ### 3.9 Telemetry
 
@@ -355,8 +355,11 @@ owner's miner. So the owner publishes what it has mined.
 - The broker settings are rendered as `${env:…:-}` references in the
   receiver config and set through `receiver.extraEnv` or a secret, as
   RFC 0061 §3.1 does for `max_request_bytes`.
-- The querier needs the same broker settings to read the tail; the
-  chart renders them into the querier's config too.
+- Tail replicas are a second StatefulSet, `-wal-tail`, with an
+  ephemeral volume for their local Parquet cache, rendered into
+  `tail_peers`; it carries the broker settings, and queriers reach it
+  over the peer protocol with mutual TLS (RFC 0065 §6.8), so queriers
+  need no broker settings.
 
 ### 3.11 Invariants and hazards
 
@@ -370,7 +373,7 @@ owner's miner. So the owner publishes what it has mined.
 - **§3.6 object storage as truth:** checkpoints, snapshots and the
   recorded topic layout live in the store; the broker holds records only
   up to the WAL horizon.
-- **§3.7 tenancy:** the tenant is in every frame and every tail batch;
+- **§3.7 tenancy:** the tenant is in every frame and every tail row;
   every consumer and the querier filter by it.
 - **H3:** the produce batch window is the latency knob; RFC0066.3 is
   the backend's crash test.
@@ -399,10 +402,13 @@ local backend, but the querier must find and reach every replica, decide
 what a missing answer means, and the records still die with a lost
 volume. The broker gives one place to read and removes the volume.
 
-**Let the querier mine the raw tail.** Template ids come from the
-owner's miner and its reservations (RFC 0059); a second miner would
-assign different ids, and `count by template_id` would disagree between
-tail and Parquet. Publishing the owner's mined rows avoids that.
+**A tail topic of mined rows.** The earlier draft had the owner produce
+its mined rows to a second topic. It needed its own retention, a
+source-to-tail offset mapping kept in step with every checkpoint and
+rebuild, and every tail read scanned the whole partition's backlog
+before filtering. Deterministic tail replicas (§3.8) need none of that,
+and mined rows would cost 3.3–6.8× the raw replication traffic (RFC
+0065 §7).
 
 **Consumer groups for assignment.** Kafka's group protocol rebalances
 partitions automatically, but `rskafka` does not implement it, and the
@@ -419,10 +425,9 @@ grows with tenants and partition assignment becomes per topic. Tenancy
 is enforced by the frame's tenant instead, as on the local WAL.
 
 **The built-in replicated WAL (RFC 0065).** No external system and an
-fsync on every replica, but receivers keep their disks, and a querier
-reads the tail from each group's leader rather than from a shared log,
-so the tail is unavailable during an election. The two backends sit behind one
-seam; this one is for teams that already run Kafka.
+fsync on every replica, but receivers keep their disks. Both backends
+serve the tail the same way (§3.8) behind one seam; this one is for
+teams that already run Kafka.
 
 **Other logs: NATS JetStream, Apache Pulsar.** Both can replicate and be
 read by offset. The Kafka protocol covers the most deployments
@@ -513,20 +518,30 @@ removes only copies of the same log entry.
 > - **Then** the receiver StatefulSet has no `volumeClaimTemplates`, and
 >   the receiver and querier configs carry the `${env:…:-}` references
 
-> **Scenario RFC0066.11 — a prolonged outage keeps the tail complete**
+> **Scenario RFC0066.11 — a prolonged outage stays complete and searchable (RFC 0065 B19, B25)**
 > - **Given** a broker backend whose object store is unreachable for
->   longer than ten barrier intervals
-> - **When** a query covers the outage, and again after the tail
->   partition's oldest batches are deleted by a short retention
-> - **Then** the first returns every acknowledged record; the second
->   reports the tail unavailable, and after the owner rebuilds it the
->   same query returns every acknowledged record again
+>   longer than ten barrier intervals, and a querier started during the
+>   outage
+> - **When** a narrow query and a broad query cover the outage
+> - **Then** both return every acknowledged record, the narrow one reads
+>   a number of bytes that does not grow with the backlog, no frame
+>   above the checkpoint is deleted, and once `max_backlog_bytes` is
+>   reached exports get the retryable rejection
+
+> **Scenario RFC0066.12 — a delayed former owner cannot move a checkpoint back**
+> - **Given** a partition whose new owner has checkpointed cut 200 and
+>   deleted the records below it
+> - **When** the former owner, delayed, publishes its checkpoint for
+>   cut 100 to the store and the partition
+> - **Then** `checkpoint.json` still names cut 200, every consumer
+>   ignores the cut-100 record, and a restarting tail replica restores
+>   from cut 200
 
 ## 6. Testing strategy
 
 - RFC0066.1, .4: unit tests in `ourios-server/src/config` and next to
   the hash; golden values committed with the hash.
-- RFC0066.5, .6, .7, .8, .11: integration tests against an in-memory
+- RFC0066.5, .6, .7, .8, .11, .12: integration tests against an in-memory
   `BrokerClient` (§3.2), runnable locally. RFC0066.7's equal-count arm
   is also a `proptest` over random flush and barrier points.
 - RFC0066.2, .3 and RFC0066.7's latency arm: CI-only container tests
@@ -558,13 +573,9 @@ removes only copies of the same log entry.
   in the receiver.
 - [ ] `rskafka` (this draft) or `rdkafka`? `rskafka` is maintained by
   one company that no longer uses it; a fork may become necessary.
-- [ ] On a retention gap, continue from the log start (this draft) or
-  stop mining that partition until an operator acts?
 - [ ] WarpStream stores its log in object storage and acknowledges
   slower than a disk-backed broker. Is that latency acceptable as a
   supported target, or documented as "works, slower acks"?
-- [ ] Should the tail topic be optional (`tail_topic` unset → broker WAL
-  without the queryable tail)?
 
 ## 8. References
 

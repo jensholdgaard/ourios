@@ -655,14 +655,18 @@ group id so no RPC crosses into another group.
 >   replica becomes the flusher without replaying the log, and after
 >   compaction no `(tenant, ingest position)` appears twice
 
-> **Scenario RFC0065.24 — a wiped disk rejoins as a new replica (B4, B6)**
-> - **Given** a three-node cluster, and a node restarted under the same
->   name on an empty volume, once with the leader alive and once after
->   the leader is lost
+> **Scenario RFC0065.24 — a wiped disk rejoins as a new replica (B4, B6, B8)**
+> - **Given** a group of three voters, and a voter restarted under the
+>   same name on an empty volume, once while the other two (one of them
+>   the leader) are up, and once while the leader is also lost
 > - **When** the cluster continues
-> - **Then** the node joins under a new identity as a learner and is
->   promoted only once caught up, no node's core panics, and every
->   acknowledged record is present
+> - **Then** in the first case the node joins under a new identity as a
+>   learner and is promoted only once caught up, no node's core panics,
+>   and every acknowledged record is present
+> - **And** in the second case only one original voter remains, so the
+>   group fails closed: no election, no membership change and no ack
+>   until an original quorum returns, with the retryable rejection for
+>   its tenants; permanent loss of that quorum is B8's offline recovery
 
 > **Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13)**
 > - **Given** a group whose other two voters are lost for good, with
@@ -673,6 +677,14 @@ group id so no RPC crosses into another group.
 >   survivor leads alone, and its first new entry's position is above
 >   every position in any published file, so no new row collides with
 >   an old one
+
+> **Scenario RFC0065.26 — a delayed former flusher cannot move a checkpoint back**
+> - **Given** a group whose new flusher has checkpointed `seq` 200 and
+>   whose replicas have purged below it
+> - **When** the former flusher, delayed, writes its bundle and
+>   `checkpoint.json` for `seq` 100 and proposes its checkpoint entry
+> - **Then** `checkpoint.json` still names 200, the leader rejects the
+>   proposal, and a restarting tail replica restores from 200
 
 ## 6. Proposed design
 
@@ -850,7 +862,14 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   and its unused reserved blocks, all taken at the same cut. Only after
   every object of the bundle is durable does it write `checkpoint.json`
   (the `seq`, the term, the bundle's key) and propose a checkpoint entry
-  to the leader. Every replica snapshots and purges its group WAL below
+  to the leader. Publication is **monotonic and fenced**: bundles are
+  immutable, keyed by their `seq`; `checkpoint.json` changes only by
+  `put_if_match` and a writer whose `seq` is not above the stored one
+  abandons its write; and the leader appends a checkpoint entry only
+  from the flusher named by the latest flusher-assignment entry, with a
+  `seq` above the last applied checkpoint, so a delayed former flusher
+  can neither move the checkpoint back nor make a replica restore from a
+  cut whose history is purged. Every replica snapshots and purges its group WAL below
   the checkpoint (RFC 0008 §6.7) when it applies that entry, so no
   history is purged that a miner restore still needs. Unlike RFC 0052
   §3.1 on the local backend, a failed snapshot write here **fails the

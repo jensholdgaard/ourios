@@ -888,13 +888,17 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   before the next block entry does so at the same log position on every
   replica, so the outcome (no id, body kept, as `id_reservation_failed`
   today) is still identical everywhere.
-- **Miner snapshots** move to
-  `<bucket>/wal/replicated/snapshots/<tenant>.snap`, written at the
-  barrier as today (`recovery::write_folded_snapshots`). The snapshot's
-  `wal_high_water` gains a variant `{ group, seq }`, a new snapshot
-  format version; a snapshot of an older version is discarded and the
-  tenant fully replayed, as `ourios-miner/src/snapshot.rs` already does
-  for any unreadable snapshot.
+- **Snapshot and bundle formats.** The checkpoint bundle (§6.5) and the
+  miner snapshots in it carry a format version; the snapshot's
+  `wal_high_water` gains a variant `{ group, seq }`. Once the WAL below a
+  checkpoint is purged, a full replay can no longer rebuild the miner
+  and allocator state, so the local backend's rule of discarding an
+  unreadable snapshot and replaying does not carry over: a release that
+  changes a bundle format ships a migration from the previous one, and a
+  replica that finds neither a usable bundle nor the group's complete
+  history from `seq` 0 **fails closed** for that group (it serves no
+  tail and does not flush, and reports why) rather than mine rows that
+  could differ from its peers'.
 - **Recovery** of a tail replica on start: read the checkpoint `c` and
   the snapshots, replay the local group WAL from the lower of `c` and
   the snapshots' marks, and suppress per consumer as RFC 0008 §6.6
@@ -914,8 +918,16 @@ record.
   (`UInt32`), written with dictionary encoding off and
   `DELTA_BINARY_PACKED`. Old files and local-backend files have no such
   columns, and readers treat them as absent (RFC 0005 §3.9), so
-  `AGENTS.md` §3.5 needs no migration. RFC 0066 writes the same columns
-  with the Kafka partition as the group and the offset as `seq`.
+  `AGENTS.md` §3.5 needs no migration.
+- **A log namespace in the group number.** `ingest_group` is not the raw
+  group index but a **log id** allocated once per log incarnation: the
+  first start of a cluster allocates one id per group from a counter in
+  `<bucket>/wal/log_ids.json` by compare-and-swap, and records the
+  mapping in `cluster.json`. RFC 0066 allocates one per (topic id,
+  partition), using the broker's topic UUID, so a recreated topic gets
+  new ids. Positions from different logs, backends or topic incarnations
+  therefore never compare equal, and switching a tenant's backend or
+  recreating a topic cannot make dedup discard unrelated rows.
 - **Cost, measured** (2026-11-01 spike, otel-demo-v4, 735 377 rows at
   28 B a row on disk, the real writer properties): 0.03 B a row (0.1 %)
   in freshly flushed files, which hold ascending runs, and 0.9 B a row
@@ -993,11 +1005,28 @@ never count toward an ack (learners, under §4.3's shape).
   (`AGENTS.md` §3.1–§3.3). A tail replica whose rows diverge from the
   flusher's anyway is a bug B16 catches (RFC0065.20).
 - **Read your acks (B14) without touching ingest (B23).** A `Tail` call
-  to a tail replica first asks the leader for its commit point (one
-  small call, batched across concurrent reads), waits until the replica
-  has applied and mined through it, then answers. A tail replica that
-  cannot reach the leader answers "unavailable" instead of a possibly
-  stale tail.
+  to a tail replica first obtains a **quorum-confirmed** read point:
+  the replica asks the leader for its `read_log_id`, which the leader
+  returns only after confirming its leadership with a quorum (ReadIndex,
+  not a lease), so a deposed leader or one whose commit point lags
+  cannot answer. One confirmation is batched across concurrent reads.
+  The replica then waits until it has applied and mined through that
+  id, and answers. If it cannot obtain a confirmed read point it answers
+  "unavailable" instead of a possibly stale tail.
+- **Templates and aliases (H5).** The querier compiles body-equality
+  predicates and renders rows against the stored template map (RFC
+  0033) before it plans (`ourios-querier/src/lib.rs`). Tail rows can
+  use templates minted since that map was published, so a `Tail` call
+  first returns the template definitions (`template_id`,
+  `template_version`, tokens) the replica has minted above the
+  checkpoint, as of the same read point, and the querier compiles and
+  renders against the union of the stored map and those definitions;
+  ids are identical on every replica (§6.7), so the union has no
+  conflicts. Alias state is not produced by mining and is read as
+  today. During an object-store outage the querier uses its last
+  refreshed map and alias state (RFC 0060) plus the tail's definitions,
+  and a query whose predicate needs a template neither holds fails
+  with the unavailable report rather than matching nothing.
 - **The querier's read**, per group the query's tenant is in:
   1. read the group's checkpoint `c`;
   2. list the tenant's Parquet files as today (`file_set.rs`);

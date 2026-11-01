@@ -189,9 +189,17 @@ succeeds, so the trait changes shape:
 - A produce that fails or times out fails every turn in the window
   with the retryable rejection RFC 0053 §3.1 defines (`UNAVAILABLE`,
   HTTP `503`); `NOT_ENOUGH_REPLICAS` is the common cause. Nothing is
-  acked. The receiver does not retry a produce itself: a timed-out
-  produce may have been written, and the client's own retry makes the
-  same duplicate a lost ack makes on the local backend today.
+  acked. Nothing retries a produce on the receiver's behalf: a
+  timed-out produce may have been written, and a resend would create a
+  second copy at a new offset, which position dedup cannot see. `rskafka`
+  0.6.0's `PartitionClient::produce` retries I/O failures internally
+  (`maybe_retry`) without idempotent sequencing, so the `BrokerClient`
+  either sets its backoff to zero retries for produce or, if that cannot
+  be configured, carries a small patch or fork that removes the retry;
+  enabling Kafka's idempotent producer is the alternative if the client
+  is replaced (§7). A lost produce response is then the same duplicate a
+  lost ack makes on the local backend today, from the client's own
+  retry, and nothing more (RFC0066.13).
 - After the ack, the receiver does **not** mine the batch. Mining moves
   to the partition's owner (§3.5).
 
@@ -222,13 +230,12 @@ succeeds, so the trait changes shape:
   can neither move the store's checkpoint back nor make a replica
   restore from a cut whose history is gone. Every frame below the
   checkpoint is in Parquet. Ourios never commits offsets to the broker.
-- **Miner snapshots** move to `<bucket>/wal/<topic>/snapshots/<tenant>.snap`,
-  written at the barrier as today (`recovery::write_folded_snapshots`).
-  The snapshot's `wal_high_water` gains a broker variant
-  `{ partition, offset }`, which is a new snapshot format version; a
-  snapshot of an older version is discarded and the tenant fully
-  replayed, as `ourios-miner/src/snapshot.rs` already does for any
-  unreadable snapshot.
+- **Snapshot and bundle formats** follow RFC 0065 §6.5: the snapshot's
+  `wal_high_water` gains a broker variant `{ partition, offset }`, a
+  bundle-format change ships a migration, and a consumer that finds
+  neither a usable bundle nor the partition's complete history fails
+  closed for that partition, since `DeleteRecords` has removed what a
+  full replay would need.
 - **Recovery** on start or on taking over a partition: read the
   checkpoint `c` and the snapshots, fetch from the lower of `c` and the
   snapshots' high-water marks, and suppress per consumer as RFC 0008
@@ -281,12 +288,15 @@ numbers.
 
 - **Storage.** RFC 0065 §6.6's `OPTIONAL` `ingest_group`,
   `ingest_seq` and `ingest_index` columns (its amendment of RFC 0005
-  §3.2), kept for the file's life as there. Kafka offsets are
-  non-negative, so `offset` fits `ingest_seq` and `partition`
-  `ingest_group` unchanged.
+  §3.2), kept for the file's life as there. `ingest_group` holds the
+  log id RFC 0065 §6.6 allocates once per (topic UUID, partition) and
+  records in `topic.json`, so a recreated or different topic, or a
+  tenant moved from the replicated backend, never reuses a position
+  already stored in Parquet; Kafka offsets are non-negative and fit
+  `ingest_seq`.
 - **Compaction** (RFC 0009) keeps the first row of each
   `(tenant, ingest position)` within a partition and drops the rest.
-- **Queries** dedup by it at the flush boundary (§3.8).
+- **Queries** dedup by it across the whole input (§3.8).
 
 ### 3.7 Producer identity
 
@@ -486,8 +496,10 @@ removes only copies of the same log entry.
 >   checkpoint
 > - **When** its owner starts
 > - **Then** it records `ourios.ingest.batches{error.type="retention_gap"}`
->   and an error event naming the partition and both offsets, and
->   continues from the log start
+>   and an error event naming the partition and both offsets, stops
+>   consuming that partition, and reports its tail unavailable
+> - **And** it continues from the log start only after an operator
+>   acknowledges the gap with the CLI verb (§3.5)
 
 > **Scenario RFC0066.7 — the tail is queryable and counted once**
 > - **Given** a broker backend with the age trigger at 300 s and a test
@@ -537,11 +549,18 @@ removes only copies of the same log entry.
 >   ignores the cut-100 record, and a restarting tail replica restores
 >   from cut 200
 
+> **Scenario RFC0066.13 — a lost produce response makes no second copy**
+> - **Given** a broker that appends a produce request and then drops its
+>   response
+> - **When** the receiver's produce times out
+> - **Then** the export gets the retryable rejection, the broker holds
+>   exactly one copy of the frame, and the client did not resend it
+
 ## 6. Testing strategy
 
 - RFC0066.1, .4: unit tests in `ourios-server/src/config` and next to
   the hash; golden values committed with the hash.
-- RFC0066.5, .6, .7, .8, .11, .12: integration tests against an in-memory
+- RFC0066.5, .6, .7, .8, .11, .12, .13: integration tests against an in-memory
   `BrokerClient` (§3.2), runnable locally. RFC0066.7's equal-count arm
   is also a `proptest` over random flush and barrier points.
 - RFC0066.2, .3 and RFC0066.7's latency arm: CI-only container tests

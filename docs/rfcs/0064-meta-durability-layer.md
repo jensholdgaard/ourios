@@ -31,10 +31,11 @@ replicas have fsynced it. This RFC does not change what "durably"
 means. It writes down what the existing sentence requires of a
 replicated WAL, so the rule is checkable rather than implied, and
 states it without naming a protocol, so it binds an in-sync-set design
-and a Raft quorum alike: an ack waits until every replica that could
-later lead holds the batch fsynced, never on fewer than a configured
-floor; a replica that has lost leadership can never acknowledge; and
-the crash test covers the replicated backend too. H8 goes from dormant
+and a Raft quorum alike, as three separate guarantees: an ack waits
+until at least a configured floor of replicas has fsynced the batch; a
+replica becomes leader only if it already holds every acknowledged
+batch; and a replica that has lost leadership can never acknowledge.
+The crash test covers the replicated backend too. H8 goes from dormant
 to live for the replicated backend, with the dedup key RFC 0065
 defines.
 
@@ -78,10 +79,10 @@ becomes:
 
 ```markdown
 - Replication is in addition to the WAL, not instead of it. A
-  replicated WAL acknowledges a batch only after it is fsynced on
-  enough replicas that any replica able to become leader later holds
-  it, and never on fewer than its configured floor; when the floor
-  cannot be met, the batch is rejected, not acknowledged on fewer. A
+  replicated WAL acknowledges a batch only after at least its
+  configured floor of replicas has fsynced it; when the floor cannot be
+  met, the batch is rejected, not acknowledged on fewer. A replica
+  becomes leader only if it already holds every acknowledged batch. A
   replica that has lost leadership can never acknowledge, whatever its
   clock says.
 ```
@@ -105,9 +106,9 @@ RFC 0057 used:
 
 ```markdown
 2026-MM-DD revision states what §3.4's "replication is in addition to
-the WAL" requires of a replicated WAL (fsync on every replica that
-could later lead before the ack, a replica floor, fencing of a replaced
-leader) and extends §4
+the WAL" requires of a replicated WAL (a floor of fsynced replicas
+before the ack, a new leader holding every acknowledged batch, fencing
+of a replaced leader) and extends §4
 item 3's crash test to every backend, per **RFC 0064**
 (maintainer-approved `meta:` RFC).
 ```
@@ -119,10 +120,10 @@ and `*Last updated: …*` moves to the enacting date.
 - **H3.** The mitigation bullet "Replication, when added, is **in
   addition to** the WAL, not a replacement." becomes: "Replication is
   **in addition to** the WAL, not a replacement. On the replicated
-  backend (RFC 0065) an ack waits until every replica that could later
-  lead holds the batch fsynced, never on fewer than a configured floor;
-  a replaced leader cannot acknowledge; and the crash-recovery test
-  kills the leader mid-batch."
+  backend (RFC 0065) an ack waits for a configured floor of fsynced
+  replicas, a replica becomes leader only if it holds every
+  acknowledged batch, a replaced leader cannot acknowledge, and the
+  crash-recovery test kills the leader mid-batch."
 - **H8.** The banner's "Ourios does not currently replicate at ingest,
   so this hazard is dormant" becomes "This hazard is dormant on the
   local WAL backend and live on the replicated one (RFC 0065)." The

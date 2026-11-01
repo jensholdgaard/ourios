@@ -1,7 +1,7 @@
 ---
 rfc: 0064
 title: "meta: replication behind WAL-before-ack"
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-01
@@ -11,14 +11,15 @@ superseded-by: —
 
 # RFC 0064 — meta: replication behind WAL-before-ack
 
-> **Status: `drafted`.** Tracks #1141 (option 2). This is a `meta:` RFC.
+> **Status: `specified`.** Tracks #1141 (option 2). This is a `meta:` RFC.
 > It proposes changes to `AGENTS.md` §3.4 and §4 and to
 > `docs/hazards.md` H3 and H8. `AGENTS.md`'s footer requires "a `meta:`
 > RFC and majority maintainer approval" for any change to it, and
 > `docs/hazards.md` §Adding a new hazard requires one for a changed
 > hazard contract. Per `AGENTS.md` §8.5 the edits are **not** made in
 > the drafting session: §3 gives the exact text, and it lands in a
-> separate PR after approval. Precedent: RFC 0012 and RFC 0057. The
+> separate PR as soon as the maintainer approves this RFC, not when RFC
+> 0065 ships (§7, Q1). Precedent: RFC 0012 and RFC 0057. The
 > implementation is RFC 0065, which cannot reach `red` before this RFC
 > is accepted.
 
@@ -32,7 +33,8 @@ means. It writes down what the existing sentence requires of a
 replicated WAL, so the rule is checkable rather than implied, and
 states it without naming a protocol, so it binds an in-sync-set design
 and a Raft quorum alike, as three separate guarantees: an ack waits
-until at least a configured floor of replicas has fsynced the batch; a
+until at least two replicas, and at least the backend's configured
+floor, have fsynced the batch; a
 replica becomes leader only if it already holds every acknowledged
 batch; and a replica that has lost leadership can never acknowledge.
 The crash test covers the replicated backend too. H8 goes from dormant
@@ -61,8 +63,8 @@ inferred.
 A local fsync survives a process crash and a power loss on that node.
 It does not survive losing the node's disk, which takes every acked
 record not yet in Parquet with it (#1141). Replicating the WAL to other
-nodes, each fsyncing its own copy, survives losing any disk below the
-in-sync floor without weakening the fsync rule.
+nodes, each fsyncing its own copy, survives losing any one disk
+without weakening the fsync rule.
 
 ## 3. Proposed design
 
@@ -79,9 +81,10 @@ becomes:
 
 ```markdown
 - Replication is in addition to the WAL, not instead of it. A
-  replicated WAL acknowledges a batch only after at least its
-  configured floor of replicas has fsynced it; when the floor cannot be
-  met, the batch is rejected, not acknowledged on fewer. A replica
+  replicated WAL acknowledges a batch only after at least two
+  replicas, and at least its configured floor, have fsynced it, so
+  losing one disk never loses an acknowledged batch; when that cannot
+  be met, the batch is rejected, not acknowledged on fewer. A replica
   becomes leader only if it already holds every acknowledged batch. A
   replica that has lost leadership can never acknowledge, whatever its
   clock says.
@@ -106,7 +109,7 @@ RFC 0057 used:
 
 ```markdown
 2026-MM-DD revision states what §3.4's "replication is in addition to
-the WAL" requires of a replicated WAL (a floor of fsynced replicas
+the WAL" requires of a replicated WAL (at least two fsynced replicas
 before the ack, a new leader holding every acknowledged batch, fencing
 of a replaced leader) and extends §4
 item 3's crash test to every backend, per **RFC 0064**
@@ -120,8 +123,8 @@ and `*Last updated: …*` moves to the enacting date.
 - **H3.** The mitigation bullet "Replication, when added, is **in
   addition to** the WAL, not a replacement." becomes: "Replication is
   **in addition to** the WAL, not a replacement. On the replicated
-  backend (RFC 0065) an ack waits for a configured floor of fsynced
-  replicas, a replica becomes leader only if it holds every
+  backend (RFC 0065) an ack waits for at least two fsynced replicas
+  (its write quorum), a replica becomes leader only if it holds every
   acknowledged batch, a replaced leader cannot acknowledge, and the
   crash-recovery test kills the leader mid-batch."
 - **H8.** The banner's "Ourios does not currently replicate at ingest,
@@ -171,11 +174,13 @@ a correlated power loss can lose acked records. RFC 0065 needs no
 widening, so this RFC does not make one; RFC 0066 must argue for it on
 its own.
 
-**Allow a floor of 1.** The leader alone would then acknowledge, which
-is today's local guarantee and is what the local backend is for. RFC
-0065 derives its floor from the replication factor (a majority of 3 or
-5, RFC 0065 §3.8), so the rule requires the floor to be explicit, not
-necessarily configurable.
+**Allow a floor of 1, or leave the floor to configuration.** The leader
+alone would then acknowledge, which is today's local guarantee and is
+what the local backend is for; a replicated backend configured that way
+loses acknowledged data with one disk and stops meaning safe. Rejected
+(maintainer, 2026-11-02, §7 Q2): the rule fixes a minimum of two. RFC
+0065 never goes below it (a majority of 3 or 5, RFC 0065 §3.8), so the
+minimum binds future backends such as RFC 0066.
 
 ## 5. Acceptance criteria
 
@@ -208,34 +213,17 @@ necessarily configurable.
 
 ## 7. Open questions
 
-Behaviour questions for the maintainer, each with the options and a
-recommendation.
+Both resolved by the maintainer on 2026-11-02.
 
-- [ ] **Q1. When should the project rules change?** This RFC rewrites
-  the durability rule in `AGENTS.md` so it covers data copied to
-  several machines, not only one local disk.
-  - *On approval*: the new rule governs the replication code while it
-    is written and reviewed; until it ships, `AGENTS.md` describes a
-    feature that does not exist yet.
-  - *Once replication works* (RFC 0065 `green`): `AGENTS.md` describes
-    only what exists, but the replication PRs are reviewed against the
-    old wording.
-
-  *Recommendation: on approval.* The new rule is the bar those PRs
-  must meet, and for today's single-disk setup it says the same thing
-  as the old one.
-- [ ] **Q2. With replication on, may Ourios confirm data that only one
-  disk holds?** Without replication one disk is all there is, and that
-  stays allowed; this is only about replication.
-  - *No, fixed in `AGENTS.md`*: a write is confirmed only once at least
-    two disks hold it, so losing one disk never loses confirmed data,
-    and every future backend (Kafka included) must meet that.
-  - *Leave it to configuration* (this draft): an operator could set up
-    replication that still loses confirmed data when one disk dies.
-
-  *Recommendation: fix it at 2.* RFC 0065 already cannot go below 2,
-  so this binds only future backends; without it, "replicated" stops
-  meaning safe.
+- [x] **Q1. When should the project rules change?** **On approval.**
+  The enacting PR lands as soon as this RFC is approved, so the new
+  rule is the bar the RFC 0065 implementation PRs are reviewed against;
+  for the local backend it says what the old rule said.
+- [x] **Q2. With replication on, may Ourios confirm data that only one
+  disk holds?** **No: a minimum of two, fixed in `AGENTS.md`** (§3.1).
+  Without replication one disk is all there is, and that stays
+  allowed. RFC 0065 already cannot go lower, so the minimum binds only
+  future backends, Kafka included (RFC 0066).
 
 ## 8. References
 

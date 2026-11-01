@@ -1,7 +1,7 @@
 ---
 rfc: 0065
 title: Replicated WAL and a queryable tail
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-01
@@ -11,8 +11,8 @@ superseded-by: —
 
 # RFC 0065 — Replicated WAL and a queryable tail
 
-> **Status: `drafted`.** Tracks #1141 (option 2). It depends on
-> **RFC 0064** (`meta:`, `drafted`), which states in `AGENTS.md` §3.4
+> **Status: `specified`.** Tracks #1141 (option 2). It depends on
+> **RFC 0064** (`meta:`, `specified`), which states in `AGENTS.md` §3.4
 > what a replicated WAL must guarantee; this RFC cannot reach `red`
 > before RFC 0064 is accepted. §3 states the required behaviour without
 > naming a mechanism; §4 surveys the Rust crates that could provide it;
@@ -23,8 +23,9 @@ superseded-by: —
 > and per-`template_id` counts are invariant across a compaction
 > (RFC0009.2)" gains "except rows that repeat an ingest position, of
 > which compaction keeps one" (§6.6), **extends RFC 0016 §3.4 and RFC
-> 0027's tool results** (`accepted`) with an additive `tail_unavailable`
-> field (§6.7), and adds a group variant to the miner snapshot's
+> 0027's tool results** (`accepted`) with additive `tail_unavailable`
+> and `parquet_unavailable` response fields and an additive
+> `require_complete` request field (§6.7), and adds a group variant to the miner snapshot's
 > high-water mark (RFC 0001 §6.9, `accepted`). It reuses RFC 0052's barrier and
 > checkpoint (`green`), RFC 0053's retryable rejection (`drafted`) and
 > RFC 0059's template-id allocation (`green`), whose reservations §6.7
@@ -177,9 +178,10 @@ headline requirements are durability (§3.1–§3.3), a queryable tail
   moves from the tail into Parquet, across a flush, a checkpoint, a
   failover and a compaction.
 - **B17. Never silently partial.** If a tenant's tail cannot be read,
-  the query returns its Parquet results and names the tail as
-  unavailable in the response, or fails, never returns fewer records
-  without saying so.
+  the query by default returns its Parquet results and names the tail
+  as unavailable in the response; a caller that asks for a complete
+  answer (an alerting rule) gets a failed query instead. It never
+  returns fewer records without saying so.
 - **B18. Same rules as Parquet.** Tail rows go through the same plan:
   tenant and conversation predicates, row masking (RFC 0047) and the
   DSL (H6) apply unchanged.
@@ -676,8 +678,12 @@ the mass-failover time and vote-log batching as tuning signals.
 >   takeover yet)
 > - **When** a tenant in it is queried
 > - **Then** the response carries the Parquet results and names the
->   tail as unavailable, or the query fails; it never returns fewer
->   records without saying so
+>   tail as unavailable; it never returns fewer records without saying
+>   so
+> - **And** the same query with `require_complete: true` fails with the
+>   retryable unavailable error (HTTP `503`, an MCP tool error) naming
+>   the group, and returns no rows; the same holds for
+>   `parquet_unavailable` during a store outage (RFC0065.21)
 
 > **Scenario RFC0065.15 — a store outage does not stop acks (B10)**
 > - **Given** a healthy three-node cluster
@@ -807,7 +813,8 @@ the mass-failover time and vote-log batching as tuning signals.
   `<bucket>/wal/replicated/cluster.json` (voting peer ids, `groups`,
   `replication_factor`) with `put_if_absent` the first time a node
   starts. A node whose configuration differs refuses to start. Changing
-  the voting layout is a migration this RFC does not define (§9).
+  the voting layout is a migration this RFC does not define; a later
+  RFC will (§9, Q5).
 - **The tail pool is not part of the layout (B24).** `tail_peers` and
   `tail_replicas` can change at any time. Each group's tail replicas are
   the `tail_replicas` members of `tail_peers` with the highest
@@ -1070,7 +1077,8 @@ record.
 - **Queries** dedup the tail against Parquet by it (§6.7).
 - **What it does not remove.** A client retry after a lost ack is a
   new entry with a new `seq`, the same duplicate the local backend makes
-  today. This draft adds no Ourios-specific key to remove it (§9, Q4).
+  today. Ourios adds no key of its own to remove it; the delivery is
+  documented as at least once, as OTLP's is (§9, Q4).
 
 ### 6.7 The tail service
 
@@ -1194,7 +1202,12 @@ never count toward an ack (learners, under §4.3's shape).
   bounded retry, the response carries the Parquet results and a
   `tail_unavailable` entry naming the group. The query API and the MCP
   tools gain that field; a client that ignores it sees today's
-  behaviour.
+  behaviour. A request with `require_complete: true` (default `false`)
+  instead fails with the retryable unavailable error (HTTP `503`, an
+  MCP tool error) naming what was unreachable, and returns no rows; it
+  applies to `parquet_unavailable` alike. Dashboards keep the default;
+  alerting rules set the flag, so a missing tail never reads as
+  "nothing happened".
 - **Same plan (B18).** The tail is a DataFusion table beside the
   Parquet listing, so tenant and conversation predicates, row masking
   (RFC 0047) and the DSL apply unchanged.
@@ -1366,57 +1379,33 @@ from rows.
 
 ## 9. Open questions
 
-Behaviour questions for the maintainer. Each says what a user or
-operator would notice, the options, and a recommendation.
+The behaviour questions were resolved by the maintainer on 2026-11-02;
+Q1 and Q2 are RFC 0064's (§7 there).
 
-- [ ] **Q3. If recent logs can't be reached, should a query fail or
-  return what it has? (B17)** The last few seconds to minutes of logs
-  live on the tail replicas until they reach Parquet. If those cannot
-  be reached:
-  - *Return the older results, clearly marked incomplete* (this
-    draft): dashboards keep working with a warning, but an alert such
-    as "zero errors in the last 5 minutes" could be wrong if it ignores
-    the mark.
-  - *Fail the query*: never wrong, but dashboards go blank during a
-    tail outage.
-  - *Both*: marked results by default, and a request flag with which a
-    caller (an alerting rule) asks for "complete or fail".
-
-  *Recommendation: both.* One request flag; dashboards and alerts need
-  different answers, and only the caller knows which it is.
-- [ ] **Q4. Should Ourios block duplicates when a client resends after
-  a lost acknowledgement? (H8)** If the acknowledgement is lost on the
-  network and the client resends, the logs are stored twice. That is
-  how OTLP behaves everywhere and how Ourios behaves today; replication
-  adds no new duplicates of this kind, and its own internal ones are
-  removed (§6.6).
-  - *Accept it, documented*: no change for clients.
-  - *Add an Ourios-only request ID*: duplicates dropped, but only for
-    clients that send it; the OpenTelemetry Collector and SDKs never
-    would, since OTLP has no such field.
-
-  *Recommendation: accept and document it.* A fix almost no client
-  would use is not worth a contract kept forever; revisit if a real
+- [x] **Q3. If recent logs can't be reached, should a query fail or
+  return what it has? (B17)** **Both.** By default the query returns
+  the older results marked incomplete (`tail_unavailable`,
+  `parquet_unavailable`), so dashboards keep working with a warning; a
+  request with `require_complete: true` fails instead, for alerting
+  rules where a missing tail must not read as "nothing happened" (§6.7,
+  RFC0065.14).
+- [x] **Q4. Should Ourios block duplicates when a client resends after
+  a lost acknowledgement? (H8)** **No; accepted and documented.** It is
+  how OTLP behaves everywhere and how the local backend behaves today;
+  replication adds no new duplicates of this kind, and its own are
+  removed by position (§6.6). An Ourios-only request ID would be sent
+  by almost no client, since OTLP has no such field; revisit if a real
   client asks.
-- [ ] **Q5. Can a running cluster add machines that accept writes?**
-  Adding tail capacity is free at any time (B24). This is only about
-  the voters and the replication factor.
-  - *Refuse* (this draft): a node with a changed layout will not start;
-    growing write capacity means building a new cluster.
-  - *Migrate in place*: flush everything pending to Parquet, then
-    switch layouts. Acknowledgements pause for as long as that flush
-    takes: seconds normally, much longer while a backlog (B25) waits.
-  - *Refuse now, migrate later*: ship with refusal and specify the
-    migration in a follow-up RFC.
+- [x] **Q5. Can a running cluster add machines that accept writes?**
+  **Not in this RFC.** A node with a changed voting layout refuses to
+  start (§6.1); an in-place migration (flush to Parquet, then switch
+  layouts) gets its own RFC. Tail capacity scales at any time (B24),
+  and the 16 default groups spread load over up to 16 machines without
+  a layout change.
 
-  *Recommendation: refuse now, migrate later.* The 16 default groups
-  already spread load over up to 16 machines without a layout change;
-  the migration has its own hard cases (writes during a long flush)
-  and deserves its own RFC; refusal is safe meanwhile.
-
-Decided in this draft (technical): RFC0065.10's check uses
-`openraft`'s upstream verification plus our seeded simulation suite,
-not a TLA+ specification of our own (§8 gives the reasoning).
+Decided as technical calls: RFC0065.10's check uses `openraft`'s
+upstream verification plus our seeded simulation suite, not a TLA+
+specification of our own (§8 gives the reasoning).
 
 ## 10. References
 

@@ -474,6 +474,52 @@ takeover and the version choice.
 `cluster_name` is a tracing label, not a guard: the transport routes by
 group id so no RPC crosses into another group.
 
+### 4.6 Performance spike result
+
+Indicative only: one laptop (10 cores, SSD), every node in one process
+over an in-memory network, with antivirus scanning the writes and
+another spike running; means were stable across repeats, p99s noisy.
+`openraft` 0.10.0-alpha.37, release build, fsync off the core task.
+
+- **Ack latency.** With fast disks, a 3-voter group adds about
+  0.3–0.4 ms at p50 over the local WAL (1 KiB at 500/s: 0.17 ms local,
+  0.40 ms Raft); 5 voters cost barely more. With a modelled disk per
+  node (about 3.5 ms per fsync) the leader's and a follower's fsyncs
+  overlap, so Raft adds about 0.25 ms to a 4.5 ms ack. Closed-loop
+  throughput on one shared disk was 3–4× below local, from the leader's
+  single core task and three times the bytes on one disk; separate disks
+  and the pipelined `stream_append` transport (measured faster than
+  sequential) are what production has.
+- **Many groups.** `openraft`'s own idle cost is linear, about 4 ms of
+  CPU per group per second (50 ms heartbeats) and under 1 MiB per
+  group; 512 groups cost about 2 cores of heartbeats per process. The
+  real knee is ours: each RFC 0008 WAL preallocates an 8.3 MiB RFC 0052
+  reclaim sidecar sized for 1 024 tenants, so 512 per-group WALs would
+  cost about 4.3 GiB of disk and memory per node before any data. A
+  128-group run with WALs did not finish and was not diagnosed.
+  `openraft-multi` only shares connections; it changes none of this.
+- **Tail isolation (B23, B24).** Learners never sit in the ack path:
+  with tail reads at saturation, ingest held its rate and ack p99
+  stayed within the noise of the run without reads. Each ReadIndex
+  confirmation costs the leader about two append messages; batching one
+  confirmation across all queued reads cut confirmations 4.5× and the
+  leader's messages 2.8×, and `openraft`'s piggyback option (wait for
+  the next heartbeat) adds none at about 1.7 ms per read. A second
+  learner doubled tail reads (55 000 to 100 000 a second) with voters,
+  quorum and ack p50 unchanged.
+- **Failover.** The time from killing the leader to the first ack on a
+  new one is about 1.8 × `election_timeout_max` (the vote is refused
+  until the old leader's lease, equal to that maximum, expires): about
+  0.55 s at `openraft`'s defaults (50 ms heartbeat, 150–300 ms
+  election), 0.22 s at 20 / 60–120 ms. The tail is unavailable for the
+  same window and back within about 2 ms of the first ack.
+
+**Consequences:** §6.1 sizes each group's WAL sidecar to the group
+instead of the node (coordinate with RFC 0052, whose sidecar geometry
+becomes a WAL setting); §6.7 batches read confirmations; §6.9 starts
+from `openraft`'s timeouts with the failover bound stated; the 128-group
+stall is diagnosed before `red`.
+
 ## 5. Acceptance criteria
 
 > **Scenario RFC0065.1 — the backend is configurable and checked at start**
@@ -729,7 +775,11 @@ group id so no RPC crosses into another group.
   an identity whose vote it has lost.
 - **Each replica keeps one RFC 0008 WAL per group** under
   `wal_root/groups/<group>/`, with RFC 0008's segments, fsync policy
-  and CRCs unchanged.
+  and CRCs unchanged, and its RFC 0052 reclaim sidecar sized for the
+  group's share of tenants rather than the node's 1 024, since a
+  node-sized sidecar per group costs 8.3 MiB each (§4.6). The sidecar's
+  tenant capacity becomes a `WalConfig` setting (coordinate with RFC
+  0052).
 
 ### 6.2 The group record
 
@@ -1009,7 +1059,10 @@ never count toward an ack (learners, under §4.3's shape).
   the replica asks the leader for its `read_log_id`, which the leader
   returns only after confirming its leadership with a quorum (ReadIndex,
   not a lease), so a deposed leader or one whose commit point lags
-  cannot answer. One confirmation is batched across concurrent reads.
+  cannot answer. One confirmation serves every read queued before it
+  was issued (§4.6: 4.5× fewer confirmations); `openraft`'s piggyback
+  option, which waits for the next heartbeat instead, is the setting
+  for read-heavy deployments.
   The replica then waits until it has applied and mined through that
   id, and answers. If it cannot obtain a confirmed read point it answers
   "unavailable" instead of a possibly stale tail.
@@ -1117,10 +1170,10 @@ signal that tunes it:
 |---|---|---|
 | Backlog limit (B25) | 90 % of the WAL volume, sized for 24 h | backlog bytes and age per group, time to the 50 % alert in real outages |
 | Catch-up rate (B26) | ≥ 2× the sized ingest rate | flush throughput against ingest throughput per group, measured drain times |
-| Groups | 16 | per-group CPU, memory and heartbeat cost; ingest skew across groups |
+| Groups | 16 (about 0.06 cores of heartbeats; §4.6) | per-group CPU, memory and heartbeat cost; ingest skew across groups |
 | `tail_replicas` | 1 | tail call latency and saturation per tail replica |
 | Tail memory before local Parquet | the record sink's size and age triggers | tail replica memory, local file count and query bytes read |
-| Election and heartbeat timeouts | `openraft`'s, until measured | failover time, spurious leadership changes |
+| Election and heartbeat timeouts | 50 ms heartbeat, 150–300 ms election: failover and tail gap about 1.8 × the election maximum, 0.55 s (§4.6) | failover time, spurious leadership changes |
 | Freshness target (B15) | under 1 s | ack-to-queryable latency, a new histogram on the tail path |
 
 The backlog bytes and age, flush and ingest throughput per group, and

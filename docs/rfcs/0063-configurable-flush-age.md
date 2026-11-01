@@ -24,9 +24,10 @@ superseded-by: —
 `receiver.max_buffer_age_secs` sets how old a partition's oldest
 buffered record may get before the receiver flushes it to Parquet. The
 default is today's 300 s, and the value can only be lowered (`1..=300`).
-The age sweep runs every `min(30 s, max_buffer_age_secs)`, so a record
-on a quiet tenant becomes queryable within `max_buffer_age_secs` plus one
-sweep. A development or low-volume install can trade more small files,
+The age sweep runs every `min(30 s, max_buffer_age_secs)`, so a quiet
+tenant's partition is drained within `max_buffer_age_secs` plus one
+sweep; its records become queryable once that write reaches the store.
+A development or low-volume install can trade more small files,
 which the compactor already merges, for fresher queries.
 
 ## 2. Motivation
@@ -69,11 +70,14 @@ number of seconds.
 - **Why it can only be lowered.** Two consumers assume no record stays
   buffered longer than 300 s. The compactor's erasure settle
   (`compaction_policy`, `ourios-server/src/main.rs`) waits twice the
-  receiver's maximum flush age, so that rows acked before an erasure
-  request are published before it rewrites (RFC 0009 §3.4). The
-  compactor can run as its own pod and cannot read the receiver's
-  setting, so it keeps using the 300 s ceiling, and a receiver flushing
-  sooner only makes that wait more conservative. RFC 0052's barrier
+  receiver's maximum flush age, which makes it rare in normal operation
+  that a row acked before an erasure request is still unpublished when
+  the rewrite runs (RFC 0009 §3.4). It does not make that window empty:
+  a flush backlog or a WAL replay can still publish later, the residual
+  RFC 0009 §3.4 records as decision D3. The compactor can run as its own
+  pod and cannot read the receiver's setting, so it keeps using the
+  300 s ceiling. A receiver flushing sooner keeps that mitigation as it
+  is and leaves the residual unchanged. RFC 0052's barrier
   (§3.3) drains every partition each 300 s, so a higher age would not
   take effect anyway. Raising the ceiling is a later RFC if anyone needs
   it.
@@ -91,8 +95,9 @@ number of seconds.
 `flush_config()` takes `max_buffer_age` from the resolved config instead
 of the constant. The age sweep's interval becomes
 `min(SINK_FLUSH_TICK, max_buffer_age)`: at the default it stays 30 s;
-at 10 s it is 10 s, so a record is queryable within 20 s rather than
-40 s. RFC 0014 §3.2's trigger rule (flush when age ≥ the configured
+at 10 s it is 10 s, so a partition is drained within 20 s rather than
+40 s. Visibility adds the time to write the object and for the query to
+run, and a sweep waits for the previous sweep's writes to settle. RFC 0014 §3.2's trigger rule (flush when age ≥ the configured
 max) is unchanged.
 
 ### 3.3 The barrier keeps its own cadence
@@ -116,7 +121,10 @@ writes show there as more, smaller flushes.
 
 - **§3.4 WAL-before-ack:** unchanged. The age only decides when acked,
   WAL-durable records are copied to Parquet. A lower age publishes
-  sooner, which also shortens recovery replay.
+  sooner but does not shorten recovery replay: the checkpoint still
+  advances only at RFC 0052's barrier, and records an age flush
+  published after the last cut are re-published on replay (RFC 0052
+  §3.1).
 - **§3.6 object storage as truth:** unchanged; nothing new is kept on
   local disk.
 - **§3.7 tenancy:** the age is per receiver, the same for every tenant,
@@ -168,11 +176,19 @@ age would mean per-tenant sweep bookkeeping for a dev-install problem.
 >   with `OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS=10` in
 >   `receiver.extraEnv`, and to the default without it
 
-> **Scenario RFC0063.2 — a lowered age makes records queryable sooner**
-> - **Given** a running server with `max_buffer_age_secs = 2`
+> **Scenario RFC0063.2 — the sweep drains on the configured age**
+> - **Given** a sink built with `max_buffer_age = 2 s` on a paused
+>   Tokio clock, holding records for one partition
+> - **When** the clock advances 1 s, then 2 s more
+> - **Then** the first sweep writes nothing and the second writes the
+>   partition, without a shutdown or a WAL rotation
+
+> **Scenario RFC0063.5 — a lowered age makes records queryable sooner**
+> - **Given** a running server with `max_buffer_age_secs = 2` on the
+>   local filesystem store, with no other load
 > - **When** a few records are sent for one tenant and no more arrive
-> - **Then** a query returns them within 4 s of the ack, without a
->   shutdown or a WAL rotation
+> - **Then** a query polled every 500 ms returns them within 15 s of
+>   the ack, well under the 300 s default's ~330 s
 
 > **Scenario RFC0063.3 — the sweep follows the age, the barrier does not**
 > - **Given** resolved ages of `300` and `10`
@@ -190,7 +206,9 @@ age would mean per-tenant sweep bookkeeping for a dev-install problem.
 - RFC0063.1: config resolution unit tests in `ourios-server/src/config`,
   beside the `encode_workers` ones; the Helm arm in
   `deploy/helm/render-tests.sh`.
-- RFC0063.2: an integration test in `ourios-server/tests`, beside the
+- RFC0063.2: a unit test on the sweep in `ourios-server/src/receiver.rs`
+  with `tokio::time::pause`.
+- RFC0063.5: an integration test in `ourios-server/tests`, beside the
   existing served-role tests, using the bare-env form and a short age.
 - RFC0063.3 and .4: unit tests in `ourios-server/src/receiver.rs` and
   `main.rs` on the interval and policy builders.
@@ -202,10 +220,10 @@ age would mean per-tenant sweep bookkeeping for a dev-install problem.
 
 ## 7. Open questions
 
-- [ ] Is 300 s the right ceiling, or should the range stop lower (say
-  `1..=60`) for the first release and widen only on request? The
-  ceiling only has to stay at or below the compactor's 300 s
-  assumption.
+- [x] Is 300 s the right ceiling, or should the range stop lower (say
+  `1..=60`)? **Resolved (maintainer, 2026-11-01): `1..=300`**, as
+  proposed. The ceiling only has to stay at or below the compactor's
+  300 s assumption (§3.1).
 
 ## 8. References
 

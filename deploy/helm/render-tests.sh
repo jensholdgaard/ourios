@@ -70,6 +70,26 @@ OTEL_TRACES_SAMPLER_ARG=0.01" \
       --set 'extraEnv[1].name=OTEL_TRACES_SAMPLER_ARG' \
       --set-string 'extraEnv[1].value=0.01' | grep '^OTEL_')"
 
+# Regression: the global extraEnv is appended after the chart's own env entries
+# (OTEL_EXPORTER_OTLP_ENDPOINT, AWS_DEFAULT_REGION). Its first entry must start
+# on a new line, or the workload fails to render as YAML ("block sequence
+# entries are not allowed in this context").
+for template in receiver-statefulset.yaml querier-deployment.yaml compactor-deployment.yaml; do
+  check "global extraEnv after exporterEndpoint ($template)" \
+    "OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317
+OTEL_RESOURCE_ATTRIBUTES=service.namespace=obs" \
+    "$(workload_env "$template" --set otel.exporterEndpoint=http://collector:4317 \
+        --set 'extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES' \
+        --set 'extraEnv[0].value=service.namespace=obs' | grep '^OTEL_')"
+done
+check "global extraEnv after the S3 region" \
+  "AWS_DEFAULT_REGION=eu-north-1
+OTEL_RESOURCE_ATTRIBUTES=service.namespace=obs" \
+  "$(workload_env querier-deployment.yaml --set storage.backend=s3 \
+      --set storage.s3.bucket=logs --set storage.s3.region=eu-north-1 \
+      --set 'extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES' \
+      --set 'extraEnv[0].value=service.namespace=obs' | grep -E '^(AWS_DEFAULT_REGION|OTEL_)')"
+
 # A role's extraEnv lands only on that role's workload.
 check "role extraEnv is scoped to its workload (present on querier)" \
   "OTEL_RESOURCE_ATTRIBUTES=service.namespace=query" \

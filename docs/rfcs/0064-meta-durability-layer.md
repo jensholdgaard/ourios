@@ -1,0 +1,210 @@
+---
+rfc: 0064
+title: "meta: replication behind WAL-before-ack"
+status: drafted
+author: Jens Holdgaard Pedersen <jens@holdgaard.org>
+drafting-assistance: Claude
+created: 2026-11-01
+supersedes: —
+superseded-by: —
+---
+
+# RFC 0064 — meta: replication behind WAL-before-ack
+
+> **Status: `drafted`.** Tracks #1141 (option 2). This is a `meta:` RFC.
+> It proposes changes to `AGENTS.md` §3.4 and §4 and to
+> `docs/hazards.md` H3 and H8. `AGENTS.md`'s footer requires "a `meta:`
+> RFC and majority maintainer approval" for any change to it, and
+> `docs/hazards.md` §Adding a new hazard requires one for a changed
+> hazard contract. Per `AGENTS.md` §8.5 the edits are **not** made in
+> the drafting session: §3 gives the exact text, and it lands in a
+> separate PR after approval. Precedent: RFC 0012 and RFC 0057. The
+> implementation is RFC 0065, which cannot reach `red` before this RFC
+> is accepted.
+
+## 1. Summary
+
+`AGENTS.md` §3.4 already allows replication "in addition to the WAL,
+not instead of it". RFC 0065 proposes exactly that: each replica keeps
+a local, fsynced WAL, and a batch is acknowledged only once enough
+replicas have fsynced it. This RFC does not change what "durably"
+means. It writes down what the existing sentence requires of a
+replicated WAL, so the rule is checkable rather than implied, and
+states it without naming a protocol, so it binds an in-sync-set design
+and a Raft quorum alike: an ack waits until every replica that could
+later lead holds the batch fsynced, never on fewer than a configured
+floor; a replica that has lost leadership can never acknowledge; and
+the crash test covers the replicated backend too. H8 goes from dormant
+to live for the replicated backend, with the dedup key RFC 0065
+defines.
+
+An earlier draft of this RFC widened "durably" to a Kafka broker's
+acknowledgement, which is replication without fsync. That widening is
+no longer proposed here; RFC 0066 (the Kafka backend) would need its
+own `meta:` amendment.
+
+## 2. Motivation
+
+### 2.1 The sentence exists, the rules do not
+
+§3.4's last rule says only "If you add replication later, it is in
+addition to the WAL, not instead of it." It says nothing about when a
+replicated write may be acknowledged, how many replicas are enough, or
+what stops an old leader from acknowledging after it has been replaced.
+Each of those is a way to lose acked data while keeping to the letter
+of the rule. A reviewer of RFC 0065's code needs them stated here, not
+inferred.
+
+### 2.2 Why replication at all
+
+A local fsync survives a process crash and a power loss on that node.
+It does not survive losing the node's disk, which takes every acked
+record not yet in Parquet with it (#1141). Replicating the WAL to other
+nodes, each fsyncing its own copy, survives losing any disk below the
+in-sync floor without weakening the fsync rule.
+
+## 3. Proposed design
+
+### 3.1 `AGENTS.md` §3.4, the replication bullet
+
+The last bullet of §3.4's rules,
+
+```markdown
+- If you add replication later, it is in addition to the WAL, not
+  instead of it.
+```
+
+becomes:
+
+```markdown
+- Replication is in addition to the WAL, not instead of it. A
+  replicated WAL acknowledges a batch only after it is fsynced on
+  enough replicas that any replica able to become leader later holds
+  it, and never on fewer than its configured floor; when the floor
+  cannot be met, the batch is rejected, not acknowledged on fewer. A
+  replica that has lost leadership can never acknowledge, whatever its
+  clock says.
+```
+
+The rest of §3.4 is unchanged. The crash-recovery bullet already says
+"an ingester killed mid-batch must recover without losing acknowledged
+data"; §3.2 adds that this covers every backend.
+
+### 3.2 `AGENTS.md` §4, item 3
+
+```markdown
+3. **WAL durability vs. latency** — batched fsync with explicit knob,
+   crash-recovery test in CI for every WAL backend, including a leader
+   killed mid-batch on the replicated one.
+```
+
+### 3.3 `AGENTS.md` footer
+
+A dated sentence in the footer's changelog, in the form RFC 0012 and
+RFC 0057 used:
+
+```markdown
+2026-MM-DD revision states what §3.4's "replication is in addition to
+the WAL" requires of a replicated WAL (fsync on every replica that
+could later lead before the ack, a replica floor, fencing of a replaced
+leader) and extends §4
+item 3's crash test to every backend, per **RFC 0064**
+(maintainer-approved `meta:` RFC).
+```
+
+and `*Last updated: …*` moves to the enacting date.
+
+### 3.4 `docs/hazards.md` H3 and H8
+
+- **H3.** The mitigation bullet "Replication, when added, is **in
+  addition to** the WAL, not a replacement." becomes: "Replication is
+  **in addition to** the WAL, not a replacement. On the replicated
+  backend (RFC 0065) an ack waits until every replica that could later
+  lead holds the batch fsynced, never on fewer than a configured floor;
+  a replaced leader cannot acknowledge; and the crash-recovery test
+  kills the leader mid-batch."
+- **H8.** The banner's "Ourios does not currently replicate at ingest,
+  so this hazard is dormant" becomes "This hazard is dormant on the
+  local WAL backend and live on the replicated one (RFC 0065)." The
+  *Currently* bullet becomes: "Dormant on the local backend, which does
+  not replicate. **Live on the replicated backend**: a client retry
+  after a lost ack, and a new leader replaying from the last
+  checkpoint, can each write a record twice. RFC 0065 meets the *When
+  replication is proposed* rule with a key the log assigns once: each
+  record's group, sequence number and index in its frame, never a time
+  window." The *Detection* signals become required for the replicated
+  backend (RFC 0065 §6.9).
+
+### 3.5 What does not change
+
+- What "durably" means: fsync or equivalent, on every replica that
+  counts toward the ack.
+- `AGENTS.md` §3.6: object storage stays the source of truth, and local
+  disk stays cache and WAL. RFC 0065 keeps its leadership records and
+  checkpoints in the store.
+- `AGENTS.md` §1: Ourios still ships one binary and a Helm chart. The
+  replicated WAL needs no external system beyond the object store every
+  deployment already has.
+- RFC 0008 (`accepted`) stays the local WAL's specification.
+
+## 4. Alternatives considered
+
+**Change nothing and let RFC 0065 carry the rules.** The rules would
+bind only RFC 0065's implementation, and the next replication proposal
+could ignore them. They belong next to the invariant.
+
+**Widen "durably" to a broker's acknowledgement.** The earlier draft of
+this RFC. A Kafka broker acknowledges on replication, not on fsync, so
+a correlated power loss can lose acked records. RFC 0065 needs no
+widening, so this RFC does not make one; RFC 0066 must argue for it on
+its own.
+
+**Allow an in-sync floor of 1.** The leader alone would then
+acknowledge, which is today's local guarantee. It is allowed as a
+configuration (RFC 0065 §3.8, `min_in_sync`), but the rule requires the
+floor to be explicit so an operator chooses it.
+
+## 5. Acceptance criteria
+
+> **Scenario RFC0064.1 — `AGENTS.md` §3.4 and §4 match §3.1–§3.3**
+> - **Given** the enacting PR
+> - **When** `AGENTS.md` is diffed against the version before it
+> - **Then** §3.4's last rule is exactly §3.1's text, §4 item 3 is
+>   exactly §3.2's text, the footer carries §3.3's sentence and a new
+>   `Last updated` date, and nothing else in the file changes
+
+> **Scenario RFC0064.2 — `docs/hazards.md` matches §3.4**
+> - **Given** the enacting PR
+> - **When** `docs/hazards.md` is diffed against the version before it
+> - **Then** H3's replication bullet, H8's banner and H8's *Currently*
+>   bullet read as §3.4 gives them, and no other hazard changes
+
+> **Scenario RFC0064.3 — citations still resolve**
+> - **Given** the enacted `AGENTS.md`
+> - **When** `just agents-citations` and `mdbook build` run
+> - **Then** both pass; §3.4 keeps its number, so no citation moves
+
+## 6. Testing strategy
+
+- RFC0064.1 and .2: maintainer review of the enacting PR's diff against
+  §3.1–§3.4; the text is fixed here so the review is a comparison, not a
+  judgement.
+- RFC0064.3: the existing `book` CI job runs both checks.
+- The behaviour the new rule requires is tested by RFC 0065's criteria
+  (RFC0065.2–.6), not by this RFC.
+
+## 7. Open questions
+
+- [ ] Enact this RFC on approval, or only once RFC 0065 reaches
+  `green`? Enacting early changes the rules before any code relies on
+  them; enacting late keeps `AGENTS.md` describing only what exists.
+- [ ] Should the rule fix a minimum floor (2, so one disk loss never
+  loses acked data), or leave the floor to configuration as drafted?
+
+## 8. References
+
+- `AGENTS.md` §1, §3.4, §3.6, §4, §8.5, footer
+- `docs/hazards.md` H3, H8, §Adding a new hazard
+- RFC 0008 (local WAL), RFC 0012 and RFC 0057 (`meta:` precedent),
+  RFC 0065 (replicated WAL), RFC 0066 (Kafka backend)
+- Issue #1141

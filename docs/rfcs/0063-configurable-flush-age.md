@@ -176,11 +176,12 @@ age would mean per-tenant sweep bookkeeping for a dev-install problem.
 >   with `OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS=10` in
 >   `receiver.extraEnv`, and to the default without it
 
-> **Scenario RFC0063.2 — the sweep drains on the configured age**
-> - **Given** a sink built with `max_buffer_age = 2 s` on a paused
->   Tokio clock, holding records for one partition
-> - **When** the clock advances 1 s, then 2 s more
-> - **Then** the first sweep writes nothing and the second writes the
+> **Scenario RFC0063.2 — the sink drains on the configured age**
+> - **Given** a record sink built from the resolved config with
+>   `max_buffer_age_secs = 1`, holding records for one partition
+> - **When** `drain_aged` runs at once, and again after 1.2 s of real
+>   time
+> - **Then** the first drain returns nothing and the second returns the
 >   partition, without a shutdown or a WAL rotation
 
 > **Scenario RFC0063.5 — a lowered age makes records queryable sooner**
@@ -206,8 +207,12 @@ age would mean per-tenant sweep bookkeeping for a dev-install problem.
 - RFC0063.1: config resolution unit tests in `ourios-server/src/config`,
   beside the `encode_workers` ones; the Helm arm in
   `deploy/helm/render-tests.sh`.
-- RFC0063.2: a unit test on the sweep in `ourios-server/src/receiver.rs`
-  with `tokio::time::pause`.
+- RFC0063.2: a unit test in `ourios-server/src/receiver.rs` on the
+  sink `flush_config` builds. It waits in real time, because the sink
+  ages its buffers with `std::time::Instant`
+  (`ourios-ingester/src/record_sink.rs`), which a paused Tokio clock
+  does not move. RFC0063.3 covers the sweep interval with a paused
+  clock.
 - RFC0063.5: an integration test in `ourios-server/tests`, beside the
   existing served-role tests, using the bare-env form and a short age.
 - RFC0063.3 and .4: unit tests in `ourios-server/src/receiver.rs` and

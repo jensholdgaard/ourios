@@ -21,7 +21,10 @@ superseded-by: —
 > carries the top-level comparison of #1137: RFC 0022 §3.3 defines the
 > JSON arm as the #146 `LIKE` fragment, which matches a pair nested
 > anywhere in the row, and RFC0022.3 takes that compile as its
-> reference, so #1137 amends both (§3.4) and lands at this RFC's red.
+> reference, so #1137 amends both (§3.4). #1137 merged ahead of this
+> RFC (8cd141b4, maintainer's call), so `main` already behaves as the
+> RFC 0022 amendment states and RFC0062.7's tests already pass; the
+> amendment binds once this RFC is accepted.
 
 ## 1. Summary
 

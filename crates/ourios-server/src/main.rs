@@ -533,6 +533,7 @@ async fn start_receiver(
         encode_workers: params.encode_workers,
         miner: params.miner,
         template_ids_allow_bootstrap: params.template_ids_allow_bootstrap,
+        max_buffer_age: params.max_buffer_age,
         graph_emitter,
     };
     let handle = receiver::serve_until(receiver_config, stopping).await?;
@@ -1024,5 +1025,17 @@ mod tests {
         let err = validate_graph_columns(&bad, &promoted).expect_err("listed must be promoted");
         assert!(err.contains("identities.agent_columns"), "{err}");
         assert!(err.contains("attr.absent.key"), "{err}");
+    }
+
+    /// Scenario RFC0063.4 — the compactor's erasure settle is unchanged.
+    /// See `docs/rfcs/0063-configurable-flush-age.md` §5. The policy reads
+    /// the age ceiling, never the receiver's configured age.
+    #[test]
+    fn rfc0063_4_the_erasure_settle_is_unchanged() {
+        let policy = compaction_policy();
+        assert_eq!(
+            policy.erasure_settle_nanos,
+            2 * 300 * 1_000_000_000 + CompactionPolicy::default().grace_nanos
+        );
     }
 }

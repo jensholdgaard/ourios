@@ -111,7 +111,17 @@ pub struct ReceiverParams {
     /// (`receiver.template_ids_allow_bootstrap` /
     /// `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP`; default off).
     pub template_ids_allow_bootstrap: bool,
+    /// RFC 0063 §3.1 — the sink's age trigger
+    /// (`receiver.max_buffer_age_secs` /
+    /// `OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS`; default and ceiling
+    /// [`MAX_BUFFER_AGE_CEILING`]).
+    pub max_buffer_age: Duration,
 }
+
+/// RFC 0063 §3.1 — the receiver's flush age default, which is also its
+/// ceiling: the compactor's erasure settle and the RFC 0052 barrier
+/// assume no record stays buffered longer.
+pub const MAX_BUFFER_AGE_CEILING: Duration = Duration::from_secs(300);
 
 /// Raw inputs for [`build_store_config`]. Named fields so the env and
 /// file front-ends can't transpose the same-typed values (four of the
@@ -177,6 +187,10 @@ pub struct ReceiverInputs<'a> {
     /// `receiver.template_ids_allow_bootstrap` (`1`/`true`/`yes`
     /// authorises; default off — RFC 0059 §3.5).
     pub template_ids_allow_bootstrap: Option<&'a str>,
+    /// `OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS` /
+    /// `receiver.max_buffer_age_secs` (`1..=300`; default 300 — RFC 0063
+    /// §3.1).
+    pub max_buffer_age_secs: Option<&'a str>,
 }
 
 /// Raw inputs for [`build_querier_config`].
@@ -273,6 +287,7 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
     let http_addr = std::env::var("OURIOS_RECEIVER_HTTP_ADDR").ok();
     let encode_workers = std::env::var("OURIOS_RECEIVER_ENCODE_WORKERS").ok();
     let allow_bootstrap = std::env::var("OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP").ok();
+    let max_buffer_age = std::env::var("OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS").ok();
     // TLS and the miner dial are config-file only (RFC 0030 §3.1 /
     // RFC 0050 §3.2): the env path takes the defaults (plaintext,
     // `ignore` mode).
@@ -283,6 +298,7 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
         wal_root: std::env::var_os("OURIOS_WAL_ROOT").map(PathBuf::from),
         encode_workers: encode_workers.as_deref(),
         template_ids_allow_bootstrap: allow_bootstrap.as_deref(),
+        max_buffer_age_secs: max_buffer_age.as_deref(),
         ..ReceiverInputs::default()
     })?;
     let querier_enabled = std::env::var("OURIOS_QUERIER_ENABLED").ok();
@@ -375,6 +391,7 @@ pub fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String
             upstream_association_limit: file.miner.upstream_association_limit.as_deref(),
         },
         template_ids_allow_bootstrap: file.receiver.template_ids_allow_bootstrap.as_deref(),
+        max_buffer_age_secs: file.receiver.max_buffer_age_secs.as_deref(),
     })?;
     let querier = build_querier_config(QuerierInputs {
         enabled: file.querier.enabled.as_deref(),
@@ -627,6 +644,7 @@ pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<Receiv
         inputs.template_ids_allow_bootstrap.map(str::trim),
         Some("1" | "true" | "yes")
     );
+    let max_buffer_age = parse_max_buffer_age(inputs.max_buffer_age_secs)?;
     Ok(Some(ReceiverParams {
         grpc_addr,
         grpc_tls,
@@ -636,6 +654,7 @@ pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<Receiv
         encode_workers,
         miner,
         template_ids_allow_bootstrap,
+        max_buffer_age,
     }))
 }
 
@@ -707,6 +726,27 @@ pub fn parse_encode_workers(raw: Option<&str>) -> Result<usize, String> {
         Ok(n) if n >= 1 => Ok(n),
         _ => Err(format!(
             "OURIOS_RECEIVER_ENCODE_WORKERS must be an integer ≥ 1, got {raw:?}"
+        )),
+    }
+}
+
+/// Parse the RFC 0063 flush age: whole seconds in `1..=300` when set,
+/// else the ceiling. Out of range is an error, never clamped (RFC 0004
+/// §3.2).
+///
+/// # Errors
+///
+/// A set value that is not an integer in `1..=300`.
+pub fn parse_max_buffer_age(raw: Option<&str>) -> Result<Duration, String> {
+    let ceiling = MAX_BUFFER_AGE_CEILING.as_secs();
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(MAX_BUFFER_AGE_CEILING);
+    };
+    match raw.parse::<u64>() {
+        Ok(secs) if (1..=ceiling).contains(&secs) => Ok(Duration::from_secs(secs)),
+        _ => Err(format!(
+            "receiver.max_buffer_age_secs (OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS) \
+             must be an integer in 1..={ceiling}, got {raw:?}"
         )),
     }
 }

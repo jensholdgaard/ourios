@@ -211,6 +211,7 @@ receiver:
   {{- if $.Values.receiver.templateIdsAllowBootstrap }}
   template_ids_allow_bootstrap: true
   {{- end }}
+  max_buffer_age_secs: "${env:OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS:-}"
   {{- with include "ourios.tlsConfig" . }}
   {{- . | trim | nindent 2 }}
   {{- end }}
@@ -719,7 +720,7 @@ disables compaction on the receiver/querier), so it must be enabled.
   value: {{ . | quote }}
 {{- end }}
 {{- with .Values.extraEnv }}
-{{- toYaml . }}
+{{ toYaml . }}
 {{- end }}
 {{- end }}
 

@@ -208,11 +208,34 @@ necessarily configurable.
 
 ## 7. Open questions
 
-- [ ] Enact this RFC on approval, or only once RFC 0065 reaches
-  `green`? Enacting early changes the rules before any code relies on
-  them; enacting late keeps `AGENTS.md` describing only what exists.
-- [ ] Should the rule fix a minimum floor (2, so one disk loss never
-  loses acked data), or leave the floor to configuration as drafted?
+Behaviour questions for the maintainer, each with the options and a
+recommendation.
+
+- [ ] **Q1. When should the project rules change?** This RFC rewrites
+  the durability rule in `AGENTS.md` so it covers data copied to
+  several machines, not only one local disk.
+  - *On approval*: the new rule governs the replication code while it
+    is written and reviewed; until it ships, `AGENTS.md` describes a
+    feature that does not exist yet.
+  - *Once replication works* (RFC 0065 `green`): `AGENTS.md` describes
+    only what exists, but the replication PRs are reviewed against the
+    old wording.
+
+  *Recommendation: on approval.* The new rule is the bar those PRs
+  must meet, and for today's single-disk setup it says the same thing
+  as the old one.
+- [ ] **Q2. With replication on, may Ourios confirm data that only one
+  disk holds?** Without replication one disk is all there is, and that
+  stays allowed; this is only about replication.
+  - *No, fixed in `AGENTS.md`*: a write is confirmed only once at least
+    two disks hold it, so losing one disk never loses confirmed data,
+    and every future backend (Kafka included) must meet that.
+  - *Leave it to configuration* (this draft): an operator could set up
+    replication that still loses confirmed data when one disk dies.
+
+  *Recommendation: fix it at 2.* RFC 0065 already cannot go below 2,
+  so this binds only future backends; without it, "replicated" stops
+  meaning safe.
 
 ## 8. References
 

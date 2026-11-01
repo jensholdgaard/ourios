@@ -639,12 +639,16 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Then** it serves nothing from that log, rebuilds it from a healthy
 >   replica, and no record is lost or duplicated
 
-> **Scenario RFC0065.10 — the protocol model holds its invariants**
-> - **Given** a model of the design's election, membership, append,
->   commit, fencing, repair and tail-read steps, with message loss,
->   reordering, node crashes and arbitrary clock skew
-> - **When** it is model-checked to a bounded depth
-> - **Then** no reachable state breaks B1, B5, B6, B14 or B16
+> **Scenario RFC0065.10 — the protocol holds its invariants under faults**
+> - **Given** the in-process cluster (§8) with message loss,
+>   reordering, partitions, node crashes, segment-cut disk loss and
+>   arbitrary clock skew, driving writes, membership changes, flusher
+>   handoffs, checkpoints and tail reads
+> - **When** the deterministic simulation suite runs at least 1 000
+>   seeds in CI (and every failing seed is kept as a regression test)
+> - **Then** no run breaks B1, B5, B6, B14 or B16
+> - **And** with the §6.2–§6.4 fallback instead of `openraft`, a model
+>   of the whole protocol is also model-checked to a bounded depth
 
 > **Scenario RFC0065.11 — a record is queryable within the allowance (B14, B15)**
 > - **Given** a replicated backend with the flush age at 300 s
@@ -1066,7 +1070,7 @@ record.
 - **Queries** dedup the tail against Parquet by it (§6.7).
 - **What it does not remove.** A client retry after a lost ack is a
   new entry with a new `seq`, the same duplicate the local backend makes
-  today; H8's producer-supplied idempotency key would remove it (§9).
+  today. This draft adds no Ourios-specific key to remove it (§9, Q4).
 
 ### 6.7 The tail service
 
@@ -1339,10 +1343,16 @@ from rows.
 - RFC0065.3 and RFC0065.11's latency arm: the existing WAL
   crash-recovery job gains a multi-process variant that SIGKILLs the
   leader, as RFC 0064 §3.2 requires.
-- RFC0065.10: with `openraft`, its upstream TLA+-checked simulation
-  covers election and replication, and ours covers the Ourios parts
-  (§9); with §6, a model of the whole protocol, checked in CI to a
-  bounded depth.
+- RFC0065.10: with `openraft`, election and replication rest on its
+  upstream TLA+-checked design and test suite, re-run on every pin
+  bump; the Ourios parts (checkpoint publication, flusher handoff,
+  dedup, the tail read barrier) are covered by the seeded simulation
+  suite plus their targeted scenarios (RFC0065.12, .23, .25, .26). We
+  write no TLA+ of our own: those parts are small, each known hazard
+  in them has a scenario, and a second specification language and
+  toolchain for a single-maintainer project would cost more than it
+  finds. With the §6 fallback, a model of the whole protocol, checked
+  in CI to a bounded depth, since nothing upstream covers it.
 - RFC0065.16: the existing suites, unchanged.
 - RFC0065.17: `deploy/helm/render-tests.sh`.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process
@@ -1356,18 +1366,57 @@ from rows.
 
 ## 9. Open questions
 
-- [ ] Changing the cluster layout (peers, groups, replication factor):
-  refuse (this draft), or define a migration, for example draining
-  every group to a barrier and starting a new layout?
-- [ ] B17: report an unavailable tail in the response (this draft), or
-  fail the query?
-- [ ] Add an idempotency key so a client retry after a lost ack is
-  deduplicated too (H8's producer key)? OTLP has no such field, so it
-  would be Ourios-specific.
-- [ ] RFC0065.10's model: with `openraft`, rely on its TLA+-checked
-  simulation plus our own `turmoil` suite for the Ourios parts (tail,
-  checkpoint snapshot, dedup), or write a TLA+ specification of those
-  parts? `stateright` is dormant (§4.1).
+Behaviour questions for the maintainer. Each says what a user or
+operator would notice, the options, and a recommendation.
+
+- [ ] **Q3. If recent logs can't be reached, should a query fail or
+  return what it has? (B17)** The last few seconds to minutes of logs
+  live on the tail replicas until they reach Parquet. If those cannot
+  be reached:
+  - *Return the older results, clearly marked incomplete* (this
+    draft): dashboards keep working with a warning, but an alert such
+    as "zero errors in the last 5 minutes" could be wrong if it ignores
+    the mark.
+  - *Fail the query*: never wrong, but dashboards go blank during a
+    tail outage.
+  - *Both*: marked results by default, and a request flag with which a
+    caller (an alerting rule) asks for "complete or fail".
+
+  *Recommendation: both.* One request flag; dashboards and alerts need
+  different answers, and only the caller knows which it is.
+- [ ] **Q4. Should Ourios block duplicates when a client resends after
+  a lost acknowledgement? (H8)** If the acknowledgement is lost on the
+  network and the client resends, the logs are stored twice. That is
+  how OTLP behaves everywhere and how Ourios behaves today; replication
+  adds no new duplicates of this kind, and its own internal ones are
+  removed (§6.6).
+  - *Accept it, documented*: no change for clients.
+  - *Add an Ourios-only request ID*: duplicates dropped, but only for
+    clients that send it; the OpenTelemetry Collector and SDKs never
+    would, since OTLP has no such field.
+
+  *Recommendation: accept and document it.* A fix almost no client
+  would use is not worth a contract kept forever; revisit if a real
+  client asks.
+- [ ] **Q5. Can a running cluster add machines that accept writes?**
+  Adding tail capacity is free at any time (B24). This is only about
+  the voters and the replication factor.
+  - *Refuse* (this draft): a node with a changed layout will not start;
+    growing write capacity means building a new cluster.
+  - *Migrate in place*: flush everything pending to Parquet, then
+    switch layouts. Acknowledgements pause for as long as that flush
+    takes: seconds normally, much longer while a backlog (B25) waits.
+  - *Refuse now, migrate later*: ship with refusal and specify the
+    migration in a follow-up RFC.
+
+  *Recommendation: refuse now, migrate later.* The 16 default groups
+  already spread load over up to 16 machines without a layout change;
+  the migration has its own hard cases (writes during a long flush)
+  and deserves its own RFC; refusal is safe meanwhile.
+
+Decided in this draft (technical): RFC0065.10's check uses
+`openraft`'s upstream verification plus our seeded simulation suite,
+not a TLA+ specification of our own (§8 gives the reasoning).
 
 ## 10. References
 

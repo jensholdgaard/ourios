@@ -111,11 +111,18 @@ receiver:
   `backend: kafka` requires `brokers` and `topic`, and ignores
   `wal_root`. Anything else is a startup error naming the field.
 - Ourios does not create topics. At startup the receiver reads the
-  topic's metadata and fails startup if it is missing, if
-  `min.insync.replicas` is below 2 (§3.12), if `retention.ms` or
+  topic's metadata and its effective configuration and fails startup
+  if the topic is missing, if `min.insync.replicas` is below 2 (§3.12),
+  if `unclean.leader.election.enable` is `true` (it would let a lagging
+  replica lead and drop acknowledged batches, against RFC 0065 B6 and
+  B8), if `cleanup.policy` is anything but exactly `delete` (compaction
+  would remove tenant-keyed batches before their checkpoint, leaving
+  holes no log-start check sees), if `retention.ms` or
   `retention.bytes` is not unlimited (Ourios reclaims by checkpoint,
-  §3.5), or if the partition count differs from the one recorded in
-  the store (§3.3).
+  §3.5), if `max.message.bytes` is below the largest record batch the
+  receiver can produce (RFC 0061's request limit plus frame overhead,
+  §3.4), or if the partition count or topic id differs from the one
+  recorded in the store (§3.3).
 - The batch window (`wal_batch_window_ms`, RFC 0008 §6.9) keeps its
   meaning: the group-commit coordinator collects turns for up to that
   long and sends one produce request per partition.
@@ -143,8 +150,18 @@ Redpanda and WarpStream all speak.
   large FFI surface outside our `#![deny(unsafe_code)]` crates.
 
 The backend uses `rskafka` behind a small `BrokerClient` trait (produce
-to a partition, fetch from an offset, read metadata), so the tests can
-use an in-memory broker and a later RFC can swap the client.
+to a partition, fetch from an offset, read metadata and topic
+configuration, delete records below an offset), so the tests can use an
+in-memory broker and a later RFC can swap the client. `rskafka` 0.6.0
+does not cover all of it, checked against its source: its Metadata
+request stops at version 4, whose response has no topic id (added in
+version 10, KIP-516), it has no DescribeConfigs message, and its produce
+retries internally (§3.4). The backend therefore carries a patch or fork
+of `rskafka` adding Metadata v10+ for the topic id, DescribeConfigs for
+§3.1's startup checks, and a produce without internal retry, offered
+upstream; until upstream takes them the fork is a maintained
+dependency. A replacement client must provide the same four operations
+before it is chosen (§7).
 `rskafka`'s dependencies are permissively licensed and go through the
 existing `cargo deny` check.
 
@@ -161,9 +178,13 @@ existing `cargo deny` check.
   sees a tenant's frames in the order the broker acknowledged them, as
   it sees the local WAL's frames in append order today.
 - **The partition count is recorded** in `<bucket>/wal/<topic>/topic.json`
-  (topic, partition count, broker cluster id) the first time a receiver
-  starts on the topic, with `put_if_absent` (RFC 0013). A later start
-  that sees a different count or cluster id refuses to start. Changing
+  (topic, topic id, partition count, broker cluster id) the first time
+  a receiver starts on the topic, with `put_if_absent` (RFC 0013). A
+  later start that sees a different count, cluster id or topic id (the
+  topic was deleted and recreated) refuses to start before producing or
+  consuming, so an old checkpoint is never applied to a new topic's
+  offsets. Checkpoints and bundles are also keyed by the topic id
+  (§3.5). Changing
   the count is a migration this RFC does not define (§7).
 - **The tenant travels in the frame**: the record value is the RFC 0046
   §3.3 `TenantOtlpBatch` payload, byte for byte. Every consumer reads
@@ -189,7 +210,14 @@ succeeds, so the trait changes shape:
 - A produce that fails or times out fails every turn in the window
   with the retryable rejection RFC 0053 §3.1 defines (`UNAVAILABLE`,
   HTTP `503`); `NOT_ENOUGH_REPLICAS` is the common cause. Nothing is
-  acked. Nothing retries a produce on the receiver's behalf: a
+  acked. A size rejection (`MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`)
+  is not an outage, since resending the same batch cannot succeed: the
+  coordinator splits a window's frames into record batches under the
+  topic's `max.message.bytes`, startup refuses a topic whose limit is
+  below one maximal frame (§3.1), and if the limit is lowered while
+  running, the turns whose frames no longer fit get RFC 0061's
+  non-retryable size response (`RESOURCE_EXHAUSTED` without
+  `RetryInfo`, HTTP `413`). Nothing retries a produce on the receiver's behalf: a
   timed-out produce may have been written, and a resend would create a
   second copy at a new offset, which position dedup cannot see. `rskafka`
   0.6.0's `PartitionClient::produce` retries I/O failures internally
@@ -219,9 +247,9 @@ succeeds, so the trait changes shape:
 - **Checkpoint.** RFC 0052's barrier runs per owned partition: cut at
   the last consumed offset, publish everything buffered, write RFC 0065
   §6.5's immutable cut-consistent bundle under
-  `<bucket>/wal/<topic>/<partition>/checkpoints/<offset>/`, then
+  `<bucket>/wal/<topic>/<topic_id>/<partition>/checkpoints/<offset>/`, then
   publish the checkpoint **monotonically**:
-  `<bucket>/wal/<topic>/<partition>/checkpoint.json` changes only by
+  `<bucket>/wal/<topic>/<topic_id>/<partition>/checkpoint.json` changes only by
   `put_if_match`, and a writer whose cut is not above the stored one
   abandons its write; and the owner produces a **checkpoint record**
   (the cut, the bundle's key) to the WAL partition itself. Every
@@ -327,6 +355,15 @@ partition in place of the Raft log; there is no separate tail topic.
 - **Cost (B19).** The replica prunes its local files by footer
   statistics and returns only the query's tenant, range and predicates,
   so a narrow query reads what it selects, not the backlog.
+- **Published rows are served from the store only.** After each file it
+  publishes, the owner produces a **published record** (the file's key
+  and the offsets it holds) to the WAL partition, as it does checkpoint
+  records, and consumers ignore one from an owner other than the one
+  the latest checkpoint or assignment names. A tail replica that
+  applies it stops serving those rows and returns the key to `Tail`
+  callers until the checkpoint passes it, so an erasure (RFC 0047 §3.6)
+  that rewrites a published file is never undone by a cached copy, as
+  in RFC 0065 §6.7.
 - **Checkpoint without the store.** The replica holds the last
   checkpoint record it applied, from the WAL partition, so it answers a
   querier that cannot reach the store, including one that started
@@ -457,8 +494,12 @@ removes only copies of the same log entry.
 > - **Then** the first three resolve to local, local and kafka, and the
 >   last two fail startup with an error naming the field
 > - **And** with `kafka`, startup fails when a topic is missing, when
->   its `min.insync.replicas` is below 2, or when its partition count or
->   cluster id differs from `<bucket>/wal/<topic>/topic.json`
+>   its `min.insync.replicas` is below 2, its effective
+>   `unclean.leader.election.enable` is `true`, its `cleanup.policy` is
+>   not exactly `delete` (a compacted topic is refused), its retention
+>   is not unlimited, its `max.message.bytes` is below one maximal
+>   frame, or its partition count, cluster id or topic id differs from
+>   `<bucket>/wal/<topic>/topic.json` (a recreated topic is refused)
 
 > **Scenario RFC0066.2 — an export is acked only after every in-sync replica has it**
 > - **Given** a broker backend on a three-broker cluster with
@@ -556,11 +597,22 @@ removes only copies of the same log entry.
 > - **Then** the export gets the retryable rejection, the broker holds
 >   exactly one copy of the frame, and the client did not resend it
 
+> **Scenario RFC0066.14 — size rejections are not outages, and erased rows stay erased**
+> - **Given** a topic whose `max.message.bytes` is lowered below a
+>   frame while the receiver runs, and separately a conversation whose
+>   rows the owner has published above the checkpoint
+> - **When** an export with that frame arrives, and an erasure of the
+>   conversation completes before the tenant is queried
+> - **Then** the export gets the non-retryable size response
+>   (`RESOURCE_EXHAUSTED` without `RetryInfo`, HTTP `413`), not
+>   `UNAVAILABLE`; and the query returns no erased row from any tail
+>   replica
+
 ## 6. Testing strategy
 
 - RFC0066.1, .4: unit tests in `ourios-server/src/config` and next to
   the hash; golden values committed with the hash.
-- RFC0066.5, .6, .7, .8, .11, .12, .13: integration tests against an in-memory
+- RFC0066.5, .6, .7, .8, .11, .12, .13, .14: integration tests against an in-memory
   `BrokerClient` (§3.2), runnable locally. RFC0066.7's equal-count arm
   is also a `proptest` over random flush and barrier points.
 - RFC0066.2, .3 and RFC0066.7's latency arm: CI-only container tests

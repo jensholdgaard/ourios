@@ -795,12 +795,21 @@ the mass-failover time and vote-log batching as tuning signals.
 >   left without a leader, and the node's vote log took fewer fsyncs
 >   than vote writes
 
+> **Scenario RFC0065.28 — the tail never resurrects an erased row**
+> - **Given** a conversation whose rows the flusher has published above
+>   the checkpoint, with the checkpoint not yet past them
+> - **When** an erasure of that conversation completes, and the tenant
+>   is then queried, with the store reachable and during an outage
+> - **Then** no erased row is returned: with the store reachable the
+>   rewritten file answers for them, and during the outage that file is
+>   named in `parquet_unavailable`; no tail replica serves them
+
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
 > (election, replication, fencing, repair) are the hand-written
 > fallback, which acknowledges on a configured in-sync floor
-> (`min_in_sync`, `1..=replication_factor`) instead of a majority, and
+> (`min_in_sync`, `2..=replication_factor`, the RFC 0064 minimum) instead of a majority, and
 > is kept because the `Journal` seam lets it replace `openraft` if the
 > dependency has to go; with `openraft`, §4.3's shape replaces
 > them. §6.1 and §6.5–§6.11 apply to both, with Raft's log id
@@ -1161,9 +1170,11 @@ never count toward an ack (learners, under §4.3's shape).
   1. read the group's checkpoint `c`;
   2. list the tenant's Parquet files as today (`file_set.rs`);
   3. call `Tail` on any tail replica of the group with `from = c`; it
-     answers with rows at or above `c` for that tenant only, or "too
-     old" if `c` is below the oldest row it keeps, in which case the
-     querier restarts at step 1 (bounded retries);
+     answers with that tenant's **unpublished** rows at or above `c`,
+     plus the keys of the tenant's files published above `c` as of its
+     read point, or "too old" if `c` is below the oldest row it keeps,
+     in which case the querier restarts at step 1 (bounded retries);
+     the querier adds any of those files its listing missed;
   4. deduplicate by ingest position across the whole input, Parquet
      and tail together, before any aggregation or projection drops the
      key. Candidates are chosen by **position**, never by file name or
@@ -1176,8 +1187,9 @@ never count toward an ack (learners, under §4.3's shape).
      group, so in steady state only the newest files overlap the tail,
      and the range test costs footer reads (88 µs in the spike).
 
-  Listing before the call means a flush between the two leaves its rows
-  in the tail answer, and position dedup removes the overlap. Two live
+  A flush between the listing and the call is caught by the published
+  file keys the tail returns, so its rows are read from the store, not
+  the tail. Two live
   files holding one position (a flusher reassignment, a replay after a
   failover) overlap in range and are deduplicated the same way, before
   compaction removes the copy. So every acknowledged record is counted
@@ -1185,14 +1197,26 @@ never count toward an ack (learners, under §4.3's shape).
 - **During an object-store outage** the querier cannot read
   `checkpoint.json` or list remote files. It then takes the checkpoint
   from the tail replica, which holds it as the last applied checkpoint
-  entry, and the tail replica serves every row above it from memory and
-  its local Parquet files. Remote Parquet below the checkpoint is
-  unreachable: the response returns the tail's rows and names the
-  historical range as unavailable (`parquet_unavailable`, alongside
+  entry, and the tail replica serves every unpublished row above it from
+  memory and its local Parquet files. Remote Parquet is unreachable,
+  both below the checkpoint and the files published above it: the
+  response returns the tail's rows and names those as unavailable (`parquet_unavailable`, alongside
   B17's `tail_unavailable`), so nothing is silently missing. Every
   record acknowledged during the outage is above the checkpoint, which
   cannot advance without the store, so the whole outage stays
   searchable (RFC0065.21).
+- **Published rows are served from the store only (erasure).** After
+  each file it publishes, the flusher proposes a **published entry**
+  naming the file's key and the positions it holds; the leader accepts
+  it only from the current flusher, as for checkpoint entries. A tail
+  replica that applies it stops serving those rows and keeps only the
+  key, which it returns to `Tail` callers (step 3) until the checkpoint
+  passes it. So once a row is in the object store, the store is its only
+  source (`AGENTS.md` §3.6), and an erasure (RFC 0047 §3.6, RFC 0009)
+  that rewrites a published file is never undone by a cached copy. A
+  row not yet published when the erasure's confirming pass runs is the
+  residual RFC 0009 §7 D3 already accepts on the local backend,
+  unchanged here.
 - **Scaling (B24).** Tail replicas come from the tail pool (§6.1),
   `tail_replicas` per group (default 1); the querier spreads `Tail`
   calls across them. Adding tail nodes or raising `tail_replicas` is a
@@ -1374,6 +1398,8 @@ from rows.
 - RFC0065.27: the same in-process cluster with real per-group WALs and
   the vote log on disk, durable fsync on, killing one node; indicative
   on the CI runner first, with §4.7's runs as the baseline.
+- RFC0065.28: the in-process cluster with the compactor's erasure
+  pass on the in-memory store.
 - `criterion`: ack latency on the replicated backend against the local
   one, and the tail merge, before `validated`.
 

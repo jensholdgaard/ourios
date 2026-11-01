@@ -146,9 +146,14 @@ no stack, so value depth is not limited by the lookup.
   key by RFC 0062 §3.1. Old and new files must still answer
   identically, row for row.
 - **RFC 0002 §6.6.** This alters result sets, so it is grammar
-  **v2.0**. A record holding the literal key answers exactly as before.
-  For a record without it, an `==` or `!=` comparison can newly be true,
-  never newly false. A query is not always monotone in its comparisons,
+  **v2.0**, in two steps. The RFC 0022 §3.3 fix (RFC0062.7) only
+  removes matches: a record whose only `k` sits nested in another
+  attribute's map, such as `outer = {k: "x"}`, no longer matches
+  `attr.k == "x"` or `attr.k != "y"`, which the `LIKE` arm matched.
+  Path resolution then only adds them, relative to that fix: a record
+  holding the literal key answers exactly as before, and for a record
+  without it an `==` or `!=` comparison can newly be true, never newly
+  false. A query is not always monotone in its comparisons,
   though: `not (attr.user.id == "u7")` stops matching a record that
   holds only `user = {id: "u7"}`. Nor is a limited result:
   `attr.user.id == "u7" | sort ts desc | limit 1` can return a newer
@@ -287,9 +292,11 @@ available as an additive form later.
 - [x] RFC 0002 §6.6's deprecation window and migration. **Resolved
   (maintainer, 2026-10-31): no window.** The change ships as grammar
   v2.0 with a `feat(querier)!` commit and a `BREAKING CHANGE` footer.
-  The query cookbook documents the rule and the two ways a saved query
-  can lose rows (§3.4): a negated attribute comparison on a record that
-  holds the value only under a map, and a sorted, limited query whose
+  The query cookbook documents the rule and the three ways a saved
+  query can lose rows (§3.4): a direct comparison that matched only
+  through a pair nested in another attribute's map, which the RFC 0022
+  §3.3 fix removes; a negated attribute comparison on a record that
+  holds the value only under a map; and a sorted, limited query whose
   newly matching records displace the ones it returned before.
 - [x] Should `attr["a.b"]` stay literal-only, as an opt-out from path
   resolution? **Resolved (maintainer, 2026-10-31): no.** Both forms

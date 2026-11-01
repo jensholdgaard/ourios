@@ -102,14 +102,17 @@ headline requirements are durability (§3.1–§3.3), a queryable tail
 ### 3.1 Durability
 
 - **B1.** An export is acknowledged only after its records are fsynced
-  on at least `min_in_sync` replicas (§3.8), each an RFC 0008 WAL or
-  an equivalent fsynced log. No in-memory acknowledgement, ever.
-- **B2.** With `replication_factor` replicas and a floor of
-  `min_in_sync`, losing any `min_in_sync − 1` replicas' disks loses no
-  acknowledged record.
-- **B3.** When fewer replicas than the floor can take a write, exports
-  for the affected tenants get the retryable rejection (RFC 0053 §3.1:
-  gRPC `UNAVAILABLE`, HTTP `503`). The ack never degrades.
+  on a **write quorum** of the group's voting replicas, each an RFC 0008
+  WAL or an equivalent fsynced log. With `openraft` (§4.3) the write
+  quorum is a majority of `replication_factor` (§3.8): 2 of 3, 3 of 5.
+  No in-memory acknowledgement, ever.
+- **B2.** Losing any `write quorum − 1` voting replicas' disks loses no
+  acknowledged record: one disk of 3, two of 5.
+- **B3.** When fewer than a write quorum can take a write, exports for
+  the affected tenants get the retryable rejection (RFC 0053 §3.1: gRPC
+  `UNAVAILABLE`, HTTP `503`). The ack never degrades. A rejected write's
+  outcome is uncertain, as a lost ack's is today: its entry may still
+  commit once a quorum returns, and becomes visible then.
 - **B4.** A replica whose local log fails its integrity checks does not
   serve or recover from that log; it rebuilds from a healthy replica.
 
@@ -128,10 +131,10 @@ headline requirements are durability (§3.1–§3.3), a queryable tail
   affected tenants' exports get the retryable rejection.
 - **B8.** If no replica can meet B6, the tenants stay unavailable rather
   than lose acknowledged data. Overriding that is an explicit, offline
-  operator action, `ourios wal force-leader`, which starts from the
-  store's checkpoint so no position is reused (B13) and reports the
-  range of acknowledged records that may be lost before it acts
-  (§4.5).
+  operator action, `ourios wal force-leader`, which starts above every
+  position the group has ever published, not only above its checkpoint,
+  so no position is reused (B13), and reports the range of acknowledged
+  records that may be lost before it acts (§4.5, §6.5).
 - **B9.** A client never has to know which replica holds a tenant: an
   export sent to any receiver reaches the right one.
 - **B10.** An outage of the object store must not stop acknowledgements
@@ -217,23 +220,27 @@ receiver:
     replicated:
       node_id: "${env:OURIOS_NODE_ID}"          # stable and unique, e.g. the pod name
       listen_addr: 0.0.0.0:4319                 # the peer listener
-      peers: "${env:OURIOS_RECEIVER_WAL_PEERS}" # id=host:port,… including this node
+      peers: "${env:OURIOS_RECEIVER_WAL_PEERS}"           # voting replicas: id=host:port,…
+      tail_peers: "${env:OURIOS_RECEIVER_WAL_TAIL_PEERS}" # tail pool: id=host:port,… (B24)
       groups: 16
-      replication_factor: 3
-      min_in_sync: 2
-      tail_replicas: 1                          # non-voting replicas serving the tail (B24)
+      replication_factor: 3                     # voters per group: 3 or 5
+      tail_replicas: 1                          # learners per group from the tail pool, ≥ 1
       tls: { ... }                              # peer mTLS; RFC 0030's TlsSection leaves
 ```
 
 Every leaf is `${env:VAR}`-substitutable like `ReceiverSection`, with
-bare env under `OURIOS_RECEIVER_WAL_*`. `replication_factor` is
-`1..=peers` and `min_in_sync` is `1..=replication_factor`; a floor of 1
-is today's single-disk guarantee and is allowed only when set
-explicitly (RFC 0064 §4). `tail_replicas` is `0..`; 0 disables the tail. Timing knobs depend on the design and are
+bare env under `OURIOS_RECEIVER_WAL_*`. A node is a voter if its
+`node_id` is in `peers` and a tail replica if it is in `tail_peers`,
+never both. `replication_factor` is 3 or 5 and at most `peers`; its
+majority is the write quorum (B1), so the durability floor is derived,
+not set (an even factor would add a copy without raising the floor, and
+1 is the local backend). `tail_replicas` is `1..=tail_peers`: one tail
+replica per group is its flusher (§6.5), so a group without one would
+never publish to Parquet. Timing knobs depend on the design and are
 listed in §6. Classification under RFC 0004: `backend` is a deployment
-choice; `groups`, `replication_factor` and `min_in_sync` are layout and
-durability choices fixed at first start (§6.1); the rest are locations
-and credentials.
+choice; `groups` and `replication_factor` are layout and durability
+choices fixed at first start (§6.1); `tail_peers` and `tail_replicas`
+may change at any time (§6.1); the rest are locations and credentials.
 
 ## 4. Background — the Rust replication ecosystem
 
@@ -472,21 +479,24 @@ group id so no RPC crosses into another group.
 > **Scenario RFC0065.1 — the backend is configurable and checked at start**
 > - **Given** `receiver.wal.backend` unset, `local`, and `replicated`
 >   with every field set, and then `replicated` without `peers`, with a
->   `node_id` missing from `peers`, with `min_in_sync` above
->   `replication_factor`, and without `tls`
+>   `node_id` in neither `peers` nor `tail_peers`, with
+>   `replication_factor` 4 or above `peers`, with `tail_replicas` 0, and
+>   without `tls`
 > - **When** the server resolves its config and starts
 > - **Then** the first three start (local, local, replicated), and each
 >   of the rest fails startup with an error naming the field
 > - **And** a node whose `peers`, `groups` or `replication_factor`
 >   differs from the recorded layout fails startup naming the field
 
-> **Scenario RFC0065.2 — an ack waits for the in-sync floor (B1, B3)**
-> - **Given** a three-node cluster with `min_in_sync = 2`
-> - **When** an export is sent while a follower's fsync is held
-> - **Then** no ack is sent until enough replicas have fsynced it to
->   meet the design's commit rule
-> - **And** with two followers down, the export gets the retryable
->   rejection and none of its records is ever served or mined
+> **Scenario RFC0065.2 — an ack waits for the write quorum (B1, B3)**
+> - **Given** a group of three voters
+> - **When** an export is sent while both followers' fsyncs are held
+> - **Then** no success acknowledgement is sent until a second voter has
+>   fsynced it
+> - **And** with both followers down, the export gets the retryable
+>   rejection and no success acknowledgement is ever sent for it; if
+>   its entry commits after the followers return, its records become
+>   visible then (B3's uncertain outcome)
 
 > **Scenario RFC0065.3 — crash recovery on the replicated backend (B2, B7)**
 > - **Given** a three-node cluster ingesting a steady stream
@@ -512,7 +522,7 @@ group id so no RPC crosses into another group.
 >   acked record
 
 > **Scenario RFC0065.6 — losing and regaining a follower (B1, B3)**
-> - **Given** a three-node cluster with `min_in_sync = 2`
+> - **Given** a group of three voters
 > - **When** one follower stops, then returns
 > - **Then** acks continue with two replicas, the returning follower
 >   catches up before it counts toward an ack again, and no ack ever
@@ -606,7 +616,8 @@ group id so no RPC crosses into another group.
 
 > **Scenario RFC0065.19 — tail capacity scales on its own (B24)**
 > - **Given** a group with one tail replica under saturating tail load
-> - **When** a second tail replica is added
+> - **When** a node is added to `tail_peers` and `tail_replicas` raised
+>   to 2, with `peers` unchanged
 > - **Then** tail query throughput rises, while the voting set, the ack
 >   quorum and the ack latency do not change
 
@@ -655,35 +666,47 @@ group id so no RPC crosses into another group.
 
 > **Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13)**
 > - **Given** a group whose other two voters are lost for good, with
->   acknowledged records above the store's checkpoint that only they held
+>   acknowledged records above the store's checkpoint that only they
+>   held, some of them already flushed to Parquet by the flusher
 > - **When** an operator runs `ourios wal force-leader` on the survivor
 > - **Then** it prints the possibly-lost range before acting, the
 >   survivor leads alone, and its first new entry's position is above
->   the checkpoint
+>   every position in any published file, so no new row collides with
+>   an old one
 
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
 > (election, replication, fencing, repair) are the hand-written
-> fallback, kept because the `Journal` seam lets it replace `openraft`
-> if the dependency has to go; with `openraft`, §4.3's shape replaces
+> fallback, which acknowledges on a configured in-sync floor
+> (`min_in_sync`, `1..=replication_factor`) instead of a majority, and
+> is kept because the `Journal` seam lets it replace `openraft` if the
+> dependency has to go; with `openraft`, §4.3's shape replaces
 > them. §6.1 and §6.5–§6.11 apply to both, with Raft's log id
 > `(term, index)` in place of `(epoch, seq)` and §6.7's tail replicas
 > as `openraft` learners.
 
 ### 6.1 Cluster layout
 
-- **The layout is recorded** in `<bucket>/wal/replicated/cluster.json`
-  (peer ids, `groups`, `replication_factor`) with `put_if_absent` the
-  first time a node starts. A node whose configuration differs refuses
-  to start. Changing the layout is a migration this RFC does not define
-  (§9).
+- **The voting layout is recorded** in
+  `<bucket>/wal/replicated/cluster.json` (voting peer ids, `groups`,
+  `replication_factor`) with `put_if_absent` the first time a node
+  starts. A node whose configuration differs refuses to start. Changing
+  the voting layout is a migration this RFC does not define (§9).
+- **The tail pool is not part of the layout (B24).** `tail_peers` and
+  `tail_replicas` can change at any time. Each group's tail replicas are
+  the `tail_replicas` members of `tail_peers` with the highest
+  `xxh3_64(group, node_id)`; when that set changes, the group's leader
+  adds the new members as `openraft` learners (they catch up from the
+  checkpoint snapshot) and removes the old ones, a learner-only
+  membership change that never touches the voters, the write quorum or
+  voter placement. Adding tail capacity is adding tail nodes.
 - **A tenant belongs to one group**:
   `group = xxh3_64(tenant_bytes) mod groups`. The hash and its seed are
   fixed by this RFC and pinned by golden values (RFC0065.8).
-- **A group's replicas** are the `replication_factor` peers with the
-  highest `xxh3_64(group, node_id)` (rendezvous hashing): deterministic,
-  spread across nodes, with no record of its own.
+- **A group's voters** are the `replication_factor` members of `peers`
+  with the highest `xxh3_64(group, node_id)` (rendezvous hashing):
+  deterministic, spread across nodes, with no record of its own.
 - **A replica's identity lives on its disk (B4, B6).** The first start
   on an empty `wal_root` writes a `replica.id` file holding a fresh
   UUIDv7, fsynced, and the Raft node id is that UUID, not `node_id`
@@ -820,11 +843,26 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   write identical rows, which compaction deduplicates by position
   (§6.6).
 - **Checkpoint.** RFC 0052's barrier runs on the flusher: cut at the
-  last mined `seq`, publish everything buffered, write
-  `<bucket>/wal/replicated/groups/<g>/checkpoint.json` with that `seq`,
-  the term and the barrier's wall-clock time, then propose a checkpoint
-  entry to the leader. Every replica snapshots and purges its group WAL
-  below the checkpoint (RFC 0008 §6.7) when it applies that entry.
+  last mined `seq`, publish everything buffered, then write a
+  **cut-consistent bundle** for that `seq` to
+  `<bucket>/wal/replicated/groups/<g>/checkpoints/<seq>/`: the miner
+  snapshot of every tenant in the group, the group's id-allocator cursor
+  and its unused reserved blocks, all taken at the same cut. Only after
+  every object of the bundle is durable does it write `checkpoint.json`
+  (the `seq`, the term, the bundle's key) and propose a checkpoint entry
+  to the leader. Every replica snapshots and purges its group WAL below
+  the checkpoint (RFC 0008 §6.7) when it applies that entry, so no
+  history is purged that a miner restore still needs. Unlike RFC 0052
+  §3.1 on the local backend, a failed snapshot write here **fails the
+  checkpoint**: the barrier retries, and nothing is purged until a
+  bundle is complete.
+- **Highest published position.** The flusher also records, per group,
+  the highest ingest position in any file it has published
+  (`published_high` in `checkpoint.json`, and in the footer statistics
+  of every file). `ourios wal force-leader` (B8) starts its new log
+  above the larger of that and the survivor's log end, so a position
+  that a lost replica flushed but never checkpointed is never issued
+  again (§4.5).
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
   when the flusher reports its remaining ids. A miner that exhausts them
@@ -948,19 +986,40 @@ never count toward an ack (learners, under §4.3's shape).
      answers with rows at or above `c` for that tenant only, or "too
      old" if `c` is below the oldest row it keeps, in which case the
      querier restarts at step 1 (bounded retries);
-  4. drop tail rows whose ingest position is in a Parquet file listed
-     in step 2 and written after `c`'s barrier time (UUIDv7 names, RFC
-     0005 §3.4): only those files can hold a tail row. A freshly flushed
-     file holds one ascending run of positions per group, so the check
-     is a range test on its footer statistics (88 µs in the spike); only
-     a file whose range overlaps reads the columns.
+  4. deduplicate by ingest position across the whole input, Parquet
+     and tail together, before any aggregation or projection drops the
+     key. Candidates are chosen by **position**, never by file name or
+     time: from the footer statistics of the files the query already
+     plans, the querier finds the files whose `ingest_seq` range for a
+     group overlaps another file's or the tail's range, and only rows in
+     those files and the overlapping tail rows go through a
+     dedup-by-position step; every other file is scanned as today. A
+     freshly flushed file holds one ascending run of positions per
+     group, so in steady state only the newest files overlap the tail,
+     and the range test costs footer reads (88 µs in the spike).
 
   Listing before the call means a flush between the two leaves its rows
-  in the tail answer, and the anti-join removes the overlap, so every
-  acknowledged record is counted once (B16).
-- **Scaling (B24).** Tail replicas per group are a configuration value
-  (`tail_replicas`, default 1); the querier spreads `Tail` calls across
-  them. Adding one changes neither the voting set nor the ack path.
+  in the tail answer, and position dedup removes the overlap. Two live
+  files holding one position (a flusher reassignment, a replay after a
+  failover) overlap in range and are deduplicated the same way, before
+  compaction removes the copy. So every acknowledged record is counted
+  once (B16), whatever a clock said when a file was named.
+- **During an object-store outage** the querier cannot read
+  `checkpoint.json` or list remote files. It then takes the checkpoint
+  from the tail replica, which holds it as the last applied checkpoint
+  entry, and the tail replica serves every row above it from memory and
+  its local Parquet files. Remote Parquet below the checkpoint is
+  unreachable: the response returns the tail's rows and names the
+  historical range as unavailable (`parquet_unavailable`, alongside
+  B17's `tail_unavailable`), so nothing is silently missing. Every
+  record acknowledged during the outage is above the checkpoint, which
+  cannot advance without the store, so the whole outage stays
+  searchable (RFC0065.21).
+- **Scaling (B24).** Tail replicas come from the tail pool (§6.1),
+  `tail_replicas` per group (default 1); the querier spreads `Tail`
+  calls across them. Adding tail nodes or raising `tail_replicas` is a
+  learner-only membership change: neither the voters, the write quorum
+  nor the ack path change.
 - **Unavailable (B17).** If no tail replica of a group answers past a
   bounded retry, the response carries the Parquet results and a
   `tail_unavailable` entry naming the group. The query API and the MCP
@@ -971,9 +1030,9 @@ never count toward an ack (learners, under §4.3's shape).
   (RFC 0047) and the DSL apply unchanged.
 - **Cost (B19).** A `Tail` call prunes the local files by their footer
   statistics exactly as the querier prunes remote ones, so it reads
-  what the query's range and predicates select, not the backlog. The
-  anti-join reads only footer statistics, and at most the three
-  position columns, from remote files written since the checkpoint.
+  what the query's range and predicates select, not the backlog. Position
+  dedup reads footer statistics of the files already planned, and the
+  three position columns only from files whose ranges overlap.
 
 ### 6.8 The peer protocol
 
@@ -1022,10 +1081,15 @@ rest of this section.
 
 ### 6.10 Helm
 
-- `receiver.wal.backend: replicated` keeps the StatefulSet and its
-  volume claims, and renders `peers` from `receiver.replicas` and the
-  existing `-receiver-headless` Service (`ourios-receiver-<i>.<service>:4319`),
-  with `node_id` from the pod name.
+- `receiver.wal.backend: replicated` keeps the receiver StatefulSet and
+  its volume claims as the voters, and renders `peers` from
+  `receiver.replicas` and the existing `-receiver-headless` Service
+  (`ourios-receiver-<i>.<service>:4319`), with `node_id` from the pod
+  name.
+- The tail pool is a second StatefulSet, `-wal-tail`, with its own
+  `walTail.replicas`, volume claims and headless Service, rendered into
+  `tail_peers`. Scaling it changes `tail_peers` only, never `peers`, so
+  the voting layout check (§6.1) is unaffected (B24).
 - The peer port is on the headless Service only. Peer and querier
   client certificates are mounted from secrets named in values, as RFC
   0030's listener certificates are.
@@ -1125,7 +1189,6 @@ from rows.
 - [ ] Changing the cluster layout (peers, groups, replication factor):
   refuse (this draft), or define a migration, for example draining
   every group to a barrier and starting a new layout?
-- [ ] Default `min_in_sync` 2 with `replication_factor` 3, as drafted?
 - [ ] B17: report an unavailable tail in the response (this draft), or
   fail the query?
 - [ ] Add an idempotency key so a client retry after a lost ack is

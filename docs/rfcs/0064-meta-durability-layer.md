@@ -127,13 +127,24 @@ and `*Last updated: …*` moves to the enacting date.
   so this hazard is dormant" becomes "This hazard is dormant on the
   local WAL backend and live on the replicated one (RFC 0065)." The
   *Currently* bullet becomes: "Dormant on the local backend, which does
-  not replicate. **Live on the replicated backend**: a client retry
-  after a lost ack, and a new leader replaying from the last
-  checkpoint, can each write a record twice. RFC 0065 meets the *When
-  replication is proposed* rule with a key the log assigns once: each
-  record's group, sequence number and index in its frame, never a time
-  window." The *Detection* signals become required for the replicated
-  backend (RFC 0065 §6.9).
+  not replicate. **Live on the replicated backend**: a new leader or
+  flusher replaying from the last checkpoint can write a record twice,
+  and RFC 0065 removes those copies with a key the log assigns once
+  (each record's group, sequence number and index in its frame), never
+  a time window." The *When replication is proposed* bullet, which today
+  requires a producer-supplied idempotency key, is split in two:
+  - "*Replication duplicates* — copies the replication layer itself
+    makes by replay, redelivery or handoff — MUST be deduplicated by a
+    key assigned once per acknowledged record, by the producer or by the
+    log, never by a time window."
+  - "*Client-retry duplicates* — a client resending after a lost ack —
+    are not caused by replication and exist on the local backend too.
+    Removing them needs a producer-supplied idempotency key; until an
+    RFC adds one, they are the same as on the local backend, and a
+    replicated backend MUST NOT make them more frequent."
+
+  The *Detection* signals become required for the replicated backend
+  (RFC 0065 §6.9).
 
 ### 3.5 What does not change
 
@@ -159,10 +170,11 @@ a correlated power loss can lose acked records. RFC 0065 needs no
 widening, so this RFC does not make one; RFC 0066 must argue for it on
 its own.
 
-**Allow an in-sync floor of 1.** The leader alone would then
-acknowledge, which is today's local guarantee. It is allowed as a
-configuration (RFC 0065 §3.8, `min_in_sync`), but the rule requires the
-floor to be explicit so an operator chooses it.
+**Allow a floor of 1.** The leader alone would then acknowledge, which
+is today's local guarantee and is what the local backend is for. RFC
+0065 derives its floor from the replication factor (a majority of 3 or
+5, RFC 0065 §3.8), so the rule requires the floor to be explicit, not
+necessarily configurable.
 
 ## 5. Acceptance criteria
 

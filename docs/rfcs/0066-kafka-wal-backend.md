@@ -222,12 +222,19 @@ succeeds, so the trait changes shape:
   snapshots' high-water marks, and suppress per consumer as RFC 0008
   §6.6 does: Parquet emission below `c`, mining at or below each
   tenant's snapshot mark.
-- **Handoff.** When `R` changes, a partition's old and new owner can
-  both mine it for a while. That is no worse than today, where every
-  replica mines every tenant: template ids stay disjoint through RFC
-  0059 §3.6's reservations, and the duplicate rows are removed by
-  position (§3.6). An owner lease is not required for correctness and
-  is left out (§4).
+- **Handoff and template ids.** When `R` changes, a partition's old and
+  new owner can both mine it for a while, and position dedup keeps only
+  one copy of each row, so both copies must be identical, `template_id`
+  included (RFC 0065 B11). Disjoint ids from RFC 0059's per-process
+  reservations would not be. So this backend uses RFC 0065 §6.7's
+  log-ordered allocation: an owner that needs ids produces an
+  "id block reserved" record (reserved in the store first, as today) to
+  the WAL partition itself, every miner of that partition allocates
+  from those records in offset order, and the checkpoint carries the
+  cut-consistent miner and allocator bundle of RFC 0065 §6.5. Two
+  owners replaying one partition from one checkpoint then mine
+  identical rows, whichever copy survives. An owner lease is still not
+  required for correctness and is left out (§4).
 - **Reclamation** is the broker's retention; Ourios deletes nothing.
   The journal's RFC 0052 rotation and housekeeping methods answer an
   explicit "not applicable" on this backend instead of the trait's
@@ -287,29 +294,41 @@ owner's miner. So the owner publishes what it has mined.
   map holds. This is the read-side form of RFC 0008 §6.4's rule.
 - **The querier's tail provider** is a DataFusion table beside the
   Parquet listing (`ourios-querier/src/file_set.rs`), for one tenant:
-  1. read the partition's checkpoint `c` and its barrier time `t`;
-  2. fetch the tail partition from the first record at or after `t`
-     (a timestamp offset lookup), keep rows whose tenant is the query's
-     tenant and whose source offset is at or above `c`;
-  3. drop tail rows whose ingest position repeats an earlier tail row
-     (an owner restart re-publishes from `c`);
-  4. anti-join the remaining rows on the ingest position against the
-     Parquet files of that tenant whose UUIDv7 name (RFC 0005 §3.4) is
-     at or after `t`: those are the only files an age or size flush can
-     have written since the checkpoint.
-  The union of Parquet and that remainder holds every acked record once.
-- **Bounded cost.** The tail spans one barrier interval at most (300 s,
-  RFC 0052 §3.1), and the anti-join reads only the ingest-position columns from
-  files written in that interval.
+  1. read the WAL partition's high-water offset `h` (a `ListOffsets`
+     call) **at query start**, then the partition's checkpoint `c`,
+     which also records `tail_from`, the first tail offset whose source
+     offset is at or above `c` (the owner knows it when it produces that
+     batch, and the checkpoint is written only after it);
+  2. fetch the tail partition from `tail_from`, keep rows whose tenant
+     is the query's tenant and whose source offset is at or above `c`;
+     no timestamp is consulted, so owner clock skew cannot skip a batch;
+  3. **read barrier (B14):** wait, bounded, until the tail holds batches
+     through source offset `h − 1`; past the bound, report the tail as
+     unavailable (B17) rather than return what has arrived;
+  4. deduplicate by ingest position across Parquet and tail together,
+     choosing candidate files by overlapping position ranges in their
+     footer statistics, never by file name or time, exactly as RFC 0065
+     §6.7 step 4 does; this also removes two live Parquet copies of one
+     position left by a handoff (B16).
+- **Cost (B19).** Position dedup reads footer statistics of the files
+  the query already plans, and the position columns only from files
+  whose ranges overlap. The tail read is bounded by the records since
+  the checkpoint, however long that is (next bullet).
 - **Visibility.** The tail rows go through the same plan as Parquet
   rows, so tenant predicates, conversation predicates and row masking
   (RFC 0047) apply unchanged. The DSL is unchanged (H6).
 - **Freshness.** A record becomes queryable when its frame is mined and
   its tail batch is acknowledged: typically well under a second after
   the ack. RFC0066.7 states the test's allowance.
-- **Retention.** The tail topic needs to hold at least two barrier
-  intervals. It is derived data: replaying the WAL topic from the
-  checkpoint rebuilds it.
+- **Retention and long stalls (RFC 0065 B19, B25).** The tail topic's
+  retention is at least the WAL topic's, so a tail batch outlives every
+  record not yet in Parquet; the checkpoint cannot advance during an
+  object-store outage, so the tail grows with the backlog. If a query
+  finds the tail partition's log start above `tail_from` (retention set
+  too short, or a deleted topic), it reports the tail unavailable (B17)
+  and the owner rebuilds the missing tail by re-mining the WAL
+  partition from `c`; the tail is derived data. RFC0066.11 covers a
+  prolonged outage.
 
 ### 3.9 Telemetry
 
@@ -494,11 +513,20 @@ removes only copies of the same log entry.
 > - **Then** the receiver StatefulSet has no `volumeClaimTemplates`, and
 >   the receiver and querier configs carry the `${env:…:-}` references
 
+> **Scenario RFC0066.11 — a prolonged outage keeps the tail complete**
+> - **Given** a broker backend whose object store is unreachable for
+>   longer than ten barrier intervals
+> - **When** a query covers the outage, and again after the tail
+>   partition's oldest batches are deleted by a short retention
+> - **Then** the first returns every acknowledged record; the second
+>   reports the tail unavailable, and after the owner rebuilds it the
+>   same query returns every acknowledged record again
+
 ## 6. Testing strategy
 
 - RFC0066.1, .4: unit tests in `ourios-server/src/config` and next to
   the hash; golden values committed with the hash.
-- RFC0066.5, .6, .7, .8: integration tests against an in-memory
+- RFC0066.5, .6, .7, .8, .11: integration tests against an in-memory
   `BrokerClient` (§3.2), runnable locally. RFC0066.7's equal-count arm
   is also a `proptest` over random flush and barrier points.
 - RFC0066.2, .3 and RFC0066.7's latency arm: CI-only container tests

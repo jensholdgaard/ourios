@@ -208,18 +208,23 @@ async fn rfc0063_5_a_lowered_age_makes_records_queryable_sooner() {
     let acked = Instant::now();
 
     let dsl = b"service == \"checkout\"";
-    let mut seen = 0;
-    while acked.elapsed() < Duration::from_secs(15) {
-        seen = rows(&post(querier, "/v1/query", "text/plain", dsl).await);
-        if seen == 3 {
-            break;
+    let poll = async {
+        loop {
+            if rows(&post(querier, "/v1/query", "text/plain", dsl).await) == 3 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    assert_eq!(
-        seen,
-        3,
-        "the acked records are queryable within 15 s, not ~330 s ({:?} elapsed)",
-        acked.elapsed()
-    );
+    };
+    timeout(
+        Duration::from_secs(15).saturating_sub(acked.elapsed()),
+        poll,
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the acked records are queryable within 15 s, not ~330 s ({:?} elapsed)",
+            acked.elapsed()
+        )
+    });
 }

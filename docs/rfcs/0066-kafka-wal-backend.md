@@ -99,7 +99,9 @@ receiver:
       brokers: "${env:OURIOS_RECEIVER_WAL_KAFKA_BROKERS}"  # comma-separated host:port
       topic: ourios-wal           # raw frames
       produce_timeout_ms: 5000
-      max_backlog_bytes: 0        # per partition above its checkpoint; 0 = derived (§3.5)
+      max_backlog_bytes: "${env:OURIOS_RECEIVER_WAL_KAFKA_MAX_BACKLOG_BYTES}"  # per partition above its checkpoint, required (§3.5)
+      tail_peers: "${env:OURIOS_RECEIVER_WAL_TAIL_PEERS}"  # tail pool: id=host:port,… (§3.8)
+      tail_replicas: 1            # tail replicas per partition from the pool, 1..=tail_peers
       tls: { ... }                # client TLS; same leaves as RFC 0030's TlsSection
       sasl:
         mechanism: "${env:OURIOS_RECEIVER_WAL_KAFKA_SASL_MECHANISM:-}"  # PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
@@ -113,6 +115,9 @@ receiver:
 - Ourios does not create topics. At startup the receiver reads the
   topic's metadata and its effective configuration and fails startup
   if the topic is missing, if `min.insync.replicas` is below 2 (§3.12),
+  if any partition has fewer replicas than the larger of 2 and
+  `min.insync.replicas` (a replication factor of 1 would pass the
+  in-sync check and then reject every produce),
   if `unclean.leader.election.enable` is `true` (it would let a lagging
   replica lead and drop acknowledged batches, against RFC 0065 B6 and
   B8), if `cleanup.policy` is anything but exactly `delete` (compaction
@@ -170,13 +175,19 @@ existing `cargo deny` check.
 - **One topic, shared by all tenants.** A topic per tenant would make
   topic count grow with tenants, which brokers handle badly.
 - **A tenant's frames go to one partition**:
-  `partition = xxh3_64(tenant_bytes) mod partition_count`. The hash and
-  its seed are fixed by this RFC and pinned by golden values (RFC0066.4),
-  because changing them moves tenants between partitions. The record
+  `partition = xxh3_64(tenant_bytes) mod partition_count`, with the
+  hash, seed (0) and byte encoding (the tenant id's bytes as the
+  `TenantOtlpBatch` header carries them, RFC 0046 §3.3, no
+  normalisation) exactly as RFC 0065 §6.1 fixes them, pinned by golden
+  values (RFC0066.4), because changing them moves tenants between
+  partitions. The record
   key is the tenant id, for operators reading the topic.
-- **Per-tenant order.** One partition is totally ordered, so the miner
-  sees a tenant's frames in the order the broker acknowledged them, as
-  it sees the local WAL's frames in append order today.
+- **Per-tenant order.** One partition is totally ordered, and the
+  ordering contract is **increasing partition offset**: the miner sees a
+  tenant's frames in offset order, as it sees the local WAL's frames in
+  append order today. Acknowledgements of concurrent produce requests
+  can complete in any order, so acknowledgement order is not the
+  contract.
 - **The partition count is recorded** in `<bucket>/wal/<topic>/topic.json`
   (topic, topic id, partition count, broker cluster id) the first time
   a receiver starts on the topic, with `put_if_absent` (RFC 0013). A
@@ -186,10 +197,21 @@ existing `cargo deny` check.
   offsets. Checkpoints and bundles are also keyed by the topic id
   (§3.5). Changing
   the count is a migration this RFC does not define (§7).
-- **The tenant travels in the frame**: the record value is the RFC 0046
-  §3.3 `TenantOtlpBatch` payload, byte for byte. Every consumer reads
-  the tenant from the frame, never from the partition, so partitions
-  shared between tenants cannot mix them (`AGENTS.md` §3.7).
+- **The tenant travels in the frame**: a data record's value is the RFC
+  0046 §3.3 `TenantOtlpBatch` payload, byte for byte. Every consumer
+  reads the tenant from the frame, never from the partition, so
+  partitions shared between tenants cannot mix them (`AGENTS.md` §3.7).
+- **Every record says what it is.** A record header `ourios.kind`
+  names its kind and `ourios.v` its format version (`1`): `batch` (the
+  data record above), and the control records `checkpoint` (cut, bundle
+  key, owner), `published` (file key, offsets held, owner) and
+  `id_block` (the reserved range, owner), whose values are JSON objects
+  with exactly those fields. Consumers process every kind in offset
+  order: `batch` is mined, `checkpoint` and `published` are applied as
+  §3.5 and §3.8 say, `id_block` feeds the allocator. A record with an
+  unknown kind or a higher version stops consumption of that partition
+  and reports it, rather than being skipped, since skipping a control
+  record could make replicas mine differently.
 
 ### 3.4 The ack path
 
@@ -245,7 +267,9 @@ succeeds, so the trait changes shape:
   The sink's size and age triggers (RFC 0014 §3.2, RFC 0063) are
   unchanged.
 - **Checkpoint.** RFC 0052's barrier runs per owned partition: cut at
-  the last consumed offset, publish everything buffered, write RFC 0065
+  `c`, the offset of the last frame it has mined (inclusive: the bundle
+  covers every record at offsets `≤ c`, data and control alike, and
+  nothing above), publish everything buffered, write RFC 0065
   §6.5's immutable cut-consistent bundle under
   `<bucket>/wal/<topic>/<topic_id>/<partition>/checkpoints/<offset>/`, then
   publish the checkpoint **monotonically**:
@@ -256,8 +280,11 @@ succeeds, so the trait changes shape:
   consumer applies checkpoint records in offset order and ignores any
   whose cut is not above the last it applied, so a delayed former owner
   can neither move the store's checkpoint back nor make a replica
-  restore from a cut whose history is gone. Every frame below the
-  checkpoint is in Parquet. Ourios never commits offsets to the broker.
+  restore from a cut whose history is gone. Every frame at or below `c`
+  is in Parquet. Replay after a restore starts at `c + 1`, never at the
+  checkpoint record's own offset, so frames produced between the cut
+  and that record are mined; the record is applied when replay reaches
+  it. Ourios never commits offsets to the broker.
 - **Snapshot and bundle formats** follow RFC 0065 §6.5: the snapshot's
   `wal_high_water` gains a broker variant `{ partition, offset }`, a
   bundle-format change ships a migration, and a consumer that finds
@@ -284,19 +311,24 @@ succeeds, so the trait changes shape:
   required for correctness and is left out (§4).
 - **Reclamation is checkpoint-controlled (RFC 0065 B25).** Time and
   size retention are off (startup checks it), so the broker never
-  deletes a frame on its own. After a checkpoint record, the owner
-  deletes the partition below the checkpoint (`DeleteRecords`). During
+  deletes a frame on its own. After a checkpoint record for cut `c`, the owner
+  deletes the partition's records at offsets `≤ c` (`DeleteRecords`
+  with `before = c + 1`); the checkpoint record itself, above `c`,
+  survives. During
   a long object-store outage the checkpoint cannot advance, so nothing
   is deleted, and once a partition's bytes above its checkpoint reach
-  `max_backlog_bytes` (default: the broker's free log capacity divided
-  among the partitions, read at startup) further exports to it get the
-  retryable rejection (B3), never a silent deletion. The journal's RFC
+  `max_backlog_bytes` further exports to it get the retryable
+  rejection (B3), never a silent deletion. The limit is set explicitly
+  (no default): the Kafka protocol gives a client no reliable view of a
+  broker's free capacity shared with other topics, so the operator sizes
+  it from the brokers' disks as the chart sizes RFC 0065's WAL volume,
+  and a change takes effect at the next start. The journal's RFC
   0052 rotation and housekeeping methods answer an explicit "not
   applicable" on this backend, and `reclaim_state` reports the bytes
   above the checkpoint.
 - **Retention gap** is then a misconfiguration: if a partition's log
-  start offset is above its checkpoint, someone changed retention or
-  deleted records. The owner records an error event and
+  start offset is above `c + 1` for its applied checkpoint `c`, someone
+  changed retention or deleted records. The owner records an error event and
   `ourios.ingest.batches{error.type="retention_gap"}`, refuses to
   advance past the gap until an operator acknowledges it with an
   explicit CLI verb, and reports the tail unavailable for that range.
@@ -304,9 +336,11 @@ succeeds, so the trait changes shape:
 ### 3.6 Position as the dedup key (H8)
 
 Every mined row carries its **ingest position**, in RFC 0065 §6.6's
-column with the partition as the group and the offset as the sequence
-number: `(partition, offset, index)`, where `index` is the
-record's place in its frame. The position is assigned once by the log,
+columns: `(log_id, offset, index)`, where `log_id` (stored in
+`ingest_group`) is the log id allocated once per (topic id, partition),
+never the raw partition number, `offset` (in `ingest_seq`) is the
+record's partition offset, and `index` is the record's place in its
+frame. The position is assigned once by the log,
 so a redelivered frame, a frame mined by two owners during a handoff,
 and a row seen both in the tail and in Parquet all carry the same key.
 No time window is involved (H8: "dedup MUST be content-keyed, never
@@ -339,9 +373,13 @@ producer without changing the frame.
 The tail is served exactly as RFC 0065 §6.7 serves it, with the WAL
 partition in place of the Raft log; there is no separate tail topic.
 
-- **Tail replicas** are a pool of receivers in tail mode (`tail_peers`,
-  `tail_replicas` per partition, chosen by rendezvous hashing as in RFC
-  0065 §6.1). Each consumes its partitions from the latest checkpoint
+- **Tail replicas** are a pool of receivers in tail mode, set under
+  `receiver.wal.kafka` (§3.1): `tail_peers` (`OURIOS_RECEIVER_WAL_TAIL_PEERS`,
+  `id=host:port,…`) and `tail_replicas`
+  (`OURIOS_RECEIVER_WAL_KAFKA_TAIL_REPLICAS`, `1..=tail_peers`), validated
+  as RFC 0065 §3.8 validates its fields, and a node in `tail_peers` runs
+  in tail mode. Each partition's tail replicas are chosen by rendezvous
+  hashing as in RFC 0065 §6.1. Each consumes its partitions from the latest checkpoint
   record, mines them with RFC 0065's deterministic miner and the
   log-ordered id allocation of §3.5, and keeps the mined rows above the
   checkpoint in memory and in local Parquet files, written by the same
@@ -375,7 +413,13 @@ partition in place of the Raft log; there is no separate tail topic.
   footer statistics, never by file name or time.
 - **A lost tail replica** loses only a cache: its replacement consumes
   from the checkpoint record and serves once it has mined through the
-  high-water.
+  high-water. That needs the checkpoint's bundle, which is in the
+  object store, and the records at or below the cut are deleted, so a
+  tail replica that starts with an empty cache **during** a store
+  outage cannot rebuild its miner state: it reports the tail
+  unavailable (B17) until the store is reachable. RFC0066.11's
+  guarantee covers tail replicas running when the outage began;
+  `tail_replicas ≥ 2` keeps one through a restart.
 
 ### 3.9 Telemetry
 
@@ -508,8 +552,10 @@ removes only copies of the same log entry.
 >   brokers stopped
 > - **Then** the first is acked and its frame is readable from the
 >   topic, and the second gets the retryable rejection (gRPC
->   `UNAVAILABLE`, HTTP `503`) and no frame from it becomes readable as
->   acked
+>   `UNAVAILABLE`, HTTP `503`) and no successful acknowledgement; its
+>   outcome is uncertain (§3.4), so its frame may become readable later
+>   once the brokers return, at most once and without a client
+>   retry
 
 > **Scenario RFC0066.3 — crash recovery on the broker backend**
 > - **Given** a broker-backed receiver ingesting a steady stream
@@ -522,7 +568,8 @@ removes only copies of the same log entry.
 > - **When** it runs on a fixed set of tenant ids
 > - **Then** it returns the golden partition numbers committed with
 >   this RFC's implementation, and the frames of one tenant are mined in
->   the order the broker acknowledged them
+>   increasing offset order, including when two produce requests to the
+>   partition complete out of order
 
 > **Scenario RFC0066.5 — redelivery and handoff do not duplicate rows**
 > - **Given** a partition mined twice from the same checkpoint, once by
@@ -573,11 +620,15 @@ removes only copies of the same log entry.
 
 > **Scenario RFC0066.11 — a prolonged outage stays complete and searchable (RFC 0065 B19, B25)**
 > - **Given** a broker backend whose object store is unreachable for
->   longer than ten barrier intervals, and a querier started during the
->   outage
+>   longer than ten barrier intervals, at least one tail replica of
+>   each partition running since before the outage, and a querier
+>   started during the outage
 > - **When** a narrow query and a broad query cover the outage
-> - **Then** both return every acknowledged record, the narrow one reads
->   a number of bytes that does not grow with the backlog, no frame
+> - **Then** both return every record acknowledged during the outage,
+>   and name the Parquet published before it (including files
+>   published above the checkpoint) as `parquet_unavailable`; the
+>   narrow one reads a number of bytes that does not grow with the
+>   backlog, no frame
 >   above the checkpoint is deleted, and once `max_backlog_bytes` is
 >   reached exports get the retryable rejection
 

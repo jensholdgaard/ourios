@@ -760,8 +760,12 @@ the mass-failover time and vote-log batching as tuning signals.
 >   the leader) are up, and once while the leader is also lost
 > - **When** the cluster continues
 > - **Then** in the first case the node joins under a new identity as a
->   learner and is promoted only once caught up, no node's core panics,
->   and every acknowledged record is present
+>   learner and is promoted only once caught up, by one membership
+>   change that also removes its old identity, so no membership ever
+>   lists two voters with its `node_id` and the old identity is gone
+>   after promotion; this holds when the leader changes between the
+>   steps; no node's core panics, and every acknowledged record is
+>   present
 > - **And** in the second case only one original voter remains, so the
 >   group fails closed: no election, no membership change and no ack
 >   until an original quorum returns, with the retryable rejection for
@@ -831,9 +835,16 @@ the mass-failover time and vote-log batching as tuning signals.
   adds the new members as `openraft` learners (they catch up from the
   checkpoint snapshot) and removes the old ones, a learner-only
   membership change that never touches the voters, the write quorum or
-  voter placement. Adding tail capacity is adding tail nodes.
+  voter placement. Adding tail capacity is adding tail nodes. The
+  current flusher (§6.5) is removed last: when it leaves the set, the
+  leader first commits a flusher-assignment entry naming a remaining
+  tail replica that has mined through the commit point, and only then
+  removes it, so a group is never without a flusher.
 - **A tenant belongs to one group**:
-  `group = xxh3_64(tenant_bytes) mod groups`. The hash and its seed are
+  `group = xxh3_64(tenant_bytes) mod groups`, where `xxh3_64` is
+  XXH3's 64-bit variant with seed 0 and `tenant_bytes` are the tenant
+  id's bytes exactly as the `TenantOtlpBatch` header carries them (RFC
+  0046 §3.3), with no normalisation. The hash, seed and encoding are
   fixed by this RFC and pinned by golden values (RFC0065.8).
 - **A group's voters** are the `replication_factor` members of `peers`
   with the highest `xxh3_64(group, node_id)` (rendezvous hashing):
@@ -841,11 +852,21 @@ the mass-failover time and vote-log batching as tuning signals.
 - **A replica's identity lives on its disk (B4, B6).** The first start
   on an empty `wal_root` writes a `replica.id` file holding a fresh
   UUIDv7, fsynced, and the Raft node id is that UUID, not `node_id`
-  (the pod name stays the address and the label). A node whose
-  `wal_root` is empty or unreadable therefore joins as a new replica:
-  the leader removes the old identity and adds the new one as a learner,
-  promoting it once it has caught up (§4.5). A node never rejoins under
-  an identity whose vote it has lost.
+  (the pod name stays the address and the label). The mapping lives in
+  the group's Raft membership itself: each member's node data is its
+  `node_id`, so membership pairs every UUID with the `node_id` it runs
+  under, and it is replicated and persisted like any log entry. A node
+  whose `wal_root` is empty or unreadable joins as a new replica: it
+  asks the leader to join under its new UUID and `node_id`; the leader
+  adds it as a learner, waits until its applied index reaches the
+  commit point, and then commits **one** membership change that
+  replaces the voter with the same `node_id` and a different UUID by the
+  new UUID (joint consensus, so the voter count never drops). Each step
+  is decided from the committed membership alone, so a new leader after
+  a failover resumes it; until the replacement commits, the old UUID is
+  an absent voter and the group runs on the rest of its quorum. A
+  membership never holds two voters with the same `node_id`, and a node
+  never rejoins under an identity whose vote it has lost (§4.5).
 - **Each replica keeps one RFC 0008 WAL per group** under
   `wal_root/groups/<group>/`, with RFC 0008's segments, fsync policy
   and CRCs unchanged, and its RFC 0052 reclaim sidecar sized for the
@@ -945,10 +966,20 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
 
 - **Epoch fencing (B5).** Each replica stores the highest epoch it has
   seen per group in `wal_root/groups/<g>/epoch`, fsynced before it acts
-  on that epoch, and rejects appends from a lower epoch. A new leader is
-  a member of `in_sync`, and the old leader can commit only with every
-  member's fsync, so once the new leader holds the higher epoch the old
-  one cannot commit anything. An old leader that tries to remove the
+  on that epoch, and rejects appends from a lower epoch. A candidate
+  fsyncs `epoch + 1` to its own epoch file **before** its election
+  compare-and-swap, and a follower's reply carries the epoch it appended
+  under. The new leader is a member of `in_sync`, and the old leader
+  commits only with every member's fsync at the old epoch, so the
+  linearization point is the candidate's epoch fsync: an old-epoch entry
+  commits only if the candidate fsynced it before that point, and is
+  then in the candidate's log (B6); nothing the old leader appends after
+  it can commit. An acknowledgement the old leader sends late is
+  therefore always of an entry the new leader holds, and B5's "can
+  never acknowledge again" is enforced at the commit, not the send.
+  Before the fallback replaces `openraft`, this handshake must pass
+  RFC0065.10's bounded model check, including the interleaving of a
+  late follower reply with an election. An old leader that tries to remove the
   new one from `in_sync` loses the compare-and-swap, because the
   election changed the ETag. None of this reads a clock.
 - **Starting an epoch.** A new leader first raises every reachable

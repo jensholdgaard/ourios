@@ -17,9 +17,11 @@ superseded-by: —
 > JSON arm compares one top-level key. RFC 0042 §3.4's integer JSON arm
 > is defined "as RFC 0022 §3.3" and follows it. The change alters result
 > sets, a major version under RFC 0002 §6.6 (§3.4, §7). RFC 0002 and
-> RFC 0022 get a dated pointer here once this RFC is accepted. It builds on the top-level comparison of
-> #1137, which restores what RFC 0022 §3.3 already states and needs no
-> RFC.
+> RFC 0022 get a dated pointer here once this RFC is accepted. It also
+> carries the top-level comparison of #1137: RFC 0022 §3.3 defines the
+> JSON arm as the #146 `LIKE` fragment, which matches a pair nested
+> anywhere in the row, and RFC0022.3 takes that compile as its
+> reference, so #1137 amends both (§3.4) and lands at this RFC's red.
 
 ## 1. Summary
 
@@ -134,8 +136,15 @@ no stack, so value depth is not limited by the lookup.
   attribute `"http.status_code"`)" becomes: the attribute named
   `<key>`; when there is none, `<key>` is resolved as a path into map
   values by RFC 0062 §3.1. The same for `resource.<key>`.
-- **RFC 0022 §3.3.** The JSON arm `J` compares the value `resolve`
-  (RFC 0062 §3.1) yields, instead of the top-level key's value.
+- **RFC 0022 §3.3.** The JSON arm `J` is no longer the #146 `LIKE`
+  fragment, which also matches a pair nested inside a map value. It
+  compares the value `resolve` (RFC 0062 §3.1) yields; for a key
+  without dots that is the first top-level occurrence. The `LIKE`
+  fragment stays as a prefilter only.
+- **RFC 0022 §5, RFC0022.3.** The reference result set is no longer
+  the pure-`LIKE` compile's but that of a full decode resolving each
+  key by RFC 0062 §3.1. Old and new files must still answer
+  identically, row for row.
 - **RFC 0002 §6.6.** This alters result sets, so it is grammar
   **v2.0**. A record holding the literal key answers exactly as before.
   For a record without it, an `==` or `!=` comparison can newly be true,
@@ -253,9 +262,15 @@ available as an additive form later.
 >   cases within 20%, and the results are recorded in the implementing
 >   PR
 
+> **Scenario RFC0062.7 — a nested pair is not a top-level key**
+> - **Given** a record holding only `outer = {k: "x"}`, written once
+>   with `k` promoted and once without
+> - **When** `attr.k == "x"` and `attr.k != "y"` run
+> - **Then** no query matches the record
+
 ## 6. Testing strategy
 
-- RFC0062.1–.4: integration tests in
+- RFC0062.1–.4 and .7: integration tests in
   `ourios-querier/tests/it/rfc0022_attr_columns.rs`, each run with and
   without promotion, through the existing table-driven `assert_counts`
   helper.
@@ -263,9 +278,9 @@ available as an additive form later.
   extending #1137's scan-against-decode property.
 - RFC0062.6: the `attr_predicate` criterion bench in `ourios-bench`,
   run locally first, then on the ci-runner.
-- The existing tests that pin top-level-only behaviour for keys
-  without dots (`a_nested_pair_is_not_a_top_level_attribute`, the
-  #1137 query tests) stay unchanged: a key without dots has no path.
+- RFC0062.7 is #1137's `a_nested_pair_is_not_a_top_level_attribute`
+  and its query tests, which stay unchanged: a key without dots has no
+  path.
 
 ## 7. Open questions
 
@@ -290,7 +305,7 @@ available as an additive form later.
   (dot-delimited namespaces),
   [Defining attributes](https://opentelemetry.io/docs/specs/semconv/how-to-write-conventions/#defining-attributes)
   (complex attributes and backend indexing)
-- RFC 0002 §6.1, §6.6 (amended here); RFC 0022 §3.1, §3.3 (amended
-  here); RFC 0042 §3.4 (integer JSON arm, same rule); RFC 0024
+- RFC 0002 §6.1, §6.6 (amended here); RFC 0022 §3.3 and criterion
+  RFC0022.3 (amended here), §3.1; RFC 0042 §3.4 (integer JSON arm, same rule); RFC 0024
   (adversarial generator); RFC 0032 (query-schema resource)
 - Issue #1134, PR #1137, issue #1136

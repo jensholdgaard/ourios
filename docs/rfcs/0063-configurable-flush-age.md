@@ -1,7 +1,7 @@
 ---
 rfc: 0063
 title: Configurable receiver flush age
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-01
@@ -11,7 +11,8 @@ superseded-by: —
 
 # RFC 0063 — Configurable receiver flush age
 
-> **Status: `drafted`.** Tracks #1141 (option 1). This RFC puts RFC
+> **Status: `specified` (2026-11-01, #1143, maintainer-approved: option 1
+> of #1141 with the `1..=300` range).** Tracks #1141 (option 1). This RFC puts RFC
 > 0014 §3.2's `max_buffer_age` on the server config surface, the
 > promotion RFC 0014 §7 leaves open ("Promoting them to RFC 0004 config
 > knobs … remains open"). It contradicts no accepted text: the default

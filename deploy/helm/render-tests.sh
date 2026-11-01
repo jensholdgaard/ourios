@@ -149,6 +149,19 @@ check "templateIdsAllowBootstrap renders into the receiver config" \
   "$(receiver_config --set receiver.templateIdsAllowBootstrap=true \
       | grep -o 'template_ids_allow_bootstrap: true')"
 
+# --- RFC 0063 flush age --------------------------------------------------------
+
+# The age reaches the receiver through extraEnv: the rendered config carries
+# an ${env:…:-} reference, which resolves empty (the default) when unset.
+check "the flush age is an env reference in the receiver config" \
+  'max_buffer_age_secs: "${env:OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS:-}"' \
+  "$(receiver_config | grep -o 'max_buffer_age_secs: .*')"
+check "receiver extraEnv carries the flush age to the receiver" \
+  "OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS=10" \
+  "$(workload_env receiver-statefulset.yaml \
+      --set 'receiver.extraEnv[0].name=OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS' \
+      --set-string 'receiver.extraEnv[0].value=10' | grep '^OURIOS_RECEIVER_MAX')"
+
 # --- receiver startup probe --------------------------------------------------
 
 # Startup recovery (WAL replay, the RFC 0059 bootstrap scan) runs before the

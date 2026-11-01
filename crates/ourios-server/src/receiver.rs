@@ -34,6 +34,7 @@ use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_ingester::template_ids::{TemplateIds, TemplateIdsError};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Caller, PromotedAttributes, Store};
+use ourios_server::config::resolve::MAX_BUFFER_AGE_CEILING;
 use ourios_serving::AuthResolver;
 use ourios_serving::serve::{
     GRPC_KEEPALIVE_INTERVAL, GRPC_KEEPALIVE_TIMEOUT, PlainListener, TCP_KEEPALIVE, accept_backoff,
@@ -45,7 +46,7 @@ use ourios_serving::tls_serve::{
 };
 use ourios_wal::{Wal, WalConfig, WalOffset};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
@@ -55,18 +56,21 @@ use tonic::transport::server::TcpIncoming;
 const SNAPSHOTS_DIR: &str = "snapshots";
 
 /// RFC 0014 §3 flush-policy defaults for the receiver's data sink. These are
-/// go-live starting points; tuning against representative corpora — and
-/// exposing them as RFC 0004 config knobs — is RFC 0014 §7.
+/// go-live starting points; tuning against representative corpora is RFC
+/// 0014 §7. Only the age is configurable (RFC 0063).
 ///
 /// `target_bytes` is the per-partition in-memory estimate that triggers a
 /// flush, aimed at the RFC 0005 §3.5 file-size band; `max_buffer_age` bounds
 /// how long a low-volume partition's data stays unqueryable; `ceiling_bytes`
 /// is the hard cap on total buffered bytes (RFC0014.4).
 const SINK_TARGET_BYTES: usize = 256 * 1024 * 1024;
-pub(crate) const SINK_MAX_BUFFER_AGE: Duration = Duration::from_secs(300);
+/// The age ceiling, not the configured age: the compactor's erasure settle
+/// and [`BARRIER_TICK`] hold for any `receiver.max_buffer_age_secs`
+/// (RFC 0063 §3.1, §3.3).
+pub(crate) const SINK_MAX_BUFFER_AGE: Duration = MAX_BUFFER_AGE_CEILING;
 const SINK_CEILING_BYTES: usize = 1024 * 1024 * 1024;
-/// How often the age sweep runs (≤ `SINK_MAX_BUFFER_AGE`): an aged partition
-/// flushes within `SINK_MAX_BUFFER_AGE + SINK_FLUSH_TICK`.
+/// How often the age sweep runs at most: an aged partition flushes within
+/// the configured age plus [`sweep_interval`].
 const SINK_FLUSH_TICK: Duration = Duration::from_secs(30);
 
 /// RFC 0052 §3.1's `barrier_secs`, defaulting to the sink's age trigger.
@@ -89,15 +93,21 @@ const BARRIER_TICK: Duration = SINK_MAX_BUFFER_AGE;
 /// event is small and the normal driver is the cadence, not this signal.
 const AUDIT_SINK_CEILING_EVENTS: usize = 100_000;
 
-fn flush_config() -> FlushConfig {
+fn flush_config(max_buffer_age: Duration) -> FlushConfig {
     FlushConfig {
         target_bytes: SINK_TARGET_BYTES,
-        max_buffer_age: SINK_MAX_BUFFER_AGE,
+        max_buffer_age,
         ceiling_bytes: SINK_CEILING_BYTES,
     }
 }
 
-/// The age-sweep task (RFC0014.2): every [`SINK_FLUSH_TICK`] — or sooner, when
+/// RFC 0063 §3.2: a sweep at most every [`SINK_FLUSH_TICK`], and never
+/// slower than the age it enforces.
+fn sweep_interval(max_buffer_age: Duration) -> Duration {
+    SINK_FLUSH_TICK.min(max_buffer_age)
+}
+
+/// The age-sweep task (RFC0014.2): every `every` — or sooner, when
 /// the audit buffer reaches its ceiling and raises `audit_overflow` (issue #302
 /// fix #3) — publish the aged record partitions, audit-ordered and race-free
 /// (issue #302 fix #1).
@@ -121,11 +131,12 @@ fn flush_config() -> FlushConfig {
 fn spawn_age_sweep(
     pipeline: SharedPipeline,
     coordinator: PublishCoordinator,
-    audit_overflow: Arc<Notify>,
+    every: Duration,
     mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<()> {
+    let audit_overflow = coordinator.audit().overflow_notify();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(SINK_FLUSH_TICK);
+        let mut tick = tokio::time::interval(every);
         // A slow sweep (e.g. against S3) must not make the interval "catch up"
         // with back-to-back flushes; keep a steady cadence from the last tick.
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -425,6 +436,10 @@ pub struct ReceiverConfig {
     /// RFC 0059 §3.5 — authorise the one-time template-id bootstrap on a
     /// store that already holds data.
     pub template_ids_allow_bootstrap: bool,
+    /// RFC 0063 §3.1 — the sink's age trigger
+    /// (`receiver.max_buffer_age_secs`; the config layer validates it to
+    /// at most [`SINK_MAX_BUFFER_AGE`]).
+    pub max_buffer_age: Duration,
     /// The RFC 0047 §3.3 graph emitter, fed on the flush cadence, when the
     /// graph is configured with a bound conversation object.
     pub graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
@@ -604,6 +619,7 @@ fn latch_on_panic(epochs: &BarrierEpochs, cut: impl FnOnce() -> CutOutcome) {
 fn build_write_sinks(
     store: Store,
     promoted: PromotedAttributes,
+    max_buffer_age: Duration,
 ) -> (SharedParquetSink, SharedParquetAuditSink) {
     let audit_sink = SharedParquetAuditSink::new(BufferingAuditSink::new(
         store.clone().with_caller(Caller::AuditSink),
@@ -612,13 +628,16 @@ fn build_write_sinks(
     let barrier_audit = audit_sink.clone();
     let quarantine_audit = audit_sink.clone();
     let sink = SharedParquetSink::new(
-        ParquetRecordSink::new(store.with_caller(Caller::Sink), flush_config())
-            .with_promoted_attributes(promoted)
-            .with_audit_barrier(Box::new(move || barrier_audit.settled()))
-            // RFC 0025 §3.3: permanently-rejected records quarantine
-            // to the shared audit stream instead of wedging the
-            // partition buffer (#362).
-            .with_audit_sink(Box::new(quarantine_audit)),
+        ParquetRecordSink::new(
+            store.with_caller(Caller::Sink),
+            flush_config(max_buffer_age),
+        )
+        .with_promoted_attributes(promoted)
+        .with_audit_barrier(Box::new(move || barrier_audit.settled()))
+        // RFC 0025 §3.3: permanently-rejected records quarantine
+        // to the shared audit stream instead of wedging the
+        // partition buffer (#362).
+        .with_audit_sink(Box::new(quarantine_audit)),
     );
     (sink, audit_sink)
 }
@@ -925,6 +944,8 @@ struct CadenceInputs {
     /// The journal owner housekeeping reclaims through.
     commits: Arc<CommitCoordinator>,
     housekeeping: HousekeepingPlan,
+    /// The age sweep's interval, [`sweep_interval`] of the configured age.
+    sweep_every: Duration,
 }
 
 /// Start the cadences over one publish coordinator.
@@ -938,8 +959,8 @@ fn spawn_cadences(
         barrier,
         commits,
         housekeeping,
+        sweep_every,
     } = inputs;
-    let overflow = publisher.audit().overflow_notify();
     let housekeeper = Arc::new(Housekeeper::new(
         commits,
         Arc::clone(&barrier),
@@ -957,7 +978,7 @@ fn spawn_cadences(
         barrier: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
         // The age sweep drains under the barrier exclusion and the miner
         // lock, and writes audit-ordered off both (issue #302 #1/#2).
-        sweep: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
+        sweep: spawn_age_sweep(pipeline.clone(), publisher, sweep_every, shutdown.clone()),
     }
 }
 
@@ -1168,7 +1189,8 @@ pub async fn serve_until(
     let ids = TemplateIds::new(config.store.clone().with_caller(Caller::TemplateIds))
         .with_bootstrap_allowed(config.template_ids_allow_bootstrap)
         .with_shutdown(stopping);
-    let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
+    let (sink, audit_sink) =
+        build_write_sinks(config.store, config.promoted, config.max_buffer_age);
     let miner = build_miner(config.miner, (&sink, &audit_sink), &ids);
     let Recovered {
         wal,
@@ -1234,6 +1256,7 @@ pub async fn serve_until(
             barrier: Arc::clone(&barrier),
             commits,
             housekeeping,
+            sweep_every: sweep_interval(config.max_buffer_age),
         },
         &shutdown_rx,
     );
@@ -1683,6 +1706,7 @@ mod tests {
             encode_workers: 2,
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
+            max_buffer_age: SINK_MAX_BUFFER_AGE,
         })
         .await
         .expect("serve");
@@ -1788,6 +1812,7 @@ mod tests {
             encode_workers: 2,
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
+            max_buffer_age: SINK_MAX_BUFFER_AGE,
         })
         .await
         .expect("serve");
@@ -1850,6 +1875,7 @@ mod tests {
         let (sink, audit) = build_write_sinks(
             Store::local(root.join("store")).expect("local store"),
             PromotedAttributes::default(),
+            SINK_MAX_BUFFER_AGE,
         );
         let publisher = PublishCoordinator::new(sink, audit);
         let commits = CommitCoordinator::new(
@@ -1983,6 +2009,7 @@ mod tests {
             encode_workers: 2,
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
+            max_buffer_age: SINK_MAX_BUFFER_AGE,
         };
 
         // Given a node that sealed a segment and stamped past it: the second
@@ -2047,6 +2074,7 @@ mod tests {
             encode_workers: 2,
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
+            max_buffer_age: SINK_MAX_BUFFER_AGE,
         };
         let expected = Some(ourios_miner::snapshot::WalHighWater {
             segment: horizon.segment.to_string(),
@@ -2127,6 +2155,7 @@ mod tests {
             encode_workers: 2,
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
+            max_buffer_age: SINK_MAX_BUFFER_AGE,
         }
     }
 
@@ -2381,6 +2410,7 @@ mod tests {
             encode_workers: 2,
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
+            max_buffer_age: SINK_MAX_BUFFER_AGE,
         })
         .await
         .expect("serve");
@@ -2568,6 +2598,7 @@ mod tests {
             encode_workers: 2,
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
+            max_buffer_age: SINK_MAX_BUFFER_AGE,
         })
         .await
         .expect("serve");
@@ -2616,6 +2647,7 @@ mod tests {
             encode_workers: 2,
             miner: MinerConfig::default().with_upstream_templates(UpstreamTemplates::Adopt),
             template_ids_allow_bootstrap: false,
+            max_buffer_age: SINK_MAX_BUFFER_AGE,
         })
         .await
         .expect("serve");
@@ -2826,6 +2858,7 @@ mod tests {
             encode_workers: 2,
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
+            max_buffer_age: SINK_MAX_BUFFER_AGE,
         })
         .await
         .expect("serve");
@@ -2888,7 +2921,8 @@ mod tests {
             ..test_wal_config(wal_root)
         })
         .expect("open WAL");
-        let (sink, audit_sink) = build_write_sinks(store, PromotedAttributes::default());
+        let (sink, audit_sink) =
+            build_write_sinks(store, PromotedAttributes::default(), SINK_MAX_BUFFER_AGE);
         let miner =
             MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit_sink.clone()))
                 .with_record_sink(Box::new(sink.clone()));
@@ -3351,5 +3385,41 @@ mod tests {
             recovery_failed(&failed),
             StartError::Failed(message) if message.contains("data/x.parquet")
         ));
+    }
+
+    /// Scenario RFC0063.2 — the sink drains on the configured age.
+    /// See `docs/rfcs/0063-configurable-flush-age.md` §5. Real time,
+    /// because the sink ages its buffers with `std::time::Instant`.
+    #[test]
+    fn rfc0063_2_the_sink_drains_on_the_configured_age() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let mut sink = ParquetRecordSink::new(
+            Store::local(tmp.path()).expect("local store"),
+            flush_config(Duration::from_secs(1)),
+        );
+        sink.emit(rec());
+        assert!(
+            sink.drain_aged().is_empty(),
+            "a young partition stays buffered"
+        );
+        std::thread::sleep(Duration::from_millis(1_200));
+        let drained = sink.drain_aged();
+        assert_eq!(drained.partitions().len(), 1, "the aged partition drains");
+        assert_eq!(drained.partitions()[0].1.len(), 1);
+    }
+
+    /// Scenario RFC0063.3 — the sweep follows the age, the barrier does not.
+    /// See `docs/rfcs/0063-configurable-flush-age.md` §5.
+    #[test]
+    fn rfc0063_3_the_sweep_follows_the_age_the_barrier_does_not() {
+        assert_eq!(
+            sweep_interval(Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            sweep_interval(Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(BARRIER_TICK, Duration::from_secs(300));
     }
 }

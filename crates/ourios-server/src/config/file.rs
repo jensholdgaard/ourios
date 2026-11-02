@@ -1916,6 +1916,8 @@ receiver:
     reload_interval_secs: ${env:L26}
   wal_root: ${env:L27}
   encode_workers: ${env:L28}
+  max_buffer_age_secs: ${env:L72}
+  max_request_bytes: ${env:L73}
 querier:
   enabled: ${env:L29}
   http_addr: ${env:L30}

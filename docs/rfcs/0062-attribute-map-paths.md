@@ -283,7 +283,10 @@ available as an additive form later.
 >   implementation
 > - **When** it runs against the pre-RFC baseline
 > - **Then** promoted-key cases stay within 3%, unpromoted `==` cases
->   within 20%, and unpromoted `!=` cases within 20% per matching row
+>   within 20%, and unpromoted `!=` cases within 20% per matching row;
+>   a promoted key whose matching rows hold it only under a map counts
+>   as unpromoted, since those rows' promoted cells are null and take the
+>   JSON arm
 >   (a `!=` now matches more rows, §3.6: 2.61 µs a row before, 2.79 µs
 >   with paths in the experiment), and the results are recorded in the
 >   implementing PR
@@ -295,13 +298,14 @@ available as an additive form later.
 > - **Then** no query matches the record
 
 > **Scenario RFC0062.8 — no engine name reaches the user (H6)**
-> - **Given** a query comparing a map path with a value of the wrong
->   type, `attr.user.id == 7` against `user = {id: "u7"}`, and a
->   malformed path `attr.user..id`
+> - **Given** `user.id` promoted as `i64` and a record holding only
+>   `user = {id: "u7"}`, the query `attr.user.id == 7` (a value of the
+>   wrong type; unpromoted, an integer literal is rejected with a DSL
+>   error as it is today), and a malformed path `attr.user..id`
 > - **When** each runs through the HTTP query endpoint and the MCP
 >   `query_logs` tool
 > - **Then** the first matches nothing and the second is rejected with
->   a DSL error, and no response, error or explain output names
+>   a DSL error, and no response or error names
 >   `ourios_attr_cmp`, `LIKE` or any DataFusion function
 > - **And** the RFC 0032 query-schema resource states the §3.1 rule
 
@@ -320,10 +324,12 @@ available as an additive form later.
 - RFC0062.5: a proptest beside the UDF in `plan/attr_value.rs`,
   extending #1137's scan-against-decode property.
 - RFC0062.6: the `attr_predicate` criterion bench in `ourios-bench`,
-  run locally first, then on the ci-runner.
-- RFC0062.8: the querier's HTTP and MCP error-scrubbing tests in
-  `ourios-server/src/{querier,mcp}.rs`, plus an assertion on the
-  query-schema resource text.
+  pre and post binaries run alternately on an otherwise idle machine
+  (no CI workflow runs this bench); the numbers go in the implementing
+  PR.
+- RFC0062.8: `ourios-server/tests/it/rfc0062_8_engine_names.rs`,
+  beside the existing HTTP and MCP error-scrubbing tests, plus an
+  assertion on the query-schema resource text.
 - RFC0062.9: the existing tenancy integration tests in
   `ourios-querier/tests/it`, with a path query added.
 - RFC0062.7 is #1137's `a_nested_pair_is_not_a_top_level_attribute`

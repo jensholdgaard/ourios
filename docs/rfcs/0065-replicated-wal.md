@@ -18,9 +18,9 @@ superseded-by: —
 > arm, .14's `require_complete` arms, .17) in `ourios-server`
 > (`tests/it/rfc0065_replicated_wal.rs`).
 > Specified 2026-11-02 (#1146). Tracks #1141 (option 2). It depends on
-> **RFC 0064** (`meta:`, `specified`), which states in `AGENTS.md` §3.4
-> what a replicated WAL must guarantee; this RFC cannot reach `red`
-> before RFC 0064 is accepted. §3 states the required behaviour without
+> **RFC 0064** (`meta:`, `accepted` 2026-11-02, enacted 2026-11-03),
+> which states in `AGENTS.md` §3.4 what a replicated WAL must
+> guarantee. §3 states the required behaviour without
 > naming a mechanism; §4 surveys the Rust crates that could provide it;
 > §6 is the design that follows. The design **extends RFC 0008 §6.2.2**
 > (`accepted`) with a new frame kind in the range that section reserves,

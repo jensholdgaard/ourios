@@ -16,7 +16,7 @@ superseded-by: —
 > replication bullet, §4 item 3 and the footer took §3.1–§3.3's text,
 > and `docs/hazards.md` H3 and H8 took §3.4's. The note below is the
 > drafting-time status.
-
+>
 > **Status: `specified`.** Tracks #1141 (option 2). This is a `meta:` RFC.
 > It proposes changes to `AGENTS.md` §3.4 and §4 and to
 > `docs/hazards.md` H3 and H8. `AGENTS.md`'s footer requires "a `meta:`

@@ -38,7 +38,8 @@ broker that verifiably persists before it acknowledges meets the bullet
 unchanged. For one that does not, only the fsync is waived, and only
 under an explicit operator opt-in, with a startup warning and replicas
 in separate failure domains; the two-replica floor, leader safety and
-fencing are never waived.
+fencing are never waived, so a broker on which Ourios cannot establish
+them is unsupported, opt-in or not.
 
 ## 2. Motivation
 
@@ -132,16 +133,18 @@ and a bullet follows it:
 - A broker-backed WAL (a Kafka-protocol log) meets the rule above
   through the broker's write quorum and leader election, which Ourios
   checks from the broker's configuration at startup and periodically
-  while running; a broker whose configuration cannot be read does not
+  while running; a broker whose configuration cannot be read, or on
+  which the floor or leader safety cannot be established, does not
   start. If Ourios cannot verify that the broker fsyncs, or commits to
   object storage, before it acknowledges, the replicas hold the batch
   only in memory: the backend then acknowledges only when the operator
   has opted in by configuration, warns at startup, and has every
-  partition's replicas in distinct failure domains. The opt-in waives
-  the fsync only, never the two-replica floor, leader safety or
-  fencing. A check that fails while running stops acknowledgements on
-  that topic with a retryable rejection until it passes again, or, for
-  a lost fsync guarantee, until the opt-in covers it.
+  partition's replicas in distinct failure domains, re-checked with
+  the rest. The opt-in waives the fsync only, never the two-replica
+  floor, leader safety or fencing. A check that fails while running
+  stops acknowledgements on that topic with a retryable rejection until
+  it passes again, or, for a lost fsync guarantee, until the opt-in
+  covers it.
 ```
 
 The rest of §3.4 and §4 item 3 (crash test for every backend) are
@@ -193,13 +196,18 @@ RFC 0066 owns the checks; this table is what they must establish.
 
 | Rule | Apache Kafka | Redpanda (Raft) | WarpStream |
 |---|---|---|---|
-| ≥ 2 replicas and the write quorum hold the batch | `acks=all`, `min.insync.replicas ≥ 2`, every partition with ≥ `max(2, min.insync.replicas)` replicas | `acks=all` (majority), every partition with ≥ 2 replicas | not verifiable (object storage replicates internally) |
-| Leader holds every acked batch | `unclean.leader.election.enable=false`; with the opt-in, also ELR (§7 Q5) | Raft election | single metadata store |
-| fsync before ack (verified) | `flush.messages=1` (§7 Q4) | `write.caching=false` | not exposed: opt-in |
+| ≥ 2 replicas and the write quorum hold the batch (never waived) | `acks=all`, `min.insync.replicas ≥ 2`, every partition with ≥ `max(2, min.insync.replicas)` replicas | `acks=all` (majority), every partition with ≥ 2 replicas | not readable through the Kafka protocol: **unsupported** |
+| Leader holds every acked batch (never waived) | `unclean.leader.election.enable=false`; with the opt-in, also ELR enabled in the finalized features (§7 Q5) | Raft election | not readable: **unsupported** |
+| fsync before ack (waivable by the opt-in) | `flush.messages=1` (§7 Q4) | `write.caching=false` | — |
+| Failure domains (opt-in only, never waived once opted in) | current replica assignment, each partition's replicas on distinct non-empty `rack` labels | same | — |
 
-A broker that cannot show a row's setting is classified conservatively:
-a broker that does persist but cannot show it needs the opt-in, never
-the reverse.
+Classification is per row. A row marked never waived that cannot be
+read, or reads as failing, rejects the topic whatever the opt-in says;
+only the fsync row falls back to the opt-in, and conservatively: a
+broker that does persist but cannot show it needs the opt-in, never the
+reverse. WarpStream's own documentation promises an ack only after the
+object-store commit, but Ourios cannot read its floor or leader safety,
+so it is unsupported until it can (§7 Q7).
 
 **Lifetime.** The checks run at startup and every **60 s** while
 running; 60 s is a starting value, tuned by the re-check outcome metric
@@ -208,9 +216,13 @@ Each check fails closed:
 
 - the configuration cannot be read at startup → the receiver does not
   start;
-- the floor or leader check fails, or the config cannot be read while
-  running → the topic stops acknowledging (retryable rejection, RFC
-  0053 §3.1) until a check passes;
+- the floor or leader check fails (including, under the opt-in on
+  Kafka, ELR disabled or the finalized features unreadable), or the
+  config cannot be read while running → the topic stops acknowledging
+  (retryable rejection, RFC 0053 §3.1) until a check passes;
+- under the opt-in, the replica assignment cannot be read or a
+  partition's replicas no longer sit on distinct non-empty racks, on
+  entering unverified mode or at any re-check → the same;
 - the fsync check moves from verified to unverified and the opt-in is
   not set → the same; with the opt-in set → acknowledgements continue
   and a WARN event is emitted.
@@ -235,7 +247,7 @@ of magnitude" slower; RFC 0066's batch window produces one record batch
 per partition per window, so `flush.messages=1` costs one fsync per
 broker per partition per window, close to the local WAL's group commit,
 but it applies to the whole topic and Kafka operators rarely accept it.
-WarpStream would be excluded. Close second; §7 Q1 is this choice.
+Close second; §7 Q1 is this choice.
 
 **Forbid the broker backend.** RFC 0065 already gives replication with
 fsync and no external system. It throws away RFC 0066's reason to
@@ -323,13 +335,20 @@ Behaviour decisions for the maintainer. Each has a recommendation.
   acknowledged data when it was the last in-sync copy (§3.1, row 3),
   which RFC 0064's leader rule forbids. ELR is on by default only on new
   clusters from Kafka 4.1. *Recommendation: yes,* checked from the
-  broker's finalized features; Redpanda and WarpStream do not use
-  Kafka's ISR election.
+  broker's finalized features at startup and every re-check; Redpanda
+  does not use Kafka's ISR election.
 - [ ] **Q6. How quickly must Ourios notice that the broker's settings
   changed?** *Recommendation: re-check every 60 s to start, and tune it
   from the re-check metric.* Shorter costs one metadata and config
   request per topic per interval; longer leaves a wider window in which
   a changed broker keeps getting acknowledged writes.
+- [ ] **Q7. Should WarpStream be supported even though Ourios cannot
+  read its replica floor or leader safety?** Its documentation says it
+  acknowledges only after the object-store commit, which would meet
+  the rule, but Ourios cannot check it. *Recommendation: no, not in
+  this RFC;* list it as unsupported and revisit if WarpStream exposes
+  something Ourios can read. Allowing it on the operator's word would
+  make the never-waived guarantees waivable.
 
 ## 8. References
 

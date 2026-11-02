@@ -155,17 +155,22 @@ Redpanda and WarpStream all speak.
   large FFI surface outside our `#![deny(unsafe_code)]` crates.
 
 The backend uses `rskafka` behind a small `BrokerClient` trait (produce
-to a partition, fetch from an offset, read metadata and topic
-configuration, delete records below an offset), so the tests can use an
+to a partition, fetch from an offset, read metadata (including each
+partition's current replica assignment and each broker's `rack`) and
+topic configuration, read the cluster's finalized features
+(ApiVersions v3+, KIP-584; on Apache Kafka this is how RFC 0067's ELR
+check reads `eligible.leader.replicas.version`), delete records below
+an offset), so the tests can use an
 in-memory broker and a later RFC can swap the client. `rskafka` 0.6.0
 does not cover all of it, checked against its source: its Metadata
 request stops at version 4, whose response has no topic id (added in
 version 10, KIP-516), it has no DescribeConfigs message, and its produce
 retries internally (§3.4). The backend therefore carries a patch or fork
 of `rskafka` adding Metadata v10+ for the topic id, DescribeConfigs for
-§3.1's startup checks, and a produce without internal retry, offered
+§3.1's startup checks, the finalized features from ApiVersions if its
+parser drops them, and a produce without internal retry, offered
 upstream; until upstream takes them the fork is a maintained
-dependency. A replacement client must provide the same four operations
+dependency. A replacement client must provide the same five operations
 before it is chosen (§7).
 `rskafka`'s dependencies are permissively licensed and go through the
 existing `cargo deny` check.
@@ -732,12 +737,18 @@ removes only copies of the same log entry.
 >   fails whether or not the opt-in is set
 
 > **Scenario RFC0066.17 — the opt-in starts with a warning (RFC 0067)**
-> - **Given** the topic of RFC0066.16, every partition's replicas on
->   brokers with distinct non-empty racks, and the opt-in set
+> - **Given** the topic of RFC0066.16 on Apache Kafka, every partition's
+>   replicas on brokers with distinct non-empty racks, finalized features
+>   with `eligible.leader.replicas.version ≥ 1`, and the opt-in set
 > - **When** the receiver starts
 > - **Then** it starts, logs one WARN event naming the topic and stating
 >   that acknowledged batches are not verified on disk, and reports the
 >   unverified mode in its telemetry (§3.9)
+> - **And** the same fixture with ELR disabled, or with the finalized
+>   features unreadable, fails startup naming the ELR feature
+> - **And** a topic whose replica floor or leader safety cannot be read
+>   (no readable `min.insync.replicas` or unclean-election setting, as on
+>   WarpStream) fails startup with the opt-in set
 
 > **Scenario RFC0066.18 — the opt-in still needs separate failure domains (RFC 0067)**
 > - **Given** the opt-in set, and a topic where one partition has two
@@ -760,17 +771,27 @@ removes only copies of the same log entry.
 >   `UNAVAILABLE`, HTTP `503`) and none is acknowledged until a re-check
 >   finds the topic verified again
 > - **And** with the opt-in set, the same change keeps
->   acknowledgements flowing and emits a WARN event naming the topic
+>   acknowledgements flowing and emits a WARN event naming the topic,
+>   provided the failure-domain and (on Apache Kafka) ELR checks pass on
+>   entering unverified mode; if either fails then, exports get the
+>   retryable rejection instead
 > - **And** a re-check that finds `min.insync.replicas` below 2,
 >   unclean leader election enabled, or the configuration unreadable
 >   stops acknowledgements on that topic whether or not the opt-in is set
+> - **And** in unverified mode with the opt-in set, a re-check that
+>   cannot read the current replica assignment, finds two replicas of a
+>   partition on one rack or a replica with no rack (a reassignment or a
+>   relabelled broker), or on Apache Kafka finds ELR disabled or the
+>   finalized features unreadable, stops acknowledgements on that topic
+>   with the retryable rejection until a re-check passes
 
 ## 6. Testing strategy
 
 - RFC0066.1, .4: unit tests in `ourios-server/src/config` and next to
   the hash; golden values committed with the hash.
 - RFC0066.16–.20: unit tests against the in-memory `BrokerClient`,
-  which returns the topic configuration and broker racks each scenario
+  which returns the topic configuration, replica assignment, broker
+  racks and finalized features each scenario
   names and changes them between re-checks; the re-check runs on a test
   clock.
 - RFC0066.5, .6, .7, .8, .11, .12, .13, .14, .15: integration tests against an in-memory

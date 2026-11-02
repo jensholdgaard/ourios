@@ -24,8 +24,9 @@ superseded-by: —
 
 Both OTLP listeners enforce a single configurable request-size limit,
 `receiver.max_request_bytes`. Its default sits 4 KiB below the WAL
-frame ceiling (16 MiB − 4 KiB), so a request the listener accepts always
-fits one WAL frame. A gRPC Export over the limit, whether it is over before or after
+frame ceiling (16 MiB − 4 KiB), so a request the listener accepts fits
+one WAL frame unless re-encoding enlarges it (§3.1); one that does gets
+the same non-retryable rejection. A gRPC Export over the limit, whether it is over before or after
 decompression, gets `RESOURCE_EXHAUSTED` with no `RetryInfo`, which the
 OTLP spec defines as non-retryable. An HTTP Export over the limit gets
 `413`, as it does today. A batch that passes the limit but still exceeds
@@ -90,12 +91,19 @@ bytes. The value is shared by both listeners.
   WAL append, after the whole request had been decoded into memory. The
   frame adds a tenant prefix of at most 130 bytes (a `u16` length plus a
   tenant of up to `MAX_TENANT_BYTES` = 128). Re-encoding a decoded
-  protobuf request does not make it larger than the bytes it was decoded
-  from (prost drops unknown fields and writes minimal encodings), and the
-  protobuf form of an OTLP/JSON body is smaller than the JSON. So 4 KiB
-  covers the wrap with room for a future prefix change without moving
-  the config number, and a request at the limit does not reach
-  `TooLarge`, which stays the backstop. This is a
+  request usually makes it no larger (prost drops unknown fields and
+  overlong varints), and the protobuf form of an OTLP/JSON body is
+  smaller than the JSON, so 4 KiB covers the wrap with room for a future
+  prefix change without moving the config number. Re-encoding can grow,
+  though: a negative `int32` enum such as `severity_number = -1`, which
+  a client may send as the five bytes `ff ff ff ff 0f`, is written back
+  as ten, and the pipeline encodes the frame before it normalises
+  severity (`receiver/pipeline.rs`). About 800 such fields use up the
+  margin, so a request at or near the limit can still reach
+  `AppendError::TooLarge`. That is the backstop and not a bug: it gets
+  the same non-retryable codes and `error.type` as the listener's
+  rejection (RFC0061.3), the WAL holds nothing of it, and RFC0061.6 pins
+  the case. This is a
   documented deviation from the spec's RECOMMENDED 64 MiB default.
   RECOMMENDED is a SHOULD-level clause; §4 says why the frame ceiling is
   not raised to meet it.
@@ -258,8 +266,9 @@ worth it while protobuf is the format producers default to.
 
 > **Scenario RFC0061.4 — at-limit Exports are accepted on both transports**
 > - **Given** a configured limit `L`
-> - **When** a gRPC and an HTTP Export of exactly `L` bytes are sent
->   under a 128-byte tenant, with `L` at the default
+> - **When** a gRPC and an HTTP Export of exactly `L` bytes, written with
+>   minimal encodings, are sent under a 128-byte tenant, with `L` at the
+>   default
 > - **Then** both are acked (neither reaches `AppendError::TooLarge`)
 >   and their records are readable after flush
 
@@ -269,12 +278,22 @@ worth it while protobuf is the format producers default to.
 > - **Then** each gets `413` (RFC0003.11's HTTP arm, now driven by the
 >   configured `L` instead of the hard-coded 4 MiB)
 
+> **Scenario RFC0061.6 — a request that grows on re-encoding is rejected, not failed**
+> - **Given** a gRPC and an OTLP/HTTP protobuf Export just under the
+>   default limit whose 1 000 records carry `severity_number = -1`
+>   encoded in five bytes, so the re-encoded frame exceeds
+>   `MAX_FRAME_BYTES`
+> - **When** each is sent
+> - **Then** gRPC returns `RESOURCE_EXHAUSTED` without `RetryInfo`, HTTP
+>   returns `413`, `error.type="request_too_large"` is recorded, and the
+>   WAL holds no frame from either
+
 ## 6. Testing strategy
 
 - RFC0061.1: config resolution unit tests in `ourios-server/src/config`,
   next to the existing `ReceiverSection` substitution tests; the Helm
   arm in the chart's existing render tests.
-- RFC0061.2, .4, .5: integration tests in `ourios-ingester/tests/it`
+- RFC0061.2, .4, .5, .6: integration tests in `ourios-ingester/tests/it`
   (beside `http_transport_errors.rs`) driving a real tonic client and
   the axum router. The three gRPC arms of .2 also extend RFC0003.11's
   test. Arm (a) is what pins tonic's `OUT_OF_RANGE` path behind the
@@ -290,7 +309,8 @@ worth it while protobuf is the format producers default to.
 
 - [x] Default at the frame ceiling or slightly below? **Resolved
   (maintainer, 2026-10-31): below**, at 16 MiB − 4 KiB, so an accepted
-  request never reaches `TooLarge` (§3.1).
+  request with minimal encodings never reaches `TooLarge`; one that
+  grows on re-encoding gets the same rejection through it (§3.1).
 - [x] A Helm value key or `extraEnv`? **Resolved (maintainer,
   2026-10-31): `extraEnv`**, through a rendered `${env:…:-}` reference
   (§3.1).

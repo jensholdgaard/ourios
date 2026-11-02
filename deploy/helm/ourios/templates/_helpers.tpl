@@ -212,6 +212,7 @@ receiver:
   template_ids_allow_bootstrap: true
   {{- end }}
   max_buffer_age_secs: "${env:OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS:-}"
+  max_request_bytes: "${env:OURIOS_RECEIVER_MAX_REQUEST_BYTES:-}"
   {{- with include "ourios.tlsConfig" . }}
   {{- . | trim | nindent 2 }}
   {{- end }}

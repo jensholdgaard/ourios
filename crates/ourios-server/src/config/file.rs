@@ -444,6 +444,11 @@ pub struct ReceiverSection {
     /// (`receiver.max_buffer_age_secs`; default and ceiling 300).
     #[serde(deserialize_with = "scalar_opt")]
     pub max_buffer_age_secs: Option<String>,
+    /// RFC 0061 §3.1 — the OTLP request-size limit in bytes, shared by
+    /// both listeners (`receiver.max_request_bytes`; default and ceiling
+    /// 16773120).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub max_request_bytes: Option<String>,
 }
 
 /// One `*_tls` block (RFC 0030 §3.1). Raw string leaves — the §3.1
@@ -989,7 +994,8 @@ impl ReceiverSection {
         substitute(&mut self.wal_root, lookup)?;
         substitute(&mut self.encode_workers, lookup)?;
         substitute(&mut self.template_ids_allow_bootstrap, lookup)?;
-        substitute(&mut self.max_buffer_age_secs, lookup)
+        substitute(&mut self.max_buffer_age_secs, lookup)?;
+        substitute(&mut self.max_request_bytes, lookup)
     }
 }
 

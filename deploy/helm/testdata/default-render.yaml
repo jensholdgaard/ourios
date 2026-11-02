@@ -31,6 +31,7 @@ data:
       http_addr: "0.0.0.0:4318"
       wal_root: "/var/lib/ourios/wal"
       max_buffer_age_secs: "${env:OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS:-}"
+      max_request_bytes: "${env:OURIOS_RECEIVER_MAX_REQUEST_BYTES:-}"
     compaction:
       enabled: false
   querier.yaml: |
@@ -336,7 +337,7 @@ spec:
         app.kubernetes.io/component: receiver
       annotations:
         # Roll the pods when the mounted RFC 0020 config changes.
-        checksum/config: 240078a395916516df6065d632b05444c1daaac538f8ed693feafa12ac6b9d9d
+        checksum/config: def6733e1717c5057b40c3af2cca252aab01b59aa6f8dd994d79b557726b8c32
     spec:
       serviceAccountName: t-ourios
       automountServiceAccountToken: true

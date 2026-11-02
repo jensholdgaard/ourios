@@ -534,6 +534,7 @@ async fn start_receiver(
         miner: params.miner,
         template_ids_allow_bootstrap: params.template_ids_allow_bootstrap,
         max_buffer_age: params.max_buffer_age,
+        max_request_bytes: params.max_request_bytes,
         graph_emitter,
     };
     let handle = receiver::serve_until(receiver_config, stopping).await?;

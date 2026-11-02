@@ -7,7 +7,8 @@
 //! - tenant-resolution failure → `INVALID_ARGUMENT` (naming the failing
 //!   `ResourceLogs` index + attribute, RFC0003.4/.11);
 //! - an oversize payload (`AppendError::TooLarge`, > 16 MiB) →
-//!   `INVALID_ARGUMENT` — a permanent client sizing error, non-retryable;
+//!   `RESOURCE_EXHAUSTED` without `RetryInfo` — a permanent client sizing
+//!   error, non-retryable (RFC 0061 §3.2);
 //! - any other WAL append/sync failure → `UNAVAILABLE` — a transient
 //!   failure (the batch was not acked, §3.4), so retryable per the OTLP
 //!   failures table (RFC 0018 §3.2);
@@ -17,16 +18,24 @@
 //! `ingest` is async (its fsync is batched by the group-commit
 //! coordinator — RFC0008.8 — which offloads the blocking `sync` itself),
 //! so the handler simply `.await`s it; the handler never panics.
+//!
+//! [`logs_service`] builds the served service: gzip accepted, the decoder
+//! bounded by `receiver.max_request_bytes`, and [`RequestSizeService`]
+//! around it so every over-limit rejection is `RESOURCE_EXHAUSTED`
+//! (RFC 0061 §3.2).
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
+    LogsService, LogsServiceServer,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
+use tonic::server::NamedService;
 use tonic::{Code, Request, Response, Status};
 
 use opentelemetry::context::FutureExt as _;
@@ -150,6 +159,107 @@ where
     }
 }
 
+/// The served OTLP/gRPC logs service (RFC 0061 §3.2): the
+/// [`LogsReceiver`] behind tonic's decoder, which accepts gzip (the
+/// Collector's OTLP exporter compresses by default) and bounds each
+/// request at `max_request_bytes` on the wire and after decompression,
+/// wrapped in [`RequestSizeService`].
+#[must_use]
+pub fn logs_service(
+    pipeline: SharedPipeline,
+    max_request_bytes: usize,
+) -> RequestSizeService<LogsServiceServer<LogsReceiver>> {
+    RequestSizeService::new(
+        LogsServiceServer::new(LogsReceiver::new(pipeline))
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .max_decoding_message_size(max_request_bytes),
+    )
+}
+
+const GRPC_STATUS: http::HeaderName = http::HeaderName::from_static("grpc-status");
+
+/// RFC 0061 §3.2 — the size edge directly around `LogsServiceServer`.
+///
+/// tonic rejects a frame whose declared length is over the limit with
+/// `OUT_OF_RANGE`, which OTLP lists as retryable, so a client would resend
+/// the same oversize batch until its export timeout. This rewrites that
+/// status to `RESOURCE_EXHAUSTED`, keeping tonic's `grpc-message`. Sound
+/// because [`LogsReceiver`] never returns `OUT_OF_RANGE`: on this service
+/// it can only come from the decoder's size check. tonic sends a decode
+/// failure trailers-only, so the status is in the response headers.
+///
+/// It also counts every too-big rejection on `ourios.ingest.batches`
+/// (`error.type = request_too_large`, §3.5): the rewritten one, tonic's own
+/// `RESOURCE_EXHAUSTED` for a body that inflates past the limit, and the
+/// handler's `AppendError::TooLarge`. The service returns
+/// `RESOURCE_EXHAUSTED` for nothing else — backpressure is `UNAVAILABLE`
+/// (RFC 0053 §3.1) — so the status alone identifies the class.
+#[derive(Clone)]
+pub struct RequestSizeService<S> {
+    inner: S,
+    metrics: Arc<crate::metrics::IngestMetrics>,
+}
+
+impl<S> RequestSizeService<S> {
+    /// Wrap `inner`.
+    #[must_use]
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            metrics: Arc::new(crate::metrics::IngestMetrics::new()),
+        }
+    }
+}
+
+impl<S: NamedService> NamedService for RequestSizeService<S> {
+    const NAME: &'static str = S::NAME;
+}
+
+impl<S, ReqBody, ResBody> tower::Service<http::Request<ReqBody>> for RequestSizeService<S>
+where
+    S: tower::Service<http::Request<ReqBody>, Response = http::Response<ResBody>>,
+    S::Future: Send + 'static,
+    ResBody: Send + 'static,
+{
+    type Response = http::Response<ResBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<ReqBody>) -> Self::Future {
+        let response = self.inner.call(request);
+        let metrics = Arc::clone(&self.metrics);
+        Box::pin(async move {
+            let mut response = response.await?;
+            mark_too_large(&mut response, &metrics);
+            Ok(response)
+        })
+    }
+}
+
+/// Rewrite a size-check `OUT_OF_RANGE` to `RESOURCE_EXHAUSTED` and count
+/// every too-big rejection (see [`RequestSizeService`]).
+fn mark_too_large<B>(response: &mut http::Response<B>, metrics: &crate::metrics::IngestMetrics) {
+    let code = response
+        .headers()
+        .get(&GRPC_STATUS)
+        .map(|value| Code::from_bytes(value.as_bytes()));
+    match code {
+        Some(Code::OutOfRange) => {
+            let exhausted = http::HeaderValue::from(Code::ResourceExhausted as i32);
+            response.headers_mut().insert(GRPC_STATUS, exhausted);
+            metrics.record_rejected_batch(crate::metrics::ERROR_TYPE_REQUEST_TOO_LARGE);
+        }
+        Some(Code::ResourceExhausted) => {
+            metrics.record_rejected_batch(crate::metrics::ERROR_TYPE_REQUEST_TOO_LARGE);
+        }
+        _ => {}
+    }
+}
+
 /// The gRPC `LogsService` over a shared `IngestPipeline`.
 pub struct LogsReceiver {
     pipeline: SharedPipeline,
@@ -214,8 +324,9 @@ impl LogsService for LogsReceiver {
 ///
 /// Permanent client errors are non-retryable: a tenant outside the token's
 /// set → `PERMISSION_DENIED`; an oversize payload (`AppendError::TooLarge`,
-/// over the 16 MiB WAL frame ceiling) → `INVALID_ARGUMENT` — retrying an
-/// oversize batch byte-identical can never succeed.
+/// over the 16 MiB WAL frame ceiling) → `RESOURCE_EXHAUSTED` without
+/// `RetryInfo`, the code the listener's own size limit uses (RFC 0061
+/// §3.2) — retrying an oversize batch byte-identical can never succeed.
 ///
 /// Every other WAL append/sync failure is `UNAVAILABLE`, which OTLP defines
 /// as retryable — the batch was not acked (§3.4), so compliant clients
@@ -233,8 +344,9 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
     let msg = error.to_string();
     match IngestFailure::classify(error) {
         IngestFailure::Denied => Status::permission_denied(msg),
-        // gRPC has no payload-too-large code (RFC 0026 §3.5 mapping).
-        IngestFailure::TooLarge => Status::invalid_argument(msg),
+        // OTLP names RESOURCE_EXHAUSTED for an over-size request; with no
+        // RetryInfo it is non-retryable (RFC 0061 §3.2).
+        IngestFailure::TooLarge => Status::resource_exhausted(msg),
         // Both durability classes are `UNAVAILABLE`: a non-retryable code
         // would tell the client to drop a batch that was never acked
         // (RFC 0018 §3.2, as RFC 0052 §3.3 amends it). The message, not
@@ -297,7 +409,7 @@ mod tests {
             len: 32 * 1024 * 1024,
             limit: 16 * 1024 * 1024,
         });
-        assert_eq!(ingest_error_status(&e).code(), Code::InvalidArgument);
+        assert_eq!(ingest_error_status(&e).code(), Code::ResourceExhausted);
     }
 
     /// Scenario RFC0061.3 — a batch over the WAL frame maps the same way
@@ -307,7 +419,6 @@ mod tests {
     /// `tests/rfc0061_telemetry.rs`.
     /// See `docs/rfcs/0061-otlp-request-size-limit.md` §5.
     #[test]
-    #[ignore = "RFC0061.3 stub — implemented with the gRPC status remap"]
     fn rfc0061_3_too_large_is_resource_exhausted_without_retry_info() {
         use tonic_types::StatusExt as _;
 

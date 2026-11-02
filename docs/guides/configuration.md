@@ -68,6 +68,10 @@ receiver:
   # is this old (1..300, default 300). Lower means fresher queries and
   # more small files for the compactor; keep the default in production.
   max_buffer_age_secs: 300
+  # RFC 0061: the largest OTLP Export either listener accepts, in bytes,
+  # on the wire and after decompression (1..16773120, default 16773120).
+  # A larger one gets gRPC RESOURCE_EXHAUSTED or HTTP 413, not retried.
+  max_request_bytes: 16773120
 
 querier:
   enabled: true
@@ -150,6 +154,7 @@ auth:
 | `OURIOS_WAL_ROOT` | WAL directory (receiver) |
 | `OURIOS_RECEIVER_ENCODE_WORKERS` | concurrent encode pool size (RFC 0035; default: all cores) |
 | `OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS` / `receiver.max_buffer_age_secs` | flush age in seconds, `1`–`300` (RFC 0063; default 300) |
+| `OURIOS_RECEIVER_MAX_REQUEST_BYTES` / `receiver.max_request_bytes` | OTLP request-size limit in bytes for both listeners, `1`–`16773120` (RFC 0061; default 16773120, 16 MiB − 4 KiB) |
 | `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` / `receiver.template_ids_allow_bootstrap` | authorise the one-time template-id bootstrap over existing data, for the upgrade to RFC 0059 only (default off); see [the bootstrap's cost](#the-template-id-bootstrap) |
 | `OURIOS_QUERIER_ENABLED` / `OURIOS_QUERIER_HTTP_ADDR` / `OURIOS_QUERIER_DEFAULT_WINDOW_SECS` | querier role |
 | `OURIOS_QUERIER_MCP_ENABLED` | the `/mcp` agent surface (RFC 0027) |

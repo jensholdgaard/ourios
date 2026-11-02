@@ -162,6 +162,19 @@ check "receiver extraEnv carries the flush age to the receiver" \
       --set 'receiver.extraEnv[0].name=OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS' \
       --set-string 'receiver.extraEnv[0].value=10' | grep '^OURIOS_RECEIVER_MAX')"
 
+# --- RFC 0061 request-size limit -------------------------------------------
+
+# Like the flush age, the limit reaches the receiver through extraEnv and an
+# ${env:…:-} reference that resolves empty (the default) when unset.
+check "the request-size limit is an env reference in the receiver config" \
+  'max_request_bytes: "${env:OURIOS_RECEIVER_MAX_REQUEST_BYTES:-}"' \
+  "$(receiver_config | grep -o 'max_request_bytes: .*')"
+check "receiver extraEnv carries the request-size limit to the receiver" \
+  "OURIOS_RECEIVER_MAX_REQUEST_BYTES=8388608" \
+  "$(workload_env receiver-statefulset.yaml \
+      --set 'receiver.extraEnv[0].name=OURIOS_RECEIVER_MAX_REQUEST_BYTES' \
+      --set-string 'receiver.extraEnv[0].value=8388608' | grep '^OURIOS_RECEIVER_MAX')"
+
 # --- receiver startup probe --------------------------------------------------
 
 # Startup recovery (WAL replay, the RFC 0059 bootstrap scan) runs before the

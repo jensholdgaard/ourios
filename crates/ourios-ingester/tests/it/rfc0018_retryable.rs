@@ -62,16 +62,17 @@ async fn rfc0018_3_grpc_transient_is_unavailable_permanent_is_invalid_argument()
         "transient WAL-append failure → retryable UNAVAILABLE (RFC 0018 §3.2)",
     );
 
-    // Permanent oversize payload (AppendError::TooLarge) → INVALID_ARGUMENT,
-    // never retryable: retrying the same oversized batch can't succeed.
+    // Permanent oversize payload (AppendError::TooLarge) → RESOURCE_EXHAUSTED
+    // without RetryInfo (RFC 0061 §3.4 amends RFC 0018 §3.2), never
+    // retryable: retrying the same oversized batch can't succeed.
     let oversize = LogsReceiver::new(Arc::new(oversize_append_pipeline()))
         .export(grpc_request(valid_request()))
         .await
         .expect_err("an oversize payload is rejected");
     assert_eq!(
         oversize.code(),
-        Code::InvalidArgument,
-        "oversize payload → non-retryable INVALID_ARGUMENT, not UNAVAILABLE (RFC 0018 §3.2)",
+        Code::ResourceExhausted,
+        "oversize payload → non-retryable RESOURCE_EXHAUSTED, not UNAVAILABLE (RFC 0061 §3.4)",
     );
 
     // Permanent: no tenant selector → INVALID_ARGUMENT (RFC0046.1).

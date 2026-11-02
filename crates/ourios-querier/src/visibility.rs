@@ -10,7 +10,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::lit;
 
-use crate::dsl::ir::{Call, Field, GroupTerm, Predicate, Query, Stage};
+use crate::dsl::ir::{Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, Stage};
 use crate::log_row::{LogBody, LogRow};
 use crate::{QueryError, has_column};
 use ourios_parquet::promoted;
@@ -75,13 +75,13 @@ impl Visibility {
         let Self::Masked { content_columns } = self else {
             return Ok(());
         };
-        let mut fields: Vec<&Field> = Vec::new();
+        let mut fields: Vec<Read<'_>> = Vec::new();
         collect_predicate_fields(&query.predicate, &mut fields);
         for stage in &query.stages {
             match stage {
                 Stage::Count { by } => collect_group_fields(by, &mut fields),
                 Stage::Agg { path, by, .. } => {
-                    fields.push(path);
+                    fields.push(Read::column(path));
                     collect_group_fields(by, &mut fields);
                 }
                 Stage::Range(..)
@@ -91,14 +91,14 @@ impl Visibility {
                 | Stage::Render => {}
             }
         }
-        for field in fields {
-            if let Some(name) = dsl_name(field)
-                && content_columns.contains(&name)
-            {
-                return Err(QueryError::Forbidden { column: name });
-            }
+        match fields
+            .iter()
+            .flat_map(Read::names)
+            .find(|name| content_columns.contains(name))
+        {
+            Some(column) => Err(QueryError::Forbidden { column }),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// The plan-time filter for a scoped principal: `column IN (ids)` OR
@@ -198,15 +198,55 @@ fn dsl_name(field: &Field) -> Option<String> {
     }
 }
 
-fn collect_predicate_fields<'a>(predicate: &'a Predicate, out: &mut Vec<&'a Field>) {
+/// A field a query reads, and whether the read resolves the key as a path
+/// into map values (RFC 0062 §3.1: `==` / `!=` on an attribute).
+struct Read<'a> {
+    field: &'a Field,
+    paths: bool,
+}
+
+impl<'a> Read<'a> {
+    fn column(field: &'a Field) -> Self {
+        Self {
+            field,
+            paths: false,
+        }
+    }
+
+    /// The DSL columns the read can see: the field itself and, for a path
+    /// read, every map head of its key (`attr.a` and `attr.a.b` for
+    /// `attr.a.b.c`), since a value under a masked map is masked content.
+    /// `service` is `resource.service.name`.
+    fn names(&self) -> Vec<String> {
+        let (prefix, key) = match self.field {
+            Field::Attr(key) => (promoted::ATTR_PREFIX, key.as_str()),
+            Field::Resource(key) => (promoted::RESOURCE_PREFIX, key.as_str()),
+            Field::Service if self.paths => (promoted::RESOURCE_PREFIX, "service.name"),
+            field => return dsl_name(field).into_iter().collect(),
+        };
+        let heads = key
+            .match_indices('.')
+            .map(|(i, _)| &key[..i])
+            .filter(|_| self.paths);
+        std::iter::once(key)
+            .chain(heads)
+            .map(|k| format!("{prefix}{k}"))
+            .collect()
+    }
+}
+
+fn collect_predicate_fields<'a>(predicate: &'a Predicate, out: &mut Vec<Read<'a>>) {
     match predicate {
         Predicate::Bool(_) | Predicate::Severity { .. } => {}
-        Predicate::Comparison { field, .. } => out.push(field),
+        Predicate::Comparison { field, op, .. } => out.push(Read {
+            field,
+            paths: matches!(op, CmpOp::Ord(OrdOp::Eq | OrdOp::Ne)),
+        }),
         Predicate::Call(call) => match call {
             Call::Matches { field, .. }
             | Call::Contains { field, .. }
             | Call::StartsWith { field, .. }
-            | Call::EndsWith { field, .. } => out.push(field),
+            | Call::EndsWith { field, .. } => out.push(Read::column(field)),
             Call::ResolvesTo(_) => {}
         },
         Predicate::Not(inner) => collect_predicate_fields(inner, out),
@@ -218,10 +258,10 @@ fn collect_predicate_fields<'a>(predicate: &'a Predicate, out: &mut Vec<&'a Fiel
     }
 }
 
-fn collect_group_fields<'a>(by: &'a [GroupTerm], out: &mut Vec<&'a Field>) {
+fn collect_group_fields<'a>(by: &'a [GroupTerm], out: &mut Vec<Read<'a>>) {
     for term in by {
         if let GroupTerm::Field(field) = term {
-            out.push(field);
+            out.push(Read::column(field));
         }
     }
 }
@@ -301,6 +341,43 @@ mod tests {
         }
         .validate(&query)
         .expect("scoped principals read their content");
+    }
+
+    /// RFC 0062 §3.1 meets RFC0047.8: an `==` / `!=` on a dotted key can
+    /// read a value under a masked map, so a masked head forbids it, for
+    /// filters and counts alike. Reads that do not resolve paths, and
+    /// unmasked siblings, still pass.
+    #[test]
+    fn a_masked_map_forbids_paths_into_it() {
+        let masked = Visibility::Masked {
+            content_columns: vec!["attr.user".to_string(), "resource.service".to_string()],
+        };
+        for (statement, column) in [
+            ("attr.user.id == \"u7\"", "attr.user"),
+            ("attr.user.id != \"u7\"", "attr.user"),
+            ("attr.user.id == \"u7\" | count", "attr.user"),
+            ("not (attr.user.id.x == \"u7\")", "attr.user"),
+            ("resource.service.name == \"api\"", "resource.service"),
+            ("service == \"api\"", "resource.service"),
+        ] {
+            match masked.validate(&logs(statement)) {
+                Err(QueryError::Forbidden { column: named }) => {
+                    assert_eq!(named, column, "{statement}");
+                }
+                other => panic!("{statement}: expected Forbidden, got {other:?}"),
+            }
+        }
+        for statement in [
+            "attr.userid == \"u7\"",
+            "attr.team.id == \"t1\"",
+            "attr.user.id >= \"u7\"",
+            "true | count by attr.user.id",
+            "true | count by service",
+        ] {
+            masked
+                .validate(&logs(statement))
+                .unwrap_or_else(|e| panic!("{statement}: {e:?}"));
+        }
     }
 
     /// RFC0047.8: masking sets the body to `Masked` and unsets the value of

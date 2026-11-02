@@ -1171,15 +1171,15 @@ License: http://www.apache.org/licenses/LICENSE-2.0
 
 Used by:
 
-- `arrow-array` 59.3.1 — <https://github.com/apache/arrow-rs>
-- `arrow-buffer` 59.3.1 — <https://github.com/apache/arrow-rs>
-- `arrow-cast` 59.3.1 — <https://github.com/apache/arrow-rs>
-- `arrow-data` 59.3.1 — <https://github.com/apache/arrow-rs>
-- `arrow-ipc` 59.3.1 — <https://github.com/apache/arrow-rs>
-- `arrow-ord` 59.3.1 — <https://github.com/apache/arrow-rs>
-- `arrow-schema` 59.3.1 — <https://github.com/apache/arrow-rs>
-- `arrow-select` 59.3.1 — <https://github.com/apache/arrow-rs>
-- `parquet` 59.3.1 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-buffer` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-cast` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-data` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-ipc` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-ord` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-schema` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-select` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `parquet` 59.3.2 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -9526,7 +9526,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `arrow-array` 59.3.1 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 59.3.2 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>

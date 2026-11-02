@@ -1,7 +1,7 @@
 ---
 rfc: 0065
 title: Replicated WAL and a queryable tail
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-01
@@ -11,7 +11,13 @@ superseded-by: —
 
 # RFC 0065 — Replicated WAL and a queryable tail
 
-> **Status: `specified`.** Tracks #1141 (option 2). It depends on
+> **Status: `red`.** Every §5 scenario arm has an `#[ignore]`d `todo!`
+> stub naming the slice that discharges it: the in-process cluster arms
+> in `ourios-ingester` (`tests/it/rfc0065_replicated_wal.rs`), and the
+> config, served-binary and chart arms (RFC0065.1, .3, .11's latency
+> arm, .14's `require_complete` arms, .17) in `ourios-server`
+> (`tests/it/rfc0065_replicated_wal.rs`).
+> Specified 2026-11-02 (#1146). Tracks #1141 (option 2). It depends on
 > **RFC 0064** (`meta:`, `specified`), which states in `AGENTS.md` §3.4
 > what a replicated WAL must guarantee; this RFC cannot reach `red`
 > before RFC 0064 is accepted. §3 states the required behaviour without

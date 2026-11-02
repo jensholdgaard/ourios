@@ -86,3 +86,5 @@ mod rfc0059_age_sweep_orphan;
 mod rfc0059_corrupt_object_bootstrap;
 mod rfc0059_refiller_shutdown;
 mod rfc0059_support;
+mod rfc0061_request_size_limit;
+mod rfc0061_support;

@@ -63,8 +63,10 @@ pub struct HttpConfig {
     /// The accepted `POST` path (default `/v1/logs`; configurable per
     /// §6.2 / RFC0003.14).
     pub path: String,
-    /// Maximum request body size in bytes; a larger body is rejected with
-    /// 413 (RFC0003.11).
+    /// Maximum request body size in bytes, on the wire and after gzip
+    /// decompression; a larger body is rejected with 413 (RFC0003.11).
+    /// The server sets it from `receiver.max_request_bytes`, the limit the
+    /// gRPC listener shares (RFC 0061 §3.3).
     pub max_body_bytes: usize,
     /// The RFC 0026 / RFC 0029 credential resolver; the default
     /// (`AuthResolver::static_only(None)`) is open mode (§3.1). Otherwise
@@ -78,7 +80,7 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             path: "/v1/logs".to_owned(),
-            max_body_bytes: 4 * 1024 * 1024,
+            max_body_bytes: crate::receiver::MAX_REQUEST_BYTES,
             auth: AuthResolver::static_only(None),
         }
     }
@@ -92,6 +94,8 @@ impl Default for HttpConfig {
 struct AppState {
     pipeline: SharedPipeline,
     max_decompressed_bytes: usize,
+    /// RFC 0061 §3.5 — every `413` counts as `request_too_large`.
+    metrics: Arc<crate::metrics::IngestMetrics>,
 }
 
 /// Build the OTLP/HTTP router over `pipeline`.
@@ -99,6 +103,7 @@ pub fn router(pipeline: SharedPipeline, config: &HttpConfig) -> Router {
     let state = AppState {
         pipeline,
         max_decompressed_bytes: config.max_body_bytes,
+        metrics: Arc::new(crate::metrics::IngestMetrics::new()),
     };
     Router::new()
         .route(&config.path, post(handle_logs))
@@ -241,8 +246,25 @@ enum Encoding {
     Gzip,
 }
 
+/// The logs handler. Every `413` it returns — the body limit, the gzip
+/// bound, or `AppendError::TooLarge` — counts on `ourios.ingest.batches`
+/// as `error.type = request_too_large` (RFC 0061 §3.5).
 async fn handle_logs(
     State(state): State<AppState>,
+    binding: Option<axum::Extension<Arc<AuthBinding>>>,
+    headers: HeaderMap,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let metrics = Arc::clone(&state.metrics);
+    let response = logs_response(state, binding, headers, body).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        metrics.record_rejected_batch(crate::metrics::ERROR_TYPE_REQUEST_TOO_LARGE);
+    }
+    response
+}
+
+async fn logs_response(
+    state: AppState,
     binding: Option<axum::Extension<Arc<AuthBinding>>>,
     headers: HeaderMap,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,

@@ -7,6 +7,7 @@
 
 use crate::config::file::{FileConfig, PromotedEntry, TlsSection};
 use ourios_config::{MinerConfig, UpstreamTemplates};
+pub use ourios_ingester::receiver::MAX_REQUEST_BYTES;
 use ourios_parquet::{PromotedAttributes, S3Config, StoreConfig};
 use ourios_serving::tls::TlsSettings;
 use ourios_wal::WalConfig;
@@ -116,6 +117,11 @@ pub struct ReceiverParams {
     /// `OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS`; default and ceiling
     /// [`MAX_BUFFER_AGE_CEILING`]).
     pub max_buffer_age: Duration,
+    /// RFC 0061 §3.1 — the OTLP request-size limit both listeners enforce
+    /// (`receiver.max_request_bytes` /
+    /// `OURIOS_RECEIVER_MAX_REQUEST_BYTES`; default and ceiling
+    /// [`MAX_REQUEST_BYTES`]).
+    pub max_request_bytes: usize,
 }
 
 /// RFC 0063 §3.1 — the receiver's flush age default, which is also its
@@ -191,6 +197,9 @@ pub struct ReceiverInputs<'a> {
     /// `receiver.max_buffer_age_secs` (`1..=300`; default 300 — RFC 0063
     /// §3.1).
     pub max_buffer_age_secs: Option<&'a str>,
+    /// `OURIOS_RECEIVER_MAX_REQUEST_BYTES` / `receiver.max_request_bytes`
+    /// (`1..=16773120`; default 16773120 — RFC 0061 §3.1).
+    pub max_request_bytes: Option<&'a str>,
 }
 
 /// Raw inputs for [`build_querier_config`].
@@ -288,6 +297,7 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
     let encode_workers = std::env::var("OURIOS_RECEIVER_ENCODE_WORKERS").ok();
     let allow_bootstrap = std::env::var("OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP").ok();
     let max_buffer_age = std::env::var("OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS").ok();
+    let max_request_bytes = std::env::var("OURIOS_RECEIVER_MAX_REQUEST_BYTES").ok();
     // TLS and the miner dial are config-file only (RFC 0030 §3.1 /
     // RFC 0050 §3.2): the env path takes the defaults (plaintext,
     // `ignore` mode).
@@ -299,6 +309,7 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
         encode_workers: encode_workers.as_deref(),
         template_ids_allow_bootstrap: allow_bootstrap.as_deref(),
         max_buffer_age_secs: max_buffer_age.as_deref(),
+        max_request_bytes: max_request_bytes.as_deref(),
         ..ReceiverInputs::default()
     })?;
     let querier_enabled = std::env::var("OURIOS_QUERIER_ENABLED").ok();
@@ -392,6 +403,7 @@ pub fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String
         },
         template_ids_allow_bootstrap: file.receiver.template_ids_allow_bootstrap.as_deref(),
         max_buffer_age_secs: file.receiver.max_buffer_age_secs.as_deref(),
+        max_request_bytes: file.receiver.max_request_bytes.as_deref(),
     })?;
     let querier = build_querier_config(QuerierInputs {
         enabled: file.querier.enabled.as_deref(),
@@ -645,6 +657,7 @@ pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<Receiv
         Some("1" | "true" | "yes")
     );
     let max_buffer_age = parse_max_buffer_age(inputs.max_buffer_age_secs)?;
+    let max_request_bytes = parse_max_request_bytes(inputs.max_request_bytes)?;
     Ok(Some(ReceiverParams {
         grpc_addr,
         grpc_tls,
@@ -655,6 +668,7 @@ pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<Receiv
         miner,
         template_ids_allow_bootstrap,
         max_buffer_age,
+        max_request_bytes,
     }))
 }
 
@@ -747,6 +761,26 @@ pub fn parse_max_buffer_age(raw: Option<&str>) -> Result<Duration, String> {
         _ => Err(format!(
             "receiver.max_buffer_age_secs (OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS) \
              must be an integer in 1..={ceiling}, got {raw:?}"
+        )),
+    }
+}
+
+/// Parse the RFC 0061 request-size limit: bytes in `1..=16773120` when
+/// set, else the ceiling. Out of range is an error, never clamped (RFC 0004
+/// §3.2).
+///
+/// # Errors
+///
+/// A set value that is not an integer in `1..=16773120`.
+pub fn parse_max_request_bytes(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(MAX_REQUEST_BYTES);
+    };
+    match raw.parse::<usize>() {
+        Ok(bytes) if (1..=MAX_REQUEST_BYTES).contains(&bytes) => Ok(bytes),
+        _ => Err(format!(
+            "receiver.max_request_bytes (OURIOS_RECEIVER_MAX_REQUEST_BYTES) \
+             must be an integer in 1..={MAX_REQUEST_BYTES}, got {raw:?}"
         )),
     }
 }
@@ -2239,6 +2273,70 @@ auth:
             .is_err(),
             "a malformed bind address is rejected",
         );
+    }
+
+    /// Scenario RFC0061.1 — the limit is configurable and validated,
+    /// through both front-ends and the Helm chart's rendered reference
+    /// (`deploy/helm/render-tests.sh` pins the line).
+    /// See `docs/rfcs/0061-otlp-request-size-limit.md` §5.
+    #[test]
+    fn rfc0061_1_the_limit_is_configurable_and_validated() {
+        const CHART_LINE: &str =
+            "  max_request_bytes: \"${env:OURIOS_RECEIVER_MAX_REQUEST_BYTES:-}\"\n";
+        let from_env = |raw: Option<&str>| {
+            build_receiver_config(ReceiverInputs {
+                enabled: Some("1"),
+                wal_root: Some(PathBuf::from("/wal")),
+                max_request_bytes: raw,
+                ..ReceiverInputs::default()
+            })
+            .map(|params| params.expect("enabled").max_request_bytes)
+        };
+        let from_file = |field: &str, env: Option<&str>| {
+            let yaml = format!(
+                "storage:\n  local:\n    bucket_root: /store\n\
+                 receiver:\n  enabled: true\n  wal_root: /wal\n{field}"
+            );
+            let lookup = |name: &str| {
+                (name == "OURIOS_RECEIVER_MAX_REQUEST_BYTES")
+                    .then(|| env.map(str::to_owned))
+                    .flatten()
+            };
+            let file = parse(&yaml, &lookup).map_err(|e| e.to_string())?;
+            server_config_from_file(&file)
+                .map(|config| config.receiver.expect("enabled").max_request_bytes)
+        };
+
+        assert_eq!(MAX_REQUEST_BYTES, 16_773_120);
+        assert_eq!(from_env(None), Ok(16_773_120));
+        assert_eq!(from_env(Some("")), Ok(16_773_120));
+        assert_eq!(from_env(Some("8388608")), Ok(8_388_608));
+        assert_eq!(from_file("", None), Ok(16_773_120));
+        assert_eq!(
+            from_file("  max_request_bytes: \"\"\n", None),
+            Ok(16_773_120)
+        );
+        assert_eq!(
+            from_file("  max_request_bytes: 8388608\n", None),
+            Ok(8_388_608)
+        );
+        assert_eq!(from_file(CHART_LINE, Some("8388608")), Ok(8_388_608));
+        assert_eq!(from_file(CHART_LINE, None), Ok(16_773_120));
+        for bad in ["0", "16773121"] {
+            for err in [
+                from_env(Some(bad)).expect_err(bad),
+                from_file(&format!("  max_request_bytes: {bad}\n"), None).expect_err(bad),
+            ] {
+                assert!(
+                    err.contains("receiver.max_request_bytes"),
+                    "the error names the field: {err}"
+                );
+                assert!(
+                    err.contains("16773120"),
+                    "the error names the ceiling: {err}"
+                );
+            }
+        }
     }
 
     #[test]

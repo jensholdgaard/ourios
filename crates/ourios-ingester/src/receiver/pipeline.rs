@@ -1053,8 +1053,9 @@ pub(super) enum IngestFailure {
     /// §3.2). HTTP 403 / gRPC `PERMISSION_DENIED`.
     Denied,
     /// The batch exceeds the WAL's frame bound; the client must
-    /// shrink it. HTTP 413 / gRPC `INVALID_ARGUMENT` (gRPC has no
-    /// payload-too-large code).
+    /// shrink it. HTTP 413 / gRPC `RESOURCE_EXHAUSTED` without
+    /// `RetryInfo`, as for an Export over the listener's limit (RFC 0061
+    /// §3.2).
     TooLarge,
     /// Durability is temporarily unavailable; retryable. HTTP 503 /
     /// gRPC `UNAVAILABLE`.
@@ -1117,7 +1118,7 @@ impl IngestFailure {
     /// rejection that is the client's fault: an `ingest logs` span is a
     /// server span, which semconv leaves unset on a 4xx / client-error
     /// status (HTTP 403 / 413, gRPC `PERMISSION_DENIED` /
-    /// `INVALID_ARGUMENT`). The gRPC server convention counts UNAVAILABLE
+    /// `RESOURCE_EXHAUSTED`). The gRPC server convention counts UNAVAILABLE
     /// and INTERNAL, the codes the other classes map to, as errors.
     #[must_use]
     pub(super) fn span_error_type(self) -> Option<&'static str> {

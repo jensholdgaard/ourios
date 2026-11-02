@@ -136,9 +136,10 @@ impl IngestMetrics {
     }
 
     /// Record one rejected request on the existing `ourios.ingest.batches`
-    /// counter with `error.type` (`unauthenticated` | `permission_denied`)
-    /// — the RFC 0026 §3.4 recording-errors convention: no new metric
-    /// name, the reason on a low-cardinality attribute.
+    /// counter with `error.type` (`unauthenticated` | `permission_denied`
+    /// | `request_too_large`) — the RFC 0026 §3.4 recording-errors
+    /// convention: no new metric name, the reason on a low-cardinality
+    /// attribute.
     pub fn record_rejected_batch(&self, error_type: &'static str) {
         self.batches
             .add(1, &[KeyValue::new(ERROR_TYPE, error_type)]);
@@ -160,6 +161,10 @@ pub(crate) const ERROR_TYPE: &str = "error.type";
 /// The domain-specific `error.type` value for an out-of-`0..=24`
 /// `SeverityNumber` (RFC 0018 §3.5). `error.type`'s value space is open.
 const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
+/// The `error.type` value for an Export rejected as too big (RFC 0061
+/// §3.5): over `receiver.max_request_bytes` on either listener, or over the
+/// WAL frame (`AppendError::TooLarge`).
+pub(crate) const ERROR_TYPE_REQUEST_TOO_LARGE: &str = "request_too_large";
 /// The `error.type` value for a cadence sweep step that panicked (#791),
 /// and for an RFC 0052 §3.2 housekeeping tick that panicked.
 ///

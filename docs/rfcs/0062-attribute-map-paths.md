@@ -159,21 +159,23 @@ no stack, so value depth is not limited by the lookup.
   false. A query is not always monotone in its comparisons,
   though: `not (attr.user.id == "u7")` stops matching a record that
   holds only `user = {id: "u7"}`. Nor is a limited result:
-  `attr.user.id == "u7" | sort ts desc | limit 1` can return a newer
-  map-only record in place of the older literal-key one. So a saved
-  query that negates an attribute comparison, or that sorts and limits,
-  can lose rows. §7 records how the deprecation window is handled.
+  `attr.user.id == "u7" | limit 1` can return a newly matching map-only
+  record in place of the one it returned before (the querier rejects
+  `sort` today; once it executes, `sort ts desc | limit 1` can likewise
+  return a newer map-only record). So a saved query that negates an
+  attribute comparison, or that limits its result, can lose rows. §7 records how the deprecation window is handled.
 
 ### 3.5 Invariants and hazards
 
 - **H6 (DSL vs SQL), `ourios-querier/src/plan/`:** the DSL surface
   changes meaning as §3.4 records; no DataFusion name or behaviour
   reaches the user. The query cookbook and the RFC 0032 query-schema
-  resource text describing `attr.<key>` are updated with it.
+  resource text describing `attr.<key>` are updated with it
+  (RFC0062.8).
 - **§3.5 Parquet schema, §3.3 / H7 reconstruction, H1–H5:** untouched.
   Nothing is written differently.
 - **§3.7 tenancy:** the lookup runs inside the tenant-scoped scan; no
-  new path reads data.
+  new path reads data (RFC0062.9).
 
 ### 3.6 Cost
 
@@ -266,15 +268,34 @@ available as an additive form later.
 > - **Given** the `attr_predicate` bench, committed with this RFC's
 >   implementation
 > - **When** it runs against the pre-RFC baseline
-> - **Then** promoted-key cases stay within 3%, and unpromoted `==`
->   cases within 20%, and the results are recorded in the implementing
->   PR
+> - **Then** promoted-key cases stay within 3%, unpromoted `==` cases
+>   within 20%, and unpromoted `!=` cases within 20% per matching row
+>   (a `!=` now matches more rows, §3.6: 2.61 µs a row before, 2.79 µs
+>   with paths in the experiment), and the results are recorded in the
+>   implementing PR
 
 > **Scenario RFC0062.7 — a nested pair is not a top-level key**
 > - **Given** a record holding only `outer = {k: "x"}`, written once
 >   with `k` promoted and once without
 > - **When** `attr.k == "x"` and `attr.k != "y"` run
 > - **Then** no query matches the record
+
+> **Scenario RFC0062.8 — no engine name reaches the user (H6)**
+> - **Given** a query comparing a map path with a value of the wrong
+>   type, `attr.user.id == 7` against `user = {id: "u7"}`, and a
+>   malformed path `attr.user..id`
+> - **When** each runs through the HTTP query endpoint and the MCP
+>   `query_logs` tool
+> - **Then** the first matches nothing and the second is rejected with
+>   a DSL error, and no response, error or explain output names
+>   `ourios_attr_cmp`, `LIKE` or any DataFusion function
+> - **And** the RFC 0032 query-schema resource states the §3.1 rule
+
+> **Scenario RFC0062.9 — paths stay inside the tenant (`AGENTS.md` §3.7)**
+> - **Given** tenant `a` with a record `user = {id: "u7"}` and tenant
+>   `b` with a record `user.id = "u7"`
+> - **When** each tenant runs `attr.user.id == "u7"`
+> - **Then** each matches only its own record
 
 ## 6. Testing strategy
 
@@ -286,6 +307,11 @@ available as an additive form later.
   extending #1137's scan-against-decode property.
 - RFC0062.6: the `attr_predicate` criterion bench in `ourios-bench`,
   run locally first, then on the ci-runner.
+- RFC0062.8: the querier's HTTP and MCP error-scrubbing tests in
+  `ourios-server/src/{querier,mcp}.rs`, plus an assertion on the
+  query-schema resource text.
+- RFC0062.9: the existing tenancy integration tests in
+  `ourios-querier/tests/it`, with a path query added.
 - RFC0062.7 is #1137's `a_nested_pair_is_not_a_top_level_attribute`
   and its query tests, which stay unchanged: a key without dots has no
   path.
@@ -299,8 +325,8 @@ available as an additive form later.
   query can lose rows (§3.4): a direct comparison that matched only
   through a pair nested in another attribute's map, which the RFC 0022
   §3.3 fix removes; a negated attribute comparison on a record that
-  holds the value only under a map; and a sorted, limited query whose
-  newly matching records displace the ones it returned before.
+  holds the value only under a map; and a limited query whose newly
+  matching records displace the ones it returned before.
 - [x] Should `attr["a.b"]` stay literal-only, as an opt-out from path
   resolution? **Resolved (maintainer, 2026-10-31): no.** Both forms
   resolve by §3.1; rule 1 already makes the literal key win, and the IR
@@ -315,6 +341,9 @@ available as an additive form later.
   (dot-delimited namespaces),
   [Defining attributes](https://opentelemetry.io/docs/specs/semconv/how-to-write-conventions/#defining-attributes)
   (complex attributes and backend indexing)
+- `AGENTS.md` §3.5 (schema: nothing is written differently), §3.7
+  (tenancy, RFC0062.9) and §4 hazard 6 / `docs/hazards.md` H6 (DSL vs
+  SQL surface, RFC0062.8).
 - RFC 0002 §6.1, §6.6 (amended here); RFC 0022 §3.3 and criterion
   RFC0022.3 (amended here), §3.1; RFC 0042 §3.4 (integer JSON arm, same rule); RFC 0024
   (adversarial generator); RFC 0032 (query-schema resource)

@@ -39,7 +39,7 @@ fn recent_ns() -> u64 {
     u64::try_from(now.saturating_sub(60 * 60 * 1_000_000_000)).unwrap_or(0)
 }
 
-fn mined(tenant: &str, template_id: u64) -> MinedRecord {
+pub(crate) fn mined(tenant: &str, template_id: u64) -> MinedRecord {
     MinedRecord {
         tenant_id: TenantId::new(tenant),
         template_id,

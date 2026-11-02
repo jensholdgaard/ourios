@@ -1,7 +1,7 @@
 ---
 rfc: 0062
 title: Attribute paths into map values
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-10-31
@@ -11,18 +11,19 @@ superseded-by: —
 
 # RFC 0062 — Attribute paths into map values
 
-> **Status: `red` (2026-11-02).** RFC0062.1–.4 have `#[ignore]`d
-> `todo!` stubs in `ourios-querier/tests/it/rfc0022_attr_columns.rs`,
-> RFC0062.5 beside the UDF in `plan/attr_value.rs`, RFC0062.8 in
-> `ourios-server/tests/it/rfc0062_8_engine_names.rs` (beside the HTTP
-> and MCP scrubbing tests, which live in `tests/it`, not in the `src`
-> files §6 names) and RFC0062.9 in
-> `ourios-querier/tests/it/execution.rs`, each naming the slice that
-> discharges it. RFC0062.6's `attr_predicate` bench lands with the
-> stubs (`ourios-bench/benches/attr_predicate.rs`); its numbers against
-> the bounds go in the implementing PR. RFC0062.7 is already green:
-> #1137's `a_nested_pair_is_not_a_top_level_attribute` and its query
-> tests pass on `main` and stay unchanged.
+> **Status: `green` (2026-11-02).** `ourios_attr_cmp` resolves a key by
+> §3.1 and the JSON arm prefilters one `LIKE` per stored key (§3.3).
+> RFC0062.1–.4 pass in `ourios-querier/tests/it/rfc0022_attr_columns.rs`,
+> RFC0062.5 as a proptest beside the UDF in `plan/attr_value.rs`,
+> RFC0062.8 in `ourios-server/tests/it/rfc0062_8_engine_names.rs`
+> (beside the HTTP and MCP scrubbing tests, which live in `tests/it`,
+> not in the `src` files §6 names) and RFC0062.9 in
+> `ourios-querier/tests/it/execution.rs`. RFC0062.7 is #1137's tests,
+> unchanged. RFC0062.6's local `attr_predicate` numbers are in the
+> implementing PR and sit inside the bounds on the mean of quiet runs,
+> with about a point to spare for the two path `==` cases; the
+> ci-runner run is still to do.
+> Red 2026-11-02: the §5 stubs landed with the bench.
 > Specified 2026-11-02 (maintainer-approved by merging #1138 and asking
 > for the implementation). Tracks #1134. This RFC **amends RFC 0002 §6.1**
 > (`accepted`), which reads `attr.<key>` as the attribute key "taken

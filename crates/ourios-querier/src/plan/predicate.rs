@@ -7,6 +7,7 @@
 
 #[allow(clippy::wildcard_imports)] // parent glue after the file split
 use super::*;
+use datafusion::logical_expr::utils::disjunction;
 use ourios_core::otlp::any_value;
 
 /// The result of compiling a predicate against a known schema.
@@ -651,8 +652,10 @@ pub(super) fn numeric_attr_match(
 /// The JSON arm of an `==` / `!=` attribute comparison against the
 /// canonical-JSON `column`. A `LIKE` on the stored key/value pair (`==`),
 /// or on the key with any value of `value`'s type (`!=`), is a cheap
-/// prefilter. It also matches the pair nested inside another attribute's
-/// map value, so [`attr_cmp`] then decides on the first top-level `key`.
+/// prefilter, one per key the value can be stored under: `key` itself and
+/// every tail after one of its dots, the last key of a path into map
+/// values (RFC 0062 §3.3). It also matches pairs `key` does not resolve
+/// to, so [`attr_cmp`] then applies RFC 0062 §3.1.
 fn json_arm(
     column: &str,
     key: &str,
@@ -663,17 +666,25 @@ fn json_arm(
         detail: format!("attribute {what} is not encodable: {e}"),
     };
     let expected = canonical_value(value).map_err(|e| not_encodable("value", e.to_string()))?;
-    let quoted_key = serde_json::to_string(key).map_err(|e| not_encodable("key", e.to_string()))?;
     // `{"stringValue":` / `{"intValue":`: the start of every value of this type.
     let type_prefix = expected
         .find(':')
         .map_or(expected.as_str(), |i| &expected[..=i]);
-    let pattern = if eq {
-        format!("{{\"key\":{quoted_key},\"value\":{expected}}}")
-    } else {
-        format!("{{\"key\":{quoted_key},\"value\":{type_prefix}")
-    };
-    let candidate = col(column).like(lit(format!("%{}%", like_escape(&pattern))));
+    let stored_keys =
+        std::iter::once(key).chain(key.match_indices('.').map(|(i, _)| &key[i + 1..]));
+    let candidates = stored_keys
+        .map(|stored| {
+            let quoted =
+                serde_json::to_string(stored).map_err(|e| not_encodable("key", e.to_string()))?;
+            let pattern = if eq {
+                format!("{{\"key\":{quoted},\"value\":{expected}}}")
+            } else {
+                format!("{{\"key\":{quoted},\"value\":{type_prefix}")
+            };
+            Ok(col(column).like(lit(format!("%{}%", like_escape(&pattern)))))
+        })
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    let candidate = disjunction(candidates).unwrap_or_else(|| lit(false));
     Ok(candidate.and(attr_cmp(col(column), key, &expected, eq)))
 }
 

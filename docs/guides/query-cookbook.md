@@ -49,6 +49,46 @@ Two more limits apply to the samples below:
   a family of lines, match its template: `template_id == N`. Find `N`
   with `true | count by template_id` or the MCP `list_templates` tool.
 
+### Attribute keys and map values
+
+`attr.<key>` names the attribute called `<key>`, dots included:
+`attr.http.route` is the attribute `http.route`. When a record has no
+attribute of that name, `==` and `!=` read a dotted key as a path into
+map values (RFC 0062): `attr.user.id == "u7"` also finds a record that
+stores `user = {id: "u7"}`. The rule, for `attr.a.b.c`:
+
+- An attribute named exactly `a.b.c` is the answer, whatever its value.
+- Otherwise the longest leading key is tried first: the value under `c`
+  in a map `a.b`, then the value under `b.c` (or `b` → `c`) in a map
+  `a`. The first one that resolves is the answer.
+- Arrays and scalars are not entered: `user = [{id: "u7"}]` and
+  `user = "u7"` hold no `user.id`.
+
+`attr["a.b.c"]` resolves the same way. `resource.<key>` and `service`
+(`resource.service.name`) follow the same rule. A key that resolves to
+nothing is a missing field, so `!=` does not match it either.
+
+Paths apply to `==` and `!=` only. Ordering (`<`, `>=`), regex (`=~`),
+grouping and aggregation read the promoted column, which holds the
+top-level attribute only, so a value reachable only by a path never
+matches them. An attribute promoted as a float has no fallback either:
+a double stored only inside a map never matches its `==` or `!=`.
+
+**Saved queries.** This rule is grammar v2.0. It changes results in
+three ways a saved query can lose rows:
+
+- A comparison that matched only because the pair sat nested inside
+  another attribute's map no longer matches: `outer = {k: "x"}` is not
+  `attr.k == "x"`, and not `attr.k != "y"`.
+- A negated comparison can stop matching a record that holds the value
+  only under a map: `not (attr.user.id == "u7")` no longer matches
+  `user = {id: "u7"}`.
+- A limited query can return different records: `attr.user.id == "u7"
+  | limit 1` may now return a map-shaped record instead of the one it
+  returned before.
+
+A query on a record that holds the literal key answers as before.
+
 ## The samples
 
 1. Every error or worse in the last hour:

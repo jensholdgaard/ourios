@@ -1,12 +1,14 @@
-//! `ourios_attr_cmp(json, key, expected, eq)`: whether the first top-level
-//! attribute named `key` in a canonical-JSON attribute column holds
-//! `expected` (`eq`), or a different value of the same type (`!eq`; a
-//! missing key never matches). This is the JSON arm of an attribute
-//! comparison (RFC 0022 §3.3). A substring match alone also hits the same
-//! key/value pair nested inside another attribute's map value. First
-//! occurrence wins, as in the promoted-column projection
-//! (`promoted::project_string_value`).
+//! `ourios_attr_cmp(json, key, expected, eq)`: whether `key` resolves, in a
+//! canonical-JSON attribute column, to `expected` (`eq`), or to a different
+//! value of the same type (`!eq`; a key that resolves to nothing never
+//! matches). This is the JSON arm of an attribute comparison (RFC 0022
+//! §3.3). `key` resolves by RFC 0062 §3.1: the first top-level attribute
+//! named `key`, or else a dotted key as a path into map values. A
+//! substring match alone also hits the same key/value pair nested inside
+//! another attribute's map value. First occurrence wins, as in the
+//! promoted-column projection (`promoted::project_string_value`).
 
+use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
 use datafusion::arrow::array::{Array, AsArray, BooleanBuilder};
@@ -19,6 +21,9 @@ use datafusion::prelude::lit;
 use ourios_core::otlp::canonical;
 
 const NAME: &str = "ourios_attr_cmp";
+
+/// The member name every stored map value opens with.
+const KVLIST: &str = "\"kvlistValue\"";
 
 static UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(AttrCmp {
@@ -98,6 +103,7 @@ impl ScalarUDFImpl for AttrCmp {
 }
 
 struct Cmp<'a> {
+    key: &'a str,
     expected: &'a str,
     /// `{"stringValue":` / `{"intValue":`: how every value of the
     /// expected type starts.
@@ -109,19 +115,41 @@ struct Cmp<'a> {
     needle: String,
     pair: String,
     typed: String,
+    /// The needle of every run of `key` from its start or a dot to a dot
+    /// or its end: the heads and tails a path splits the key into.
+    segments: Vec<(Range<usize>, String)>,
 }
 
 impl<'a> Cmp<'a> {
     fn new(key: &'a str, expected: &'a str, eq: bool) -> Self {
-        let quoted = serde_json::to_string(key).unwrap_or_default();
+        let needle = |part: &str| {
+            let quoted = serde_json::to_string(part).unwrap_or_default();
+            format!("\"key\":{quoted}")
+        };
         let type_prefix = expected.find(':').map_or(expected, |i| &expected[..=i]);
+        let dots = key.match_indices('.').map(|(i, _)| i);
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(dots.clone().map(|i| i + 1))
+            .collect();
+        let ends: Vec<usize> = dots.chain(std::iter::once(key.len())).collect();
+        let segments = starts
+            .iter()
+            .flat_map(|&s| ends.iter().filter(move |&&e| e >= s).map(move |&e| s..e))
+            .map(|span| {
+                let text = needle(&key[span.clone()]);
+                (span, text)
+            })
+            .collect();
+        let whole = needle(key);
         Self {
+            key,
             expected,
             type_prefix,
             eq,
-            needle: format!("\"key\":{quoted}"),
-            pair: format!("{{\"key\":{quoted},\"value\":{expected}}}"),
-            typed: format!("{{\"key\":{quoted},\"value\":{type_prefix}"),
+            pair: format!("{{{whole},\"value\":{expected}}}"),
+            typed: format!("{{{whole},\"value\":{type_prefix}"),
+            needle: whole,
+            segments,
         }
     }
 
@@ -138,57 +166,97 @@ impl<'a> Cmp<'a> {
 
     /// The key's first occurrence is the first top-level one unless a map
     /// value opens before it, and JSON escaping keeps the pair out of
-    /// string values, so the text there answers. Otherwise the row is
-    /// scanned for its first top-level occurrence.
+    /// string values, so the text there answers. A row without the key
+    /// can hold a path only through a map. Otherwise the row is resolved.
     fn eval(&self, json: &str) -> Result<bool> {
-        let Some(at) = json.find(&self.needle) else {
-            return Ok(false);
+        let value = match json.find(&self.needle) {
+            Some(at) if !json[..at].contains(KVLIST) => {
+                // `pair` and `typed` open with the `{` before the needle.
+                let rest = &json[at..];
+                let is = |text: &str| rest.starts_with(&text[1..]);
+                return Ok(if self.eq {
+                    is(&self.pair)
+                } else {
+                    is(&self.typed) && !is(&self.pair)
+                });
+            }
+            None if !self.key.contains('.') || !json.contains(KVLIST) => return Ok(false),
+            _ => self.resolve(json, 0..self.key.len())?,
         };
-        if !json[..at].contains("\"kvlistValue\"") {
-            // `pair` and `typed` open with the `{` before the needle.
-            let rest = &json[at..];
-            let is = |text: &str| rest.starts_with(&text[1..]);
-            return Ok(if self.eq {
-                is(&self.pair)
+        Ok(value.is_some_and(|value| {
+            if self.eq {
+                value == self.expected
             } else {
-                is(&self.typed) && !is(&self.pair)
-            });
-        }
-        let Some(value) = self.first_top_level(json)? else {
-            return Ok(false);
-        };
-        Ok(if self.eq {
-            value == self.expected
-        } else {
-            value.starts_with(self.type_prefix) && value != self.expected
-        })
+                value.starts_with(self.type_prefix) && value != self.expected
+            }
+        }))
     }
 
-    /// The stored text of the first top-level `key`'s value, which is
-    /// what [`canonical::encode_any_value`] writes for it. A top-level
-    /// pair's members sit at depth 2 (array, then object). The scan keeps
-    /// no stack, so value depth is no limit. A row that ends early fails
-    /// the query rather than drop out of the result.
-    fn first_top_level<'j>(&self, json: &'j str) -> Result<Option<&'j str>> {
-        let b = json.as_bytes();
-        let mut depth = 0usize;
-        for token in Tokens::new(b, 0) {
-            let (i, _, c) = token?;
-            match c {
-                b'"' if depth == 2 && b[i..].starts_with(self.needle.as_bytes()) => {
-                    return value_after(json, i + self.needle.len());
-                }
-                b'[' | b'{' => depth += 1,
-                b']' | b'}' => depth = depth.saturating_sub(1),
-                _ => {}
+    /// RFC 0062 §3.1 on the stored pair list `list`, for the part of the
+    /// key in `span`: the value of the first pair it names, or else, the
+    /// longest head first, the rest of the part resolved inside the map
+    /// held by the first pair the head names.
+    fn resolve<'j>(&self, list: &'j str, span: Range<usize>) -> Result<Option<&'j str>> {
+        if let Some(value) = first_pair(list, self.needle_of(&span)?)? {
+            return Ok(Some(value));
+        }
+        for (dot, _) in self.key[span.clone()].rmatch_indices('.') {
+            let at = span.start + dot;
+            let head = first_pair(list, self.needle_of(&(span.start..at))?)?;
+            let Some(map) = head.and_then(map_entries) else {
+                continue;
+            };
+            if let Some(value) = self.resolve(map, at + 1..span.end)? {
+                return Ok(Some(value));
             }
         }
-        if depth == 0 {
-            Ok(None)
-        } else {
-            Err(truncated())
+        Ok(None)
+    }
+
+    fn needle_of(&self, span: &Range<usize>) -> Result<&str> {
+        self.segments
+            .iter()
+            .find(|(s, _)| s == span)
+            .map(|(_, needle)| needle.as_str())
+            .ok_or_else(|| exec_datafusion_err!("{NAME}: no needle for key bytes {span:?}"))
+    }
+}
+
+/// The stored text of the value of the first pair in `list` whose key
+/// is `needle`, which is what [`canonical::encode_any_value`] writes for
+/// it; empty for a pair stored without a value. A list's pairs have their
+/// members at depth 2 (array, then object). The scan keeps no stack, so
+/// value depth is no limit. A row that ends early fails the query rather
+/// than drop out of the result.
+fn first_pair<'j>(list: &'j str, needle: &str) -> Result<Option<&'j str>> {
+    if !list.contains(needle) {
+        return Ok(None);
+    }
+    let b = list.as_bytes();
+    let mut depth = 0usize;
+    for token in Tokens::new(b, 0) {
+        let (i, _, c) = token?;
+        match c {
+            b'"' if depth == 2 && b[i..].starts_with(needle.as_bytes()) => {
+                return Ok(Some(value_after(list, i + needle.len())?.unwrap_or("")));
+            }
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
+    if depth == 0 {
+        Ok(None)
+    } else {
+        Err(truncated())
+    }
+}
+
+/// The pair list inside a stored map value, `None` for any other value.
+fn map_entries(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("{\"kvlistValue\":{\"values\":")?
+        .strip_suffix("}}")
 }
 
 /// The value text after a pair's key at `at`, `None` for a pair stored
@@ -270,6 +338,8 @@ impl Iterator for Tokens<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use ourios_core::otlp::any_value::Value;
     use ourios_core::otlp::{AnyValue, KeyValue, KeyValueList};
 
@@ -425,14 +495,124 @@ mod tests {
         }
     }
 
-    /// Scenario RFC0062.5 — the UDF agrees with a reference resolver.
-    /// See `docs/rfcs/0062-attribute-map-paths.md` §5.
+    /// RFC 0062 §3.1 on decoded attributes: the first pair named `key`,
+    /// else the longest head that holds a map with the rest resolving in
+    /// it, as stored text; empty for a pair without a value.
+    fn resolve_decoded(attrs: &[KeyValue], key: &str) -> Option<String> {
+        if let Some(kv) = attrs.iter().find(|kv| kv.key == key) {
+            return Some(kv.value.as_ref().map_or_else(String::new, |v| {
+                String::from_utf8(canonical::encode_any_value(v).expect("encode")).expect("utf-8")
+            }));
+        }
+        key.rmatch_indices('.').find_map(|(dot, _)| {
+            let head = attrs.iter().find(|kv| kv.key == key[..dot])?;
+            match head.value.as_ref()?.value.as_ref()? {
+                Value::KvlistValue(map) => resolve_decoded(&map.values, &key[dot + 1..]),
+                _ => None,
+            }
+        })
+    }
+
+    /// Every key and every dotted join of a key path from the top level.
+    fn keys_and_paths(attrs: &[KeyValue], prefix: &str, out: &mut BTreeSet<String>) {
+        for kv in attrs {
+            let path = if prefix.is_empty() {
+                kv.key.clone()
+            } else {
+                format!("{prefix}.{}", kv.key)
+            };
+            if let Some(Value::KvlistValue(m)) = kv.value.as_ref().and_then(|v| v.value.as_ref()) {
+                keys_and_paths(&m.values, &path, out);
+            }
+            out.insert(kv.key.clone());
+            out.insert(path);
+        }
+    }
+
     #[test]
-    #[ignore = "RFC0062.5 stub — implemented with the §3.1 path resolution"]
-    fn rfc0062_5_the_udf_agrees_with_a_reference_resolver() {
-        todo!(
-            "RFC0062.5 — over the RFC 0024 adversarial generator, `==` and `!=` for every \
-             key and every dotted join of nested keys equal a decode-and-resolve oracle"
-        );
+    fn a_dotted_key_resolves_by_the_rfc_0062_rule() {
+        let c = |v: &str| kv("c", string(v));
+        // RFC 0062 §3.1's table for `a.b.c`.
+        let cases = [
+            (
+                vec![
+                    kv("a.b.c", string("x")),
+                    kv("a", map(vec![kv("b", map(vec![c("y")]))])),
+                ],
+                Some("x"),
+            ),
+            (
+                vec![
+                    kv("a.b", map(vec![c("x")])),
+                    kv("a", map(vec![kv("b.c", string("y"))])),
+                ],
+                Some("x"),
+            ),
+            (vec![kv("a", map(vec![kv("b.c", string("y"))]))], Some("y")),
+            (
+                vec![kv("a", map(vec![kv("b", map(vec![c("x")]))]))],
+                Some("x"),
+            ),
+            (vec![kv("a", string("s"))], None),
+            (
+                vec![kv(
+                    "a",
+                    Value::ArrayValue(ourios_core::otlp::ArrayValue {
+                        values: vec![AnyValue {
+                            value: Some(map(vec![kv("b", map(vec![c("x")]))])),
+                        }],
+                    }),
+                )],
+                None,
+            ),
+        ];
+        for (attrs, resolves_to) in cases {
+            let json = stored(&attrs);
+            for v in ["x", "y", "s"] {
+                let expected = canonical_value(string(v)).expect("encode");
+                let run = |eq| Cmp::new("a.b.c", &expected, eq).eval(&json).expect("eval");
+                let want = resolves_to.map_or((false, false), |r| (r == v, r != v));
+                assert_eq!((run(true), run(false)), want, "{v} in {json}");
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: ourios_testgen::proptest_cases(32),
+            ..ProptestConfig::default()
+        })]
+
+        /// Scenario RFC0062.5 — the UDF agrees with a reference resolver.
+        /// See `docs/rfcs/0062-attribute-map-paths.md` §5.
+        #[test]
+        fn rfc0062_5_the_udf_agrees_with_a_reference_resolver(
+            record in adversarial(),
+            v in "[a-z]{0,2}",
+        ) {
+            let json = stored(&record.attributes);
+            let decoded = canonical::decode_attributes(json.as_bytes()).expect("decode");
+            let mut keys = BTreeSet::new();
+            keys_and_paths(&decoded, "", &mut keys);
+            for key in keys {
+                let actual = resolve_decoded(&decoded, &key);
+                let mut values = vec![canonical_value(string(&v)).expect("encode")];
+                // A query literal is a string or an integer.
+                values.extend(actual.clone().filter(|a| {
+                    a.starts_with("{\"stringValue\":") || a.starts_with("{\"intValue\":")
+                }));
+                for expected in values {
+                    let type_prefix = expected.find(':').map_or(expected.as_str(), |i| &expected[..=i]);
+                    let oracle = actual.as_deref().map_or((false, false), |a| {
+                        (a == expected, a.starts_with(type_prefix) && a != expected)
+                    });
+                    let got = (
+                        Cmp::new(&key, &expected, true).eval(&json).expect("eval"),
+                        Cmp::new(&key, &expected, false).eval(&json).expect("eval"),
+                    );
+                    prop_assert_eq!(got, oracle, "key {:?} expected {} in {}", key, expected, json);
+                }
+            }
+        }
     }
 }

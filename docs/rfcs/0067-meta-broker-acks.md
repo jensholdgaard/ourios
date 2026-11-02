@@ -12,75 +12,74 @@ superseded-by: —
 # RFC 0067 — meta: broker-replicated acks under WAL-before-ack
 
 > **Status: `drafted`.** This is a `meta:` RFC. It proposes a change to
-> `AGENTS.md` §3.4, on top of the text **RFC 0064** fixes, and to
-> `docs/hazards.md` H3 and H8. `AGENTS.md`'s footer requires "a `meta:`
-> RFC and majority maintainer approval" for any change to it, and
-> `docs/hazards.md` §Adding a new hazard requires one for a changed
-> hazard contract. Per `AGENTS.md` §8.5 the edits are **not** made in
-> the drafting session: §3 gives the exact text, and it lands in a
-> separate PR once the maintainer approves this RFC. Precedent: RFC
-> 0012, RFC 0057, RFC 0064. It is the amendment **RFC 0066** (`drafted`,
-> Kafka WAL backend) §3.12 asks for; RFC 0066 cannot reach `red` before
-> this RFC is accepted.
+> `AGENTS.md` §3.4, written against the text **RFC 0064** (`accepted`)
+> put there, and to `docs/hazards.md` H3 and H8. `AGENTS.md`'s footer
+> requires "a `meta:` RFC and majority maintainer approval" for any
+> change to it, and `docs/hazards.md` §Adding a new hazard requires one
+> for a changed hazard contract. Per `AGENTS.md` §8.5 the edits are
+> **not** made in the drafting session: §3 gives the exact text, and it
+> lands in a separate PR once the maintainer approves this RFC.
+> Precedent: RFC 0012, RFC 0057, RFC 0064. It is the amendment **RFC
+> 0066** (`drafted`, Kafka WAL backend) §3.12 asks for; RFC 0066 cannot
+> reach `red` before this RFC is accepted, and carries the runtime
+> criteria this rule requires (§5).
 
 ## 1. Summary
 
-`AGENTS.md` §3.4 says "durably" means fsync or equivalent, and "no
-in-memory-only acks, ever". A Kafka-protocol broker acknowledges a
-produce with `acks=all` once every in-sync replica has the record, and
-Apache Kafka by default holds it in page cache, not on disk, on every
-one of them. This RFC adds a broker case to §3.4: a broker
-acknowledgement counts as durable when it comes from every in-sync
-replica, at least two are in sync, and a replica that may lack an
-acknowledged batch cannot become leader. A broker that persists before
-it acknowledges (Redpanda's default, Kafka with `flush.messages=1`,
-WarpStream's object-store commit) meets the rule as it stands. A broker
-that does not is allowed only by an explicit operator opt-in, with a
-startup warning and replicas in separate failure domains, because then
-a power loss across every in-sync replica at once loses acknowledged
-batches.
+`AGENTS.md` §3.4 says "durably" means fsync or equivalent and allows
+"no in-memory-only acks, ever"; RFC 0064's replication bullet requires
+at least two replicas to have **fsynced** a batch before the ack. A
+Kafka-protocol broker acknowledges once its write quorum holds the
+batch, and Apache Kafka by default holds it in page cache, not on disk.
+This RFC lets a broker-backed WAL meet RFC 0064's bullet through the
+broker's own quorum and leader election, checked by Ourios from the
+broker's configuration at startup and periodically while running. A
+broker that verifiably persists before it acknowledges meets the bullet
+unchanged. For one that does not, only the fsync is waived, and only
+under an explicit operator opt-in, with a startup warning and replicas
+in separate failure domains; the two-replica floor, leader safety and
+fencing are never waived.
 
 ## 2. Motivation
 
 RFC 0066 makes a Kafka-protocol topic the receiver's WAL, so receivers
-keep no disk (RFC 0066 §2.2). Its ack path (§3.4) waits for `acks=all`,
-not for an fsync Ourios can see. After RFC 0064, §3.4 allows replication
-only in addition to an fsynced WAL, so RFC 0066 as drafted breaks the
-invariant on the default Apache Kafka configuration. Either the rule
-says what a broker must guarantee, or the backend cannot ship. The rule
-belongs next to the invariant, not inside RFC 0066, so a later broker
-backend is held to the same bar.
+keep no disk (RFC 0066 §2.2). Its ack waits for the broker, not for an
+fsync Ourios can see. RFC 0064's bullet applies to any replicated WAL,
+so RFC 0066 as drafted breaks §3.4 on the default Apache Kafka
+configuration. Either the rule says what a broker must guarantee, or
+the backend cannot ship. The rule belongs next to the invariant, not
+inside RFC 0066, so a later broker backend is held to the same bar.
 
 ## 3. Proposed design
 
 ### 3.1 What a broker acknowledgement guarantees
 
-| Failure | Kafka, default (no broker fsync) | Broker that persists before ack |
+| Failure | Broker that does not fsync first (Kafka default) | Broker that persists before ack |
 |---|---|---|
-| One broker process crash | survives: the other in-sync replicas hold the batch | survives |
-| One disk lost | survives with ≥ 2 in sync | survives |
-| One machine loses power | survives only if the replica that lost its page cache cannot lead: with Eligible Leader Replicas (KIP-966), Kafka tolerates `min.insync.replicas − 1` such shutdowns; without it, a sole remaining in-sync leader that restarts empty is re-elected and the others truncate | survives |
-| Every in-sync replica loses power before writeback | **acknowledged batches lost** | survives |
+| One broker process crash | survives: the rest of the write quorum holds the batch | survives |
+| One disk lost | survives with a quorum of ≥ 2 | survives |
+| One machine loses power | Kafka: survives only if the replica that lost its page cache cannot lead; with Eligible Leader Replicas (KIP-966) it tolerates `min.insync.replicas − 1` such shutdowns, without it a sole remaining in-sync leader that restarts empty is re-elected and the others truncate | survives |
+| Every replica in the write quorum loses power before writeback | **acknowledged batches lost** | survives |
 | Unclean leader election | **acknowledged batches lost** | **acknowledged batches lost** |
 
-Sources for each row are in §8. Kafka's design states it does "not
-require that crashed nodes recover with all their data intact" and
-does "not want to require the use of fsync on every write"; its topic
-docs recommend "use replication for durability" over `flush.messages`.
-Redpanda "fsyncs each acks=all batch to disk on a majority of replicas
+Sources are in §8. Kafka's design states it does "not require that
+crashed nodes recover with all their data intact" and does "not want to
+require the use of fsync on every write"; its topic docs recommend
+"use replication for durability" over `flush.messages`. Redpanda, a
+Raft log, "fsyncs each acks=all batch to disk on a majority of replicas
 before it acknowledges" unless write caching is on, which is off by
 default in production mode. WarpStream "never acknowledges writes until
 data is durably persisted in object storage and committed to the
 metadata store".
 
-The gap is the fourth row: a power loss that reaches every in-sync
-replica before the kernel writes their pages out. Placing replicas in
-separate failure domains (Kafka `broker.rack`, Redpanda `rack`) turns
-it from one rack or zone event into several independent ones.
+The gap is the fourth row: a power loss that reaches the whole write
+quorum before the kernel writes its pages out. Separate failure domains
+(Kafka `broker.rack`, Redpanda `rack`) turn one rack or zone event into
+several independent ones.
 
 ### 3.2 `AGENTS.md` §3.4
 
-The opening paragraph, as it stands after RFC 0064,
+The opening paragraph,
 
 ```markdown
 Ingester acknowledges an OTLP batch only after it has been durably
@@ -96,168 +95,197 @@ written to the WAL. "Durably" means fsync or equivalent. No in-memory-only
 acks, except the opt-in broker case in the rules below.
 ```
 
-and a bullet is added after RFC 0064's replication bullet:
+RFC 0064's replication bullet, as enacted,
 
 ```markdown
-- A broker-backed WAL (a Kafka-protocol log) acknowledges a batch only
-  after every in-sync replica holds it, with at least two in sync, and
-  only on a topic where a replica that may lack an acknowledged batch
-  cannot become leader (no unclean leader election); when that cannot
-  be met, the batch is rejected, not acknowledged on fewer. If Ourios
-  cannot verify that the broker writes the batch to disk or object
-  storage before acknowledging it, the acknowledgement is in memory on
-  every replica, so the backend starts only when the operator has
-  opted in by configuration, logs a warning at startup, and refuses a
-  topic with two replicas of one partition in the same failure domain.
+- Replication is in addition to the WAL, not instead of it. A
+  replicated WAL acknowledges a batch only after at least two
+  replicas, and at least its configured floor, have fsynced it, so
+  losing one disk never loses an acknowledged batch; when that cannot
+  be met, the batch is rejected, not acknowledged on fewer. A replica
+  becomes leader only if it already holds every acknowledged batch. A
+  replica that has lost leadership can never commit another batch,
+  whatever its clock says, so a success it sends late is only ever for
+  a batch the new leader holds.
 ```
 
-The rest of §3.4, including RFC 0064's text and §4 item 3's
-every-backend crash test, is unchanged.
+becomes (changes: the broker's write quorum named as its floor, and
+the exception named at the end):
+
+```markdown
+- Replication is in addition to the WAL, not instead of it. A
+  replicated WAL acknowledges a batch only after at least two
+  replicas, and at least its configured floor (on a broker, its write
+  quorum), have fsynced it, so losing one disk never loses an
+  acknowledged batch; when that cannot be met, the batch is rejected,
+  not acknowledged on fewer. A replica becomes leader only if it
+  already holds every acknowledged batch. A replica that has lost
+  leadership can never commit another batch, whatever its clock says,
+  so a success it sends late is only ever for a batch the new leader
+  holds. The only exception is the fsync, and
+  only for an opted-in broker-backed WAL, as the next rule says.
+```
+
+and a bullet follows it:
+
+```markdown
+- A broker-backed WAL (a Kafka-protocol log) meets the rule above
+  through the broker's write quorum and leader election, which Ourios
+  checks from the broker's configuration at startup and periodically
+  while running; a broker whose configuration cannot be read does not
+  start. If Ourios cannot verify that the broker fsyncs, or commits to
+  object storage, before it acknowledges, the replicas hold the batch
+  only in memory: the backend then acknowledges only when the operator
+  has opted in by configuration, warns at startup, and has every
+  partition's replicas in distinct failure domains. The opt-in waives
+  the fsync only, never the two-replica floor, leader safety or
+  fencing. A check that fails while running stops acknowledgements on
+  that topic with a retryable rejection until it passes again, or, for
+  a lost fsync guarantee, until the opt-in covers it.
+```
+
+The rest of §3.4 and §4 item 3 (crash test for every backend) are
+unchanged.
 
 ### 3.3 `AGENTS.md` footer
 
 ```markdown
-2026-MM-DD revision adds a broker case to §3.4: a Kafka-protocol WAL
-acknowledges from every in-sync replica with at least two in sync and
-no unclean election, and an acknowledgement the broker does not persist
-first needs an operator opt-in, a startup warning and replicas in
-separate failure domains, per **RFC 0067** (maintainer-approved `meta:`
-RFC).
+2026-MM-DD revision adds the broker case to §3.4: a Kafka-protocol WAL
+meets the replication rule through the broker's write quorum and leader
+election, checked at startup and while running, and an acknowledgement
+the broker does not verifiably persist first needs an operator opt-in,
+a startup warning and replicas in separate failure domains, per **RFC
+0067** (maintainer-approved `meta:` RFC).
 ```
 
 and `*Last updated: …*` moves to the enacting date.
 
 ### 3.4 `docs/hazards.md`
 
-- **H3.** A mitigation bullet is added after the replication bullet:
-  "On the broker backend (RFC 0066) an ack waits for `acks=all` with
-  `min.insync.replicas ≥ 2` and no unclean leader election. When Ourios
-  cannot verify that the broker persists before acknowledging, the ack
-  is in page cache on every replica: the backend then needs an operator
-  opt-in, warns at startup, and requires each partition's replicas in
-  distinct failure domains; a power loss across all in-sync replicas
-  before writeback still loses acknowledged batches." The *Escalation*
-  line gains: "Broker backend running in opt-in mode without its
-  startup warning, or on a topic that fails the checks → P0 bug."
-- **H8.** The banner, after RFC 0064, gains the broker backend: "This
-  hazard is dormant on the local WAL backend and live on the replicated
-  (RFC 0065) and broker (RFC 0066) backends." No mitigation changes;
-  RFC 0066 §3.6 dedups by log position, which H8 as RFC 0064 words it
-  allows.
+- **H3, first mitigation.** "An ack is emitted **only after** fsync (or
+  equivalent durability primitive) on the WAL." becomes: "An ack is
+  emitted **only after** fsync (or equivalent durability primitive) on
+  the WAL. The one exception is an opted-in broker backend (RFC 0066,
+  RFC 0067) whose broker Ourios cannot verify persists before
+  acknowledging: there the ack waits for the broker's write quorum of
+  at least two replicas, in distinct failure domains, holding the batch
+  in memory, and a power loss across that whole quorum before writeback
+  loses acknowledged batches."
+- **H3, replication bullet.** RFC 0064's bullet gains a final sentence:
+  "On the broker backend (RFC 0066) the same floor and leader rules
+  hold through the broker's quorum and election, re-checked while
+  running; a failed check stops acknowledgements on that topic."
+- **H3, escalation.** "Ack-without-fsync ever observed in code review →
+  P0 bug, hotfix path." becomes: "Ack-without-fsync ever observed in
+  code review → P0 bug, hotfix path, except on a broker backend whose
+  operator has opted in (RFC 0067); a broker backend acknowledging
+  without verified persistence and without the opt-in, or after a
+  failed runtime check, is the same P0."
+- **H8, banner.** "This hazard is dormant on the local WAL backend and
+  live on the replicated one (RFC 0065)." becomes "This hazard is
+  dormant on the local WAL backend and live on the replicated (RFC
+  0065) and broker (RFC 0066) backends." No mitigation changes; RFC
+  0066 §3.6 dedups by log position, which H8 allows.
 
-### 3.5 How Ourios decides "persists before acknowledging"
+### 3.5 How the rule maps to brokers
 
-At startup the broker backend reads the topic's effective configuration
-(DescribeConfigs, RFC 0066 §3.2):
+RFC 0066 owns the checks; this table is what they must establish.
 
-- `write.caching` present and `false` (Redpanda) → persisted;
-- otherwise `flush.messages` equal to `1` (Apache Kafka) → persisted;
-- anything else, including a broker that exposes neither key
-  (WarpStream, Redpanda before 24.1) → not verified, opt-in required.
+| Rule | Apache Kafka | Redpanda (Raft) | WarpStream |
+|---|---|---|---|
+| ≥ 2 replicas and the write quorum hold the batch | `acks=all`, `min.insync.replicas ≥ 2`, every partition with ≥ `max(2, min.insync.replicas)` replicas | `acks=all` (majority), every partition with ≥ 2 replicas | not verifiable (object storage replicates internally) |
+| Leader holds every acked batch | `unclean.leader.election.enable=false`; with the opt-in, also ELR (§7 Q5) | Raft election | single metadata store |
+| fsync before ack (verified) | `flush.messages=1` (§7 Q4) | `write.caching=false` | not exposed: opt-in |
 
-The classification is conservative: a broker that does persist but
-cannot show it needs the opt-in, never the reverse. On Apache Kafka,
-`flush.messages=1` makes a follower fsync inside its append, before
-the fetch that lets the leader's high watermark pass the batch; the
-documentation does not state this ordering, so §7 Q4 asks whether to
-rely on it.
+A broker that cannot show a row's setting is classified conservatively:
+a broker that does persist but cannot show it needs the opt-in, never
+the reverse.
+
+**Lifetime.** The checks run at startup and every **60 s** while
+running; 60 s is a starting value, tuned by the re-check outcome metric
+RFC 0066 §3.9 names, against the rate of config changes it observes.
+Each check fails closed:
+
+- the configuration cannot be read at startup → the receiver does not
+  start;
+- the floor or leader check fails, or the config cannot be read while
+  running → the topic stops acknowledging (retryable rejection, RFC
+  0053 §3.1) until a check passes;
+- the fsync check moves from verified to unverified and the opt-in is
+  not set → the same; with the opt-in set → acknowledgements continue
+  and a WARN event is emitted.
+
+Between two checks an admin change can go unseen for up to one
+interval; the opt-in's warning and H3's escalation cover that window,
+and the interval is the knob that shrinks it.
 
 ### 3.6 What does not change
 
-- RFC 0064's text, including its minimum of two replicas and its leader
-  and fencing rules, which the broker case restates in broker terms.
+- RFC 0064's floor of two, leader rule and fencing, for every backend.
 - `AGENTS.md` §3.6: the broker holds records only up to the WAL
   horizon; object storage stays the source of truth.
 - The local and replicated (RFC 0065) backends: fsync, as today.
 
 ## 4. Alternatives considered
 
-**Require broker persistence, no opt-in.** Accept only topics §3.5
-classifies as persisted. It keeps "no in-memory-only acks, ever" word
-for word. Kafka's design puts fsync on every write at "two to three
-orders of magnitude" slower; RFC 0066's batch window produces one
-record batch per partition per window, so `flush.messages=1` costs one
-fsync per broker per partition per window, close to the local WAL's
-group commit, but it applies to the whole topic and teams running Kafka
-rarely accept it. WarpStream would be excluded unless it exposes a
-checkable key. Close second to this RFC's design; §7 Q1 is exactly
-this choice.
+**Require broker persistence, no opt-in.** Accept only brokers §3.5
+classifies as verified. It keeps "no in-memory-only acks, ever" word for
+word. Kafka's design puts fsync on every write at "two to three orders
+of magnitude" slower; RFC 0066's batch window produces one record batch
+per partition per window, so `flush.messages=1` costs one fsync per
+broker per partition per window, close to the local WAL's group commit,
+but it applies to the whole topic and Kafka operators rarely accept it.
+WarpStream would be excluded. Close second; §7 Q1 is this choice.
 
 **Forbid the broker backend.** RFC 0065 already gives replication with
-fsync and no external system. It throws away RFC 0066's reason to exist:
-teams that already run Kafka and want stateless receivers.
+fsync and no external system. It throws away RFC 0066's reason to
+exist: teams that already run Kafka and want stateless receivers.
 
 **Allow replication-only acks with no opt-in.** The earlier draft of RFC
 0064. It matches Kafka's own bar, but changes what §3.4 promises on
-every deployment that picks the backend, silently. The opt-in and the
-warning make the operator the one who accepts the fourth row of §3.1.
+every deployment that picks the backend, silently.
 
-**Treat Ourios's own retry as a fix.** Ourios cannot re-send what it
-has already acknowledged; the client has dropped it. There is no
-Ourios-side compensation for a lost acknowledged batch.
+**Check at startup only.** Simpler, but an admin can flip
+`flush.messages` or `write.caching` after start and the receiver keeps
+acknowledging under a guarantee it no longer has.
+
+**An all-in-sync-replicas rule.** The first draft of this RFC. It fits
+Kafka's ISR but not a Raft broker, which acknowledges on a majority;
+the write-quorum wording fits both.
 
 ## 5. Acceptance criteria
 
-RFC0067.1–.3 check the enacting PR. RFC0067.4–.7 are the behaviour the
-rule requires; they are tested by RFC 0066's implementation, and RFC
-0066 cannot reach `specified` until its §5 carries them.
+These check the enactment only, as RFC 0064 §5 does. The runtime
+behaviour the rule requires (startup classification, the opt-in and its
+warning, the failure-domain check, the periodic re-check and its
+verified-to-unverified transition) is specified as criteria
+RFC0066.16–.20 in RFC 0066 §5 and tested there.
 
 > **Scenario RFC0067.1 — `AGENTS.md` §3.4 matches §3.2–§3.3**
 > - **Given** the enacting PR
 > - **When** `AGENTS.md` is diffed against the version before it
-> - **Then** §3.4's opening paragraph and the new bullet are exactly
->   §3.2's text, the footer carries §3.3's sentence and a new
->   `Last updated` date, and nothing else in the file changes
+> - **Then** §3.4's opening paragraph, the replication bullet and the
+>   new broker bullet are exactly §3.2's text, the footer carries
+>   §3.3's sentence and a new `Last updated` date, and nothing else in
+>   the file changes
 
 > **Scenario RFC0067.2 — `docs/hazards.md` matches §3.4**
 > - **Given** the enacting PR
 > - **When** `docs/hazards.md` is diffed against the version before it
-> - **Then** H3's new bullet and escalation line and H8's banner read as
->   §3.4 gives them, and no other hazard changes
+> - **Then** H3's first mitigation, replication bullet and escalation
+>   and H8's banner read as §3.4 gives them, and no other hazard changes
 
 > **Scenario RFC0067.3 — citations still resolve**
 > - **Given** the enacted `AGENTS.md`
 > - **When** `just agents-citations` and `mdbook build` run
 > - **Then** both pass
 
-> **Scenario RFC0067.4 — an unverified broker without the opt-in refuses to start**
-> - **Given** a broker backend whose topic passes RFC 0066 §3.1's checks
->   and has `flush.messages` unset and no `write.caching` key
-> - **When** the receiver starts without the opt-in
-> - **Then** startup fails before producing or consuming, with an error
->   naming the opt-in field and the two topic keys that would verify
->   persistence
-
-> **Scenario RFC0067.5 — the opt-in starts with a warning**
-> - **Given** the topic of RFC0067.4, every partition's replicas on
->   distinct non-empty racks, and the opt-in set
-> - **When** the receiver starts
-> - **Then** it starts, logs one WARN event naming the topic and stating
->   that acknowledged batches are not verified on disk, and reports the
->   unverified mode in its telemetry
-
-> **Scenario RFC0067.6 — the opt-in still needs separate failure domains**
-> - **Given** the opt-in set, and a topic where one partition has two
->   replicas on brokers with the same rack, or a replica on a broker
->   with no rack
-> - **When** the receiver starts
-> - **Then** startup fails naming the partition and the rack
-
-> **Scenario RFC0067.7 — a verified broker needs no opt-in**
-> - **Given** a topic with `write.caching=false`, and separately one
->   with `flush.messages=1`, both passing RFC 0066 §3.1's checks
-> - **When** the receiver starts without the opt-in
-> - **Then** it starts with no warning and reports the verified mode
-
 ## 6. Testing strategy
 
 - RFC0067.1, .2: maintainer review of the enacting PR's diff against
   §3.2–§3.4; the text is fixed here, so the review is a comparison.
 - RFC0067.3: the existing `book` CI job.
-- RFC0067.4–.7: unit tests in RFC 0066's broker backend against the
-  in-memory `BrokerClient` (RFC 0066 §3.2), which returns the topic
-  configuration and broker racks each scenario names. No container
-  needed.
+- The behaviour is tested by RFC0066.16–.20 (RFC 0066 §6).
 - The fourth row of §3.1 (correlated power loss) is not testable in CI;
   it is the risk the opt-in accepts, not a property Ourios claims.
 
@@ -276,37 +304,40 @@ Behaviour decisions for the maintainer. Each has a recommendation.
   lets Kafka shops use the backend. (b) is the safe fallback if you
   want the invariant unchanged in substance.
 - [ ] **Q2. With the opt-in, must each copy be in a different rack or
-  zone?** *Recommendation: yes, checked at startup from the brokers'
-  rack labels, refusing a missing label.* Without it, one power event
-  in one rack loses data, which is the exact failure the opt-in asks
-  the operator to accept as unlikely.
-- [ ] **Q3. Two in-sync copies, or three?** RFC 0064 fixed two as the
-  minimum for any replicated WAL. *Recommendation: keep two in the rule
-  and recommend three replicas with `min.insync.replicas=2` in the
-  operator docs and Helm defaults.* Two survives a disk loss; three
-  also keeps accepting writes while one broker is down for maintenance,
-  which is an availability choice, not a durability floor.
+  zone?** *Recommendation: yes, checked from the brokers' rack labels,
+  refusing a missing label.* Without it, one power event in one rack
+  loses data, which is the exact failure the opt-in asks the operator
+  to accept as unlikely.
+- [ ] **Q3. Two copies in the write quorum, or three?** RFC 0064 fixed
+  two as the minimum. *Recommendation: keep two in the rule and
+  recommend three replicas (Kafka `min.insync.replicas=2`) in the
+  operator docs and Helm defaults.* Three keeps accepting writes while
+  one broker is down for maintenance, an availability choice, not a
+  durability floor.
 - [ ] **Q4. On Apache Kafka, does `flush.messages=1` count as "writes to
   disk first"?** The code path fsyncs each replica before the ack, but
   the documentation does not promise it. *Recommendation: yes,* with a
-  CI container test against Kafka asserting the ordering through the
-  broker's flush metrics, so an upstream change is caught.
+  CI container test against Kafka that would catch an upstream change.
 - [ ] **Q5. With the opt-in on Apache Kafka, require Eligible Leader
-  Replicas?** Without ELR, a single machine power loss can lose
+  Replicas?** Without ELR, one machine's power loss can lose
   acknowledged data when it was the last in-sync copy (§3.1, row 3),
-  which RFC 0064's "a replica becomes leader only if it already holds
-  every acknowledged batch" forbids. ELR is on by default only on new
+  which RFC 0064's leader rule forbids. ELR is on by default only on new
   clusters from Kafka 4.1. *Recommendation: yes,* checked from the
-  broker's finalized features at startup; Redpanda and WarpStream do not
-  use Kafka's ISR election, so the check applies to Apache Kafka only.
+  broker's finalized features; Redpanda and WarpStream do not use
+  Kafka's ISR election.
+- [ ] **Q6. How quickly must Ourios notice that the broker's settings
+  changed?** *Recommendation: re-check every 60 s to start, and tune it
+  from the re-check metric.* Shorter costs one metadata and config
+  request per topic per interval; longer leaves a wider window in which
+  a changed broker keeps getting acknowledged writes.
 
 ## 8. References
 
 - `AGENTS.md` §3.4, §3.6, §4, §8.5, footer
 - `docs/hazards.md` H3, H8, §Adding a new hazard
 - RFC 0012, RFC 0057, RFC 0064 (`meta:` precedent; RFC 0064 §3.1 is the
-  base text), RFC 0065 (replicated WAL), RFC 0066 §3.1, §3.2, §3.4,
-  §3.12 (Kafka backend)
+  base text), RFC 0053 §3.1 (retryable rejection), RFC 0065 (replicated
+  WAL), RFC 0066 §3.1, §3.2, §3.4, §3.9, §3.12, §5 (Kafka backend)
 - Apache Kafka 4.1 documentation, *Topic configs*
   (`flush.messages`, `flush.ms`, `min.insync.replicas`,
   `unclean.leader.election.enable`):

@@ -463,6 +463,9 @@ partition in place of the Raft log; there is no separate tail topic.
   the registry PR, checked against the OTel conventions first.
 - `error.type = retention_gap` (§3.5) uses the existing
   `ourios.ingest.batches` counter.
+- RFC 0067 §3.5's durability check: its outcome per run (verified,
+  unverified, failed) and the topic's current mode, as Ourios-owned
+  names through the registry; the re-check interval is tuned from it.
 
 ### 3.10 Helm
 
@@ -511,7 +514,9 @@ therefore needs a `meta:` RFC that adds a broker case to §3.4:
 with at least two in sync, and a broker that cannot meet that fails the
 append rather than degrading the ack. That `meta:` RFC is **RFC 0067**
 (`drafted`), which also decides how a broker that does not fsync first
-is allowed.
+is allowed; its runtime rules (an opt-in
+`receiver.wal.kafka.allow_unverified_ack`, default `false`, and a
+re-check every 60 s, RFC 0067 §3.5) are criteria RFC0066.16–.20 here.
 
 ## 4. Alternatives considered
 
@@ -715,10 +720,59 @@ removes only copies of the same log entry.
 > - **And** it mines no record past that offset, so no replica skips a
 >   control record another one applied
 
+> **Scenario RFC0066.16 — an unverified broker without the opt-in refuses to start (RFC 0067)**
+> - **Given** a topic that passes RFC0066.1's checks, with
+>   `flush.messages` unset and no `write.caching` key
+> - **When** the receiver starts without
+>   `receiver.wal.kafka.allow_unverified_ack`
+> - **Then** startup fails before producing or consuming, with an error
+>   naming the opt-in field and the topic keys that would verify
+>   persistence
+> - **And** when the topic configuration cannot be read at all, startup
+>   fails whether or not the opt-in is set
+
+> **Scenario RFC0066.17 — the opt-in starts with a warning (RFC 0067)**
+> - **Given** the topic of RFC0066.16, every partition's replicas on
+>   brokers with distinct non-empty racks, and the opt-in set
+> - **When** the receiver starts
+> - **Then** it starts, logs one WARN event naming the topic and stating
+>   that acknowledged batches are not verified on disk, and reports the
+>   unverified mode in its telemetry (§3.9)
+
+> **Scenario RFC0066.18 — the opt-in still needs separate failure domains (RFC 0067)**
+> - **Given** the opt-in set, and a topic where one partition has two
+>   replicas on brokers with the same rack, or a replica on a broker
+>   with no rack
+> - **When** the receiver starts
+> - **Then** startup fails naming the partition and the rack
+
+> **Scenario RFC0066.19 — a verified broker needs no opt-in (RFC 0067)**
+> - **Given** a topic with `write.caching=false`, and separately one
+>   with `flush.messages=1`, both passing RFC0066.1's checks
+> - **When** the receiver starts without the opt-in
+> - **Then** it starts with no warning and reports the verified mode
+
+> **Scenario RFC0066.20 — a change while running fails closed (RFC 0067)**
+> - **Given** a running receiver on a verified topic without the opt-in
+> - **When** the topic's `flush.messages` is reset (or `write.caching`
+>   set to `true`) and the next re-check runs
+> - **Then** exports to that topic get the retryable rejection (gRPC
+>   `UNAVAILABLE`, HTTP `503`) and none is acknowledged until a re-check
+>   finds the topic verified again
+> - **And** with the opt-in set, the same change keeps
+>   acknowledgements flowing and emits a WARN event naming the topic
+> - **And** a re-check that finds `min.insync.replicas` below 2,
+>   unclean leader election enabled, or the configuration unreadable
+>   stops acknowledgements on that topic whether or not the opt-in is set
+
 ## 6. Testing strategy
 
 - RFC0066.1, .4: unit tests in `ourios-server/src/config` and next to
   the hash; golden values committed with the hash.
+- RFC0066.16–.20: unit tests against the in-memory `BrokerClient`,
+  which returns the topic configuration and broker racks each scenario
+  names and changes them between re-checks; the re-check runs on a test
+  clock.
 - RFC0066.5, .6, .7, .8, .11, .12, .13, .14, .15: integration tests against an in-memory
   `BrokerClient` (§3.2), runnable locally. RFC0066.7's equal-count arm
   is also a `proptest` over random flush and barrier points.

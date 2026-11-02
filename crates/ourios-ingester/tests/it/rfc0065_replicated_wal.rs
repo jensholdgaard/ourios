@@ -232,8 +232,9 @@ fn rfc0065_16_local_backend_files_have_no_ingest_columns() {
 
 /// Scenario RFC0065.18 — tail queries do not slow ingest (B23).
 /// Given one tail replica per group at a fixed ingest rate, when tail
-/// queries saturate it and then it is paused, then ack p99 and throughput
-/// stay within the no-query run's noise band. A load run (§8).
+/// queries saturate it and then it is paused, then ack p99 stays within
+/// 10 % and throughput within 5 % of the same run's query-free baseline.
+/// A load run (§8).
 #[test]
 #[ignore = "RFC0065.18 stub — implemented with the tail load runs"]
 fn rfc0065_18_tail_queries_do_not_slow_ingest() {
@@ -381,7 +382,8 @@ fn rfc0065_26_a_delayed_former_flusher_cannot_move_a_checkpoint_back() {
 /// Scenario RFC0065.27 — a node failure with many groups fails over like one (B7).
 /// Given three voter nodes hosting 128 groups with durable fsync, when one
 /// node is killed, then every group it led acknowledges on a new leader
-/// within twice the single-group failover bound (§6.9).
+/// within twice the single-group failover time `F` measured earlier in
+/// the same run.
 #[test]
 #[ignore = "RFC0065.27 stub — implemented with the many-groups load run"]
 fn rfc0065_27_a_node_failure_with_many_groups_fails_over_like_one() {

@@ -2241,6 +2241,20 @@ auth:
         );
     }
 
+    /// Scenario RFC0061.1 — the limit is configurable and validated.
+    /// See `docs/rfcs/0061-otlp-request-size-limit.md` §5.
+    #[test]
+    #[ignore = "RFC0061.1 stub — implemented with the config field and Helm wiring"]
+    fn rfc0061_1_the_limit_is_configurable_and_validated() {
+        todo!(
+            "RFC0061.1 — unset and empty resolve to 16773120, `8388608` to 8388608; \
+             `0` and `16773121` fail startup naming `receiver.max_request_bytes` and \
+             the ceiling; the chart's rendered reference resolves to 8388608 with \
+             OURIOS_RECEIVER_MAX_REQUEST_BYTES=8388608 in receiver.extraEnv and to \
+             the default without it"
+        );
+    }
+
     #[test]
     fn build_querier_config_disabled_unless_explicitly_enabled() {
         // Arrange / Act / Assert — unset or a falsey value disables the role.

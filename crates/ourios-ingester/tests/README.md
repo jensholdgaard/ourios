@@ -27,6 +27,9 @@ one-per-binary:
   global in-memory provider.
 - `rfc0026_telemetry.rs` — the RFC0026.7 rejection-telemetry arm installs
   the global in-memory provider.
+- `rfc0061_telemetry.rs` — the RFC0061.2/.3/.6 `error.type =
+  request_too_large` arms read `ourios.ingest.batches` through the global
+  in-memory provider.
 - `rfc0052_7_telemetry/` — the RFC0052.7 WAL-state export installs the
   global in-memory meter provider and a global `tracing` subscriber
   bridged onto an in-memory log exporter; its legs share both and run

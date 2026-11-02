@@ -156,5 +156,9 @@ harness = false
 name = "compaction"
 harness = false
 
+[[bench]]
+name = "attr_predicate"
+harness = false
+
 [lints]
 workspace = true

@@ -641,3 +641,49 @@ async fn integer_json_arm_ignores_a_nested_pair() {
     assert_eq!(count(&q, "attr.n == 3").await, 1, "the top-level int only");
     assert_eq!(count(&q, "attr.n != 4").await, 1, "the top-level int only");
 }
+
+/// Scenario RFC0062.1 — the literal key wins.
+/// See `docs/rfcs/0062-attribute-map-paths.md` §5.
+#[test]
+#[ignore = "RFC0062.1 stub — implemented with the §3.1 path resolution"]
+fn rfc0062_1_the_literal_key_wins() {
+    todo!(
+        "RFC0062.1 — with `user.id = \"u9\"` and `user = {{id: \"u7\"}}`, promoted and \
+         not, `attr.user.id == \"u7\"` matches nothing and `!= \"u7\"` matches the record"
+    );
+}
+
+/// Scenario RFC0062.2 — a dotted key resolves into a map.
+/// See `docs/rfcs/0062-attribute-map-paths.md` §5.
+#[test]
+#[ignore = "RFC0062.2 stub — implemented with the §3.1 path resolution"]
+fn rfc0062_2_a_dotted_key_resolves_into_a_map() {
+    todo!(
+        "RFC0062.2 — `user.id == \"u7\"`, `user.id != \"u7\"`, `a.b.c == \"x\"` and \
+         `a.b.c == \"long\"` each match one record, `a.b.c == \"short\"` none, promoted \
+         and not"
+    );
+}
+
+/// Scenario RFC0062.3 — what a path does not enter.
+/// See `docs/rfcs/0062-attribute-map-paths.md` §5.
+#[test]
+#[ignore = "RFC0062.3 stub — implemented with the §3.1 path resolution"]
+fn rfc0062_3_what_a_path_does_not_enter() {
+    todo!(
+        "RFC0062.3 — a string, an array, an array of maps and an absent `user` match \
+         neither `attr.user.id == \"u7\"` nor `!= \"u8\"`; an `f64`-promoted `m.n` held \
+         only as `m = {{n: 1.5}}` matches neither `== 1.5` nor `!= 2.0`"
+    );
+}
+
+/// Scenario RFC0062.4 — resource attributes and `service`.
+/// See `docs/rfcs/0062-attribute-map-paths.md` §5.
+#[test]
+#[ignore = "RFC0062.4 stub — implemented with the §3.1 path resolution"]
+fn rfc0062_4_resource_attributes_and_service() {
+    todo!(
+        "RFC0062.4 — a resource holding `service = {{name: \"api\"}}` and no \
+         `service.name` matches `resource.service.name == \"api\"` and `service == \"api\"`"
+    );
+}

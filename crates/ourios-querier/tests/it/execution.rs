@@ -194,6 +194,17 @@ async fn rfc0007_5_tenant_isolation() {
     assert_eq!(none.rows, 0, "unknown tenant yields an empty result");
 }
 
+/// Scenario RFC0062.9 — paths stay inside the tenant (`AGENTS.md` §3.7).
+/// See `docs/rfcs/0062-attribute-map-paths.md` §5.
+#[test]
+#[ignore = "RFC0062.9 stub — implemented with the §3.1 path resolution"]
+fn rfc0062_9_paths_stay_inside_the_tenant() {
+    todo!(
+        "RFC0062.9 — tenant a's `user = {{id: \"u7\"}}` and tenant b's `user.id = \"u7\"`: \
+         `attr.user.id == \"u7\"` counts one row for each tenant"
+    );
+}
+
 /// A tenant directory that exists but holds no *committed*
 /// `*.parquet` (only an uncommitted `*.parquet.tmp`, e.g. a
 /// crashed writer) is an empty result, not an error — the query

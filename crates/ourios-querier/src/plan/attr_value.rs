@@ -424,4 +424,15 @@ mod tests {
             }
         }
     }
+
+    /// Scenario RFC0062.5 — the UDF agrees with a reference resolver.
+    /// See `docs/rfcs/0062-attribute-map-paths.md` §5.
+    #[test]
+    #[ignore = "RFC0062.5 stub — implemented with the §3.1 path resolution"]
+    fn rfc0062_5_the_udf_agrees_with_a_reference_resolver() {
+        todo!(
+            "RFC0062.5 — over the RFC 0024 adversarial generator, `==` and `!=` for every \
+             key and every dotted join of nested keys equal a decode-and-resolve oracle"
+        );
+    }
 }

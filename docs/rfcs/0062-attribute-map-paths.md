@@ -1,7 +1,7 @@
 ---
 rfc: 0062
 title: Attribute paths into map values
-status: drafted
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-10-31
@@ -11,7 +11,20 @@ superseded-by: —
 
 # RFC 0062 — Attribute paths into map values
 
-> **Status: `drafted`.** Tracks #1134. This RFC **amends RFC 0002 §6.1**
+> **Status: `red` (2026-11-02).** RFC0062.1–.4 have `#[ignore]`d
+> `todo!` stubs in `ourios-querier/tests/it/rfc0022_attr_columns.rs`,
+> RFC0062.5 beside the UDF in `plan/attr_value.rs`, RFC0062.8 in
+> `ourios-server/tests/it/rfc0062_8_engine_names.rs` (beside the HTTP
+> and MCP scrubbing tests, which live in `tests/it`, not in the `src`
+> files §6 names) and RFC0062.9 in
+> `ourios-querier/tests/it/execution.rs`, each naming the slice that
+> discharges it. RFC0062.6's `attr_predicate` bench lands with the
+> stubs (`ourios-bench/benches/attr_predicate.rs`); its numbers against
+> the bounds go in the implementing PR. RFC0062.7 is already green:
+> #1137's `a_nested_pair_is_not_a_top_level_attribute` and its query
+> tests pass on `main` and stay unchanged.
+> Specified 2026-11-02 (maintainer-approved by merging #1138 and asking
+> for the implementation). Tracks #1134. This RFC **amends RFC 0002 §6.1**
 > (`accepted`), which reads `attr.<key>` as the attribute key "taken
 > literally including dots", and **RFC 0022 §3.3** (`accepted`), whose
 > JSON arm compares one top-level key. RFC 0042 §3.4's integer JSON arm

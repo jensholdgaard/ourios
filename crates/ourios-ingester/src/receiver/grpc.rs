@@ -300,6 +300,26 @@ mod tests {
         assert_eq!(ingest_error_status(&e).code(), Code::InvalidArgument);
     }
 
+    /// Scenario RFC0061.3 — a batch over the WAL frame maps the same way
+    /// as an over-limit request: `RESOURCE_EXHAUSTED` without `RetryInfo`.
+    /// The HTTP arm (`413`) is `receiver/http.rs`'s
+    /// `oversize_payload_is_413`; the `error.type` arm is in
+    /// `tests/rfc0061_telemetry.rs`.
+    /// See `docs/rfcs/0061-otlp-request-size-limit.md` §5.
+    #[test]
+    #[ignore = "RFC0061.3 stub — implemented with the gRPC status remap"]
+    fn rfc0061_3_too_large_is_resource_exhausted_without_retry_info() {
+        use tonic_types::StatusExt as _;
+
+        let e = ReceiveError::WalAppend(AppendError::TooLarge {
+            len: 32 * 1024 * 1024,
+            limit: 16 * 1024 * 1024,
+        });
+        let status = ingest_error_status(&e);
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert!(status.get_details_retry_info().is_none());
+    }
+
     #[test]
     fn transient_wal_append_is_unavailable() {
         let e = ReceiveError::WalAppend(AppendError::Io {

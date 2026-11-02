@@ -98,6 +98,9 @@ receiver:
       brokers: "${env:OURIOS_RECEIVER_WAL_KAFKA_BROKERS}"  # comma-separated host:port
       topic: ourios-wal           # raw frames
       produce_timeout_ms: 5000
+      broker_kind: kafka          # kafka | redpanda: which persistence setting applies (RFC 0067 §3.5)
+      allow_unverified_ack: false # RFC 0067 opt-in; the only switch, no check can be turned off
+      durability_recheck_secs: 60 # RFC 0067 §3.5 re-check interval
       max_backlog_bytes: "${env:OURIOS_RECEIVER_WAL_KAFKA_MAX_BACKLOG_BYTES}"  # per partition above its checkpoint, required (§3.5)
       tail_peers: "${env:OURIOS_RECEIVER_WAL_TAIL_PEERS}"  # tail pool: id=host:port,… (§3.8)
       tail_replicas: 1            # tail replicas per partition from the pool, 1..=tail_peers
@@ -131,9 +134,12 @@ receiver:
 - The batch window (`wal_batch_window_ms`, RFC 0008 §6.9) keeps its
   meaning: the group-commit coordinator collects turns for up to that
   long and sends one produce request per partition.
-- Classification under RFC 0004: `backend` is a deployment choice,
-  `produce_timeout_ms` a Tunable (`100..=60_000`), the rest locations
-  and credentials.
+- Classification under RFC 0004: `backend` and `broker_kind` are
+  deployment choices, `produce_timeout_ms` a Tunable (`100..=60_000`),
+  `durability_recheck_secs` a Tunable (`5..=3600`, default 60, a starting
+  value tuned from §3.9's re-check metric), `allow_unverified_ack` an
+  invariant switch (RFC 0067; default `false`), the rest locations and
+  credentials. No setting disables the floor, leader, ELR or rack checks.
 
 ### 3.2 The client
 
@@ -160,7 +166,9 @@ partition's current replica assignment and each broker's `rack`) and
 topic configuration, read the cluster's finalized features
 (ApiVersions v3+, KIP-584; on Apache Kafka this is how RFC 0067's ELR
 check reads `eligible.leader.replicas.version`), delete records below
-an offset), so the tests can use an
+an offset), plus, for the topic-ensure verb only (§3.10), create a topic
+and alter its configuration (CreateTopics, IncrementalAlterConfigs), so
+the tests can use an
 in-memory broker and a later RFC can swap the client. `rskafka` 0.6.0
 does not cover all of it, checked against its source: its Metadata
 request stops at version 4, whose response has no topic id (added in
@@ -168,7 +176,8 @@ version 10, KIP-516), it has no DescribeConfigs message, and its produce
 retries internally (§3.4). The backend therefore carries a patch or fork
 of `rskafka` adding Metadata v10+ for the topic id, DescribeConfigs for
 §3.1's startup checks, the finalized features from ApiVersions if its
-parser drops them, and a produce without internal retry, offered
+parser drops them, CreateTopics and IncrementalAlterConfigs for §3.10's
+verb, and a produce without internal retry, offered
 upstream; until upstream takes them the fork is a maintained
 dependency. A replacement client must provide the same five operations
 before it is chosen (§7).
@@ -486,6 +495,44 @@ partition in place of the Raft log; there is no separate tail topic.
   over the peer protocol with mutual TLS, accepted only from the
   identities in `tail_clients` (RFC 0065 §6.8), so queriers need no
   broker settings.
+- **RFC 0067's rules, rendered (maintainer, 2026-11-02).** A default
+  install honours all seven of RFC 0067 §7's decisions:
+  - `receiver.wal.kafka.allowUnverifiedAck` (default `false`) is the
+    single explicit value behind `allow_unverified_ack`;
+    `receiver.wal.kafka.durabilityRecheckSecs` (default `60`) and
+    `receiver.wal.kafka.brokerKind` (default `kafka`) are rendered with
+    their defaults. The chart has no value that turns the floor, leader,
+    ELR or rack checks off, because the config has none.
+  - **Topic provisioning.** With `receiver.wal.kafka.topic.manage`
+    (default `true`), the chart renders a `pre-install,pre-upgrade` hook
+    Job running the receiver's own image and config with the verb
+    `ourios-server --config … wal topic ensure` (clap, beside `graph`).
+    The verb creates the topic, or reconciles an existing one, to the
+    settings §3.1 checks: replication factor 3 and
+    `min.insync.replicas=2` (RFC 0067 Q3; chart values
+    `topic.replicationFactor` and `topic.minInsyncReplicas`, refused
+    below 2), `topic.partitions` at creation only,
+    `unclean.leader.election.enable=false`, `cleanup.policy=delete`,
+    `retention.ms=-1`, `retention.bytes=-1`, `max.message.bytes` at
+    least one maximal frame (computed from the same RFC 0061 limit the
+    receiver uses), and, unless `allowUnverifiedAck` is set, the
+    persistence setting for `brokerKind`: `flush.messages=1` on Kafka,
+    `write.caching=false` on Redpanda. It never weakens a setting: a
+    higher `min.insync.replicas`, a larger `max.message.bytes` or an
+    existing persistence setting is kept; a replication factor or
+    partition count that differs is reported and fails the Job, since
+    changing either is a reassignment or migration this RFC does not
+    define. It ends by running the receiver's startup check (§3.1, RFC
+    0067 §3.5) against the result and fails if that check would fail, so
+    provisioning and the check cannot disagree: the rules live in one
+    place, the receiver's code.
+  - **What the chart cannot do.** Broker-side settings belong to the
+    broker's operator: `broker.rack` (Kafka) or `rack` (Redpanda) on
+    every broker, and on Apache Kafka under the opt-in, ELR enabled
+    (`eligible.leader.replicas.version=1`, default on new 4.1+
+    clusters). `NOTES.txt` and the operator docs state them; if they are
+    missing, the receiver's startup check refuses, as RFC0066.16–.18
+    require.
 
 ### 3.11 Invariants and hazards
 
@@ -518,7 +565,7 @@ therefore needs a `meta:` RFC that adds a broker case to §3.4:
 "durably" means the append was acknowledged by every in-sync replica,
 with at least two in sync, and a broker that cannot meet that fails the
 append rather than degrading the ack. That `meta:` RFC is **RFC 0067**
-(`drafted`), which also decides how a broker that does not fsync first
+(`specified`), which also decides how a broker that does not fsync first
 is allowed; its runtime rules (an opt-in
 `receiver.wal.kafka.allow_unverified_ack`, default `false`, and a
 re-check every 60 s, RFC 0067 §3.5) are criteria RFC0066.16–.20 here.
@@ -548,6 +595,12 @@ groups would mean `rdkafka` (§3.2).
 would keep two owners from mining at once during a handoff. Dedup by
 position already makes the overlap harmless, so the lease would add a
 liveness dependency on the store for no correctness gain.
+
+**Provision the topic with a Strimzi `KafkaTopic`.** The chart could
+render a `KafkaTopic` resource instead of a Job. It works only on
+Strimzi-managed Kafka, not on Redpanda or a managed service, and puts a
+second copy of the rules in YAML that can drift from the startup check.
+The ensure verb serves every broker kind from the code that checks it.
 
 **A topic per tenant.** Strict isolation at the broker, but topic count
 grows with tenants and partition assignment becomes per topic. Tenancy
@@ -785,6 +838,36 @@ removes only copies of the same log entry.
 >   finalized features unreadable, stops acknowledgements on that topic
 >   with the retryable rejection until a re-check passes
 
+> **Scenario RFC0066.21 — the chart renders RFC 0067's rules by default**
+> - **Given** `receiver.wal.backend: kafka` and otherwise default values
+> - **When** the chart renders
+> - **Then** the receiver config carries `allow_unverified_ack: false`,
+>   `durability_recheck_secs: 60` and `broker_kind: kafka`, and a
+>   `pre-install,pre-upgrade` hook Job runs `wal topic ensure` with the
+>   receiver's image and config
+> - **And** `topic.manage: false` renders no Job; `brokerKind: redpanda`
+>   makes the Job ensure `write.caching=false` instead of
+>   `flush.messages=1`; `allowUnverifiedAck: true` makes it ensure
+>   neither; `topic.minInsyncReplicas: 1` or `topic.replicationFactor: 1`
+>   fails the render
+> - **And** no chart value removes the floor, leader, ELR or rack checks
+>   from the rendered config
+
+> **Scenario RFC0066.22 — the ensure verb conforms, is idempotent and never weakens**
+> - **Given** an in-memory broker of each kind with no topic, then with
+>   the topic it created, then with a topic whose `min.insync.replicas`
+>   is 3, `max.message.bytes` above the minimum and
+>   `unclean.leader.election.enable` `true`
+> - **When** `wal topic ensure` runs, twice in each case
+> - **Then** the first case creates a topic with exactly §3.10's
+>   settings for that kind; the second changes nothing; the third keeps
+>   `min.insync.replicas=3` and the larger `max.message.bytes`, sets
+>   unclean election to `false`, and the second run changes nothing
+> - **And** a topic whose replication factor or partition count differs
+>   makes the verb fail naming it, and a result the startup check would
+>   refuse (for example a broker with no rack under the opt-in) makes the
+>   verb fail with the same error the receiver would log
+
 ## 6. Testing strategy
 
 - RFC0066.1, .4: unit tests in `ourios-server/src/config` and next to
@@ -803,7 +886,10 @@ removes only copies of the same log entry.
   only in CI. RFC0066.3 extends the WAL crash-recovery job to the broker
   backend, as RFC 0064 §3.2 requires for every backend.
 - RFC0066.9: the existing suites, unchanged.
-- RFC0066.10: `deploy/helm/render-tests.sh`.
+- RFC0066.10, .21: `deploy/helm/render-tests.sh`.
+- RFC0066.22: unit tests of the verb against the in-memory
+  `BrokerClient`; its create-and-reconcile arm also runs in the CI
+  container jobs against Redpanda and Apache Kafka.
 - `criterion`: an ack-latency bench for the broker backend against the
   in-memory client, and a query bench for the tail merge, before
   `validated`.

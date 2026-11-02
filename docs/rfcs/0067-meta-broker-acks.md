@@ -1,7 +1,7 @@
 ---
 rfc: 0067
 title: "meta: broker-replicated acks under WAL-before-ack"
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-02
@@ -11,7 +11,14 @@ superseded-by: —
 
 # RFC 0067 — meta: broker-replicated acks under WAL-before-ack
 
-> **Status: `drafted`.** This is a `meta:` RFC. It proposes a change to
+> **Status: `specified`.** The maintainer answered all seven §7
+> questions on 2026-11-02, each as recommended, and added one
+> requirement: the Helm chart provides the plumbing that makes a default
+> install honour them (§3.6, specified in RFC 0066 §3.10). §5 holds the
+> enactment checks. The enacting PR for §3.2–§3.4 lands once the
+> maintainer approves this RFC, as RFC 0064's did.
+>
+> This is a `meta:` RFC. It proposes a change to
 > `AGENTS.md` §3.4, written against the text **RFC 0064** (`accepted`)
 > put there, and to `docs/hazards.md` H3 and H8. `AGENTS.md`'s footer
 > requires "a `meta:` RFC and majority maintainer approval" for any
@@ -231,7 +238,18 @@ Between two checks an admin change can go unseen for up to one
 interval; the opt-in's warning and H3's escalation cover that window,
 and the interval is the knob that shrinks it.
 
-### 3.6 What does not change
+### 3.6 Deployment (maintainer, 2026-11-02)
+
+The Helm chart must provide the plumbing that makes a default install
+honour §7's seven decisions: the opt-in as one explicit value, default
+off; the re-check interval rendered with its default; no value that
+turns a check off; and a topic-ensure hook, running Ourios's own verb,
+that creates or reconciles the WAL topic to conforming settings and then
+runs the startup check against it. Broker-side settings (rack labels,
+ELR) stay the broker operator's; the startup check refuses without
+them. RFC 0066 §3.10 specifies this, with criteria RFC0066.21–.22.
+
+### 3.7 What does not change
 
 - RFC 0064's floor of two, leader rule and fencing, for every backend.
 - `AGENTS.md` §3.6: the broker holds records only up to the WAL
@@ -271,7 +289,8 @@ These check the enactment only, as RFC 0064 §5 does. The runtime
 behaviour the rule requires (startup classification, the opt-in and its
 warning, the failure-domain check, the periodic re-check and its
 verified-to-unverified transition) is specified as criteria
-RFC0066.16–.20 in RFC 0066 §5 and tested there.
+RFC0066.16–.20 in RFC 0066 §5, and the Helm plumbing (§3.6) as
+RFC0066.21–.22, tested there.
 
 > **Scenario RFC0067.1 — `AGENTS.md` §3.4 matches §3.2–§3.3**
 > - **Given** the enacting PR
@@ -303,52 +322,33 @@ RFC0066.16–.20 in RFC 0066 §5 and tested there.
 
 ## 7. Open questions
 
-Behaviour decisions for the maintainer. Each has a recommendation.
+All resolved by the maintainer on 2026-11-02, each as recommended.
 
-- [ ] **Q1. May Ourios confirm data that the brokers hold only in
-  memory?** On default Apache Kafka, an acknowledged batch sits in RAM
-  on two or three machines until the kernel writes it out; if all of
-  them lose power together, it is gone. Options: (a) allow only with an
-  explicit opt-in and a startup warning (this draft); (b) never: accept
-  only brokers that show they write to disk first; (c) allow without an
-  opt-in. *Recommendation: (a).* It keeps "no in-memory-only acks" as
-  the default, makes the operator choose the trade knowingly, and still
-  lets Kafka shops use the backend. (b) is the safe fallback if you
-  want the invariant unchanged in substance.
-- [ ] **Q2. With the opt-in, must each copy be in a different rack or
-  zone?** *Recommendation: yes, checked from the brokers' rack labels,
-  refusing a missing label.* Without it, one power event in one rack
-  loses data, which is the exact failure the opt-in asks the operator
-  to accept as unlikely.
-- [ ] **Q3. Two copies in the write quorum, or three?** RFC 0064 fixed
-  two as the minimum. *Recommendation: keep two in the rule and
-  recommend three replicas (Kafka `min.insync.replicas=2`) in the
-  operator docs and Helm defaults.* Three keeps accepting writes while
-  one broker is down for maintenance, an availability choice, not a
-  durability floor.
-- [ ] **Q4. On Apache Kafka, does `flush.messages=1` count as "writes to
-  disk first"?** The code path fsyncs each replica before the ack, but
-  the documentation does not promise it. *Recommendation: yes,* with a
-  CI container test against Kafka that would catch an upstream change.
-- [ ] **Q5. With the opt-in on Apache Kafka, require Eligible Leader
-  Replicas?** Without ELR, one machine's power loss can lose
-  acknowledged data when it was the last in-sync copy (§3.1, row 3),
-  which RFC 0064's leader rule forbids. ELR is on by default only on new
-  clusters from Kafka 4.1. *Recommendation: yes,* checked from the
-  broker's finalized features at startup and every re-check; Redpanda
-  does not use Kafka's ISR election.
-- [ ] **Q6. How quickly must Ourios notice that the broker's settings
-  changed?** *Recommendation: re-check every 60 s to start, and tune it
-  from the re-check metric.* Shorter costs one metadata and config
-  request per topic per interval; longer leaves a wider window in which
-  a changed broker keeps getting acknowledged writes.
-- [ ] **Q7. Should WarpStream be supported even though Ourios cannot
-  read its replica floor or leader safety?** Its documentation says it
-  acknowledges only after the object-store commit, which would meet
-  the rule, but Ourios cannot check it. *Recommendation: no, not in
-  this RFC;* list it as unsupported and revisit if WarpStream exposes
-  something Ourios can read. Allowing it on the operator's word would
-  make the never-waived guarantees waivable.
+- [x] **Q1. May Ourios confirm data that the brokers hold only in
+  memory?** **Only with an explicit opt-in and a startup warning;**
+  otherwise only brokers that show they persist first (§3.5). The
+  default keeps "no in-memory-only acks", and an operator who opts in
+  accepts §3.1's fourth row knowingly.
+- [x] **Q2. With the opt-in, must each copy be in a different rack or
+  zone?** **Yes,** checked from the brokers' rack labels at startup and
+  every re-check; a missing label refuses.
+- [x] **Q3. Two copies in the write quorum, or three?** **Two in the
+  rule; three recommended** (replication factor 3,
+  `min.insync.replicas=2`) in the operator docs and the Helm defaults
+  (RFC 0066 §3.10).
+- [x] **Q4. On Apache Kafka, does `flush.messages=1` count as "writes to
+  disk first"?** **Yes,** with a CI container test against Kafka that
+  would catch an upstream change in the ordering.
+- [x] **Q5. With the opt-in on Apache Kafka, require Eligible Leader
+  Replicas?** **Yes,** checked from the finalized features at startup
+  and every re-check; Redpanda does not use Kafka's ISR election.
+- [x] **Q6. How quickly must Ourios notice that the broker's settings
+  changed?** **Every 60 s to start,** tuned from the re-check metric;
+  every failed check fails closed with the retryable rejection (§3.5).
+- [x] **Q7. Should WarpStream be supported even though Ourios cannot
+  read its replica floor or leader safety?** **No, not in this RFC.** It
+  is listed as unsupported; a later RFC can revisit it if WarpStream
+  exposes something Ourios can read.
 
 ## 8. References
 
@@ -356,7 +356,7 @@ Behaviour decisions for the maintainer. Each has a recommendation.
 - `docs/hazards.md` H3, H8, §Adding a new hazard
 - RFC 0012, RFC 0057, RFC 0064 (`meta:` precedent; RFC 0064 §3.1 is the
   base text), RFC 0053 §3.1 (retryable rejection), RFC 0065 (replicated
-  WAL), RFC 0066 §3.1, §3.2, §3.4, §3.9, §3.12, §5 (Kafka backend)
+  WAL), RFC 0066 §3.1, §3.2, §3.4, §3.9, §3.10, §3.12, §5 (Kafka backend)
 - Apache Kafka 4.1 documentation, *Topic configs*
   (`flush.messages`, `flush.ms`, `min.insync.replicas`,
   `unclean.leader.election.enable`):

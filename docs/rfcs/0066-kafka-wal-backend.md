@@ -509,8 +509,9 @@ records; Redpanda fsyncs before it acknowledges by default. This backend
 therefore needs a `meta:` RFC that adds a broker case to §3.4:
 "durably" means the append was acknowledged by every in-sync replica,
 with at least two in sync, and a broker that cannot meet that fails the
-append rather than degrading the ack. The earlier draft of RFC 0064 held
-that text; it moves to its own `meta:` RFC if this backend goes ahead.
+append rather than degrading the ack. That `meta:` RFC is **RFC 0067**
+(`drafted`), which also decides how a broker that does not fsync first
+is allowed.
 
 ## 4. Alternatives considered
 

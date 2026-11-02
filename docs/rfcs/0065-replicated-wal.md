@@ -794,7 +794,9 @@ the mass-failover time and vote-log batching as tuning signals.
 >   every position in any published file, so no new row collides with
 >   an old one; every template id it mints is above the store's id
 >   high-water when it acted, so no id in a published file names a
->   different template
+>   different template; and a restored template the lost suffix had
+>   already widened, widened again by the survivor, gets a version
+>   above every published one for its id
 
 > **Scenario RFC0065.26 — a delayed former flusher cannot move a checkpoint back**
 > - **Given** a group whose new flusher has checkpointed `seq` 200 and
@@ -818,7 +820,9 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Given** a conversation whose rows the flusher has published above
 >   the checkpoint, with the checkpoint not yet past them, and
 >   separately a flusher paused after writing a file of that
->   conversation and before its published entry commits
+>   conversation and before its published entry commits, and a flusher
+>   whose PUT of such a file is still in flight when the erasure entry
+>   commits and completes after the confirming pass
 > - **When** an erasure of that conversation completes, the paused
 >   flusher then resumes or is replaced, and the tenant is queried,
 >   with the store reachable and during an outage
@@ -1043,7 +1047,12 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   **cut-consistent bundle** for that `seq` to
   `<bucket>/wal/replicated/groups/<g>/checkpoints/<seq>/`: the miner
   snapshot of every tenant in the group, the group's id-allocator cursor
-  and its unused reserved blocks, all taken at the same cut. Only after
+  and its unused reserved blocks, and the effective miner configuration
+  and algorithm version of every tenant (item 4 below), all taken at
+  the same cut. A restore applies that configuration before it rebuilds
+  any miner, never the process's own settings, and a bundle naming an
+  algorithm version the binary does not support is refused, failing
+  the restore closed rather than mining differently (B11). Only after
   every object of the bundle is durable does it write `checkpoint.json`
   (the `seq`, the term, the bundle's key) and propose a checkpoint entry
   to the leader. Publication is **monotonic and fenced**: bundles are
@@ -1071,7 +1080,15 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   rows with them. Before mining any new entry the survivor reserves
   fresh blocks from the store, whose compare-and-swap high-water is
   above every block ever reserved, so no template id is minted twice
-  for different templates.
+  for different templates. Ids are not the only identity at risk: a
+  widen raises `template_version` without a new id, so the lost suffix
+  may have published `(7, 2)` while the survivor's snapshot still holds
+  `(7, 1)`. Every published version has its audit event in the store
+  first (audit-before-record, `ourios-ingester/src/publish.rs`), so
+  before mining the survivor reads, per restored template, the highest
+  version the tenant's audit trail holds, and its next widen of that
+  template takes the version above it, so no `(template_id,
+  template_version)` key ever names two token sequences.
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
   when the flusher reports its remaining ids. A miner that exhausts them
@@ -1163,12 +1180,16 @@ never count toward an ack (learners, under §4.3's shape).
   queryable with the same pruning as remote Parquet. They are a cache
   derived from the WAL and rebuilt from it after a disk loss, which
   `AGENTS.md` §3.6 allows.
-- **The tail volume is bounded.** A tail replica's local files hold
-  only rows above the checkpoint, which B25 already bounds on the
-  voters, and mined Parquet is smaller than the WAL frames it comes
-  from, so the chart gives each tail replica a volume the size of a
-  voter's WAL volume by default. Ourios reports tail cache bytes per
-  replica and alerts at 50 % and 80 % of that volume. If the volume
+- **The tail volume is bounded.** A tail node keeps, for every group
+  it hosts, the group's learner WAL above the checkpoint (B25 bounds
+  it, per group, as on the voters) and the local Parquet cache of the
+  same rows, which is no larger than that WAL. A tail node may host
+  more groups than a voter, so the chart sizes its volume per hosted
+  group: twice a voter volume's per-group share, times
+  `ceil(groups × tail_replicas / len(tail_peers))`, where a voter's
+  share is its volume divided by `ceil(groups × replication_factor /
+  len(peers))`. Ourios reports tail WAL and cache bytes per node and
+  alerts at 50 % and 80 % of that volume. If the volume
   fills anyway, the replica stops caching new rows for the group that
   needed the space and reports that group's tail unavailable (B17)
   until the checkpoint frees space; acks never wait on a tail volume,
@@ -1220,27 +1241,33 @@ never count toward an ack (learners, under §4.3's shape).
 - **Templates and aliases (H5).** The querier compiles body-equality
   predicates and renders rows against the stored template map (RFC
   0033) before it plans (`ourios-querier/src/lib.rs`). Tail rows can
-  use templates the querier's map does not hold: minted since that map
-  was published, or older than it but missing from a stale cached map
-  or one never loaded during an outage. So a `Tail` call first returns,
-  as of the same read point, the definitions (`template_id`,
-  `template_version`, tokens) of every template the tenant's
-  unpublished rows reference, whether minted above the checkpoint or
-  restored from its snapshot, and the querier compiles and renders
-  against the union of the stored map and those definitions;
-  ids are identical on every replica (§6.7), so the union has no
-  conflicts. Alias state is not produced by mining and is read as
-  today. During an object-store outage the querier uses its last
-  refreshed map and alias state (RFC 0060) plus the tail's definitions,
-  and a query whose predicate needs a template neither holds fails
-  with the unavailable report rather than matching nothing.
+  use templates that map does not hold, so the tail side does not
+  depend on it: the `Tail` scan carries the query's predicates (B19),
+  and the tail replica resolves body predicates against its own
+  template state, which holds every template its rows use, restored
+  from the snapshot or minted since, with the same ids on every
+  replica (§6.7). With the rows it returns it sends the definitions
+  (`template_id`, `template_version`, tokens) of only the templates
+  those rows reference, so the exchange grows with the result, not the
+  backlog, and a `count` sends none. For the Parquet side the querier
+  acquires its map **after** step 3 below fixes the read point: every
+  file it then reads, listed or named by the tail, was published
+  before the map was acquired, and audit-before-record puts that
+  file's templates in the store first, so RFC 0033's "re-derive, never
+  serve stale" map holds them; a row flushed after the read point is
+  still a tail row at that point. Alias state is not produced by mining
+  and is read as today. During an object-store outage the querier uses
+  its last refreshed map and alias state (RFC 0060) for nothing but
+  aliases, since the Parquet it would apply to is reported
+  unavailable.
 - **The querier's read**, per group the query's tenant is in:
   1. read the group's checkpoint `c`;
   2. list the tenant's Parquet files as today (`file_set.rs`);
   3. call `Tail` on any tail replica of the group with `from = c`; it
-     answers with that tenant's **unpublished** rows at or above `c`,
-     plus the keys of the tenant's files published above `c` as of its
-     read point, or "too old" if `c` is below the oldest row it keeps,
+     fixes a read point and answers with the keys of the tenant's files
+     published above `c` as of it, and the plan's tail scan
+     (`TailScan`) later returns that tenant's **unpublished** rows at
+     or above `c` as of the same read point, or "too old" if `c` is below the oldest row it keeps,
      in which case the querier restarts at step 1 (bounded retries).
      Those keys are hints: compaction or erasure may have retired a
      file since, so the querier re-resolves each key's partition
@@ -1299,7 +1326,18 @@ never count toward an ack (learners, under §4.3's shape).
   later file, so a paused publication, a flusher change or a re-flush
   after failover cannot bring them back, and the rows not yet
   published when the confirming pass runs, the residual RFC 0009 §7 D3
-  accepts on the local backend, are closed here too. Mining still
+  accepts on the local backend, are closed here too. An upload already
+  in flight when the entry commits, from the current flusher or a
+  former one, is fenced at publication: on this backend a file is live
+  only once the flusher has added it to its partition's manifest by
+  compare-and-swap (RFC 0009 §3.4), never by its PUT alone, and every
+  manifest add names the highest erasure entry the flusher had applied
+  when it wrote the file. The confirming pass records each group's
+  erasure entry position in the manifests it rewrites, and an add whose
+  file predates that position is refused: the flusher discards the
+  file and writes those positions again with the erasure applied, and
+  the orphaned object is never listed and is removed as RFC 0009
+  removes retired files. Mining still
   consumes those entries, so every replica's miner stays identical
   (B11).
 - **Scaling (B24).** Tail replicas come from the tail pool (§6.1),
@@ -1344,7 +1382,9 @@ never count toward an ack (learners, under §4.3's shape).
 
 - A gRPC service, `ourios.wal.v1.Replication`, on `listen_addr`, with
   `Append` (leader to follower), `Fetch` (catch-up), `Forward` (any node
-  to a leader) and `Tail` (querier to tail replica).
+  to a leader), and `Tail` and `TailScan` (querier to tail replica:
+  the read point and published keys, then the rows under that read
+  point, §6.7).
 - **Mutual TLS is required** (RFC 0030's `TlsSection`). A tail replica
   accepts `Tail` only from a client certificate whose identity (its
   URI or DNS subject alternative name) is listed in `tail_clients`, the
@@ -1386,7 +1426,7 @@ signal that tunes it:
 | Groups | 16 (about 0.06 cores of heartbeats; §4.6) | per-group CPU, memory and heartbeat cost; ingest skew across groups |
 | `tail_replicas` | 1 | tail call latency and saturation per tail replica |
 | Tail memory before local Parquet | the record sink's size and age triggers | tail replica memory, local file count and query bytes read |
-| Tail volume | a voter's WAL volume size; alerts at 50 % and 80 % | tail cache bytes per replica during real outages |
+| Tail volume | twice a voter's per-group share per hosted group; alerts at 50 % and 80 % | tail WAL and cache bytes per node during real outages |
 | Election and heartbeat timeouts | 50 ms heartbeat, 150–300 ms election: failover and tail gap about 1.8 × the election maximum, 0.55 s (§4.6) | failover time, spurious leadership changes |
 | Vote log | one per node, group-committed (§4.7): a node failure at 128 groups failed over in 0.5–0.8 s | failover time when a node's groups elect at once, vote-log fsync latency and votes per fsync |
 | Freshness target (B15) | under 1 s | ack-to-queryable latency, a new histogram on the tail path |
@@ -1403,8 +1443,8 @@ rest of this section.
   (`ourios-receiver-<i>.<service>:4319`), with `node_id` from the pod
   name.
 - The tail pool is a second StatefulSet, `-wal-tail`, with its own
-  `walTail.replicas`, volume claims (sized like a voter's WAL volume by
-  default, §6.7) and headless Service, rendered into `tail_peers`, and
+  `walTail.replicas`, volume claims (sized per hosted group by default,
+  §6.7) and headless Service, rendered into `tail_peers`, and
   `tail_clients` rendered from the querier certificate's identity.
   Scaling it changes `tail_peers` only, never `peers`, so the voting
   layout check (§6.1) is unaffected (B24).
@@ -1511,8 +1551,9 @@ from rows.
   the vote log on disk, durable fsync on, killing one node; indicative
   on the CI runner first, with §4.7's runs as the baseline.
 - RFC0065.28: the in-process cluster with the compactor's erasure
-  pass on the in-memory store, the flusher paused by a failpoint
-  between its object put and its published entry.
+  pass on the in-memory store, the flusher paused by failpoints
+  between its object put and its published entry, and inside the put
+  across the confirming pass.
 - `criterion`: ack latency on the replicated backend against the local
   one, and the tail merge, before `validated`.
 

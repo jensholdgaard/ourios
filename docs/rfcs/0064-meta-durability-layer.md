@@ -128,8 +128,9 @@ and `*Last updated: …*` moves to the enacting date.
   **in addition to** the WAL, not a replacement. On the replicated
   backend (RFC 0065) an ack waits for at least two fsynced replicas
   (its write quorum), a replica becomes leader only if it holds every
-  acknowledged batch, a replaced leader cannot acknowledge, and the
-  crash-recovery test kills the leader mid-batch."
+  acknowledged batch, a replaced leader cannot commit another batch
+  (a success it sends late is only for a batch the new leader holds),
+  and the crash-recovery test kills the leader mid-batch."
 - **H8.** The banner's "Ourios does not currently replicate at ingest,
   so this hazard is dormant" becomes "This hazard is dormant on the
   local WAL backend and live on the replicated one (RFC 0065)." The

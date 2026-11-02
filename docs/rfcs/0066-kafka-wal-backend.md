@@ -328,7 +328,13 @@ succeeds, so the trait changes shape:
   applicable" on this backend, and `reclaim_state` reports the bytes
   above the checkpoint.
 - **Retention gap** is then a misconfiguration: if a partition's log
-  start offset is above `c + 1` for its applied checkpoint `c`, someone
+  start offset is above `c + 1` for its applied checkpoint `c`, the
+  consumer first re-reads `checkpoint.json`, since normal reclamation
+  overtakes a consumer that lagged behind a newer checkpoint: if it
+  names a cut `c'` with log start ≤ `c' + 1`, the consumer restores that
+  bundle and continues from `c' + 1`; if the store is unreachable, it
+  reports the tail unavailable (B17) and retries, skipping nothing.
+  Only a log start above the newest checkpoint's `c' + 1` means someone
   changed retention or deleted records. The owner records an error event and
   `ourios.ingest.batches{error.type="retention_gap"}`, refuses to
   advance past the gap until an operator acknowledges it with an
@@ -406,14 +412,18 @@ partition in place of the Raft log; there is no separate tail topic.
   callers until the checkpoint passes it, so an erasure (RFC 0047 §3.6)
   that rewrites a published file is never undone by a cached copy, as
   in RFC 0065 §6.7. The querier treats those keys as hints and
-  re-resolves them through the current manifest, as there.
+  re-resolves them through the current manifest, and templates are
+  exchanged per query, as there.
 - **Erasure goes through the partition.** As in RFC 0065 §6.7, before
   its confirming pass the compactor produces an **erasure record** (the
   tenant and the erasure's predicate) to every partition the tenant
   maps to, and waits for each produce to be acknowledged; consumers
   stop serving matching rows below its offset, and an owner writes none
   of them to a later file, so an owner that paused between writing a
-  file and its published record cannot bring them back.
+  file and its published record cannot bring them back. An upload in
+  flight when the erasure record is acknowledged is fenced at the
+  manifest exactly as in RFC 0065 §6.7, with the erasure record's
+  offset as the position the manifest add is checked against.
 - **Checkpoint without the store.** The replica holds the last
   checkpoint record it applied, from the WAL partition, so it answers a
   querier that cannot reach the store, including one that started
@@ -668,7 +678,8 @@ removes only copies of the same log entry.
 >   frame while the receiver runs, and separately a conversation whose
 >   rows the owner has published above the checkpoint, with the owner
 >   paused after writing one of its files and before producing that
->   file's published record
+>   file's published record, and another whose upload is still in
+>   flight when the erasure record is acknowledged
 > - **When** an export with that frame arrives, and an erasure of the
 >   conversation completes and the owner resumes before the tenant is
 >   queried

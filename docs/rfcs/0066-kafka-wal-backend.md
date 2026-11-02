@@ -35,15 +35,14 @@ superseded-by: —
 ## 1. Summary
 
 The receiver's WAL gets a second backend: a topic on a Kafka-protocol
-broker (`receiver.wal.backend: kafka`). A receiver acknowledges an
-export once the broker has acknowledged its frame from every in-sync
-replica. Each tenant's frames go to one partition, chosen by a fixed
-hash, and each partition is mined by one receiver, chosen by its
-StatefulSet ordinal. Checkpoints and miner snapshots move to object
+broker (`receiver.wal.backend: kafka`), and a receiver acknowledges an
+export once every in-sync broker replica holds its frame. Each tenant's
+frames go to one partition by a fixed hash, each partition is mined by
+one receiver, and checkpoints and miner snapshots live in object
 storage, so a broker-backed receiver needs no persistent volume. Tail
-replicas consume the same partitions with RFC 0065's deterministic
-miner and serve the rows not yet in Parquet, exactly as RFC 0065 §6.7
-does, so a record is queryable about a second after it is acked. Every row carries its log position, and that position is the
+replicas mine the same partitions with RFC 0065's deterministic miner
+and serve the rows not yet in Parquet, so a record is queryable about a
+second after it is acked. Every row carries its log position, the
 dedup key across redelivery, handoff and the flush boundary. The local
 backend stays the default and does not change.
 
@@ -102,6 +101,7 @@ receiver:
       max_backlog_bytes: "${env:OURIOS_RECEIVER_WAL_KAFKA_MAX_BACKLOG_BYTES}"  # per partition above its checkpoint, required (§3.5)
       tail_peers: "${env:OURIOS_RECEIVER_WAL_TAIL_PEERS}"  # tail pool: id=host:port,… (§3.8)
       tail_replicas: 1            # tail replicas per partition from the pool, 1..=tail_peers
+      tail_clients: "${env:OURIOS_RECEIVER_WAL_TAIL_CLIENTS}"  # querier certificate identities allowed to call Tail (RFC 0065 §6.8)
       tls: { ... }                # client TLS; same leaves as RFC 0030's TlsSection
       sasl:
         mechanism: "${env:OURIOS_RECEIVER_WAL_KAFKA_SASL_MECHANISM:-}"  # PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
@@ -380,13 +380,16 @@ partition in place of the Raft log; there is no separate tail topic.
   (`OURIOS_RECEIVER_WAL_KAFKA_TAIL_REPLICAS`, `1..=tail_peers`), validated
   as RFC 0065 §3.8 validates its fields, and a node in `tail_peers` runs
   in tail mode. Each partition's tail replicas are chosen by rendezvous
-  hashing as in RFC 0065 §6.1. Each consumes its partitions from the latest checkpoint
-  record, mines them with RFC 0065's deterministic miner and the
+  hashing as in RFC 0065 §6.1. Each restores the latest checkpoint's
+  bundle, consumes its partitions from `c + 1` (§3.5), mines them with RFC 0065's deterministic miner and the
   log-ordered id allocation of §3.5, and keeps the mined rows above the
   checkpoint in memory and in local Parquet files, written by the same
   writer as the store's. Those files are a cache on an ephemeral volume,
   rebuilt by re-consuming the partition, so the receivers stay
-  stateless.
+  stateless. They hold only rows above the checkpoint, which
+  `max_backlog_bytes` bounds per partition, so the chart sizes the
+  volume from it; a full volume is handled as RFC 0065 §6.7 handles a
+  full tail volume.
 - **Read barrier (B14).** A `Tail` call reads the partition's
   high-water offset `h` (`ListOffsets`) when it arrives and answers once
   the replica has mined through `h − 1`, or reports the tail
@@ -420,9 +423,9 @@ partition in place of the Raft log; there is no separate tail topic.
   from the checkpoint, then dedup by ingest position across the whole
   input, with candidates chosen by overlapping position ranges in
   footer statistics, never by file name or time.
-- **A lost tail replica** loses only a cache: its replacement consumes
-  from the checkpoint record and serves once it has mined through the
-  high-water. That needs the checkpoint's bundle, which is in the
+- **A lost tail replica** loses only a cache: its replacement restores
+  the bundle for the checkpoint `c`, consumes from `c + 1` as recovery
+  does (§3.5) and serves once it has mined through the high-water. That needs the checkpoint's bundle, which is in the
   object store, and the records at or below the cut are deleted, so a
   tail replica that starts with an empty cache **during** a store
   outage cannot rebuild its miner state: it reports the tail
@@ -458,8 +461,9 @@ partition in place of the Raft log; there is no separate tail topic.
 - Tail replicas are a second StatefulSet, `-wal-tail`, with an
   ephemeral volume for their local Parquet cache, rendered into
   `tail_peers`; it carries the broker settings, and queriers reach it
-  over the peer protocol with mutual TLS (RFC 0065 §6.8), so queriers
-  need no broker settings.
+  over the peer protocol with mutual TLS, accepted only from the
+  identities in `tail_clients` (RFC 0065 §6.8), so queriers need no
+  broker settings.
 
 ### 3.11 Invariants and hazards
 
@@ -551,8 +555,10 @@ removes only copies of the same log entry.
 >   `unclean.leader.election.enable` is `true`, its `cleanup.policy` is
 >   not exactly `delete` (a compacted topic is refused), its retention
 >   is not unlimited, its `max.message.bytes` is below one maximal
->   frame, or its partition count, cluster id or topic id differs from
->   `<bucket>/wal/<topic>/topic.json` (a recreated topic is refused)
+>   frame, any of its partitions has fewer replicas than
+>   `max(2, min.insync.replicas)`, or its partition count, cluster id
+>   or topic id differs from `<bucket>/wal/<topic>/topic.json` (a
+>   recreated topic is refused)
 
 > **Scenario RFC0066.2 — an export is acked only after every in-sync replica has it**
 > - **Given** a broker backend on a three-broker cluster with

@@ -231,6 +231,7 @@ receiver:
       groups: 16
       replication_factor: 3                     # voters per group: 3 or 5
       tail_replicas: 1                          # learners per group from the tail pool, ≥ 1
+      tail_clients: "${env:OURIOS_RECEIVER_WAL_TAIL_CLIENTS}" # querier certificate identities allowed to call Tail
       tls: { ... }                              # peer mTLS; RFC 0030's TlsSection leaves
 ```
 
@@ -245,8 +246,11 @@ replica per group is its flusher (§6.5), so a group without one would
 never publish to Parquet. Timing knobs depend on the design and are
 listed in §6. Classification under RFC 0004: `backend` is a deployment
 choice; `groups` and `replication_factor` are layout and durability
-choices fixed at first start (§6.1); `tail_peers` and `tail_replicas`
-may change at any time (§6.1); the rest are locations and credentials.
+choices fixed at first start (§6.1); `tail_peers`, `tail_replicas` and
+`tail_clients` may change at any time (§6.1); the rest are locations
+and credentials. `tail_clients` is a comma-separated list of
+certificate identities and must be non-empty, since without it no
+querier could read the tail (§6.8).
 
 ## 4. Background — the Rust replication ecosystem
 
@@ -678,6 +682,9 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **When** each tenant queries records still in the tail
 > - **Then** each sees only its own rows, and the masked attribute is
 >   masked exactly as in Parquet results
+> - **And** a `Tail` call from a client certificate not in
+>   `tail_clients`, a voter's or tail replica's own included, gets
+>   `PERMISSION_DENIED` and no rows
 
 > **Scenario RFC0065.14 — an unreachable tail is reported (B17)**
 > - **Given** a group whose tail cannot be read (its writer down, no
@@ -688,7 +695,7 @@ the mass-failover time and vote-log batching as tuning signals.
 >   so
 > - **And** the same query with `require_complete: true` fails with the
 >   retryable unavailable error (HTTP `503`, an MCP tool error) naming
->   the group, and returns no rows; the same holds for
+>   the group in the §6.7 wire form, and returns no rows; the same holds for
 >   `parquet_unavailable` during a store outage (RFC0065.21)
 
 > **Scenario RFC0065.15 — a store outage does not stop acks (B10)**
@@ -1156,6 +1163,16 @@ never count toward an ack (learners, under §4.3's shape).
   queryable with the same pruning as remote Parquet. They are a cache
   derived from the WAL and rebuilt from it after a disk loss, which
   `AGENTS.md` §3.6 allows.
+- **The tail volume is bounded.** A tail replica's local files hold
+  only rows above the checkpoint, which B25 already bounds on the
+  voters, and mined Parquet is smaller than the WAL frames it comes
+  from, so the chart gives each tail replica a volume the size of a
+  voter's WAL volume by default. Ourios reports tail cache bytes per
+  replica and alerts at 50 % and 80 % of that volume. If the volume
+  fills anyway, the replica stops caching new rows for the group that
+  needed the space and reports that group's tail unavailable (B17)
+  until the checkpoint frees space; acks never wait on a tail volume,
+  and no acknowledged record is lost, since the WAL still holds it.
 - **Where the mined rows come from: a deterministic miner.** Every tail
   replica mines the same committed log from the same snapshot and gets
   the rows the leader gets, so only raw frames are replicated. A spike
@@ -1297,7 +1314,21 @@ never count toward an ack (learners, under §4.3's shape).
   behaviour. A request with `require_complete: true` (default `false`)
   instead fails with the retryable unavailable error (HTTP `503`, an
   MCP tool error) naming what was unreachable, and returns no rows; it
-  applies to `parquet_unavailable` alike. Dashboards keep the default;
+  applies to `parquet_unavailable` alike. The wire form:
+  - Request: `require_complete`, an optional JSON boolean on the RFC
+    0016 query body and the MCP `query_logs` arguments.
+  - Response: two optional top-level arrays on the query response (RFC
+    0016's `LogQueryResponse`) and in the MCP tool's structured result,
+    omitted when empty: `tail_unavailable`, objects `{ "group": <u32> }`
+    with the group index of §6.1, one per group and sorted by it; and
+    `parquet_unavailable`, objects `{ "key": "<object key>" }`, one per
+    file, sorted by key. A store outage that hides a whole listing
+    reports `{ "key": "<partition prefix>/" }` for the prefix it could
+    not list.
+  - The `503` body is RFC 0016's `{ "error": { "kind", "message" } }`
+    with `kind` `"incomplete"`, plus the same two arrays beside
+    `error`; the MCP tool error carries the same object as its
+    structured content. Dashboards keep the default;
   alerting rules set the flag, so a missing tail never reads as
   "nothing happened".
 - **Same plan (B18).** The tail is a DataFusion table beside the
@@ -1314,9 +1345,17 @@ never count toward an ack (learners, under §4.3's shape).
 - A gRPC service, `ourios.wal.v1.Replication`, on `listen_addr`, with
   `Append` (leader to follower), `Fetch` (catch-up), `Forward` (any node
   to a leader) and `Tail` (querier to tail replica).
-- **Mutual TLS is required** (RFC 0030's `TlsSection`). A querier's
-  `Tail` call carries the query's tenant, already authorized by the
-  querier (RFC 0047); the tail replica returns only that tenant's rows.
+- **Mutual TLS is required** (RFC 0030's `TlsSection`). A tail replica
+  accepts `Tail` only from a client certificate whose identity (its
+  URI or DNS subject alternative name) is listed in `tail_clients`, the
+  queriers' identities the chart renders from the querier certificate
+  secret; any other caller, another replica included, gets
+  `PERMISSION_DENIED` and no rows. A `Tail` call carries the query's
+  tenant, already authorized by the querier (RFC 0047), and the tail
+  replica returns only that tenant's rows. Trusting the querier for the
+  tenant adds no authority: a querier already reads every tenant's
+  Parquet with its store credentials, so a `Tail` call gives it nothing
+  the store does not.
 - The protocol carries a version, and a node rejects a peer with an
   unknown version (B22).
 
@@ -1347,6 +1386,7 @@ signal that tunes it:
 | Groups | 16 (about 0.06 cores of heartbeats; §4.6) | per-group CPU, memory and heartbeat cost; ingest skew across groups |
 | `tail_replicas` | 1 | tail call latency and saturation per tail replica |
 | Tail memory before local Parquet | the record sink's size and age triggers | tail replica memory, local file count and query bytes read |
+| Tail volume | a voter's WAL volume size; alerts at 50 % and 80 % | tail cache bytes per replica during real outages |
 | Election and heartbeat timeouts | 50 ms heartbeat, 150–300 ms election: failover and tail gap about 1.8 × the election maximum, 0.55 s (§4.6) | failover time, spurious leadership changes |
 | Vote log | one per node, group-committed (§4.7): a node failure at 128 groups failed over in 0.5–0.8 s | failover time when a node's groups elect at once, vote-log fsync latency and votes per fsync |
 | Freshness target (B15) | under 1 s | ack-to-queryable latency, a new histogram on the tail path |
@@ -1363,9 +1403,11 @@ rest of this section.
   (`ourios-receiver-<i>.<service>:4319`), with `node_id` from the pod
   name.
 - The tail pool is a second StatefulSet, `-wal-tail`, with its own
-  `walTail.replicas`, volume claims and headless Service, rendered into
-  `tail_peers`. Scaling it changes `tail_peers` only, never `peers`, so
-  the voting layout check (§6.1) is unaffected (B24).
+  `walTail.replicas`, volume claims (sized like a voter's WAL volume by
+  default, §6.7) and headless Service, rendered into `tail_peers`, and
+  `tail_clients` rendered from the querier certificate's identity.
+  Scaling it changes `tail_peers` only, never `peers`, so the voting
+  layout check (§6.1) is unaffected (B24).
 - The peer port is on the headless Service only. Peer and querier
   client certificates are mounted from secrets named in values, as RFC
   0030's listener certificates are.
@@ -1381,7 +1423,9 @@ rest of this section.
 - **§3.5 schema:** one optional column; old files read unchanged.
 - **§3.6 object storage as truth:** group records, checkpoints,
   snapshots and the cluster layout live in the store. Local disk holds
-  only the WAL up to the checkpoint, and the tail is derived from it.
+  only the WAL above the checkpoint and caches derived from it (the
+  tail's memory and local Parquet files), all rebuilt from the WAL and
+  the store after a disk loss.
 - **§3.7 tenancy:** the tenant is in every frame and every tail row.
 - **H3:** the batch window stays the knob; RFC0065.3 is this backend's
   crash test.

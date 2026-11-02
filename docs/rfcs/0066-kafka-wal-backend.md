@@ -204,11 +204,12 @@ existing `cargo deny` check.
 - **Every record says what it is.** A record header `ourios.kind`
   names its kind and `ourios.v` its format version (`1`): `batch` (the
   data record above), and the control records `checkpoint` (cut, bundle
-  key, owner), `published` (file key, offsets held, owner) and
-  `id_block` (the reserved range, owner), whose values are JSON objects
+  key, owner), `published` (file key, offsets held, owner),
+  `erasure` (tenant, predicate, as RFC 0065 §6.7) and `id_block` (the
+  reserved range, owner), whose values are JSON objects
   with exactly those fields. Consumers process every kind in offset
-  order: `batch` is mined, `checkpoint` and `published` are applied as
-  §3.5 and §3.8 say, `id_block` feeds the allocator. A record with an
+  order: `batch` is mined, `checkpoint`, `published` and `erasure` are
+  applied as §3.5 and §3.8 say, `id_block` feeds the allocator. A record with an
   unknown kind or a higher version stops consumption of that partition
   and reports it, rather than being skipped, since skipping a control
   record could make replicas mine differently.
@@ -292,10 +293,10 @@ succeeds, so the trait changes shape:
   closed for that partition, since `DeleteRecords` has removed what a
   full replay would need.
 - **Recovery** on start or on taking over a partition: read the
-  checkpoint `c` and the snapshots, fetch from the lower of `c` and the
-  snapshots' high-water marks, and suppress per consumer as RFC 0008
-  §6.6 does: Parquet emission below `c`, mining at or below each
-  tenant's snapshot mark.
+  checkpoint `c`, restore its bundle, whose snapshots are cut at `c`,
+  and fetch from `c + 1`, the same rule as replay above. An older
+  bundle cannot be used once `DeleteRecords(before = c + 1)` has
+  removed the history it would need.
 - **Handoff and template ids.** When `R` changes, a partition's old and
   new owner can both mine it for a while, and position dedup keeps only
   one copy of each row, so both copies must be identical, `template_id`
@@ -401,7 +402,15 @@ partition in place of the Raft log; there is no separate tail topic.
   applies it stops serving those rows and returns the key to `Tail`
   callers until the checkpoint passes it, so an erasure (RFC 0047 §3.6)
   that rewrites a published file is never undone by a cached copy, as
-  in RFC 0065 §6.7.
+  in RFC 0065 §6.7. The querier treats those keys as hints and
+  re-resolves them through the current manifest, as there.
+- **Erasure goes through the partition.** As in RFC 0065 §6.7, before
+  its confirming pass the compactor produces an **erasure record** (the
+  tenant and the erasure's predicate) to every partition the tenant
+  maps to, and waits for each produce to be acknowledged; consumers
+  stop serving matching rows below its offset, and an owner writes none
+  of them to a later file, so an owner that paused between writing a
+  file and its published record cannot bring them back.
 - **Checkpoint without the store.** The replica holds the last
   checkpoint record it applied, from the WAL partition, so it answers a
   querier that cannot reach the store, including one that started
@@ -651,9 +660,12 @@ removes only copies of the same log entry.
 > **Scenario RFC0066.14 — size rejections are not outages, and erased rows stay erased**
 > - **Given** a topic whose `max.message.bytes` is lowered below a
 >   frame while the receiver runs, and separately a conversation whose
->   rows the owner has published above the checkpoint
+>   rows the owner has published above the checkpoint, with the owner
+>   paused after writing one of its files and before producing that
+>   file's published record
 > - **When** an export with that frame arrives, and an erasure of the
->   conversation completes before the tenant is queried
+>   conversation completes and the owner resumes before the tenant is
+>   queried
 > - **Then** the export gets the non-retryable size response
 >   (`RESOURCE_EXHAUSTED` without `RetryInfo`, HTTP `413`), not
 >   `UNAVAILABLE`; and the query returns no erased row from any tail

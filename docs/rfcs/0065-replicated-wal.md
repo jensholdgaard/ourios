@@ -119,9 +119,11 @@ headline requirements are durability (§3.1–§3.3), a queryable tail
 
 ### 3.2 One writer per tenant
 
-- **B5.** At any time at most one replica can acknowledge writes for a
-  tenant. A replica that has lost that role can never acknowledge
-  again under it, whatever its clock says.
+- **B5.** At any time at most one replica can commit writes for a
+  tenant. A replica that has lost that role can never commit again
+  under it, whatever its clock says. A success it sends late is for a
+  record it committed before losing the role, which the new holder has
+  (B6), so a late success never confirms a record that can be lost.
 - **B6.** A replica takes the role only if it holds every acknowledged
   record of that tenant's log.
 
@@ -156,9 +158,11 @@ headline requirements are durability (§3.1–§3.3), a queryable tail
 
 ### 3.4 Ordering, tenancy and dedup
 
-- **B11.** Each tenant's records are mined in the order they were
-  acknowledged, and every replica that mines them produces the same
-  rows.
+- **B11.** Each tenant's records are mined in the order of their log
+  position, which is the order they were committed; an export
+  acknowledged before another was sent always has the lower position.
+  Every replica that mines them produces the same rows. Successes of
+  concurrent exports may reach their clients in either order.
 - **B12.** Tenancy holds everywhere (`AGENTS.md` §3.7): every stored
   frame and every served row carries its tenant, and nothing is ever
   routed or filtered by a shared container alone.
@@ -601,7 +605,8 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Given** the acknowledging replica paused while another takes over
 > - **When** it resumes and processes its queued turns, with its clock
 >   set arbitrarily
-> - **Then** it acknowledges nothing, and its waiting clients get the
+> - **Then** it commits nothing new: every success it sends is for a
+>   record the new writer holds, and its other waiting clients get the
 >   retryable rejection
 
 > **Scenario RFC0065.5 — takeover only by a replica with every ack (B6, B8)**
@@ -632,8 +637,9 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **When** they run on a fixed set of tenant ids and peers, and the
 >   two tenants export to a node that does not hold their group
 > - **Then** the hashes return the golden values committed with this
->   RFC's implementation, both exports are acked and mined in ack
->   order, and each tenant's query returns only its own rows
+>   RFC's implementation, both exports are acked and mined in log
+>   position order, an export acked before the other was sent mined
+>   first, and each tenant's query returns only its own rows
 
 > **Scenario RFC0065.9 — a corrupt replica does not recover from itself (B4)**
 > - **Given** a follower whose group log fails an integrity check
@@ -779,7 +785,9 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Then** it prints the possibly-lost range before acting, the
 >   survivor leads alone, and its first new entry's position is above
 >   every position in any published file, so no new row collides with
->   an old one
+>   an old one; every template id it mints is above the store's id
+>   high-water when it acted, so no id in a published file names a
+>   different template
 
 > **Scenario RFC0065.26 — a delayed former flusher cannot move a checkpoint back**
 > - **Given** a group whose new flusher has checkpointed `seq` 200 and
@@ -801,9 +809,12 @@ the mass-failover time and vote-log batching as tuning signals.
 
 > **Scenario RFC0065.28 — the tail never resurrects an erased row**
 > - **Given** a conversation whose rows the flusher has published above
->   the checkpoint, with the checkpoint not yet past them
-> - **When** an erasure of that conversation completes, and the tenant
->   is then queried, with the store reachable and during an outage
+>   the checkpoint, with the checkpoint not yet past them, and
+>   separately a flusher paused after writing a file of that
+>   conversation and before its published entry commits
+> - **When** an erasure of that conversation completes, the paused
+>   flusher then resumes or is replaced, and the tenant is queried,
+>   with the store reachable and during an outage
 > - **Then** no erased row is returned: with the store reachable the
 >   rewritten file answers for them, and during the outage that file is
 >   named in `parquet_unavailable`; no tail replica serves them
@@ -976,7 +987,7 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   then in the candidate's log (B6); nothing the old leader appends after
   it can commit. An acknowledgement the old leader sends late is
   therefore always of an entry the new leader holds, and B5's "can
-  never acknowledge again" is enforced at the commit, not the send.
+  never commit again" is enforced at the commit, not the send.
   Before the fallback replaces `openraft`, this handshake must pass
   RFC0065.10's bounded model check, including the interleaving of a
   late follower reply with an election. An old leader that tries to remove the
@@ -1047,7 +1058,13 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   of every file). `ourios wal force-leader` (B8) starts its new log
   above the larger of that and the survivor's log end, so a position
   that a lost replica flushed but never checkpointed is never issued
-  again (§4.5).
+  again (§4.5). For the same reason it abandons every unused id block
+  the survivor holds, from its log and from the checkpoint snapshot:
+  the lost suffix may already have minted ids from them, and published
+  rows with them. Before mining any new entry the survivor reserves
+  fresh blocks from the store, whose compare-and-swap high-water is
+  above every block ever reserved, so no template id is minted twice
+  for different templates.
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
   when the flusher reports its remaining ids. A miner that exhausts them
@@ -1186,11 +1203,14 @@ never count toward an ack (learners, under §4.3's shape).
 - **Templates and aliases (H5).** The querier compiles body-equality
   predicates and renders rows against the stored template map (RFC
   0033) before it plans (`ourios-querier/src/lib.rs`). Tail rows can
-  use templates minted since that map was published, so a `Tail` call
-  first returns the template definitions (`template_id`,
-  `template_version`, tokens) the replica has minted above the
-  checkpoint, as of the same read point, and the querier compiles and
-  renders against the union of the stored map and those definitions;
+  use templates the querier's map does not hold: minted since that map
+  was published, or older than it but missing from a stale cached map
+  or one never loaded during an outage. So a `Tail` call first returns,
+  as of the same read point, the definitions (`template_id`,
+  `template_version`, tokens) of every template the tenant's
+  unpublished rows reference, whether minted above the checkpoint or
+  restored from its snapshot, and the querier compiles and renders
+  against the union of the stored map and those definitions;
   ids are identical on every replica (§6.7), so the union has no
   conflicts. Alias state is not produced by mining and is read as
   today. During an object-store outage the querier uses its last
@@ -1204,8 +1224,12 @@ never count toward an ack (learners, under §4.3's shape).
      answers with that tenant's **unpublished** rows at or above `c`,
      plus the keys of the tenant's files published above `c` as of its
      read point, or "too old" if `c` is below the oldest row it keeps,
-     in which case the querier restarts at step 1 (bounded retries);
-     the querier adds any of those files its listing missed;
+     in which case the querier restarts at step 1 (bounded retries).
+     Those keys are hints: compaction or erasure may have retired a
+     file since, so the querier re-resolves each key's partition
+     through its current manifest (RFC 0009 §3.4) and reads only the
+     live files there, replacement outputs included, never a retired
+     key;
   4. deduplicate by ingest position across the whole input, Parquet
      and tail together, before any aggregation or projection drops the
      key. Candidates are chosen by **position**, never by file name or
@@ -1244,10 +1268,23 @@ never count toward an ack (learners, under §4.3's shape).
   key, which it returns to `Tail` callers (step 3) until the checkpoint
   passes it. So once a row is in the object store, the store is its only
   source (`AGENTS.md` §3.6), and an erasure (RFC 0047 §3.6, RFC 0009)
-  that rewrites a published file is never undone by a cached copy. A
-  row not yet published when the erasure's confirming pass runs is the
-  residual RFC 0009 §7 D3 already accepts on the local backend,
-  unchanged here.
+  that rewrites a published file is never undone by a cached copy.
+- **Erasure goes through the log.** A flusher can pause after writing a
+  file and before its published entry commits, and an erasure can
+  rewrite that file meanwhile, so the published entry alone is not a
+  fence. Before its confirming pass, the compactor proposes an
+  **erasure entry** (the tenant and the erasure's predicate, RFC 0047
+  §3.6) to every group the tenant is in, through any receiver as an
+  export is (B9), and waits for each to commit; an erasure whose entry
+  cannot commit stays incomplete and is retried, it is never reported
+  done. Every replica that applies the entry stops serving the matching
+  rows below its position, and the flusher writes none of them to a
+  later file, so a paused publication, a flusher change or a re-flush
+  after failover cannot bring them back, and the rows not yet
+  published when the confirming pass runs, the residual RFC 0009 §7 D3
+  accepts on the local backend, are closed here too. Mining still
+  consumes those entries, so every replica's miner stays identical
+  (B11).
 - **Scaling (B24).** Tail replicas come from the tail pool (§6.1),
   `tail_replicas` per group (default 1); the querier spreads `Tail`
   calls across them. Adding tail nodes or raising `tail_replicas` is a
@@ -1430,7 +1467,8 @@ from rows.
   the vote log on disk, durable fsync on, killing one node; indicative
   on the CI runner first, with §4.7's runs as the baseline.
 - RFC0065.28: the in-process cluster with the compactor's erasure
-  pass on the in-memory store.
+  pass on the in-memory store, the flusher paused by a failpoint
+  between its object put and its published entry.
 - `criterion`: ack latency on the replicated backend against the local
   one, and the tail merge, before `validated`.
 

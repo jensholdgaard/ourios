@@ -36,7 +36,9 @@ and a Raft quorum alike, as three separate guarantees: an ack waits
 until at least two replicas, and at least the backend's configured
 floor, have fsynced the batch; a
 replica becomes leader only if it already holds every acknowledged
-batch; and a replica that has lost leadership can never acknowledge.
+batch; and a replica that has lost leadership can never commit
+another batch, so a success it sends late is only ever for a batch the
+new leader holds.
 The crash test covers the replicated backend too. H8 goes from dormant
 to live for the replicated backend, with the dedup key RFC 0065
 defines.
@@ -86,8 +88,9 @@ becomes:
   losing one disk never loses an acknowledged batch; when that cannot
   be met, the batch is rejected, not acknowledged on fewer. A replica
   becomes leader only if it already holds every acknowledged batch. A
-  replica that has lost leadership can never acknowledge, whatever its
-  clock says.
+  replica that has lost leadership can never commit another batch,
+  whatever its clock says, so a success it sends late is only ever for
+  a batch the new leader holds.
 ```
 
 The rest of §3.4 is unchanged. The crash-recovery bullet already says

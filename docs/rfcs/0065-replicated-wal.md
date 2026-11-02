@@ -822,11 +822,14 @@ the mass-failover time and vote-log batching as tuning signals.
 >   separately a flusher paused after writing a file of that
 >   conversation and before its published entry commits
 > - **When** an erasure of that conversation completes, the paused
->   flusher then resumes or is replaced, and the tenant is queried,
+>   flusher then resumes and commits its published entry, and the
+>   tenant is queried,
 >   with the store reachable and during an outage
 > - **Then** no erased row is returned: with the store reachable the
 >   rewritten file answers for them, and during the outage that file is
->   named in `parquet_unavailable`; no tail replica serves them
+>   named in `parquet_unavailable`; no tail replica serves them (a
+>   pre-request row a flusher publishes after the confirming pass is
+>   RFC 0009 D3's residual, pinned by RFC0009.22, not this scenario)
 
 ## 6. Proposed design
 
@@ -1322,19 +1325,21 @@ never count toward an ack (learners, under §4.3's shape).
   §3.6) to every group the tenant is in, through any receiver as an
   export is (B9), and waits for each to commit; an erasure whose entry
   cannot commit stays incomplete and is retried, it is never reported
-  done. Every replica that applies the entry stops serving the matching
-  rows below its position, and the flusher writes none of them to a
-  later file, so a paused publication, a flusher change or a re-flush
-  after failover cannot bring them back. This is the second fence RFC
-  0009 §7 D3 lists ("receivers that drop a marked conversation's rows
-  at publish, plus a receiver membership list"), with the group log as
-  the membership, so D3's residual narrows on this backend to one
-  case: an upload already in flight when the entry commits, from the
-  current flusher or a former one, whose PUT lands after the confirming
-  pass. Its rows stay readable from the store, exactly the residual D3
-  accepts and RFC0009.22 pins, and the tail never serves them. Closing
-  that case needs a store-side publication fence, which D3 leaves to a
-  later RFC; this RFC does not amend RFC 0009 §3.4's live-set rule.
+  done. A replica that has applied the entry serves none of the
+  matching rows below its position, and a flusher that has applied it
+  writes none of them to a file it publishes afterwards. So a cached
+  tail copy never outlives an erasure: the case of a paused publication
+  whose file the erasure has already rewritten is closed. Committing
+  the entry does not prove that every flusher has applied it, though:
+  a lagging current flusher, a paused former one or a re-flush after
+  failover can still publish matching pre-request rows after the
+  confirming pass. That is exactly RFC 0009 §7 D3's accepted residual
+  ("a pre-request row whose flush publishes after that pass is not
+  erased"), unchanged in scope on this backend and pinned by
+  RFC0009.22; the tail never serves those rows. Closing it needs a
+  barrier proving every possible publisher has applied the entry,
+  which D3 leaves to a later RFC; this RFC does not amend RFC 0009
+  §3.4's live-set rule.
   Mining still
   consumes those entries, so every replica's miner stays identical
   (B11).

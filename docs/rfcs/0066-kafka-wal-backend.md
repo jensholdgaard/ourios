@@ -419,13 +419,15 @@ partition in place of the Raft log; there is no separate tail topic.
 - **Erasure goes through the partition.** As in RFC 0065 §6.7, before
   its confirming pass the compactor produces an **erasure record** (the
   tenant and the erasure's predicate) to every partition the tenant
-  maps to, and waits for each produce to be acknowledged; consumers
-  stop serving matching rows below its offset, and an owner writes none
-  of them to a later file, so an owner that paused between writing a
-  file and its published record cannot bring them back. An upload in
-  flight when the erasure record is acknowledged that lands after the
-  confirming pass is RFC 0009 §7 D3's accepted residual, as in RFC
-  0065 §6.7, and no tail replica serves its rows.
+  maps to, and waits for each produce to be acknowledged. A consumer
+  that has applied it serves none of the matching rows below its
+  offset, and an owner that has applied it writes none of them to a
+  file it publishes afterwards, so no cached tail copy outlives the
+  erasure. A broker acknowledgement does not prove that every owner has
+  consumed the record, so an owner that lags or paused can still
+  publish matching pre-request rows after the confirming pass: RFC 0009
+  §7 D3's accepted residual, unchanged in scope, as in RFC 0065 §6.7,
+  and no tail replica serves those rows.
 - **Checkpoint without the store.** The replica holds the last
   checkpoint record it applied, from the WAL partition, so it answers a
   querier that cannot reach the store, including one that started

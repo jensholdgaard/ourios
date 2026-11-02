@@ -170,26 +170,30 @@ impl<'a> Cmp<'a> {
     /// can hold a path only through a map. Otherwise the row is resolved.
     fn eval(&self, json: &str) -> Result<bool> {
         let value = match json.find(&self.needle) {
-            Some(at) if !json[..at].contains(KVLIST) => {
-                // `pair` and `typed` open with the `{` before the needle.
-                let rest = &json[at..];
-                let is = |text: &str| rest.starts_with(&text[1..]);
-                return Ok(if self.eq {
-                    is(&self.pair)
-                } else {
-                    is(&self.typed) && !is(&self.pair)
-                });
-            }
+            Some(at) if !json[..at].contains(KVLIST) => return Ok(self.text_answer(&json[at..])),
             None if !self.key.contains('.') || !json.contains(KVLIST) => return Ok(false),
             _ => self.resolve(json, 0..self.key.len())?,
         };
-        Ok(value.is_some_and(|value| {
-            if self.eq {
-                value == self.expected
-            } else {
-                value.starts_with(self.type_prefix) && value != self.expected
-            }
-        }))
+        Ok(value.is_some_and(|value| self.value_answer(value)))
+    }
+
+    /// The answer from the stored text at the key's top-level pair;
+    /// `pair` and `typed` open with the `{` before the needle.
+    fn text_answer(&self, rest: &str) -> bool {
+        let is = |text: &str| rest.starts_with(&text[1..]);
+        if self.eq {
+            is(&self.pair)
+        } else {
+            is(&self.typed) && !is(&self.pair)
+        }
+    }
+
+    fn value_answer(&self, value: &str) -> bool {
+        if self.eq {
+            value == self.expected
+        } else {
+            value.starts_with(self.type_prefix) && value != self.expected
+        }
     }
 
     /// RFC 0062 §3.1 on the stored pair list `list`, for the part of the

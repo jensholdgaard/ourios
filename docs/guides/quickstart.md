@@ -119,8 +119,10 @@ survives.
 The querier reads Parquet only. A low-volume batch is written to
 Parquet once it is five minutes old, checked every 30 seconds, so it
 becomes queryable within about five and a half minutes. To see it
-sooner, stop the server with Ctrl-C (shutdown flushes everything
-buffered) and start it again.
+sooner, start the server with a shorter flush age, for example
+`OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS=5`: records then show up within
+about ten seconds, at the cost of more small Parquet files (RFC 0063).
+Stopping the server with Ctrl-C also flushes everything buffered.
 
 ## 4. Query
 

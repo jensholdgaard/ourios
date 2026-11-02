@@ -440,6 +440,10 @@ pub struct ReceiverSection {
     /// default off).
     #[serde(deserialize_with = "scalar_opt")]
     pub template_ids_allow_bootstrap: Option<String>,
+    /// RFC 0063 §3.1 — the sink's age trigger in seconds
+    /// (`receiver.max_buffer_age_secs`; default and ceiling 300).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub max_buffer_age_secs: Option<String>,
 }
 
 /// One `*_tls` block (RFC 0030 §3.1). Raw string leaves — the §3.1
@@ -984,7 +988,8 @@ impl ReceiverSection {
         self.http_tls.substitute(lookup)?;
         substitute(&mut self.wal_root, lookup)?;
         substitute(&mut self.encode_workers, lookup)?;
-        substitute(&mut self.template_ids_allow_bootstrap, lookup)
+        substitute(&mut self.template_ids_allow_bootstrap, lookup)?;
+        substitute(&mut self.max_buffer_age_secs, lookup)
     }
 }
 

@@ -89,6 +89,7 @@
 - [RFC 0058 — Query resource limits](./rfcs/0058-query-resource-limits.md)
 - [RFC 0059 — Durable template-id allocation](./rfcs/0059-durable-template-id-allocation.md)
 - [RFC 0060 — Background template-map refresh](./rfcs/0060-background-template-map-refresh.md)
+- [RFC 0061 — OTLP request-size limit](./rfcs/0061-otlp-request-size-limit.md)
 - [RFC 0062 — Attribute paths into map values](./rfcs/0062-attribute-map-paths.md)
 - [RFC 0063 — Configurable receiver flush age](./rfcs/0063-configurable-flush-age.md)
 - [RFC 0064 — meta: replication behind WAL-before-ack](./rfcs/0064-meta-durability-layer.md)

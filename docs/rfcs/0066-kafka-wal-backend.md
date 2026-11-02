@@ -394,7 +394,9 @@ partition in place of the Raft log; there is no separate tail topic.
   rebuilt by re-consuming the partition, so the receivers stay
   stateless. They hold only rows above the checkpoint, which
   `max_backlog_bytes` bounds per partition, so the chart sizes the
-  volume from it; a full volume is handled as RFC 0065 §6.7 handles a
+  volume for `max_backlog_bytes` times the topic's partition count, the
+  bound for a node holding every partition, which no placement or
+  reassignment can exceed, as RFC 0065 §6.7 does; a full volume is handled as RFC 0065 §6.7 handles a
   full tail volume.
 - **Read barrier (B14).** A `Tail` call reads the partition's
   high-water offset `h` (`ListOffsets`) when it arrives and answers once
@@ -421,9 +423,9 @@ partition in place of the Raft log; there is no separate tail topic.
   stop serving matching rows below its offset, and an owner writes none
   of them to a later file, so an owner that paused between writing a
   file and its published record cannot bring them back. An upload in
-  flight when the erasure record is acknowledged is fenced at the
-  manifest exactly as in RFC 0065 §6.7, with the erasure record's
-  offset as the position the manifest add is checked against.
+  flight when the erasure record is acknowledged that lands after the
+  confirming pass is RFC 0009 §7 D3's accepted residual, as in RFC
+  0065 §6.7, and no tail replica serves its rows.
 - **Checkpoint without the store.** The replica holds the last
   checkpoint record it applied, from the WAL partition, so it answers a
   querier that cannot reach the store, including one that started
@@ -678,8 +680,7 @@ removes only copies of the same log entry.
 >   frame while the receiver runs, and separately a conversation whose
 >   rows the owner has published above the checkpoint, with the owner
 >   paused after writing one of its files and before producing that
->   file's published record, and another whose upload is still in
->   flight when the erasure record is acknowledged
+>   file's published record
 > - **When** an export with that frame arrives, and an erasure of the
 >   conversation completes and the owner resumes before the tenant is
 >   queried

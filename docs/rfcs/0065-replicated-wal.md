@@ -682,7 +682,7 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **When** each tenant queries records still in the tail
 > - **Then** each sees only its own rows, and the masked attribute is
 >   masked exactly as in Parquet results
-> - **And** a `Tail` call from a client certificate not in
+> - **And** a `Tail` or `TailScan` call from a client certificate not in
 >   `tail_clients`, a voter's or tail replica's own included, gets
 >   `PERMISSION_DENIED` and no rows
 
@@ -820,9 +820,7 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Given** a conversation whose rows the flusher has published above
 >   the checkpoint, with the checkpoint not yet past them, and
 >   separately a flusher paused after writing a file of that
->   conversation and before its published entry commits, and a flusher
->   whose PUT of such a file is still in flight when the erasure entry
->   commits and completes after the confirming pass
+>   conversation and before its published entry commits
 > - **When** an erasure of that conversation completes, the paused
 >   flusher then resumes or is replaced, and the tenant is queried,
 >   with the store reachable and during an outage
@@ -1183,13 +1181,16 @@ never count toward an ack (learners, under §4.3's shape).
 - **The tail volume is bounded.** A tail node keeps, for every group
   it hosts, the group's learner WAL above the checkpoint (B25 bounds
   it, per group, as on the voters) and the local Parquet cache of the
-  same rows, which is no larger than that WAL. A tail node may host
-  more groups than a voter, so the chart sizes its volume per hosted
-  group: twice a voter volume's per-group share, times
-  `ceil(groups × tail_replicas / len(tail_peers))`, where a voter's
-  share is its volume divided by `ceil(groups × replication_factor /
-  len(peers))`. Ourios reports tail WAL and cache bytes per node and
-  alerts at 50 % and 80 % of that volume. If the volume
+  same rows, which is no larger than that WAL. Rendezvous placement
+  can give one tail node far more than the average share of groups,
+  and a tail-pool change moves groups, so the chart does not size from
+  an average: by default a tail volume holds twice what a node hosting
+  **every** group needs, 24 hours of the stated ingest rate for the
+  learner WAL and again for the cache, which no placement or
+  reassignment can exceed. Ourios reports the groups each node hosts
+  and its tail WAL and cache bytes, alerts at 50 % and 80 % of the
+  volume, and an operator who sizes smaller from the reported
+  placement does so knowingly. If the volume
   fills anyway, the replica stops caching new rows for the group that
   needed the space and reports that group's tail unavailable (B17)
   until the checkpoint frees space; acks never wait on a tail volume,
@@ -1324,20 +1325,17 @@ never count toward an ack (learners, under §4.3's shape).
   done. Every replica that applies the entry stops serving the matching
   rows below its position, and the flusher writes none of them to a
   later file, so a paused publication, a flusher change or a re-flush
-  after failover cannot bring them back, and the rows not yet
-  published when the confirming pass runs, the residual RFC 0009 §7 D3
-  accepts on the local backend, are closed here too. An upload already
-  in flight when the entry commits, from the current flusher or a
-  former one, is fenced at publication: on this backend a file is live
-  only once the flusher has added it to its partition's manifest by
-  compare-and-swap (RFC 0009 §3.4), never by its PUT alone, and every
-  manifest add names the highest erasure entry the flusher had applied
-  when it wrote the file. The confirming pass records each group's
-  erasure entry position in the manifests it rewrites, and an add whose
-  file predates that position is refused: the flusher discards the
-  file and writes those positions again with the erasure applied, and
-  the orphaned object is never listed and is removed as RFC 0009
-  removes retired files. Mining still
+  after failover cannot bring them back. This is the second fence RFC
+  0009 §7 D3 lists ("receivers that drop a marked conversation's rows
+  at publish, plus a receiver membership list"), with the group log as
+  the membership, so D3's residual narrows on this backend to one
+  case: an upload already in flight when the entry commits, from the
+  current flusher or a former one, whose PUT lands after the confirming
+  pass. Its rows stay readable from the store, exactly the residual D3
+  accepts and RFC0009.22 pins, and the tail never serves them. Closing
+  that case needs a store-side publication fence, which D3 leaves to a
+  later RFC; this RFC does not amend RFC 0009 §3.4's live-set rule.
+  Mining still
   consumes those entries, so every replica's miner stays identical
   (B11).
 - **Scaling (B24).** Tail replicas come from the tail pool (§6.1),
@@ -1386,7 +1384,7 @@ never count toward an ack (learners, under §4.3's shape).
   the read point and published keys, then the rows under that read
   point, §6.7).
 - **Mutual TLS is required** (RFC 0030's `TlsSection`). A tail replica
-  accepts `Tail` only from a client certificate whose identity (its
+  accepts `Tail` and `TailScan` only from a client certificate whose identity (its
   URI or DNS subject alternative name) is listed in `tail_clients`, the
   queriers' identities the chart renders from the querier certificate
   secret; any other caller, another replica included, gets
@@ -1426,7 +1424,7 @@ signal that tunes it:
 | Groups | 16 (about 0.06 cores of heartbeats; §4.6) | per-group CPU, memory and heartbeat cost; ingest skew across groups |
 | `tail_replicas` | 1 | tail call latency and saturation per tail replica |
 | Tail memory before local Parquet | the record sink's size and age triggers | tail replica memory, local file count and query bytes read |
-| Tail volume | twice a voter's per-group share per hosted group; alerts at 50 % and 80 % | tail WAL and cache bytes per node during real outages |
+| Tail volume | 2 × 24 h of the stated ingest rate (a node hosting every group); alerts at 50 % and 80 % | groups hosted and tail WAL and cache bytes per node during real outages |
 | Election and heartbeat timeouts | 50 ms heartbeat, 150–300 ms election: failover and tail gap about 1.8 × the election maximum, 0.55 s (§4.6) | failover time, spurious leadership changes |
 | Vote log | one per node, group-committed (§4.7): a node failure at 128 groups failed over in 0.5–0.8 s | failover time when a node's groups elect at once, vote-log fsync latency and votes per fsync |
 | Freshness target (B15) | under 1 s | ack-to-queryable latency, a new histogram on the tail path |
@@ -1443,8 +1441,8 @@ rest of this section.
   (`ourios-receiver-<i>.<service>:4319`), with `node_id` from the pod
   name.
 - The tail pool is a second StatefulSet, `-wal-tail`, with its own
-  `walTail.replicas`, volume claims (sized per hosted group by default,
-  §6.7) and headless Service, rendered into `tail_peers`, and
+  `walTail.replicas`, volume claims (by default twice 24 hours of the
+  stated ingest rate, §6.7) and headless Service, rendered into `tail_peers`, and
   `tail_clients` rendered from the querier certificate's identity.
   Scaling it changes `tail_peers` only, never `peers`, so the voting
   layout check (§6.1) is unaffected (B24).
@@ -1551,9 +1549,8 @@ from rows.
   the vote log on disk, durable fsync on, killing one node; indicative
   on the CI runner first, with §4.7's runs as the baseline.
 - RFC0065.28: the in-process cluster with the compactor's erasure
-  pass on the in-memory store, the flusher paused by failpoints
-  between its object put and its published entry, and inside the put
-  across the confirming pass.
+  pass on the in-memory store, the flusher paused by a failpoint
+  between its object put and its published entry.
 - `criterion`: ack latency on the replicated backend against the local
   one, and the tail merge, before `validated`.
 

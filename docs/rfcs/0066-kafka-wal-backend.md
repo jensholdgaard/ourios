@@ -115,15 +115,32 @@ receiver:
 - `backend: local` is today's behaviour and requires `wal_root`.
   `backend: kafka` requires `brokers` and `topic`, and ignores
   `wal_root`. Anything else is a startup error naming the field.
-- Ourios does not create topics. At startup the receiver reads the
-  topic's metadata and its effective configuration and fails startup
-  if the topic is missing, if `min.insync.replicas` is below 2 (§3.12),
-  if any partition has fewer replicas than the larger of 2 and
-  `min.insync.replicas` (a replication factor of 1 would pass the
-  in-sync check and then reject every produce),
-  if `unclean.leader.election.enable` is `true` (it would let a lagging
-  replica lead and drop acknowledged batches, against RFC 0065 B6 and
-  B8), if `cleanup.policy` is anything but exactly `delete` (compaction
+- The receiver does not create topics (the `wal topic ensure` verb
+  does, §3.10). At startup, and at every RFC 0067 re-check, the
+  receiver reads the topic's metadata and its effective configuration
+  (DescribeConfigs). The checks depend on `broker_kind`, because the two
+  brokers expose different settings:
+  - **`kafka`:** fails if `min.insync.replicas` or
+    `unclean.leader.election.enable` is absent from the config (the
+    broker is not Apache Kafka), if `min.insync.replicas` is below 2
+    (§3.12), if any partition has fewer replicas than the larger of 2
+    and `min.insync.replicas` (a replication factor of 1 would pass the
+    in-sync check and then reject every produce), or if
+    `unclean.leader.election.enable` is `true` (it would let a lagging
+    replica lead and drop acknowledged batches, against RFC 0065 B6 and
+    B8). The persistence key is `flush.messages`; under the opt-in, ELR
+    is read from the finalized features (RFC 0067 §3.5).
+  - **`redpanda`:** fails if `write.caching` is absent from the config
+    (the broker is not Redpanda), or if any partition's Metadata replica
+    list has fewer than 3 replicas, so its Raft majority is at least 2.
+    Redpanda's topic-property reference documents none of
+    `min.insync.replicas`, `unclean.leader.election.enable` and
+    `flush.messages`, and notes that `replication.factor` is not
+    returned as a topic property, so none of them is read: the floor
+    comes from the replica list and leader safety from Raft, identified
+    by the broker kind. The persistence key is `write.caching`
+    (`false` or `disabled` is verified).
+  - **Both:** fails if the topic is missing, if `cleanup.policy` is anything but exactly `delete` (compaction
   would remove tenant-keyed batches before their checkpoint, leaving
   holes no log-start check sees), if `retention.ms` or
   `retention.bytes` is not unlimited (Ourios reclaims by checkpoint,
@@ -508,24 +525,39 @@ partition in place of the Raft log; there is no separate tail topic.
     Job running the receiver's own image and config with the verb
     `ourios-server --config … wal topic ensure` (clap, beside `graph`).
     The verb creates the topic, or reconciles an existing one, to the
-    settings §3.1 checks: replication factor 3 and
-    `min.insync.replicas=2` (RFC 0067 Q3; chart values
-    `topic.replicationFactor` and `topic.minInsyncReplicas`, refused
-    below 2), `topic.partitions` at creation only,
-    `unclean.leader.election.enable=false`, `cleanup.policy=delete`,
+    settings §3.1 checks for `brokerKind`. Both kinds: replication
+    factor 3 (chart value `topic.replicationFactor`, RFC 0067 Q3),
+    `topic.partitions` at creation only, `cleanup.policy=delete`,
     `retention.ms=-1`, `retention.bytes=-1`, `max.message.bytes` at
     least one maximal frame (computed from the same RFC 0061 limit the
-    receiver uses), and, unless `allowUnverifiedAck` is set, the
-    persistence setting for `brokerKind`: `flush.messages=1` on Kafka,
-    `write.caching=false` on Redpanda. It never weakens a setting: a
-    higher `min.insync.replicas`, a larger `max.message.bytes` or an
-    existing persistence setting is kept; a replication factor or
+    receiver uses). `kafka` adds `min.insync.replicas=2` (chart value
+    `topic.minInsyncReplicas`, refused below 2),
+    `unclean.leader.election.enable=false`, and, unless
+    `allowUnverifiedAck` is set, `flush.messages=1`. `redpanda` sets
+    no Kafka-only key (refusing `topic.replicationFactor` below 3) and,
+    unless `allowUnverifiedAck` is set, `write.caching=false`. It never
+    weakens a setting: a higher `min.insync.replicas`, a larger
+    `max.message.bytes` or an existing persistence setting is kept; a replication factor or
     partition count that differs is reported and fails the Job, since
     changing either is a reassignment or migration this RFC does not
     define. It ends by running the receiver's startup check (§3.1, RFC
     0067 §3.5) against the result and fails if that check would fail, so
     provisioning and the check cannot disagree: the rules live in one
     place, the receiver's code.
+  - **Hook resources.** A pre-install hook runs before any of the
+    release's ordinary resources exist, and a pre-upgrade hook would see
+    the previous release's ConfigMap (`templates/configmap.yaml`), so
+    the Job uses none of them. The chart renders, as hooks on the same
+    events, a ConfigMap `<fullname>-wal-topic-ensure` from the
+    *incoming* values with the same helper the receiver's ConfigMap
+    uses, and, when `receiver.serviceAccount.create` is true, a
+    ServiceAccount for the Job; both carry `helm.sh/hook-weight: "-10"`
+    and the Job `"0"`, so they exist before it runs. Broker credentials
+    and TLS material reach the Job only through `receiver.extraEnv`
+    `secretKeyRef`s and existing Secret names, which the operator
+    creates before installing, never through a Secret the release
+    renders. Every hook resource carries
+    `helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded`.
   - **What the chart cannot do.** Broker-side settings belong to the
     broker's operator: `broker.rack` (Kafka) or `rack` (Redpanda) on
     every broker, and on Apache Kafka under the opt-in, ELR enabled
@@ -628,15 +660,22 @@ removes only copies of the same log entry.
 > - **When** the server resolves its config
 > - **Then** the first three resolve to local, local and kafka, and the
 >   last two fail startup with an error naming the field
-> - **And** with `kafka`, startup fails when a topic is missing, when
->   its `min.insync.replicas` is below 2, its effective
->   `unclean.leader.election.enable` is `true`, its `cleanup.policy` is
->   not exactly `delete` (a compacted topic is refused), its retention
->   is not unlimited, its `max.message.bytes` is below one maximal
->   frame, any of its partitions has fewer replicas than
->   `max(2, min.insync.replicas)`, or its partition count, cluster id
->   or topic id differs from `<bucket>/wal/<topic>/topic.json` (a
->   recreated topic is refused)
+> - **And** with `backend: kafka` and either `broker_kind`, startup fails when a
+>   topic is missing, its `cleanup.policy` is not exactly `delete` (a
+>   compacted topic is refused), its retention is not unlimited, its
+>   `max.message.bytes` is below one maximal frame, or its partition
+>   count, cluster id or topic id differs from
+>   `<bucket>/wal/<topic>/topic.json` (a recreated topic is refused)
+> - **And** with `broker_kind: kafka`, startup also fails when
+>   `min.insync.replicas` or `unclean.leader.election.enable` is absent
+>   or `min.insync.replicas` is below 2, the effective
+>   `unclean.leader.election.enable` is `true`, or any partition has
+>   fewer replicas than `max(2, min.insync.replicas)`
+> - **And** with `broker_kind: redpanda`, startup also fails when
+>   `write.caching` is absent or any partition's replica list has fewer
+>   than 3 replicas, and a conforming Redpanda topic that reports no
+>   `min.insync.replicas`, unclean-election or `flush.messages` key
+>   starts
 
 > **Scenario RFC0066.2 — an export is acked only after every in-sync replica has it**
 > - **Given** a broker backend on a three-broker cluster with
@@ -779,8 +818,9 @@ removes only copies of the same log entry.
 >   control record another one applied
 
 > **Scenario RFC0066.16 — an unverified broker without the opt-in refuses to start (RFC 0067)**
-> - **Given** a topic that passes RFC0066.1's checks, with
->   `flush.messages` unset and no `write.caching` key
+> - **Given** a `kafka` topic that passes RFC0066.1's checks, with
+>   `flush.messages` unset, and separately a `redpanda` topic with
+>   `write.caching=true`
 > - **When** the receiver starts without
 >   `receiver.wal.kafka.allow_unverified_ack`
 > - **Then** startup fails before producing or consuming, with an error
@@ -799,8 +839,12 @@ removes only copies of the same log entry.
 >   unverified mode in its telemetry (§3.9)
 > - **And** the same fixture with ELR disabled, or with the finalized
 >   features unreadable, fails startup naming the ELR feature
+> - **And** a `redpanda` topic with the opt-in set, `write.caching=true`
+>   and replicas on distinct racks starts with the same warning and
+>   needs no ELR or Kafka-only key
 > - **And** a topic whose replica floor or leader safety cannot be read
->   (no readable `min.insync.replicas` or unclean-election setting, as on
+>   for its `broker_kind` (`kafka` without `min.insync.replicas` or
+>   unclean-election keys, `redpanda` without `write.caching`, as on
 >   WarpStream) fails startup with the opt-in set
 
 > **Scenario RFC0066.18 — the opt-in still needs separate failure domains (RFC 0067)**
@@ -828,9 +872,11 @@ removes only copies of the same log entry.
 >   provided the failure-domain and (on Apache Kafka) ELR checks pass on
 >   entering unverified mode; if either fails then, exports get the
 >   retryable rejection instead
-> - **And** a re-check that finds `min.insync.replicas` below 2,
->   unclean leader election enabled, or the configuration unreadable
->   stops acknowledgements on that topic whether or not the opt-in is set
+> - **And** a re-check that finds, on `kafka`, `min.insync.replicas`
+>   below 2 or unclean leader election enabled, on `redpanda`, a
+>   partition with fewer than 3 replicas, or on either the configuration
+>   unreadable, stops acknowledgements on that topic whether or not the
+>   opt-in is set
 > - **And** in unverified mode with the opt-in set, a re-check that
 >   cannot read the current replica assignment, finds two replicas of a
 >   partition on one rack or a replica with no rack (a reassignment or a
@@ -845,11 +891,19 @@ removes only copies of the same log entry.
 >   `durability_recheck_secs: 60` and `broker_kind: kafka`, and a
 >   `pre-install,pre-upgrade` hook Job runs `wal topic ensure` with the
 >   receiver's image and config
-> - **And** `topic.manage: false` renders no Job; `brokerKind: redpanda`
->   makes the Job ensure `write.caching=false` instead of
->   `flush.messages=1`; `allowUnverifiedAck: true` makes it ensure
->   neither; `topic.minInsyncReplicas: 1` or `topic.replicationFactor: 1`
->   fails the render
+> - **And** the Job's ConfigMap and (with `serviceAccount.create`) its
+>   ServiceAccount are hooks on the same events rendered from the
+>   incoming values, with `helm.sh/hook-weight` `-10` against the Job's
+>   `0`, and every hook resource carries
+>   `hook-delete-policy: before-hook-creation,hook-succeeded`; changing a
+>   value changes the hook ConfigMap in the same render
+> - **And** `topic.manage: false` renders no hook resources;
+>   `brokerKind: redpanda` makes the Job ensure `write.caching=false` and
+>   no `min.insync.replicas`, unclean-election or `flush.messages` key;
+>   `allowUnverifiedAck: true` makes it ensure no persistence key;
+>   `topic.minInsyncReplicas: 1`, `topic.replicationFactor: 1`, or
+>   `topic.replicationFactor: 2` with `brokerKind: redpanda` fails the
+>   render
 > - **And** no chart value removes the floor, leader, ELR or rack checks
 >   from the rendered config
 
@@ -860,13 +914,30 @@ removes only copies of the same log entry.
 >   `unclean.leader.election.enable` `true`
 > - **When** `wal topic ensure` runs, twice in each case
 > - **Then** the first case creates a topic with exactly §3.10's
->   settings for that kind; the second changes nothing; the third keeps
+>   settings for that kind, and on `redpanda` sets no Kafka-only key; the
+>   second changes nothing; on `kafka` the third keeps
 >   `min.insync.replicas=3` and the larger `max.message.bytes`, sets
 >   unclean election to `false`, and the second run changes nothing
 > - **And** a topic whose replication factor or partition count differs
 >   makes the verb fail naming it, and a result the startup check would
 >   refuse (for example a broker with no rack under the opt-in) makes the
 >   verb fail with the same error the receiver would log
+
+> **Scenario RFC0066.23 — `flush.messages=1` makes Kafka fsync on the followers before the ack (RFC 0067 Q4)**
+> - **Given** a three-broker Apache Kafka cluster in CI whose two
+>   follower brokers keep their log directory on a `dm-delay` device
+>   adding 2 s to every write and flush, the leader on an undelayed
+>   disk, and a `kafka` topic with replication factor 3,
+>   `min.insync.replicas=2` and every partition led by the undelayed
+>   broker
+> - **When** 20 single-record produces with `acks=all` are sent one at a
+>   time, once with `flush.messages=1` and once with it unset
+> - **Then** with `flush.messages=1` every produce's ack latency is at
+>   least the device delay, and with it unset the median ack latency is
+>   below a quarter of it
+> - **And** the test fails, naming the Kafka image tag, if the
+>   `flush.messages=1` arm's latency drops below the delay, so an
+>   upstream change to the ordering is caught
 
 ## 6. Testing strategy
 
@@ -882,7 +953,22 @@ removes only copies of the same log entry.
   is also a `proptest` over random flush and barrier points.
 - RFC0066.2, .3 and RFC0066.7's latency arm: CI-only container tests
   against Redpanda and Apache Kafka, beside the existing testcontainers
-  jobs in `ci.yml`. There is no local container runtime, so these run
+  jobs in `ci.yml`. The same jobs run the real-broker arms of
+  RFC0066.1 and .16–.20 for each `broker_kind` (Redpanda: a topic with
+  three replicas on racked brokers and `write.caching` toggled; Kafka:
+  `min.insync.replicas`, unclean election and `flush.messages`
+  toggled), so the per-kind key sets are checked against what each
+  broker actually reports, not only against the in-memory fake.
+- RFC0066.23: a CI-only job on a GitHub-hosted Ubuntu runner. It needs
+  `sudo dmsetup` and a loop device, so it runs the brokers as host
+  processes or containers bind-mounting the delayed directories, not
+  under testcontainers. A delayed write reaches the device only on
+  writeback or fsync, so the ack waits for the delay only if it waits
+  for a follower's fsync; the unset arm is the control that shows the
+  delay is not on the ack path otherwise. Its limit: it proves the
+  ordering for the Kafka version and configuration under test, on one
+  kernel, and says nothing about a disk that acknowledges a flush it
+  has not made durable. There is no local container runtime, so these run
   only in CI. RFC0066.3 extends the WAL crash-recovery job to the broker
   backend, as RFC 0064 §3.2 requires for every backend.
 - RFC0066.9: the existing suites, unchanged.
@@ -930,6 +1016,13 @@ removes only copies of the same log entry.
   rejection); RFC 0059 §3.6 (several receivers); RFC 0061 §3.1
   (`extraEnv`); RFC 0063
 - OTel semantic conventions: messaging spans and metrics, Kafka
+- Redpanda documentation, *Topic properties* (documents `write.caching`,
+  `cleanup.policy`, `retention.*`, `max.message.bytes`; `replication.factor`
+  "isn't returned or displayed by `rpk topic describe` as a valid Kafka
+  property"):
+  <https://docs.redpanda.com/current/reference/properties/topic-properties/>
+- Linux device-mapper `dm-delay` (RFC0066.23's delayed follower disks):
+  <https://docs.kernel.org/admin-guide/device-mapper/delay.html>
 - `rskafka` 0.6.0 (README, `src/client/partition.rs` `acks: -1`);
   `rdkafka` 0.39.0 / `rdkafka-sys` 4.10.0+2.12.1
 - Issue #1141

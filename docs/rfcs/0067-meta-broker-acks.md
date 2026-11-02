@@ -143,8 +143,9 @@ and a bullet follows it:
   while running; a broker whose configuration cannot be read, or on
   which the floor or leader safety cannot be established, does not
   start. If Ourios cannot verify that the broker fsyncs, or commits to
-  object storage, before it acknowledges, the replicas hold the batch
-  only in memory: the backend then acknowledges only when the operator
+  object storage, before it acknowledges, persistence is unverified and
+  acknowledged batches may be lost to a correlated power loss across
+  the replicas: the backend then acknowledges only when the operator
   has opted in by configuration, warns at startup, and has every
   partition's replicas in distinct failure domains, re-checked with
   the rest. The opt-in waives the fsync only, never the two-replica
@@ -178,9 +179,9 @@ and `*Last updated: …*` moves to the enacting date.
   the WAL. The one exception is an opted-in broker backend (RFC 0066,
   RFC 0067) whose broker Ourios cannot verify persists before
   acknowledging: there the ack waits for the broker's write quorum of
-  at least two replicas, in distinct failure domains, holding the batch
-  in memory, and a power loss across that whole quorum before writeback
-  loses acknowledged batches."
+  at least two replicas, in distinct failure domains, holding the
+  batch, but its persistence is unverified, so a correlated power loss
+  across that whole quorum may lose acknowledged batches."
 - **H3, replication bullet.** RFC 0064's bullet gains a final sentence:
   "On the broker backend (RFC 0066) the same floor and leader rules
   hold through the broker's quorum and election, re-checked while
@@ -203,9 +204,9 @@ RFC 0066 owns the checks; this table is what they must establish.
 
 | Rule | Apache Kafka | Redpanda (Raft) | WarpStream |
 |---|---|---|---|
-| ≥ 2 replicas and the write quorum hold the batch (never waived) | `acks=all`, `min.insync.replicas ≥ 2`, every partition with ≥ `max(2, min.insync.replicas)` replicas | `acks=all` (majority), every partition with ≥ 2 replicas | not readable through the Kafka protocol: **unsupported** |
-| Leader holds every acked batch (never waived) | `unclean.leader.election.enable=false`; with the opt-in, also ELR enabled in the finalized features (§7 Q5) | Raft election | not readable: **unsupported** |
-| fsync before ack (waivable by the opt-in) | `flush.messages=1` (§7 Q4) | `write.caching=false` | — |
+| ≥ 2 replicas and the write quorum hold the batch (never waived) | `acks=all`, `min.insync.replicas ≥ 2`, every partition with ≥ `max(2, min.insync.replicas)` replicas | `acks=all` (Raft majority), every partition's Metadata replica list with ≥ 3 replicas (majority ≥ 2); Redpanda does not report `min.insync.replicas` or `replication.factor` as topic properties | not readable through the Kafka protocol: **unsupported** |
+| Leader holds every acked batch (never waived) | `unclean.leader.election.enable=false`; with the opt-in, also ELR enabled in the finalized features (§7 Q5) | Raft election, taken from `broker_kind: redpanda` once the `write.caching` key confirms the broker; no Kafka-only key is required | not readable: **unsupported** |
+| fsync before ack (waivable by the opt-in) | `flush.messages=1` (§7 Q4) | `write.caching=false` or `disabled` | — |
 | Failure domains (opt-in only, never waived once opted in) | current replica assignment, each partition's replicas on distinct non-empty `rack` labels | same | — |
 
 Classification is per row. A row marked never waived that cannot be
@@ -290,7 +291,7 @@ behaviour the rule requires (startup classification, the opt-in and its
 warning, the failure-domain check, the periodic re-check and its
 verified-to-unverified transition) is specified as criteria
 RFC0066.16–.20 in RFC 0066 §5, and the Helm plumbing (§3.6) as
-RFC0066.21–.22, tested there.
+RFC0066.21–.22, and the Q4 ordering test as RFC0066.23, all tested there.
 
 > **Scenario RFC0067.1 — `AGENTS.md` §3.4 matches §3.2–§3.3**
 > - **Given** the enacting PR
@@ -324,8 +325,8 @@ RFC0066.21–.22, tested there.
 
 All resolved by the maintainer on 2026-11-02, each as recommended.
 
-- [x] **Q1. May Ourios confirm data that the brokers hold only in
-  memory?** **Only with an explicit opt-in and a startup warning;**
+- [x] **Q1. May Ourios confirm data whose persistence on the brokers
+  it cannot verify?** **Only with an explicit opt-in and a startup warning;**
   otherwise only brokers that show they persist first (§3.5). The
   default keeps "no in-memory-only acks", and an operator who opts in
   accepts §3.1's fourth row knowingly.
@@ -337,8 +338,10 @@ All resolved by the maintainer on 2026-11-02, each as recommended.
   `min.insync.replicas=2`) in the operator docs and the Helm defaults
   (RFC 0066 §3.10).
 - [x] **Q4. On Apache Kafka, does `flush.messages=1` count as "writes to
-  disk first"?** **Yes,** with a CI container test against Kafka that
-  would catch an upstream change in the ordering.
+  disk first"?** **Yes,** with a CI test against Kafka that would catch
+  an upstream change in the ordering: RFC0066.23 puts the followers'
+  log directories on delayed disks and requires the ack to wait for
+  the delay.
 - [x] **Q5. With the opt-in on Apache Kafka, require Eligible Leader
   Replicas?** **Yes,** checked from the finalized features at startup
   and every re-check; Redpanda does not use Kafka's ISR election.

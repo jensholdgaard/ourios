@@ -606,9 +606,17 @@ removes only copies of the same log entry.
 >   compacted files hold no repeated `(tenant, ingest position)`
 > - **And** the dedup hit count records the removed rows
 
-> **Scenario RFC0066.6 — a retention gap is reported**
-> - **Given** a partition whose log start offset has passed its
->   checkpoint
+> **Scenario RFC0066.6 — a retention gap is reported, normal reclamation is not**
+> - **Given** a tail replica that applied checkpoint `c` and lagged
+>   while the owner checkpointed `c'` and deleted through `c'`, so the
+>   log start is above `c + 1` but at most `c' + 1`
+> - **When** the replica resumes
+> - **Then** it restores the bundle for `c'` and continues from
+>   `c' + 1` with no error event and no operator action; with the store
+>   unreachable it reports its tail unavailable and retries, skipping
+>   nothing
+> - **And given** a partition whose log start is above `c' + 1` for the
+>   newest checkpoint `c'`
 > - **When** its owner starts
 > - **Then** it records `ourios.ingest.batches{error.type="retention_gap"}`
 >   and an error event naming the partition and both offsets, stops
@@ -644,6 +652,10 @@ removes only copies of the same log entry.
 > - **When** the chart renders
 > - **Then** the receiver StatefulSet has no `volumeClaimTemplates`, and
 >   the receiver and querier configs carry the `${env:…:-}` references
+> - **And** a separate `-wal-tail` StatefulSet renders with no
+>   `volumeClaimTemplates`, an ephemeral volume for its Parquet cache
+>   sized as §3.8 says, `tail_peers` and `tail_clients` in its config,
+>   and the broker settings
 
 > **Scenario RFC0066.11 — a prolonged outage stays complete and searchable (RFC 0065 B19, B25)**
 > - **Given** a broker backend whose object store is unreachable for
@@ -689,11 +701,22 @@ removes only copies of the same log entry.
 >   `UNAVAILABLE`; and the query returns no erased row from any tail
 >   replica
 
+> **Scenario RFC0066.15 — an unknown record stops the partition**
+> - **Given** a partition holding a record whose `ourios.kind` is not
+>   one of `batch`, `checkpoint`, `published`, `erasure` or `id_block`,
+>   and separately one whose `ourios.v` is `2`
+> - **When** an owner or tail replica consumes up to it
+> - **Then** it stops consuming that partition at that offset, records
+>   an error event naming the partition, offset, kind and version, and
+>   reports its tail unavailable
+> - **And** it mines no record past that offset, so no replica skips a
+>   control record another one applied
+
 ## 6. Testing strategy
 
 - RFC0066.1, .4: unit tests in `ourios-server/src/config` and next to
   the hash; golden values committed with the hash.
-- RFC0066.5, .6, .7, .8, .11, .12, .13, .14: integration tests against an in-memory
+- RFC0066.5, .6, .7, .8, .11, .12, .13, .14, .15: integration tests against an in-memory
   `BrokerClient` (§3.2), runnable locally. RFC0066.7's equal-count arm
   is also a `proptest` over random flush and barrier points.
 - RFC0066.2, .3 and RFC0066.7's latency arm: CI-only container tests

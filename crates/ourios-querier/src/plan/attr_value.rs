@@ -615,6 +615,9 @@ mod tests {
                         Cmp::new(&key, &expected, false).eval(&json).expect("eval"),
                     );
                     prop_assert_eq!(got, oracle, "key {:?} expected {} in {}", key, expected, json);
+                    // The `==` prefilter of a dotted key (`json_arm`) keeps every match.
+                    let value_tail = format!("{}}}", &expected[type_prefix.len()..]);
+                    prop_assert!(!got.0 || json.contains(&value_tail), "{} drops {}", value_tail, json);
                 }
             }
         }

@@ -12,17 +12,30 @@ superseded-by: —
 # RFC 0062 — Attribute paths into map values
 
 > **Status: `green` (2026-11-02).** `ourios_attr_cmp` resolves a key by
-> §3.1 and the JSON arm prefilters one `LIKE` per stored key (§3.3).
+> §3.1, and the JSON arm prefilters as §3.3 describes.
 > RFC0062.1–.4 pass in `ourios-querier/tests/it/rfc0022_attr_columns.rs`,
 > RFC0062.5 as a proptest beside the UDF in `plan/attr_value.rs`,
 > RFC0062.8 in `ourios-server/tests/it/rfc0062_8_engine_names.rs`
 > (beside the HTTP and MCP scrubbing tests, which live in `tests/it`,
 > not in the `src` files §6 names) and RFC0062.9 in
 > `ourios-querier/tests/it/execution.rs`. RFC0062.7 is #1137's tests,
-> unchanged. RFC0062.6's local `attr_predicate` numbers are in the
-> implementing PR and sit inside the bounds on the mean of quiet runs,
-> with about a point to spare for the two path `==` cases; the
-> ci-runner run is still to do.
+> unchanged. RFC0062.6, measured with the `attr_predicate` bench (pre and
+> post binaries alternated, three rounds each on an idle machine): every
+> round of every case is inside its bound. The changes are the mean over
+> the rounds:
+>
+> | Case | Pre ms | Post ms | Change |
+> |---|---:|---:|---:|
+> | promoted literal `==` / `!=` / miss | 19.52 / 19.62 / 19.57 | 19.53 / 19.68 / 19.73 | +0.0% / +0.3% / +0.8% |
+> | unpromoted literal `==` / miss | 25.31 / 24.44 | 23.29 / 22.55 | −8.0% / −7.7% |
+> | path `==`, unpromoted / promoted | 22.21 / 23.02 | 22.06 / 22.81 | −0.7% / −0.9% |
+> | literal `!=`, per row | 0.207 µs | 0.205 µs | −1.1% |
+> | path `!=` per row, unpromoted / promoted | 0.498 / 0.507 µs | 0.483 / 0.486 µs | −3.0% / −4.1% |
+>
+> A path `==` returns 200 rows where the pre-RFC baseline returned 100,
+> and a path `!=` returns 199,800 where it returned 99,900. The first
+> implementation, one `LIKE` per stored key for `==` as well, put path
+> `==` at +20–22%. The single value-text pattern of §3.3 replaced it.
 > Red 2026-11-02: the §5 stubs landed with the bench.
 > Specified 2026-11-02 (maintainer-approved by merging #1138 and asking
 > for the implementation). Tracks #1134. This RFC **amends RFC 0002 §6.1**
@@ -134,10 +147,15 @@ bracket form exists for keys a bare identifier cannot spell (RFC 0002
 
 The JSON arm keeps its two steps:
 
-1. **Prefilter.** A `LIKE` on the stored pair text, as today, but one
-   pattern per key the pair can be stored under: `p` itself and every
-   tail after one of its dots (`a.b.c`, `b.c`, `c`), joined with `OR`.
-   For a key without dots this is the single pattern used today.
+1. **Prefilter.** A `LIKE` on the stored text. For a key without dots
+   this is the single pattern used today. A dotted key's value can sit
+   in a pair under `p` itself or any tail after one of its dots
+   (`a.b.c`, `b.c`, `c`). For `!=`, the prefilter is one pattern per
+   such key, joined with `OR`. For `==`, it is a single pattern: the
+   expected value's text after its type prefix, followed by the pair's
+   closing brace (`"x"}}` for `"x"`). Every one of those pairs ends with
+   that text, so one column scan replaces one per key (amended
+   2026-11-02 after RFC0062.6 measured the per-key `OR` at about +21%).
 2. **Confirm.** The internal `ourios_attr_cmp` UDF applies §3.1 to the
    candidate rows. It reads the stored text without decoding it: a row
    with no map value cannot hold a path, so the top-level shortcut from

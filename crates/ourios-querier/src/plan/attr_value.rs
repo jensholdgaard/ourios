@@ -905,6 +905,41 @@ mod tests {
         assert_eq!(got, (true, false, false));
     }
 
+    /// A pinned case of `the_scan_agrees_with_a_full_decode`: a nested key
+    /// `a.b` that only a path resolves at the top level, `a` → `b`.
+    #[test]
+    fn the_scan_agrees_with_a_full_decode_on_a_path_beside_a_nested_dotted_key() {
+        let attrs = vec![
+            kv("a", map(vec![kv("b", string("x"))])),
+            kv("outer", map(vec![kv("a.b", string("unrelated"))])),
+        ];
+        let json = stored(&attrs);
+        let mut keys = Vec::new();
+        all_keys(&attrs, &mut keys);
+        for key in keys {
+            let actual = resolve_decoded(&attrs, &key);
+            for v in ["x", "y", "unrelated"] {
+                let expected = canonical_value(string(v)).expect("encode");
+                let type_prefix = expected
+                    .find(':')
+                    .map_or(expected.as_str(), |i| &expected[..=i]);
+                let oracle = actual.as_deref().map_or((false, false), |a| {
+                    (a == expected, a.starts_with(type_prefix) && a != expected)
+                });
+                let got = (
+                    Cmp::new(&key, &expected, true).eval(&json).expect("eval"),
+                    Cmp::new(&key, &expected, false).eval(&json).expect("eval"),
+                );
+                assert_eq!(got, oracle, "key {key:?} expected {expected}");
+            }
+        }
+        let x = canonical_value(string("x")).expect("encode");
+        assert!(
+            Cmp::new("a.b", &x, true).eval(&json).expect("eval"),
+            "a.b resolves to a → b"
+        );
+    }
+
     /// Every key in `attrs`, nested map keys included.
     fn all_keys(attrs: &[KeyValue], out: &mut Vec<String>) {
         for kv in attrs {
@@ -928,11 +963,7 @@ mod tests {
             let mut keys = Vec::new();
             all_keys(&decoded, &mut keys);
             for key in keys {
-                let actual = decoded
-                    .iter()
-                    .find(|kv| kv.key == key)
-                    .and_then(|kv| kv.value.as_ref())
-                    .map(|v| String::from_utf8(canonical::encode_any_value(v).expect("encode")).expect("utf-8"));
+                let actual = resolve_decoded(&decoded, &key);
                 let mut values = vec![canonical_value(string(&v)).expect("encode")];
                 // A query literal is a string or an integer.
                 values.extend(actual.clone().filter(|a| {

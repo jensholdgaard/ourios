@@ -93,10 +93,11 @@ impl Visibility {
         }
         match fields
             .iter()
-            .flat_map(Read::names)
-            .find(|name| content_columns.contains(name))
+            .find_map(|read| read.masked_by(content_columns))
         {
-            Some(column) => Err(QueryError::Forbidden { column }),
+            Some(column) => Err(QueryError::Forbidden {
+                column: column.clone(),
+            }),
             None => Ok(()),
         }
     }
@@ -187,17 +188,6 @@ pub(crate) enum VisibilityFilter {
     Only(Expr),
 }
 
-/// The DSL name of a field the masking vocabulary can name; `None` for
-/// fields that are never content.
-fn dsl_name(field: &Field) -> Option<String> {
-    match field {
-        Field::Body => Some("body".to_string()),
-        Field::Attr(key) => Some(format!("{}{key}", promoted::ATTR_PREFIX)),
-        Field::Resource(key) => Some(format!("{}{key}", promoted::RESOURCE_PREFIX)),
-        _ => None,
-    }
-}
-
 /// A field a query reads, and whether the read resolves the key as a path
 /// into map values (RFC 0062 §3.1: `==` / `!=` on an attribute).
 struct Read<'a> {
@@ -213,25 +203,36 @@ impl<'a> Read<'a> {
         }
     }
 
-    /// The DSL columns the read can see: the field itself and, for a path
-    /// read, every map head of its key (`attr.a` and `attr.a.b` for
-    /// `attr.a.b.c`), since a value under a masked map is masked content.
-    /// `service` is `resource.service.name`.
-    fn names(&self) -> Vec<String> {
+    /// The first of `columns` the read can see, in the order the read
+    /// reaches them: the field itself, then, for a path read, its map heads
+    /// shortest first (`attr.a`, then `attr.a.b`, for `attr.a.b.c`), since a
+    /// value under a masked map is masked content. `service` is
+    /// `resource.service.name`. Each column is compared against the key
+    /// in place, so no prefix of the key is ever built.
+    fn masked_by<'c>(&self, columns: &'c [String]) -> Option<&'c String> {
+        columns
+            .iter()
+            .filter_map(|column| self.reach(column).map(|rank| (rank, column)))
+            .min_by_key(|&(rank, _)| rank)
+            .map(|(_, column)| column)
+    }
+
+    /// Where the read reaches `column`: 0 for the field itself, or one
+    /// more than the head's length for a map head.
+    fn reach(&self, column: &str) -> Option<usize> {
         let (prefix, key) = match self.field {
             Field::Attr(key) => (promoted::ATTR_PREFIX, key.as_str()),
             Field::Resource(key) => (promoted::RESOURCE_PREFIX, key.as_str()),
             Field::Service if self.paths => (promoted::RESOURCE_PREFIX, "service.name"),
-            field => return dsl_name(field).into_iter().collect(),
+            Field::Body => return (column == "body").then_some(0),
+            _ => return None,
         };
-        let heads = key
-            .match_indices('.')
-            .map(|(i, _)| &key[..i])
-            .filter(|_| self.paths);
-        std::iter::once(key)
-            .chain(heads)
-            .map(|k| format!("{prefix}{k}"))
-            .collect()
+        let head = column.strip_prefix(prefix)?;
+        match key.strip_prefix(head) {
+            Some("") => Some(0),
+            Some(rest) if self.paths && rest.starts_with('.') => Some(head.len() + 1),
+            _ => None,
+        }
     }
 }
 
@@ -377,6 +378,39 @@ mod tests {
             masked
                 .validate(&logs(statement))
                 .unwrap_or_else(|e| panic!("{statement}: {e:?}"));
+        }
+    }
+
+    /// A 65,535-byte key of 32,768 parts is checked against each masked
+    /// column in place. Building every `attr.` prefix, as the check once
+    /// did, would allocate over 1 GiB per call and over 100 GiB here.
+    #[test]
+    fn a_key_of_many_parts_is_checked_without_building_its_prefixes() {
+        let key = vec!["a"; 32_768].join(".");
+        assert_eq!(key.len(), 65_535);
+        let eq = logs(&format!("attr.{key} == \"x\""));
+        let ord = logs(&format!("attr.{key} >= \"x\""));
+        let masked = |columns: &[&str]| Visibility::Masked {
+            content_columns: columns.iter().map(ToString::to_string).collect(),
+        };
+        let deep_head = format!("attr.{}", vec!["a"; 20_000].join("."));
+        for _ in 0..100 {
+            for (columns, want) in [
+                (vec!["attr.b", "attr.a.a.a"], Some("attr.a.a.a")),
+                (vec![deep_head.as_str(), "attr.a.a"], Some("attr.a.a")),
+                (vec![deep_head.as_str()], Some(deep_head.as_str())),
+                (vec!["attr.b", "attr.a.b", "resource.a"], None),
+            ] {
+                let got = match masked(&columns).validate(&eq) {
+                    Err(QueryError::Forbidden { column }) => Some(column),
+                    Ok(()) => None,
+                    Err(other) => panic!("{other:?}"),
+                };
+                assert_eq!(got.as_deref(), want, "{columns:?}");
+            }
+            masked(&["attr.a.a.a"])
+                .validate(&ord)
+                .expect("ordering reads no path");
         }
     }
 

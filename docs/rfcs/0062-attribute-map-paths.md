@@ -156,23 +156,27 @@ The JSON arm keeps its two steps:
    closing brace (`"x"}}` for `"x"`). Every one of those pairs ends with
    that text, so one column scan replaces one per key (amended
    2026-11-02 after RFC0062.6 measured the per-key `OR` at about +21%).
-   A key of more than 16 dot-separated parts takes a single `!=`
-   pattern as well, `,"value":` plus the type prefix. One pattern per
-   tail would make the plan grow with the square of the parts.
+   A key of more than 16 dot-separated parts, or longer than 1 KiB,
+   takes a single `!=` pattern as well, `,"value":` plus the type
+   prefix. One pattern per tail would make the plan grow with the
+   square of the parts.
 2. **Confirm.** The internal `ourios_attr_cmp` UDF applies §3.1 to the
    candidate rows. It reads the stored text without decoding it: a row
    with no map value cannot hold a path, so the top-level shortcut from
    #1137 answers it; other rows are scanned, descending only into the
    maps on the path. The UDF keeps a table of the key's head and tail
-   texts only for a key of at most 16 parts. For a longer key it builds
-   each text when the scan visits it, so its memory stays linear in the
+   texts only for a key of at most 16 parts and 1 KiB. Any other key
+   builds none of these texts, so the UDF's memory stays linear in the
    key's length. A map is reached only through its own pair, and that
    pair's key fixes where the rest of the key starts, so the scan
-   resolves each map in a row at most once. For a key of more than 16
-   parts, one pass over a list finds the pair named by the whole rest of
-   the key and the pairs named by each of its heads. A row then costs at
-   most its nesting depth times its length in scanned bytes, however many
-   parts the key has. A shorter key costs at most one pass per part.
+   resolves each map in a row at most once. For an untabled key, one
+   pass over a list finds the pair named by the whole rest of the key
+   and the pairs named by each of its heads. A row then costs at most
+   its nesting depth times its length in scanned bytes, however many
+   parts the key has. A tabled key costs at most one pass per part.
+   Masking (RFC 0047 §3.4) compares each content column against the
+   queried key in place, so checking a key against its map heads
+   allocates nothing per head.
 
 A row the scan cannot read fails the query, as in #1137. The UDF keeps
 no call stack: the token scan tracks only a depth count, and the maps

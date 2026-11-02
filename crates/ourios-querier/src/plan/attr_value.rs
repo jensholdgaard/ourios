@@ -116,19 +116,28 @@ struct Cmp<'a> {
     needle: String,
     pair: String,
     typed: String,
-    /// For a key of at most [`MAX_TABLED_SEGMENTS`] dot-separated parts,
-    /// the needle of every run of `key` from its start or a dot to a dot
-    /// or its end: the heads and tails a path splits the key into. A key
-    /// with more parts builds each needle when [`Self::resolve`] visits it,
-    /// since the table grows with the square of the parts.
+    /// For a [`tabled`] key, the needle of every run of `key` from its
+    /// start or a dot to a dot or its end: the heads and tails a path
+    /// splits the key into. Any other key is resolved in one pass per list
+    /// with no needles, since the table grows with the square of the parts
+    /// times the key's length.
     segments: Vec<(Range<usize>, String)>,
 }
 
-/// The most dot-separated parts a key may have for [`Cmp`] to keep the
-/// needle of every run between its dots: 136 needles at 16 parts, while
-/// a few thousand parts would retain gigabytes. `OTel` attribute names
-/// have well under 16.
+/// The most dot-separated parts a [`tabled`] key may have: 136 needles at
+/// 16 parts, while a few thousand parts would retain gigabytes. `OTel`
+/// attribute names have well under 16.
 pub(super) const MAX_TABLED_SEGMENTS: usize = 16;
+
+/// The longest [`tabled`] key, so its needle table stays under about
+/// 140 KiB however long the parts are.
+const MAX_TABLED_KEY_BYTES: usize = 1024;
+
+/// Whether a key is short enough to keep a needle per run of its parts
+/// (and, in the `!=` prefilter, a pattern per tail).
+pub(super) fn tabled(key: &str) -> bool {
+    key.len() <= MAX_TABLED_KEY_BYTES && key.split('.').count() <= MAX_TABLED_SEGMENTS
+}
 
 /// `"key":"<part>"`, as the canonical encoder writes a pair's key.
 fn needle(part: &str) -> String {
@@ -139,7 +148,7 @@ fn needle(part: &str) -> String {
 impl<'a> Cmp<'a> {
     fn new(key: &'a str, expected: &'a str, eq: bool) -> Self {
         let type_prefix = expected.find(':').map_or(expected, |i| &expected[..=i]);
-        let segments = if key.split('.').count() <= MAX_TABLED_SEGMENTS {
+        let segments = if tabled(key) {
             let dots = key.match_indices('.').map(|(i, _)| i);
             let starts: Vec<usize> = std::iter::once(0)
                 .chain(dots.clone().map(|i| i + 1))
@@ -773,6 +782,13 @@ mod tests {
         }
         let few = Cmp::new("a.b.c", &expected, true);
         assert_eq!(few.segments.len(), 6, "a key of few parts keeps its table");
+        // Two parts, but over the byte cap: no table, the same answer.
+        let head = "h".repeat(2_000);
+        let long = format!("{head}.b");
+        let json = stored(&[kv(&head, map(vec![kv("b", string("x"))]))]);
+        let cmp = Cmp::new(&long, &expected, true);
+        assert_eq!(cmp.tabled_needle_bytes(), 0);
+        assert!(cmp.eval(&json).expect("eval"));
     }
 
     /// Maps keyed `a`, `a.a` and `a.a.a` at every level, each a head of

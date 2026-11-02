@@ -126,8 +126,15 @@ acks, ever.
   batch up to 100 ms *or* until WAL segment fills, whichever first.
 - Crash recovery test is part of CI. An ingester killed mid-batch must
   recover without losing acknowledged data.
-- If you add replication later, it is in addition to the WAL, not
-  instead of it.
+- Replication is in addition to the WAL, not instead of it. A
+  replicated WAL acknowledges a batch only after at least two
+  replicas, and at least its configured floor, have fsynced it, so
+  losing one disk never loses an acknowledged batch; when that cannot
+  be met, the batch is rejected, not acknowledged on fewer. A replica
+  becomes leader only if it already holds every acknowledged batch. A
+  replica that has lost leadership can never commit another batch,
+  whatever its clock says, so a success it sends late is only ever for
+  a batch the new leader holds.
 
 ### 3.5 Parquet schema changes require a migration plan
 The on-disk format is the contract with the user's existing data. A
@@ -163,7 +170,8 @@ list:
 2. **Parameter cardinality blowup** — length limits, overflow to body
    column, per-service alerting.
 3. **WAL durability vs. latency** — batched fsync with explicit knob,
-   crash-recovery test in CI.
+   crash-recovery test in CI for every WAL backend, including a leader
+   killed mid-batch on the replicated one.
 4. **Small file problem** — background compaction, target row-group size
    128 MB–1 GB, target file size 256 MB–2 GB.
 5. **Template schema evolution across deploys** — template versioning,
@@ -417,7 +425,7 @@ the wrong thing.
 
 ---
 
-*Last updated: 2026-10-30. Original draft 2026-04-23. 2026-04-26 revision
+*Last updated: 2026-11-02. Original draft 2026-04-23. 2026-04-26 revision
 aligned §7 with the present-day repo and added §6.7 + an mdBook entry to
 §6.6 (commits 1c806f5..84eed86). 2026-05-13 revision adds the "Tests are
 specifications, not friction" bullet to §6.2, codifying a discipline
@@ -437,5 +445,11 @@ context file the repository tracks (per-tool files such as `CLAUDE.md`,
 8.2, 8.5 and 9 agent-neutral, per **RFC 0057** (maintainer-approved
 `meta:` RFC). A `CLAUDE.md §N` citation in earlier documents means the
 same section here; the numbering did not change.
+2026-11-02 revision states what §3.4's "replication is in addition to
+the WAL" requires of a replicated WAL (at least two fsynced replicas
+before the ack, a new leader holding every acknowledged batch, fencing
+of a replaced leader) and extends §4
+item 3's crash test to every backend, per **RFC 0064**
+(maintainer-approved `meta:` RFC).
 This document is load-bearing; further changes require a `meta:` RFC and
 majority maintainer approval.*

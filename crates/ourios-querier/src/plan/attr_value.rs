@@ -216,7 +216,71 @@ impl<'a> Cmp<'a> {
     /// key in `span`: the value of the first pair it names, or else, the
     /// longest head first, the rest of the part resolved inside the map
     /// held by the first pair the head names.
+    ///
+    /// No list is resolved twice for one row: a map is reached only
+    /// through its own pair, whose key fixes where the rest of the key
+    /// starts, so each map is visited at most once, and a row costs at
+    /// most one call per map in it. A key of few parts finds each head
+    /// with its own substring search, at most [`MAX_TABLED_SEGMENTS`]
+    /// passes over a list; a longer key finds them all in one pass, so a
+    /// list costs one scan however many parts the key has.
     fn resolve<'j>(&self, list: &'j str, span: Range<usize>) -> Result<Option<&'j str>> {
+        #[cfg(test)]
+        tests::count(1, 0);
+        if self.segments.is_empty() {
+            self.resolve_wide(list, span)
+        } else {
+            self.resolve_narrow(list, span)
+        }
+    }
+
+    /// [`Self::resolve`] in one pass over `list`: the first pair named by
+    /// the whole part, which wins at once, and the first pair named by
+    /// each of its heads.
+    fn resolve_wide<'j>(&self, list: &'j str, span: Range<usize>) -> Result<Option<&'j str>> {
+        let part = &self.key[span.clone()];
+        let quoted = serde_json::to_string(part).unwrap_or_default();
+        let escaped = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or("");
+        let dots: Vec<usize> = part.match_indices('.').map(|(i, _)| i).collect();
+        let mut heads: Vec<Option<&'j str>> = vec![None; dots.len()];
+        #[cfg(test)]
+        tests::count(0, list.len());
+        let b = list.as_bytes();
+        let mut depth = 0usize;
+        for token in Tokens::new(b, 0) {
+            let (i, _, c) = token?;
+            match c {
+                b'"' if depth == 2 && b[i..].starts_with(KEY_OPEN.as_bytes()) => {
+                    // The key string's opening quote.
+                    let start = i + KEY_OPEN.len() - 1;
+                    let end = string_end(b, start)?;
+                    let value = || value_after(list, end).map(|v| v.unwrap_or(""));
+                    match name_part(escaped, &list[start + 1..end - 1]) {
+                        Named::Whole => return value().map(Some),
+                        Named::Head(k) if heads[k].is_none() => heads[k] = Some(value()?),
+                        Named::Head(_) | Named::Other => {}
+                    }
+                }
+                b'[' | b'{' => depth += 1,
+                b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return Err(truncated());
+        }
+        for (k, head) in heads.iter().enumerate().rev() {
+            let Some(map) = head.and_then(map_entries) else {
+                continue;
+            };
+            if let Some(value) = self.resolve(map, span.start + dots[k] + 1..span.end)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    fn resolve_narrow<'j>(&self, list: &'j str, span: Range<usize>) -> Result<Option<&'j str>> {
         if let Some(value) = first_pair(list, &self.needle_of(&span))? {
             return Ok(Some(value));
         }
@@ -244,7 +308,36 @@ impl<'a> Cmp<'a> {
     fn tabled_needle_bytes(&self) -> usize {
         self.segments.iter().map(|(_, n)| n.len()).sum()
     }
+
+    /// The same comparison resolved as a key of many parts is.
+    #[cfg(test)]
+    fn without_table(mut self) -> Self {
+        self.segments.clear();
+        self
+    }
 }
+
+/// How a pair's key, the text in `"key":"…"`, names the part of the key
+/// being resolved: all of it, its head before the `k`th dot, or neither.
+enum Named {
+    Whole,
+    Head(usize),
+    Other,
+}
+
+/// `stored` and `escaped` are JSON-escaped the same way, one character at
+/// a time, and no escape holds a `.`, so `stored` names a head exactly
+/// when it is a prefix of `escaped` that a `.` follows.
+fn name_part(escaped: &str, stored: &str) -> Named {
+    match escaped.strip_prefix(stored) {
+        Some("") => Named::Whole,
+        Some(rest) if rest.starts_with('.') => Named::Head(stored.matches('.').count()),
+        _ => Named::Other,
+    }
+}
+
+/// A pair's `key` member, up to the opening quote of the key itself.
+const KEY_OPEN: &str = "\"key\":\"";
 
 /// The stored text of the value of the first pair in `list` whose key
 /// is `needle`, which is what [`canonical::encode_any_value`] writes for
@@ -253,6 +346,8 @@ impl<'a> Cmp<'a> {
 /// value depth is no limit. A row that ends early fails the query rather
 /// than drop out of the result.
 fn first_pair<'j>(list: &'j str, needle: &str) -> Result<Option<&'j str>> {
+    #[cfg(test)]
+    tests::count(0, list.len());
     if !list.contains(needle) {
         return Ok(None);
     }
@@ -328,17 +423,17 @@ impl<'b> Tokens<'b> {
     fn new(b: &'b [u8], i: usize) -> Self {
         Self { b, i }
     }
+}
 
-    /// The index after the string that opens at `b[i]`.
-    fn string_end(&self, i: usize) -> Result<usize> {
-        let mut j = i + 1;
-        loop {
-            match self.b.get(j) {
-                Some(b'\\') => j += 2,
-                Some(b'"') => return Ok(j + 1),
-                Some(_) => j += 1,
-                None => return Err(truncated()),
-            }
+/// The index after the string that opens at `b[i]`.
+fn string_end(b: &[u8], i: usize) -> Result<usize> {
+    let mut j = i + 1;
+    loop {
+        match b.get(j) {
+            Some(b'\\') => j += 2,
+            Some(b'"') => return Ok(j + 1),
+            Some(_) => j += 1,
+            None => return Err(truncated()),
         }
     }
 }
@@ -350,7 +445,7 @@ impl Iterator for Tokens<'_> {
         let i = self.i;
         let c = *self.b.get(i)?;
         let end = if c == b'"' {
-            self.string_end(i)
+            string_end(self.b, i)
         } else {
             Ok(i + 1)
         };
@@ -370,7 +465,23 @@ mod tests {
     use ourios_testgen::strategies::adversarial;
     use proptest::prelude::*;
 
-    use super::{Cmp, canonical, canonical_value};
+    use super::{Cmp, MAX_TABLED_SEGMENTS, canonical, canonical_value};
+
+    thread_local! {
+        /// `resolve` calls, and the bytes of the lists scanned for pairs.
+        static RESOLVES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    pub(super) fn count(calls: usize, scanned: usize) {
+        RESOLVES.with(|c| {
+            let (n, bytes) = c.get();
+            c.set((n + calls, bytes + scanned));
+        });
+    }
+
+    fn take_resolves() -> (usize, usize) {
+        RESOLVES.with(|c| c.replace((0, 0)))
+    }
 
     fn kv(key: &str, value: Value) -> KeyValue {
         KeyValue {
@@ -502,6 +613,70 @@ mod tests {
         }
         let few = Cmp::new("a.b.c", &expected, true);
         assert_eq!(few.segments.len(), 6, "a key of few parts keeps its table");
+    }
+
+    /// Maps keyed `a`, `a.a` and `a.a.a` at every level, each a head of
+    /// the `rest` parts still to resolve, so the search enters every one
+    /// of them. Only the chain of `a` heads, which it tries last, ends in
+    /// the value.
+    fn branching(levels: usize, rest: usize, last_chain: bool) -> Vec<KeyValue> {
+        let a = |n: usize| vec!["a"; n].join(".");
+        match levels {
+            0 if last_chain => vec![kv(&a(rest), string("x"))],
+            0 => Vec::new(),
+            _ => (1..=3)
+                .map(|n| {
+                    let inner = branching(levels - 1, rest.saturating_sub(n), last_chain && n == 1);
+                    kv(&a(n), map(inner))
+                })
+                .collect(),
+        }
+    }
+
+    /// Each map is resolved at most once per row, and a key of many parts
+    /// scans each list once, so the work is linear in the row.
+    #[test]
+    fn crafted_nested_heads_resolve_in_linear_work() {
+        for (levels, parts) in [(6, 24), (5, 16)] {
+            let key = vec!["a"; parts].join(".");
+            let attrs = branching(levels, parts, true);
+            let json = stored(&attrs);
+            let maps = (1..=levels)
+                .map(|l| 3usize.pow(u32::try_from(l).expect("small")))
+                .sum::<usize>();
+            let expected = canonical_value(string("x")).expect("encode");
+            let oracle = resolve_decoded(&attrs, &key);
+            assert_eq!(
+                oracle.as_deref(),
+                Some(expected.as_str()),
+                "the value is reachable"
+            );
+            take_resolves();
+            let got = (
+                Cmp::new(&key, &expected, true).eval(&json).expect("eval"),
+                Cmp::new(&key, &expected, false).eval(&json).expect("eval"),
+            );
+            let (calls, bytes) = take_resolves();
+            assert_eq!(got, (true, false), "{parts} parts");
+            // Two comparisons, each resolving every map and the row at most
+            // once. A key of many parts scans a list once; a shorter one
+            // once per part at most. Nested lists overlap, so the lists of
+            // one level add up to at most the row.
+            let passes = if parts > MAX_TABLED_SEGMENTS {
+                1
+            } else {
+                parts
+            };
+            assert!(
+                calls <= 2 * (maps + 1),
+                "{calls} resolve calls for {maps} maps"
+            );
+            let bound = 2 * passes * (levels + 1) * json.len();
+            assert!(
+                bytes <= bound,
+                "{bytes} bytes scanned, bound {bound}, {parts} parts"
+            );
+        }
     }
 
     /// Every key in `attrs`, nested map keys included.
@@ -668,6 +843,12 @@ mod tests {
                         Cmp::new(&key, &expected, false).eval(&json).expect("eval"),
                     );
                     prop_assert_eq!(got, oracle, "key {:?} expected {} in {}", key, expected, json);
+                    // The one-pass resolution of a key of many parts agrees too.
+                    let wide = (
+                        Cmp::new(&key, &expected, true).without_table().eval(&json).expect("eval"),
+                        Cmp::new(&key, &expected, false).without_table().eval(&json).expect("eval"),
+                    );
+                    prop_assert_eq!(wide, oracle, "one pass: key {:?} expected {} in {}", key, expected, json);
                     // The `==` prefilter of a dotted key (`json_arm`) keeps every match.
                     let value_tail = format!("{}}}", &expected[type_prefix.len()..]);
                     prop_assert!(!got.0 || json.contains(&value_tail), "{} drops {}", value_tail, json);

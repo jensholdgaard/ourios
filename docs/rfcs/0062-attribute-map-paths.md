@@ -166,7 +166,13 @@ The JSON arm keeps its two steps:
    maps on the path. The UDF keeps a table of the key's head and tail
    texts only for a key of at most 16 parts. For a longer key it builds
    each text when the scan visits it, so its memory stays linear in the
-   key's length.
+   key's length. A map is reached only through its own pair, and that
+   pair's key fixes where the rest of the key starts, so the scan
+   resolves each map in a row at most once. For a key of more than 16
+   parts, one pass over a list finds the pair named by the whole rest of
+   the key and the pairs named by each of its heads. A row then costs at
+   most its nesting depth times its length in scanned bytes, however many
+   parts the key has. A shorter key costs at most one pass per part.
 
 A row the scan cannot read fails the query, as in #1137. The UDF keeps
 no stack, so value depth is not limited by the lookup.

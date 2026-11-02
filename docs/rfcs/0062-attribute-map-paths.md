@@ -156,11 +156,17 @@ The JSON arm keeps its two steps:
    closing brace (`"x"}}` for `"x"`). Every one of those pairs ends with
    that text, so one column scan replaces one per key (amended
    2026-11-02 after RFC0062.6 measured the per-key `OR` at about +21%).
+   A key of more than 16 dot-separated parts takes a single `!=`
+   pattern as well, `,"value":` plus the type prefix. One pattern per
+   tail would make the plan grow with the square of the parts.
 2. **Confirm.** The internal `ourios_attr_cmp` UDF applies §3.1 to the
    candidate rows. It reads the stored text without decoding it: a row
    with no map value cannot hold a path, so the top-level shortcut from
    #1137 answers it; other rows are scanned, descending only into the
-   maps on the path.
+   maps on the path. The UDF keeps a table of the key's head and tail
+   texts only for a key of at most 16 parts. For a longer key it builds
+   each text when the scan visits it, so its memory stays linear in the
+   key's length.
 
 A row the scan cannot read fails the query, as in #1137. The UDF keeps
 no stack, so value depth is not limited by the lookup.

@@ -793,3 +793,26 @@ async fn rfc0062_4_resource_attributes_and_service() {
     )
     .await;
 }
+
+/// RFC0062.2 for a key of more parts than the querier keeps a pattern
+/// per tail for: the path still resolves, for `==` and `!=`.
+#[tokio::test]
+async fn a_key_of_many_parts_resolves_into_a_map() {
+    let parts: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
+    let key = parts.join(".");
+    let head = parts[..19].join(".");
+    let records = records_with_log_attrs(vec![
+        vec![kv(&key, "u7")],
+        vec![map_of(&head, vec![kv("p19", "u8")])],
+        vec![kv("other", "u7")],
+    ]);
+    let eq = format!(r#"attr.{key} == "u7""#);
+    let ne = format!(r#"attr.{key} != "u7""#);
+    let eq_u8 = format!(r#"attr.{key} == "u8""#);
+    assert_counts_per_promotion(
+        &records,
+        &[PromotedAttributes::default()],
+        &[(&eq, 1), (&ne, 1), (&eq_u8, 1)],
+    )
+    .await;
+}

@@ -8,6 +8,7 @@
 //! another attribute's map value. First occurrence wins, as in the
 //! promoted-column projection (`promoted::project_string_value`).
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
@@ -115,31 +116,46 @@ struct Cmp<'a> {
     needle: String,
     pair: String,
     typed: String,
-    /// The needle of every run of `key` from its start or a dot to a dot
-    /// or its end: the heads and tails a path splits the key into.
+    /// For a key of at most [`MAX_TABLED_SEGMENTS`] dot-separated parts,
+    /// the needle of every run of `key` from its start or a dot to a dot
+    /// or its end: the heads and tails a path splits the key into. A key
+    /// with more parts builds each needle when [`Self::resolve`] visits it,
+    /// since the table grows with the square of the parts.
     segments: Vec<(Range<usize>, String)>,
+}
+
+/// The most dot-separated parts a key may have for [`Cmp`] to keep the
+/// needle of every run between its dots: 136 needles at 16 parts, while
+/// a few thousand parts would retain gigabytes. `OTel` attribute names
+/// have well under 16.
+pub(super) const MAX_TABLED_SEGMENTS: usize = 16;
+
+/// `"key":"<part>"`, as the canonical encoder writes a pair's key.
+fn needle(part: &str) -> String {
+    let quoted = serde_json::to_string(part).unwrap_or_default();
+    format!("\"key\":{quoted}")
 }
 
 impl<'a> Cmp<'a> {
     fn new(key: &'a str, expected: &'a str, eq: bool) -> Self {
-        let needle = |part: &str| {
-            let quoted = serde_json::to_string(part).unwrap_or_default();
-            format!("\"key\":{quoted}")
-        };
         let type_prefix = expected.find(':').map_or(expected, |i| &expected[..=i]);
-        let dots = key.match_indices('.').map(|(i, _)| i);
-        let starts: Vec<usize> = std::iter::once(0)
-            .chain(dots.clone().map(|i| i + 1))
-            .collect();
-        let ends: Vec<usize> = dots.chain(std::iter::once(key.len())).collect();
-        let segments = starts
-            .iter()
-            .flat_map(|&s| ends.iter().filter(move |&&e| e >= s).map(move |&e| s..e))
-            .map(|span| {
-                let text = needle(&key[span.clone()]);
-                (span, text)
-            })
-            .collect();
+        let segments = if key.split('.').count() <= MAX_TABLED_SEGMENTS {
+            let dots = key.match_indices('.').map(|(i, _)| i);
+            let starts: Vec<usize> = std::iter::once(0)
+                .chain(dots.clone().map(|i| i + 1))
+                .collect();
+            let ends: Vec<usize> = dots.chain(std::iter::once(key.len())).collect();
+            starts
+                .iter()
+                .flat_map(|&s| ends.iter().filter(move |&&e| e >= s).map(move |&e| s..e))
+                .map(|span| {
+                    let text = needle(&key[span.clone()]);
+                    (span, text)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let whole = needle(key);
         Self {
             key,
@@ -201,12 +217,12 @@ impl<'a> Cmp<'a> {
     /// longest head first, the rest of the part resolved inside the map
     /// held by the first pair the head names.
     fn resolve<'j>(&self, list: &'j str, span: Range<usize>) -> Result<Option<&'j str>> {
-        if let Some(value) = first_pair(list, self.needle_of(&span)?)? {
+        if let Some(value) = first_pair(list, &self.needle_of(&span))? {
             return Ok(Some(value));
         }
         for (dot, _) in self.key[span.clone()].rmatch_indices('.') {
             let at = span.start + dot;
-            let head = first_pair(list, self.needle_of(&(span.start..at))?)?;
+            let head = first_pair(list, &self.needle_of(&(span.start..at)))?;
             let Some(map) = head.and_then(map_entries) else {
                 continue;
             };
@@ -217,12 +233,16 @@ impl<'a> Cmp<'a> {
         Ok(None)
     }
 
-    fn needle_of(&self, span: &Range<usize>) -> Result<&str> {
-        self.segments
-            .iter()
-            .find(|(s, _)| s == span)
-            .map(|(_, needle)| needle.as_str())
-            .ok_or_else(|| exec_datafusion_err!("{NAME}: no needle for key bytes {span:?}"))
+    fn needle_of(&self, span: &Range<usize>) -> Cow<'_, str> {
+        match self.segments.iter().find(|(s, _)| s == span) {
+            Some((_, tabled)) => Cow::Borrowed(tabled),
+            None => Cow::Owned(needle(&self.key[span.clone()])),
+        }
+    }
+
+    #[cfg(test)]
+    fn tabled_needle_bytes(&self) -> usize {
+        self.segments.iter().map(|(_, n)| n.len()).sum()
     }
 }
 
@@ -451,6 +471,39 @@ mod tests {
         let json = stored(&[kv("d", deep), kv("k", string("x"))]);
         assert_eq!(cmp(&json, "x"), (true, false));
     }
+
+    /// A key of thousands of parts resolves by the same rule without
+    /// retaining a needle per run of parts, which would be gigabytes.
+    #[test]
+    fn a_key_of_many_parts_resolves_without_a_needle_table() {
+        let parts = 2_000;
+        let key = vec!["a"; parts].join(".");
+        assert_eq!(key.len(), 3_999);
+        let head = vec!["a"; parts - 1].join(".");
+        let expected = canonical_value(string("x")).expect("encode");
+        let rows = [
+            (stored(&[kv(&key, string("x"))]), (true, false)),
+            (
+                stored(&[kv(&head, map(vec![kv("a", string("x"))]))]),
+                (true, false),
+            ),
+            (
+                stored(&[kv(&head, map(vec![kv("a", string("y"))]))]),
+                (false, true),
+            ),
+            (stored(&[kv("other", map(Vec::new()))]), (false, false)),
+        ];
+        let eq = Cmp::new(&key, &expected, true);
+        let ne = Cmp::new(&key, &expected, false);
+        assert_eq!(eq.tabled_needle_bytes() + ne.tabled_needle_bytes(), 0);
+        for (json, want) in rows {
+            let got = (eq.eval(&json).expect("eval"), ne.eval(&json).expect("eval"));
+            assert_eq!(got, want, "{}", &json[..80]);
+        }
+        let few = Cmp::new("a.b.c", &expected, true);
+        assert_eq!(few.segments.len(), 6, "a key of few parts keeps its table");
+    }
+
     /// Every key in `attrs`, nested map keys included.
     fn all_keys(attrs: &[KeyValue], out: &mut Vec<String>) {
         for kv in attrs {

@@ -672,8 +672,12 @@ fn json_arm(
     let type_prefix = expected
         .find(':')
         .map_or(expected.as_str(), |i| &expected[..=i]);
-    let patterns = match (eq, key.contains('.')) {
-        (true, true) => vec![format!("{}}}", &expected[type_prefix.len()..])],
+    let parts = key.split('.').count();
+    let patterns = match (eq, parts) {
+        (true, 2..) => vec![format!("{}}}", &expected[type_prefix.len()..])],
+        // One pattern per tail would build a plan quadratic in the key;
+        // every stored value of the type carries this text.
+        (false, n) if n > MAX_TABLED_SEGMENTS => vec![format!(",\"value\":{type_prefix}")],
         _ => std::iter::once(key)
             .chain(key.match_indices('.').map(|(i, _)| &key[i + 1..]))
             .map(|stored| {

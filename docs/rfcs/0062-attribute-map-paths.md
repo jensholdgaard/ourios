@@ -175,7 +175,9 @@ The JSON arm keeps its two steps:
    parts the key has. A shorter key costs at most one pass per part.
 
 A row the scan cannot read fails the query, as in #1137. The UDF keeps
-no stack, so value depth is not limited by the lookup.
+no call stack: the token scan tracks only a depth count, and the maps
+on a path are opened from a heap worklist. Value depth is therefore not
+limited by the lookup.
 
 ### 3.4 Amendments
 

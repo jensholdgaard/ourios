@@ -188,7 +188,7 @@ impl<'a> Cmp<'a> {
         let value = match json.find(&self.needle) {
             Some(at) if !json[..at].contains(KVLIST) => return Ok(self.text_answer(&json[at..])),
             None if !self.key.contains('.') || !json.contains(KVLIST) => return Ok(false),
-            _ => self.resolve(json, 0..self.key.len())?,
+            _ => self.resolve(json)?,
         };
         Ok(value.is_some_and(|value| self.value_answer(value)))
     }
@@ -212,96 +212,133 @@ impl<'a> Cmp<'a> {
         }
     }
 
-    /// RFC 0062 §3.1 on the stored pair list `list`, for the part of the
-    /// key in `span`: the value of the first pair it names, or else, the
-    /// longest head first, the rest of the part resolved inside the map
-    /// held by the first pair the head names.
+    /// RFC 0062 §3.1 on the stored row: the value of the first pair named
+    /// by the whole key, or else, the longest head first, the rest of the
+    /// key resolved inside the map held by the first pair the head names.
     ///
-    /// No list is resolved twice for one row: a map is reached only
-    /// through its own pair, whose key fixes where the rest of the key
-    /// starts, so each map is visited at most once, and a row costs at
-    /// most one call per map in it. A key of few parts finds each head
-    /// with its own substring search, at most [`MAX_TABLED_SEGMENTS`]
-    /// passes over a list; a longer key finds them all in one pass, so a
-    /// list costs one scan however many parts the key has.
-    fn resolve<'j>(&self, list: &'j str, span: Range<usize>) -> Result<Option<&'j str>> {
+    /// A worklist of open lists replaces recursion, so stored nesting
+    /// costs heap, not stack. The first value found is the answer, since
+    /// every list it sits under would return it unchanged. No list is
+    /// opened twice for one row: a map is reached only through its own
+    /// pair, whose key fixes where the rest of the key starts. A key of
+    /// few parts finds each head with its own substring search, at most
+    /// [`MAX_TABLED_SEGMENTS`] passes over a list; a longer key finds
+    /// them all in one pass, so a list costs one scan however many parts
+    /// the key has.
+    fn resolve<'j>(&self, row: &'j str) -> Result<Option<&'j str>> {
+        let mut open = Vec::new();
+        let mut next = Some((row, 0));
+        loop {
+            if let Some((list, start)) = next.take() {
+                match self.open(list, start)? {
+                    Opened::Whole(value) => return Ok(Some(value)),
+                    Opened::List(frame) => open.push(frame),
+                }
+            }
+            let Some(frame) = open.last_mut() else {
+                return Ok(None);
+            };
+            match self.next_map(frame)? {
+                Some(map) => next = Some(map),
+                None => {
+                    open.pop();
+                }
+            }
+        }
+    }
+
+    /// `list` with the key resolved from byte `start` on: the value its
+    /// first pair named by that rest holds (rule 1), or the list to try
+    /// the heads of.
+    fn open<'j>(&self, list: &'j str, start: usize) -> Result<Opened<'j>> {
         #[cfg(test)]
         tests::count(1, 0);
-        if self.segments.is_empty() {
-            self.resolve_wide(list, span)
-        } else {
-            self.resolve_narrow(list, span)
+        let whole = start..self.key.len();
+        if !self.segments.is_empty() {
+            return Ok(match first_pair(list, &self.needle_of(&whole))? {
+                Some(value) => Opened::Whole(value),
+                None => Opened::List(Frame {
+                    list,
+                    start,
+                    heads: Heads::Search { end: whole.end },
+                }),
+            });
+        }
+        let found = scan_list(list, self.escaped_from(start))?;
+        Ok(match found {
+            Scanned::Whole(value) => Opened::Whole(value),
+            Scanned::Heads(heads) => Opened::List(Frame {
+                list,
+                start,
+                heads: Heads::Found(self.head_maps(start, heads)),
+            }),
+        })
+    }
+
+    /// The next map to resolve the rest of the key in, longest head first,
+    /// with where that rest starts.
+    fn next_map<'j>(&self, frame: &mut Frame<'j>) -> Result<Option<(&'j str, usize)>> {
+        match &mut frame.heads {
+            Heads::Found(maps) => Ok(maps.pop()),
+            Heads::Search { end } => self.search_head(frame.list, frame.start, end),
         }
     }
 
-    /// [`Self::resolve`] in one pass over `list`: the first pair named by
-    /// the whole part, which wins at once, and the first pair named by
-    /// each of its heads.
-    fn resolve_wide<'j>(&self, list: &'j str, span: Range<usize>) -> Result<Option<&'j str>> {
-        let part = &self.key[span.clone()];
-        let quoted = serde_json::to_string(part).unwrap_or_default();
-        let escaped = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or("");
-        let dots: Vec<usize> = part.match_indices('.').map(|(i, _)| i).collect();
-        let mut heads: Vec<Option<&'j str>> = vec![None; dots.len()];
-        #[cfg(test)]
-        tests::count(0, list.len());
-        let b = list.as_bytes();
-        let mut depth = 0usize;
-        for token in Tokens::new(b, 0) {
-            let (i, _, c) = token?;
-            match c {
-                b'"' if depth == 2 && b[i..].starts_with(KEY_OPEN.as_bytes()) => {
-                    // The key string's opening quote.
-                    let start = i + KEY_OPEN.len() - 1;
-                    let end = string_end(b, start)?;
-                    let value = || value_after(list, end).map(|v| v.unwrap_or(""));
-                    match name_part(escaped, &list[start + 1..end - 1]) {
-                        Named::Whole => return value().map(Some),
-                        Named::Head(k) if heads[k].is_none() => heads[k] = Some(value()?),
-                        Named::Head(_) | Named::Other => {}
-                    }
-                }
-                b'[' | b'{' => depth += 1,
-                b']' | b'}' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-        if depth != 0 {
-            return Err(truncated());
-        }
-        for (k, head) in heads.iter().enumerate().rev() {
-            let Some(map) = head.and_then(map_entries) else {
-                continue;
-            };
-            if let Some(value) = self.resolve(map, span.start + dots[k] + 1..span.end)? {
-                return Ok(Some(value));
+    /// The longest head before `end` whose first pair in `list` holds a
+    /// map, moving `end` past every head tried.
+    fn search_head<'j>(
+        &self,
+        list: &'j str,
+        start: usize,
+        end: &mut usize,
+    ) -> Result<Option<(&'j str, usize)>> {
+        while let Some(dot) = self.key[start..*end].rfind('.').map(|i| start + i) {
+            *end = dot;
+            let head = first_pair(list, &self.needle_of(&(start..dot)))?;
+            if let Some(map) = head.and_then(map_entries) {
+                return Ok(Some((map, dot + 1)));
             }
         }
         Ok(None)
     }
 
-    fn resolve_narrow<'j>(&self, list: &'j str, span: Range<usize>) -> Result<Option<&'j str>> {
-        if let Some(value) = first_pair(list, &self.needle_of(&span))? {
-            return Ok(Some(value));
-        }
-        for (dot, _) in self.key[span.clone()].rmatch_indices('.') {
-            let at = span.start + dot;
-            let head = first_pair(list, &self.needle_of(&(span.start..at)))?;
-            let Some(map) = head.and_then(map_entries) else {
-                continue;
-            };
-            if let Some(value) = self.resolve(map, at + 1..span.end)? {
-                return Ok(Some(value));
-            }
-        }
-        Ok(None)
+    /// The maps the scanned heads hold, each with where the rest of the
+    /// key starts inside it, shortest head first so the longest pops first.
+    fn head_maps<'j>(&self, start: usize, heads: Vec<(usize, &'j str)>) -> Vec<(&'j str, usize)> {
+        let mut dots = self.key[start..].match_indices('.').map(|(i, _)| start + i);
+        let mut taken = 0;
+        heads
+            .into_iter()
+            .filter_map(|(k, value)| {
+                let dot = dots.nth(k - taken)?;
+                taken = k + 1;
+                map_entries(value).map(|map| (map, dot + 1))
+            })
+            .collect()
+    }
+
+    /// The escaped text of the key from byte `start`, which follows a dot
+    /// or is the key's start; escaping keeps every `.` as it is.
+    fn escaped_from(&self, start: usize) -> &str {
+        // `needle` is `"key":"<escaped key>"`.
+        let escaped = &self.needle[KEY_OPEN.len()..self.needle.len() - 1];
+        let at = match self.key[..start].matches('.').count() {
+            0 => 0,
+            dots => escaped
+                .match_indices('.')
+                .nth(dots - 1)
+                .map_or(escaped.len(), |(i, _)| i + 1),
+        };
+        &escaped[at..]
     }
 
     fn needle_of(&self, span: &Range<usize>) -> Cow<'_, str> {
-        match self.segments.iter().find(|(s, _)| s == span) {
-            Some((_, tabled)) => Cow::Borrowed(tabled),
-            None => Cow::Owned(needle(&self.key[span.clone()])),
+        if let Some((_, tabled)) = self.segments.iter().find(|(s, _)| s == span) {
+            return Cow::Borrowed(tabled);
         }
+        #[cfg(test)]
+        tests::count_needle();
+        Cow::Owned(needle(&self.key[span.clone()]))
     }
 
     #[cfg(test)]
@@ -317,7 +354,120 @@ impl<'a> Cmp<'a> {
     }
 }
 
-/// How a pair's key, the text in `"key":"…"`, names the part of the key
+/// A list being resolved, with where the rest of the key starts in it and
+/// the heads of that rest still to try.
+struct Frame<'j> {
+    list: &'j str,
+    start: usize,
+    heads: Heads<'j>,
+}
+
+enum Heads<'j> {
+    /// A key of few parts: the heads before `end` are still to search for.
+    Search { end: usize },
+    /// A key of many parts: the maps its scan found, shortest head first.
+    Found(Vec<(&'j str, usize)>),
+}
+
+/// A list once opened: the value rule 1 found in it, or its heads.
+enum Opened<'j> {
+    Whole(&'j str),
+    List(Frame<'j>),
+}
+
+/// What one pass over a list found for the rest of the key.
+enum Scanned<'j> {
+    /// The first pair named by the whole rest: rule 1, so the answer.
+    Whole(&'j str),
+    /// The first pair named by each head, as (dot index in the rest,
+    /// value), in head order.
+    Heads(Vec<(usize, &'j str)>),
+}
+
+/// One pass over `list` for the rest of the key, `rest` as the canonical
+/// encoder escapes it.
+fn scan_list<'j>(list: &'j str, rest: &str) -> Result<Scanned<'j>> {
+    #[cfg(test)]
+    tests::count(0, list.len());
+    let mut heads = Vec::new();
+    for pair in PairKeys::new(list) {
+        let (stored, end) = pair?;
+        match classify_key(stored, rest) {
+            Named::Whole => return Ok(Scanned::Whole(value_at(list, end)?)),
+            Named::Head(k) => heads.push((k, value_at(list, end)?)),
+            Named::Other => {}
+        }
+    }
+    // A stable sort keeps the first pair of each head ahead of the others.
+    heads.sort_by_key(|&(k, _)| k);
+    heads.dedup_by_key(|&mut (k, _)| k);
+    Ok(Scanned::Heads(heads))
+}
+
+/// The value stored after a pair's key that ends at `end`, empty for a
+/// pair stored without one.
+fn value_at(list: &str, end: usize) -> Result<&str> {
+    Ok(value_after(list, end)?.unwrap_or(""))
+}
+
+/// The keys of a stored list's top-level pairs, as stored (escaped, no
+/// quotes), each with the index after its closing quote. A list's pairs
+/// have their members at depth 2 (array, then object); a list that ends
+/// early is an error.
+struct PairKeys<'j> {
+    list: &'j str,
+    tokens: Tokens<'j>,
+    depth: usize,
+}
+
+impl<'j> PairKeys<'j> {
+    fn new(list: &'j str) -> Self {
+        Self {
+            list,
+            tokens: Tokens::new(list.as_bytes(), 0),
+            depth: 0,
+        }
+    }
+}
+
+/// The key in `list` whose opening quote is at `open`, and the index after it.
+fn key_at(list: &str, open: usize) -> Result<(&str, usize)> {
+    let end = string_end(list.as_bytes(), open)?;
+    Ok((&list[open + 1..end - 1], end))
+}
+
+impl<'j> Iterator for PairKeys<'j> {
+    type Item = Result<(&'j str, usize)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_key().transpose()
+    }
+}
+
+impl<'j> PairKeys<'j> {
+    fn next_key(&mut self) -> Result<Option<(&'j str, usize)>> {
+        let b = self.list.as_bytes();
+        for token in self.tokens.by_ref() {
+            let (i, _, c) = token?;
+            match c {
+                b'"' if self.depth == 2 && b[i..].starts_with(KEY_OPEN.as_bytes()) => {
+                    return key_at(self.list, i + KEY_OPEN.len() - 1).map(Some);
+                }
+                b'[' | b'{' => self.depth += 1,
+                b']' | b'}' => self.depth = self.depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        // An unclosed list is reported once; the walk has ended either way.
+        if std::mem::take(&mut self.depth) == 0 {
+            Ok(None)
+        } else {
+            Err(truncated())
+        }
+    }
+}
+
+/// How a pair's key, the text in `"key":"…"`, names the rest of the key
 /// being resolved: all of it, its head before the `k`th dot, or neither.
 enum Named {
     Whole,
@@ -325,11 +475,11 @@ enum Named {
     Other,
 }
 
-/// `stored` and `escaped` are JSON-escaped the same way, one character at
+/// `stored` and `rest` are JSON-escaped the same way, one character at
 /// a time, and no escape holds a `.`, so `stored` names a head exactly
-/// when it is a prefix of `escaped` that a `.` follows.
-fn name_part(escaped: &str, stored: &str) -> Named {
-    match escaped.strip_prefix(stored) {
+/// when it is a prefix of `rest` that a `.` follows.
+fn classify_key(stored: &str, rest: &str) -> Named {
+    match rest.strip_prefix(stored) {
         Some("") => Named::Whole,
         Some(rest) if rest.starts_with('.') => Named::Head(stored.matches('.').count()),
         _ => Named::Other,
@@ -468,19 +618,29 @@ mod tests {
     use super::{Cmp, MAX_TABLED_SEGMENTS, canonical, canonical_value};
 
     thread_local! {
-        /// `resolve` calls, and the bytes of the lists scanned for pairs.
+        /// Lists opened, and the bytes of the lists scanned for pairs.
         static RESOLVES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+        /// Needles built while resolving, outside the table.
+        static NEEDLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    pub(super) fn count(calls: usize, scanned: usize) {
+    pub(super) fn count(opened: usize, scanned: usize) {
         RESOLVES.with(|c| {
             let (n, bytes) = c.get();
-            c.set((n + calls, bytes + scanned));
+            c.set((n + opened, bytes + scanned));
         });
+    }
+
+    pub(super) fn count_needle() {
+        NEEDLES.with(|c| c.set(c.get() + 1));
     }
 
     fn take_resolves() -> (usize, usize) {
         RESOLVES.with(|c| c.replace((0, 0)))
+    }
+
+    fn take_needles() -> usize {
+        NEEDLES.with(|c| c.replace(0))
     }
 
     fn kv(key: &str, value: Value) -> KeyValue {
@@ -676,7 +836,73 @@ mod tests {
                 bytes <= bound,
                 "{bytes} bytes scanned, bound {bound}, {parts} parts"
             );
+            assert_eq!(
+                take_needles(),
+                0,
+                "every needle comes from the table or none is needed"
+            );
         }
+    }
+
+    /// A row a key of many parts cannot resolve in, but whose value passes
+    /// the `==` prefilter, costs one pass and builds no needle.
+    #[test]
+    fn a_key_of_many_parts_rejects_an_unrelated_map_in_one_pass() {
+        let key = vec!["a"; 2_000].join(".");
+        let json = stored(&[kv("other", map(vec![kv("id", string("x"))]))]);
+        let expected = canonical_value(string("x")).expect("encode");
+        assert!(json.contains("\"x\"}}"), "the row passes the prefilter");
+        take_resolves();
+        take_needles();
+        let got = (
+            Cmp::new(&key, &expected, true).eval(&json).expect("eval"),
+            Cmp::new(&key, &expected, false).eval(&json).expect("eval"),
+        );
+        assert_eq!(got, (false, false));
+        let (opened, bytes) = take_resolves();
+        assert_eq!(
+            (opened, bytes),
+            (2, 2 * json.len()),
+            "one pass over the row each"
+        );
+        assert_eq!(take_needles(), 0);
+    }
+
+    /// One map per part, `a = {a = {… = "x"}}`, written as the encoder
+    /// writes it. Stored nesting is bounded at ingest today (#1136), but
+    /// the lookup must not rely on it.
+    fn nested_chain(depth: usize) -> String {
+        let open = r#"[{"key":"a","value":{"kvlistValue":{"values":"#;
+        let mut json = open.repeat(depth - 1);
+        json.push_str(r#"[{"key":"a","value":{"stringValue":"x"}}]"#);
+        json.push_str(&"}}}]".repeat(depth - 1));
+        json
+    }
+
+    /// The lookup keeps no Rust frame per map: 2,000 nested maps resolve
+    /// on a thread whose stack would not hold a frame for each.
+    #[test]
+    fn deep_nesting_resolves_on_a_small_stack() {
+        let depth = 2_000;
+        let json = nested_chain(depth);
+        assert!(
+            canonical::decode_attributes(nested_chain(8).as_bytes()).is_ok(),
+            "the shape decodes"
+        );
+        let key = vec!["a"; depth].join(".");
+        let got = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let expected = canonical_value(string("x")).expect("encode");
+                let eq = Cmp::new(&key, &expected, true).eval(&json).expect("eval");
+                let ne = Cmp::new(&key, &expected, false).eval(&json).expect("eval");
+                let short = Cmp::new("a.a", &expected, true).eval(&json).expect("eval");
+                (eq, ne, short)
+            })
+            .expect("spawn")
+            .join()
+            .expect("no stack overflow");
+        assert_eq!(got, (true, false, false));
     }
 
     /// Every key in `attrs`, nested map keys included.

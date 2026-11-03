@@ -510,6 +510,13 @@ partition in place of the Raft log; there is no separate tail topic.
 - `receiver.wal.backend` is a chart value, because it changes the
   workload's shape: with `kafka` the StatefulSet keeps its stable
   ordinals (§3.5) but renders no `volumeClaimTemplates`.
+- `receiver.wal.backend: kafka` requires `storage.backend: s3`; with
+  the chart's default `local` store the render fails naming both
+  values. That store is one `ReadWriteOnce` PVC the release creates,
+  so it does not exist yet when the pre-install hook below reads
+  `topic.json`, and the receiver would still need a persistent volume,
+  which is what this backend removes. A development install points
+  the store at an S3-compatible service such as MinIO.
 - The broker settings are rendered as `${env:…:-}` references in the
   receiver config and set through `receiver.extraEnv` or a secret, as
   RFC 0061 §3.1 does for `max_request_bytes`.
@@ -919,7 +926,8 @@ removes only copies of the same log entry.
 >   with the retryable rejection until a re-check passes
 
 > **Scenario RFC0066.21 — the chart renders RFC 0067's rules by default**
-> - **Given** `receiver.wal.backend: kafka` and otherwise default values
+> - **Given** `receiver.wal.backend: kafka`, `storage.backend: s3` with a
+>   bucket, and otherwise default values
 > - **When** the chart renders
 > - **Then** the receiver config carries `allow_unverified_ack: false`,
 >   `durability_recheck_secs: 60` and `broker_kind: kafka`, and a
@@ -937,6 +945,8 @@ removes only copies of the same log entry.
 >   `receiver.serviceAccount.name` binding an existing account, or with
 >   no chart-created account, the Job runs as the receiver's account and
 >   no hook ServiceAccount renders
+> - **And** `storage.backend: local` with `receiver.wal.backend: kafka`
+>   fails the render naming both values
 > - **And** `topic.manage: false` renders no hook resources;
 >   `brokerKind: redpanda` makes the Job ensure `write.caching=false` and
 >   no `min.insync.replicas`, unclean-election or `flush.messages` key;

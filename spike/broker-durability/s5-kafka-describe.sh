@@ -11,7 +11,7 @@ KEYS='flush.messages min.insync.replicas unclean.leader.election.enable'
 setup_python
 install_kafka
 for i in 1 2 3; do mkdir -p "$W/mnt/b$i"; done
-S5_STATIC_ONE_BROKER=1 kafka_configure 1
+S5_STATIC_ONE_BROKER=1 kafka_configure "${ELR:-1}"
 kafka_cluster_up
 echo "=== finalized features ==="
 kfeatures

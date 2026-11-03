@@ -88,7 +88,7 @@ listeners=CONTROLLER://127.0.0.1:19190
 controller.listener.names=CONTROLLER
 listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
 log.dirs=$W/ctrl/data
-min.insync.replicas=2
+min.insync.replicas=${CTRL_MINISR:-2}
 unclean.leader.election.enable=false
 EOF
   for i in 1 2 3; do
@@ -192,8 +192,8 @@ wait_isr() {
 # --- redpanda ---------------------------------------------------------------
 
 install_redpanda() {
-  curl -1sLf 'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' | sudo -E bash >/dev/null
-  sudo apt-get install -y -q redpanda >/dev/null
+  curl -1sLf 'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' | sudo -E bash
+  sudo apt-get install -y -q redpanda
   rpk version
   sudo sysctl -w fs.aio-max-nr=1048576
 }

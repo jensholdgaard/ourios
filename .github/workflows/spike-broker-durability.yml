@@ -51,6 +51,12 @@ jobs:
           - name: s5-kafka-describe
             script: s5-kafka-describe.sh
             env: ""
+          - name: s5-kafka-describe-elr-off
+            script: s5-kafka-describe.sh
+            env: ELR=0
+          - name: s5-kafka-describe-ctrl-minisr-1
+            script: s5-kafka-describe.sh
+            env: CTRL_MINISR=1
           - name: s5-redpanda-describe
             script: s5-redpanda-describe.sh
             env: ""
@@ -69,6 +75,7 @@ jobs:
           }
           sudo dmsetup targets
       - name: Run ${{ matrix.name }}
+        shell: bash
         run: env ${{ matrix.env }} bash spike/broker-durability/${{ matrix.script }} 2>&1 | tee "$RUNNER_TEMP/scenario.log"
       - name: Verdict lines
         if: always()

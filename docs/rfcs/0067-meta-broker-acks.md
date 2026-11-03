@@ -200,13 +200,18 @@ and `*Last updated: …*` moves to the enacting date.
 
 ### 3.5 How the rule maps to brokers
 
-RFC 0066 owns the checks; this table is what they must establish.
+RFC 0066 owns the checks; this table is what they must establish. On
+Apache Kafka every key in it counts only as a topic override
+(DescribeConfigs source `TOPIC_CONFIG`): a broker's own default is what
+the answering broker uses, not necessarily what every replica or the
+next leader does. Redpanda's `write.caching` default is a cluster
+property, the same on every broker, so either source counts there.
 
 | Rule | Apache Kafka | Redpanda (Raft) | WarpStream |
 |---|---|---|---|
 | ≥ 2 replicas and the write quorum hold the batch (never waived) | `acks=all`, `min.insync.replicas ≥ 2`, every partition with ≥ `max(2, min.insync.replicas)` replicas | `acks=all` (Raft majority), every partition's Metadata replica list with ≥ 3 replicas (majority ≥ 2); Redpanda does not report `min.insync.replicas` or `replication.factor` as topic properties | not readable through the Kafka protocol: **unsupported** |
 | Leader holds every acked batch (never waived) | `unclean.leader.election.enable=false`; with the opt-in, also ELR enabled in the finalized features (§7 Q5) | Raft election, taken from `broker_kind: redpanda` once the `write.caching` key confirms the broker; no Kafka-only key is required | not readable: **unsupported** |
-| fsync before ack (waivable by the opt-in) | `flush.messages=1` (§7 Q4) | `write.caching=false` or `disabled` | — |
+| fsync before ack (waivable by the opt-in) | `flush.messages` exactly `1` (§7 Q4); unset or any other value is unverified | `write.caching=false` or `disabled` | — |
 | Failure domains (opt-in only, never waived once opted in) | current replica assignment, each partition's replicas on distinct non-empty `rack` labels | same | — |
 
 Classification is per row. A row marked never waived that cannot be

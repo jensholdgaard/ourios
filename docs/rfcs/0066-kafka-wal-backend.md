@@ -128,8 +128,15 @@ receiver:
     in-sync check and then reject every produce), or if
     `unclean.leader.election.enable` is `true` (it would let a lagging
     replica lead and drop acknowledged batches, against RFC 0065 B6 and
-    B8). The persistence key is `flush.messages`; under the opt-in, ELR
-    is read from the finalized features (RFC 0067 §3.5).
+    B8). The persistence key is `flush.messages`, verified only when
+    it is exactly `1`; unset or any other value is unverified. Each of
+    the three keys counts only when DescribeConfigs reports it as a
+    topic override (source `TOPIC_CONFIG`): without one, the answering
+    broker reports its own default, which another replica, or the next
+    leader, need not share. A floor or leader key from any other source
+    fails the check; a `flush.messages` from any other source is
+    unverified. Under the opt-in, ELR is read from the finalized
+    features (RFC 0067 §3.5).
   - **`redpanda`:** fails if `write.caching` is absent from the config
     (the broker is not Redpanda), or if any partition's Metadata replica
     list has fewer than 3 replicas, so its Raft majority is at least 2.
@@ -533,14 +540,19 @@ partition in place of the Raft log; there is no separate tail topic.
     receiver uses). `kafka` adds `min.insync.replicas=2` (chart value
     `topic.minInsyncReplicas`, refused below 2),
     `unclean.leader.election.enable=false`, and, unless
-    `allowUnverifiedAck` is set, `flush.messages=1`. `redpanda` sets
+    `allowUnverifiedAck` is set, `flush.messages=1`, each as a topic
+    override, so a value the topic only inherits is written to the
+    topic. `redpanda` sets
     no Kafka-only key (refusing `topic.replicationFactor` below 3) and,
     unless `allowUnverifiedAck` is set, `write.caching=false`. It never
     weakens a setting: a higher `min.insync.replicas`, a larger
     `max.message.bytes` or an existing persistence setting is kept; a replication factor or
     partition count that differs is reported and fails the Job, since
     changing either is a reassignment or migration this RFC does not
-    define. An existing topic whose `cleanup.policy` includes `compact`
+    define. A store with no `topic.json` yet (§3.3), as on a first
+    install, is a first start: the final check passes that comparison
+    and writes no record, which the receiver writes when it first
+    starts. An existing topic whose `cleanup.policy` includes `compact`
     is never reconciled: compaction may already have removed frames
     before their checkpoint, holes §3.1's check cannot see once the
     policy reads `delete`, so the verb fails naming the topic and
@@ -836,8 +848,10 @@ removes only copies of the same log entry.
 
 > **Scenario RFC0066.16 — an unverified broker without the opt-in refuses to start (RFC 0067)**
 > - **Given** a `kafka` topic that passes RFC0066.1's checks, with
->   `flush.messages` unset, and separately a `redpanda` topic with
->   `write.caching=true`
+>   `flush.messages` unset, with it set to `2`, or with `1` only from a
+>   broker's own configuration (no topic override, one broker's
+>   `log.flush.interval.messages=1` and the others' default), and
+>   separately a `redpanda` topic with `write.caching=true`
 > - **When** the receiver starts without
 >   `receiver.wal.kafka.allow_unverified_ack`
 > - **Then** startup fails before producing or consuming, with an error
@@ -862,7 +876,9 @@ removes only copies of the same log entry.
 > - **And** a topic whose replica floor or leader safety cannot be read
 >   for its `broker_kind` (`kafka` without `min.insync.replicas` or
 >   unclean-election keys, `redpanda` without `write.caching`, as on
->   WarpStream) fails startup with the opt-in set
+>   WarpStream), or a `kafka` topic whose `min.insync.replicas` or
+>   unclean-election value comes only from a broker's configuration
+>   with no topic override, fails startup with the opt-in set
 
 > **Scenario RFC0066.18 — the opt-in still needs separate failure domains (RFC 0067)**
 > - **Given** the opt-in set, and a topic where one partition has two
@@ -873,7 +889,8 @@ removes only copies of the same log entry.
 
 > **Scenario RFC0066.19 — a verified broker needs no opt-in (RFC 0067)**
 > - **Given** a topic with `write.caching=false`, and separately one
->   with `flush.messages=1`, both passing RFC0066.1's checks
+>   with `flush.messages=1` as a topic override, both passing
+>   RFC0066.1's checks
 > - **When** the receiver starts without the opt-in
 > - **Then** it starts with no warning and reports the verified mode
 
@@ -941,6 +958,12 @@ removes only copies of the same log entry.
 >   second changes nothing; on `kafka` the third keeps
 >   `min.insync.replicas=3` and the larger `max.message.bytes`, sets
 >   unclean election to `false`, and the second run changes nothing
+> - **And** on an empty store (no topic, no `topic.json`) the first run
+>   creates the topic, passes, and writes no `topic.json`; the
+>   receiver's first start then records it
+> - **And** on `kafka`, a topic whose `min.insync.replicas` and
+>   `flush.messages` are inherited from the broker configuration gets
+>   both as topic overrides
 > - **And** a topic whose replication factor or partition count differs,
 >   or whose `cleanup.policy` is `compact` or `compact,delete`, makes the
 >   verb fail naming it and leaves the topic unchanged, and a result the startup check would

@@ -12,7 +12,7 @@ superseded-by: —
 # RFC 0064 — meta: replication behind WAL-before-ack
 
 > **Status note. Accepted (2026-11-02).** Maintainer-approved on
-> 2026-11-02 and enacted the same day, per §7 Q1: `AGENTS.md` §3.4's
+> 2026-11-02 and enacted on 2026-11-03, per §7 Q1: `AGENTS.md` §3.4's
 > replication bullet, §4 item 3 and the footer took §3.1–§3.3's text,
 > and `docs/hazards.md` H3 and H8 took §3.4's. The note below is the
 > drafting-time status.

@@ -232,7 +232,7 @@ async fn a_failed_wal_commit_marks_the_commit_span_and_the_batch_span() {
 }
 
 /// An oversize batch fails its commit, but it is the client's fault, so the
-/// server span stays unset (HTTP 413 / gRPC `INVALID_ARGUMENT`).
+/// server span stays unset (HTTP 413 / gRPC `RESOURCE_EXHAUSTED`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_oversize_batch_fails_the_commit_span_but_not_the_batch_span() {
     let spans = failed_ingest_spans(oversize_append_pipeline()).await;

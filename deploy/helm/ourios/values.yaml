@@ -157,6 +157,11 @@ receiver:
   # queryable within about the age plus 30 s (or plus the age, when that is
   # shorter). Lowering it writes more small files for the compactor to
   # merge; keep the default in production.
+  # The OTLP request-size limit, receiver.max_request_bytes (RFC 0061), is
+  # likewise set through extraEnv: OURIOS_RECEIVER_MAX_REQUEST_BYTES, bytes in
+  # 1..16773120, default 16773120 (16 MiB - 4 KiB, which is also the
+  # ceiling). Both OTLP listeners share it; a larger Export gets gRPC
+  # RESOURCE_EXHAUSTED or HTTP 413, which clients do not retry.
   # How long the receiver may take to start before the kubelet restarts it:
   # periodSeconds x failureThreshold (default 1 h). Its OTLP port opens
   # only after startup recovery, which replays the WAL and, on the RFC 0059

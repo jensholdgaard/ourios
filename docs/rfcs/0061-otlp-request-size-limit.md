@@ -1,7 +1,7 @@
 ---
 rfc: 0061
 title: OTLP request-size limit
-status: drafted
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-10-31
@@ -11,8 +11,18 @@ superseded-by: —
 
 # RFC 0061 — OTLP request-size limit
 
-> **Status: `drafted`.** Tracks #1132. This RFC **amends RFC 0018 §3.2**
-> (`accepted`): an oversize payload's gRPC code changes from
+> **Status: `green`** (2026-11-02). Every §5 scenario passes: RFC0061.1
+> in `ourios-server/src/config/resolve.rs` (the Helm arm in
+> `deploy/helm/render-tests.sh`), RFC0061.2 and .4–.6 in
+> `ourios-ingester/tests/it/rfc0061_request_size_limit.rs`, RFC0061.3 in
+> `ourios-ingester/src/receiver/grpc.rs` (the HTTP arm is the unchanged
+> `receiver/http.rs` `oversize_payload_is_413`), and the `error.type`
+> counter arms of .2, .3 and .6 in `ourios-ingester/tests/rfc0061_telemetry.rs`
+> (harness-exempt: it installs the global meter provider, RFC0028.2).
+> Specified 2026-11-02 (maintainer-approved: #1135 merged with the §7
+> decisions, and the implementation requested the same day). Tracks
+> #1132. This RFC **amends RFC 0018 §3.2** (`accepted`): an oversize
+> payload's gRPC code changes from
 > `INVALID_ARGUMENT` to `RESOURCE_EXHAUSTED`. The HTTP side keeps its
 > `413`. RFC 0003 RFC0003.11 already lists `RESOURCE_EXHAUSTED` for "an
 > over-size request body exceeding the receiver's configured request-size

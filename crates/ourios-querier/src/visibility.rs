@@ -10,7 +10,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::lit;
 
-use crate::dsl::ir::{Call, Field, GroupTerm, Predicate, Query, Stage};
+use crate::dsl::ir::{Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, Stage};
 use crate::log_row::{LogBody, LogRow};
 use crate::{QueryError, has_column};
 use ourios_parquet::promoted;
@@ -75,13 +75,13 @@ impl Visibility {
         let Self::Masked { content_columns } = self else {
             return Ok(());
         };
-        let mut fields: Vec<&Field> = Vec::new();
+        let mut fields: Vec<Read<'_>> = Vec::new();
         collect_predicate_fields(&query.predicate, &mut fields);
         for stage in &query.stages {
             match stage {
                 Stage::Count { by } => collect_group_fields(by, &mut fields),
                 Stage::Agg { path, by, .. } => {
-                    fields.push(path);
+                    fields.push(Read::column(path));
                     collect_group_fields(by, &mut fields);
                 }
                 Stage::Range(..)
@@ -91,14 +91,15 @@ impl Visibility {
                 | Stage::Render => {}
             }
         }
-        for field in fields {
-            if let Some(name) = dsl_name(field)
-                && content_columns.contains(&name)
-            {
-                return Err(QueryError::Forbidden { column: name });
-            }
+        match fields
+            .iter()
+            .find_map(|read| read.masked_by(content_columns))
+        {
+            Some(column) => Err(QueryError::Forbidden {
+                column: column.clone(),
+            }),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// The plan-time filter for a scoped principal: `column IN (ids)` OR
@@ -187,26 +188,66 @@ pub(crate) enum VisibilityFilter {
     Only(Expr),
 }
 
-/// The DSL name of a field the masking vocabulary can name; `None` for
-/// fields that are never content.
-fn dsl_name(field: &Field) -> Option<String> {
-    match field {
-        Field::Body => Some("body".to_string()),
-        Field::Attr(key) => Some(format!("{}{key}", promoted::ATTR_PREFIX)),
-        Field::Resource(key) => Some(format!("{}{key}", promoted::RESOURCE_PREFIX)),
-        _ => None,
+/// A field a query reads, and whether the read resolves the key as a path
+/// into map values (RFC 0062 §3.1: `==` / `!=` on an attribute).
+struct Read<'a> {
+    field: &'a Field,
+    paths: bool,
+}
+
+impl<'a> Read<'a> {
+    fn column(field: &'a Field) -> Self {
+        Self {
+            field,
+            paths: false,
+        }
+    }
+
+    /// The first of `columns` the read can see, in the order the read
+    /// reaches them: the field itself, then, for a path read, its map heads
+    /// shortest first (`attr.a`, then `attr.a.b`, for `attr.a.b.c`), since a
+    /// value under a masked map is masked content. `service` is
+    /// `resource.service.name`. Each column is compared against the key
+    /// in place, so no prefix of the key is ever built.
+    fn masked_by<'c>(&self, columns: &'c [String]) -> Option<&'c String> {
+        columns
+            .iter()
+            .filter_map(|column| self.reach(column).map(|rank| (rank, column)))
+            .min_by_key(|&(rank, _)| rank)
+            .map(|(_, column)| column)
+    }
+
+    /// Where the read reaches `column`: 0 for the field itself, or one
+    /// more than the head's length for a map head.
+    fn reach(&self, column: &str) -> Option<usize> {
+        let (prefix, key) = match self.field {
+            Field::Attr(key) => (promoted::ATTR_PREFIX, key.as_str()),
+            Field::Resource(key) => (promoted::RESOURCE_PREFIX, key.as_str()),
+            Field::Service => (promoted::RESOURCE_PREFIX, "service.name"),
+            Field::Body => return (column == "body").then_some(0),
+            _ => return None,
+        };
+        let head = column.strip_prefix(prefix)?;
+        match key.strip_prefix(head) {
+            Some("") => Some(0),
+            Some(rest) if self.paths && rest.starts_with('.') => Some(head.len() + 1),
+            _ => None,
+        }
     }
 }
 
-fn collect_predicate_fields<'a>(predicate: &'a Predicate, out: &mut Vec<&'a Field>) {
+fn collect_predicate_fields<'a>(predicate: &'a Predicate, out: &mut Vec<Read<'a>>) {
     match predicate {
         Predicate::Bool(_) | Predicate::Severity { .. } => {}
-        Predicate::Comparison { field, .. } => out.push(field),
+        Predicate::Comparison { field, op, .. } => out.push(Read {
+            field,
+            paths: matches!(op, CmpOp::Ord(OrdOp::Eq | OrdOp::Ne)),
+        }),
         Predicate::Call(call) => match call {
             Call::Matches { field, .. }
             | Call::Contains { field, .. }
             | Call::StartsWith { field, .. }
-            | Call::EndsWith { field, .. } => out.push(field),
+            | Call::EndsWith { field, .. } => out.push(Read::column(field)),
             Call::ResolvesTo(_) => {}
         },
         Predicate::Not(inner) => collect_predicate_fields(inner, out),
@@ -218,10 +259,10 @@ fn collect_predicate_fields<'a>(predicate: &'a Predicate, out: &mut Vec<&'a Fiel
     }
 }
 
-fn collect_group_fields<'a>(by: &'a [GroupTerm], out: &mut Vec<&'a Field>) {
+fn collect_group_fields<'a>(by: &'a [GroupTerm], out: &mut Vec<Read<'a>>) {
     for term in by {
         if let GroupTerm::Field(field) = term {
-            out.push(field);
+            out.push(Read::column(field));
         }
     }
 }
@@ -301,6 +342,98 @@ mod tests {
         }
         .validate(&query)
         .expect("scoped principals read their content");
+    }
+
+    /// RFC 0062 §3.1 meets RFC0047.8: an `==` / `!=` on a dotted key can
+    /// read a value under a masked map, so a masked head forbids it, for
+    /// filters and counts alike. Reads that do not resolve paths, and
+    /// unmasked siblings, still pass.
+    #[test]
+    fn a_masked_map_forbids_paths_into_it() {
+        let masked = Visibility::Masked {
+            content_columns: vec!["attr.user".to_string(), "resource.service".to_string()],
+        };
+        for (statement, column) in [
+            ("attr.user.id == \"u7\"", "attr.user"),
+            ("attr.user.id != \"u7\"", "attr.user"),
+            ("attr.user.id == \"u7\" | count", "attr.user"),
+            ("not (attr.user.id.x == \"u7\")", "attr.user"),
+            ("resource.service.name == \"api\"", "resource.service"),
+            ("service == \"api\"", "resource.service"),
+        ] {
+            match masked.validate(&logs(statement)) {
+                Err(QueryError::Forbidden { column: named }) => {
+                    assert_eq!(named, column, "{statement}");
+                }
+                other => panic!("{statement}: expected Forbidden, got {other:?}"),
+            }
+        }
+        for statement in [
+            "attr.userid == \"u7\"",
+            "attr.team.id == \"t1\"",
+            "attr.user.id >= \"u7\"",
+            "true | count by attr.user.id",
+            "true | count by service",
+        ] {
+            masked
+                .validate(&logs(statement))
+                .unwrap_or_else(|e| panic!("{statement}: {e:?}"));
+        }
+    }
+
+    /// `service` reads `resource.service.name`, so every read of it is
+    /// checked as that column is, not only the reads that resolve paths.
+    #[test]
+    fn a_masked_service_name_forbids_every_service_read() {
+        let masked = Visibility::Masked {
+            content_columns: vec!["resource.service.name".to_string()],
+        };
+        for statement in [
+            "service == \"api\"",
+            "service >= \"a\"",
+            "contains(service, \"x\")",
+            "true | count by service",
+        ] {
+            match masked.validate(&logs(statement)) {
+                Err(QueryError::Forbidden { column }) => {
+                    assert_eq!(column, "resource.service.name", "{statement}");
+                }
+                other => panic!("{statement}: expected Forbidden, got {other:?}"),
+            }
+        }
+    }
+
+    /// A 65,535-byte key of 32,768 parts is checked against each masked
+    /// column in place. Building every `attr.` prefix, as the check once
+    /// did, would allocate over 1 GiB per call and over 100 GiB here.
+    #[test]
+    fn a_key_of_many_parts_is_checked_without_building_its_prefixes() {
+        let key = vec!["a"; 32_768].join(".");
+        assert_eq!(key.len(), 65_535);
+        let eq = logs(&format!("attr.{key} == \"x\""));
+        let ord = logs(&format!("attr.{key} >= \"x\""));
+        let masked = |columns: &[&str]| Visibility::Masked {
+            content_columns: columns.iter().map(ToString::to_string).collect(),
+        };
+        let deep_head = format!("attr.{}", vec!["a"; 20_000].join("."));
+        for _ in 0..100 {
+            for (columns, want) in [
+                (vec!["attr.b", "attr.a.a.a"], Some("attr.a.a.a")),
+                (vec![deep_head.as_str(), "attr.a.a"], Some("attr.a.a")),
+                (vec![deep_head.as_str()], Some(deep_head.as_str())),
+                (vec!["attr.b", "attr.a.b", "resource.a"], None),
+            ] {
+                let got = match masked(&columns).validate(&eq) {
+                    Err(QueryError::Forbidden { column }) => Some(column),
+                    Ok(()) => None,
+                    Err(other) => panic!("{other:?}"),
+                };
+                assert_eq!(got.as_deref(), want, "{columns:?}");
+            }
+            masked(&["attr.a.a.a"])
+                .validate(&ord)
+                .expect("ordering reads no path");
+        }
     }
 
     /// RFC0047.8: masking sets the body to `Masked` and unsets the value of

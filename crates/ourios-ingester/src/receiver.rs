@@ -47,3 +47,9 @@ pub use materialize::{materialize_record, materialize_resource_logs};
 pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};
 pub use selector::{SelectorError, TENANT_HEADER};
 pub use tenant::assign;
+
+/// RFC 0061 §3.1 — the default, and the ceiling, of
+/// `receiver.max_request_bytes`: 4 KiB below the WAL frame ceiling, so an
+/// accepted request with minimal encodings fits one frame with its tenant
+/// prefix.
+pub const MAX_REQUEST_BYTES: usize = ourios_wal::MAX_FRAME_BYTES - 4096;

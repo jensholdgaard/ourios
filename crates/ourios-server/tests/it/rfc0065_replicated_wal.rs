@@ -1,0 +1,111 @@
+//! RFC 0065 — replicated WAL and a queryable tail, the config,
+//! served-binary and chart arms. See `docs/rfcs/0065-replicated-wal.md`
+//! §5 and §8. The in-process cluster arms are in `ourios-ingester`'s
+//! `tests/it/rfc0065_replicated_wal.rs`.
+//!
+//! Stubs are `#[ignore]`d so the default run stays green while the RFC is
+//! red; each names the slice that discharges it.
+
+/// Scenario RFC0065.1 — the backend is configurable and checked at start.
+/// Given `receiver.wal.backend` unset, `local`, and `replicated` with every
+/// field set, then they start as local, local and replicated. The RFC
+/// places the config arms as unit tests in `src/config`.
+#[test]
+#[ignore = "RFC0065.1 stub — implemented with the `receiver.wal` config section"]
+fn rfc0065_1_valid_backends_start() {
+    todo!(
+        "RFC0065.1 — unset and `local` resolve to the local backend, `replicated` \
+         with every field set to the replicated one"
+    );
+}
+
+/// Scenario RFC0065.1 — the backend is configurable and checked at start,
+/// the invalid arm. Each of: no `peers`, a `node_id` in neither `peers`
+/// nor `tail_peers`, `replication_factor` 4 or above `peers`,
+/// `tail_replicas` 0, no `tls` — fails startup naming the field.
+#[test]
+#[ignore = "RFC0065.1 stub — implemented with the `receiver.wal` config section"]
+fn rfc0065_1_invalid_replicated_configs_fail_naming_the_field() {
+    todo!(
+        "RFC0065.1 — each invalid `replicated` config fails startup with an error \
+         naming `peers`, `node_id`, `replication_factor`, `tail_replicas` or `tls`"
+    );
+}
+
+/// Scenario RFC0065.1 — the backend is configurable and checked at start,
+/// the layout arm. A node whose `peers`, `groups` or `replication_factor`
+/// differs from the recorded `cluster.json` fails startup naming the field.
+#[test]
+#[ignore = "RFC0065.1 stub — implemented with the recorded cluster layout"]
+fn rfc0065_1_a_layout_mismatch_fails_naming_the_field() {
+    todo!(
+        "RFC0065.1 — a `peers`, `groups` or `replication_factor` that differs from \
+         the recorded layout fails startup naming the field"
+    );
+}
+
+/// Scenario RFC0065.3 — crash recovery on the replicated backend (B2, B7).
+/// Given a three-node cluster ingesting steadily, when the acknowledging
+/// replica is killed with `SIGKILL` mid-batch, then another takes over without an
+/// operator and every acked record is in Parquet after the next
+/// checkpoint. The multi-process crash test RFC 0064 §3.2 requires.
+#[test]
+#[ignore = "RFC0065.3 stub — implemented with the multi-process crash test"]
+fn rfc0065_3_sigkill_of_the_leader_loses_no_acked_record() {
+    todo!(
+        "RFC0065.3 — another replica takes over without an operator, every acked \
+         record is in Parquet after the next checkpoint, and after compaction no \
+         `(tenant, ingest position)` appears twice"
+    );
+}
+
+/// Scenario RFC0065.11 — a record is queryable within the allowance, the
+/// latency arm (B15). On the CI runner, ack to a query returning the record
+/// is under 5 s across served binaries.
+#[test]
+#[ignore = "RFC0065.11 stub — implemented with the multi-process crash test's cluster"]
+fn rfc0065_11_ack_to_queryable_is_under_five_seconds() {
+    todo!(
+        "RFC0065.11 — with the flush age at 300 s, the time from ack to a query \
+         returning the record is under 5 s on the CI runner"
+    );
+}
+
+/// Scenario RFC0065.14 — an unreachable tail is reported, the
+/// `require_complete` arm (B17). The same query with `require_complete:
+/// true` fails with HTTP `503` and an MCP tool error naming the group in
+/// the §6.7 wire form, and returns no rows.
+#[test]
+#[ignore = "RFC0065.14 stub — implemented with `require_complete` on the query endpoint and MCP"]
+fn rfc0065_14_require_complete_fails_when_the_tail_is_unavailable() {
+    todo!(
+        "RFC0065.14 — `require_complete: true` with the tail unavailable gives \
+         HTTP 503 and an MCP tool error naming the group, and no rows"
+    );
+}
+
+/// Scenario RFC0065.14 — the same holds for `parquet_unavailable` during a
+/// store outage (RFC0065.21): `require_complete: true` fails retryably
+/// naming what was unavailable, with no rows.
+#[test]
+#[ignore = "RFC0065.14 stub — implemented with `require_complete` on the query endpoint and MCP"]
+fn rfc0065_14_require_complete_fails_when_parquet_is_unavailable() {
+    todo!(
+        "RFC0065.14 — `require_complete: true` during a store outage gives HTTP 503 \
+         and an MCP tool error in the §6.7 wire form, and no rows"
+    );
+}
+
+/// Scenario RFC0065.17 — the chart renders the replicated shape (B20, B21).
+/// Given `receiver.wal.backend: replicated` and `receiver.replicas: 3`, then
+/// the config carries the three headless-Service peers and `node_id` from
+/// the pod name, the peer port is not on the public Service, and the peer
+/// TLS secret is mounted. Lands in `deploy/helm/render-tests.sh`.
+#[test]
+#[ignore = "RFC0065.17 stub — implemented with the chart's replicated shape in render-tests.sh"]
+fn rfc0065_17_the_chart_renders_the_replicated_shape() {
+    todo!(
+        "RFC0065.17 — three peers on the headless Service, `node_id` from the pod \
+         name, no peer port on the public Service, the peer TLS secret mounted"
+    );
+}

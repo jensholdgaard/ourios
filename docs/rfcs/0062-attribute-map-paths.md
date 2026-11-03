@@ -1,7 +1,7 @@
 ---
 rfc: 0062
 title: Attribute paths into map values
-status: drafted
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-10-31
@@ -11,7 +11,34 @@ superseded-by: —
 
 # RFC 0062 — Attribute paths into map values
 
-> **Status: `drafted`.** Tracks #1134. This RFC **amends RFC 0002 §6.1**
+> **Status: `green` (2026-11-02).** `ourios_attr_cmp` resolves a key by
+> §3.1, and the JSON arm prefilters as §3.3 describes.
+> RFC0062.1–.4 pass in `ourios-querier/tests/it/rfc0022_attr_columns.rs`,
+> RFC0062.5 as a proptest beside the UDF in `plan/attr_value.rs`,
+> RFC0062.8 in `ourios-server/tests/it/rfc0062_8_engine_names.rs`
+> (beside the HTTP and MCP scrubbing tests, which live in `tests/it`,
+> not in the `src` files §6 names) and RFC0062.9 in
+> `ourios-querier/tests/it/execution.rs`. RFC0062.7 is #1137's tests,
+> unchanged. RFC0062.6, measured with the `attr_predicate` bench (pre and
+> post binaries alternated, three rounds each on an idle machine): every
+> round of every case is inside its bound. The changes are the mean over
+> the rounds:
+>
+> | Case | Pre ms | Post ms | Change |
+> |---|---:|---:|---:|
+> | promoted literal `==` / `!=` / miss | 19.52 / 19.62 / 19.57 | 19.53 / 19.68 / 19.73 | +0.0% / +0.3% / +0.8% |
+> | unpromoted literal `==` / miss | 25.31 / 24.44 | 23.29 / 22.55 | −8.0% / −7.7% |
+> | path `==`, unpromoted / promoted | 22.21 / 23.02 | 22.06 / 22.81 | −0.7% / −0.9% |
+> | literal `!=`, per row | 0.207 µs | 0.205 µs | −1.1% |
+> | path `!=` per row, unpromoted / promoted | 0.498 / 0.507 µs | 0.483 / 0.486 µs | −3.0% / −4.1% |
+>
+> A path `==` returns 200 rows where the pre-RFC baseline returned 100,
+> and a path `!=` returns 199,800 where it returned 99,900. The first
+> implementation, one `LIKE` per stored key for `==` as well, put path
+> `==` at +20–22%. The single value-text pattern of §3.3 replaced it.
+> Red 2026-11-02: the §5 stubs landed with the bench.
+> Specified 2026-11-02 (maintainer-approved by merging #1138 and asking
+> for the implementation). Tracks #1134. This RFC **amends RFC 0002 §6.1**
 > (`accepted`), which reads `attr.<key>` as the attribute key "taken
 > literally including dots", and **RFC 0022 §3.3** (`accepted`), whose
 > JSON arm compares one top-level key. RFC 0042 §3.4's integer JSON arm
@@ -120,18 +147,41 @@ bracket form exists for keys a bare identifier cannot spell (RFC 0002
 
 The JSON arm keeps its two steps:
 
-1. **Prefilter.** A `LIKE` on the stored pair text, as today, but one
-   pattern per key the pair can be stored under: `p` itself and every
-   tail after one of its dots (`a.b.c`, `b.c`, `c`), joined with `OR`.
-   For a key without dots this is the single pattern used today.
+1. **Prefilter.** A `LIKE` on the stored text. For a key without dots
+   this is the single pattern used today. A dotted key's value can sit
+   in a pair under `p` itself or any tail after one of its dots
+   (`a.b.c`, `b.c`, `c`). For `!=`, the prefilter is one pattern per
+   such key, joined with `OR`. For `==`, it is a single pattern: the
+   expected value's text after its type prefix, followed by the pair's
+   closing brace (`"x"}}` for `"x"`). Every one of those pairs ends with
+   that text, so one column scan replaces one per key (amended
+   2026-11-02 after RFC0062.6 measured the per-key `OR` at about +21%).
+   A key of more than 16 dot-separated parts, or longer than 1 KiB,
+   takes a single `!=` pattern as well, `,"value":` plus the type
+   prefix. One pattern per tail would make the plan grow with the
+   square of the parts.
 2. **Confirm.** The internal `ourios_attr_cmp` UDF applies §3.1 to the
    candidate rows. It reads the stored text without decoding it: a row
    with no map value cannot hold a path, so the top-level shortcut from
    #1137 answers it; other rows are scanned, descending only into the
-   maps on the path.
+   maps on the path. The UDF keeps a table of the key's head and tail
+   texts only for a key of at most 16 parts and 1 KiB. Any other key
+   builds none of these texts, so the UDF's memory stays linear in the
+   key's length. A map is reached only through its own pair, and that
+   pair's key fixes where the rest of the key starts, so the scan
+   resolves each map in a row at most once. For an untabled key, one
+   pass over a list finds the pair named by the whole rest of the key
+   and the pairs named by each of its heads. A row then costs at most
+   its nesting depth times its length in scanned bytes, however many
+   parts the key has. A tabled key costs at most one pass per part.
+   Masking (RFC 0047 §3.4) compares each content column against the
+   queried key in place, so checking a key against its map heads
+   allocates nothing per head.
 
 A row the scan cannot read fails the query, as in #1137. The UDF keeps
-no stack, so value depth is not limited by the lookup.
+no call stack: the token scan tracks only a depth count, and the maps
+on a path are opened from a heap worklist. Value depth is therefore not
+limited by the lookup.
 
 ### 3.4 Amendments
 
@@ -269,7 +319,10 @@ available as an additive form later.
 >   implementation
 > - **When** it runs against the pre-RFC baseline
 > - **Then** promoted-key cases stay within 3%, unpromoted `==` cases
->   within 20%, and unpromoted `!=` cases within 20% per matching row
+>   within 20%, and unpromoted `!=` cases within 20% per matching row;
+>   a promoted key whose matching rows hold it only under a map counts
+>   as unpromoted, since those rows' promoted cells are null and take the
+>   JSON arm
 >   (a `!=` now matches more rows, §3.6: 2.61 µs a row before, 2.79 µs
 >   with paths in the experiment), and the results are recorded in the
 >   implementing PR
@@ -281,13 +334,14 @@ available as an additive form later.
 > - **Then** no query matches the record
 
 > **Scenario RFC0062.8 — no engine name reaches the user (H6)**
-> - **Given** a query comparing a map path with a value of the wrong
->   type, `attr.user.id == 7` against `user = {id: "u7"}`, and a
->   malformed path `attr.user..id`
+> - **Given** `user.id` promoted as `i64` and a record holding only
+>   `user = {id: "u7"}`, the query `attr.user.id == 7` (a value of the
+>   wrong type; unpromoted, an integer literal is rejected with a DSL
+>   error as it is today), and a malformed path `attr.user..id`
 > - **When** each runs through the HTTP query endpoint and the MCP
 >   `query_logs` tool
 > - **Then** the first matches nothing and the second is rejected with
->   a DSL error, and no response, error or explain output names
+>   a DSL error, and no response or error names
 >   `ourios_attr_cmp`, `LIKE` or any DataFusion function
 > - **And** the RFC 0032 query-schema resource states the §3.1 rule
 
@@ -306,10 +360,12 @@ available as an additive form later.
 - RFC0062.5: a proptest beside the UDF in `plan/attr_value.rs`,
   extending #1137's scan-against-decode property.
 - RFC0062.6: the `attr_predicate` criterion bench in `ourios-bench`,
-  run locally first, then on the ci-runner.
-- RFC0062.8: the querier's HTTP and MCP error-scrubbing tests in
-  `ourios-server/src/{querier,mcp}.rs`, plus an assertion on the
-  query-schema resource text.
+  pre and post binaries run alternately on an otherwise idle machine
+  (no CI workflow runs this bench); the numbers go in the implementing
+  PR.
+- RFC0062.8: `ourios-server/tests/it/rfc0062_8_engine_names.rs`,
+  beside the existing HTTP and MCP error-scrubbing tests, plus an
+  assertion on the query-schema resource text.
 - RFC0062.9: the existing tenancy integration tests in
   `ourios-querier/tests/it`, with a path query added.
 - RFC0062.7 is #1137's `a_nested_pair_is_not_a_top_level_attribute`

@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_config::MinerConfig;
 use ourios_core::tenant::TenantId;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
@@ -25,7 +24,7 @@ use ourios_ingester::barrier::{Barrier, CutOutcome};
 use ourios_ingester::cadence::{self, BarrierEpochs};
 use ourios_ingester::housekeeping::Housekeeper;
 use ourios_ingester::publish::PublishCoordinator;
-use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
+use ourios_ingester::receiver::grpc::{AuthLayer, logs_service};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
@@ -440,6 +439,10 @@ pub struct ReceiverConfig {
     /// (`receiver.max_buffer_age_secs`; the config layer validates it to
     /// at most [`SINK_MAX_BUFFER_AGE`]).
     pub max_buffer_age: Duration,
+    /// RFC 0061 §3.1 — the OTLP request-size limit both listeners enforce
+    /// (`receiver.max_request_bytes`; the config layer validates it to at
+    /// most `ourios_ingester::receiver::MAX_REQUEST_BYTES`).
+    pub max_request_bytes: usize,
     /// The RFC 0047 §3.3 graph emitter, fed on the flush cadence, when the
     /// graph is configured with a bound conversation object.
     pub graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
@@ -1127,15 +1130,13 @@ fn spawn_grpc(
     incoming: TcpIncoming,
     acceptor: Option<ReloadingAcceptor>,
     auth: AuthResolver,
-    pipeline: SharedPipeline,
+    (pipeline, max_request_bytes): (SharedPipeline, usize),
     mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<Result<(), tonic::transport::Error>> {
-    // The OTel Collector's OTLP exporter gzip-compresses by default, so the
-    // receiver must accept gzip to interoperate with a stock Collector
-    // (tests/it/collector_interop.rs). Identity stays accepted; this is
-    // additive.
-    let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline))
-        .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+    // Gzip is accepted, as a stock Collector sends it
+    // (tests/it/collector_interop.rs), and the decoder is bounded by the
+    // RFC 0061 limit, every rejection `RESOURCE_EXHAUSTED`.
+    let grpc_service = logs_service(pipeline, max_request_bytes);
     let auth_layer = AuthLayer::new(auth);
     tokio::spawn(async move {
         let shutdown = async move {
@@ -1273,7 +1274,7 @@ pub async fn serve_until(
         grpc_incoming,
         grpc_acceptor,
         config.auth.clone(),
-        pipeline.clone(),
+        (pipeline.clone(), config.max_request_bytes),
         shutdown_rx.clone(),
     );
 
@@ -1281,6 +1282,7 @@ pub async fn serve_until(
         pipeline.clone(),
         &HttpConfig {
             auth: config.auth.clone(),
+            max_body_bytes: config.max_request_bytes,
             ..HttpConfig::default()
         },
     );
@@ -1707,6 +1709,7 @@ mod tests {
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
             max_buffer_age: SINK_MAX_BUFFER_AGE,
+            max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         })
         .await
         .expect("serve");
@@ -1813,6 +1816,7 @@ mod tests {
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
             max_buffer_age: SINK_MAX_BUFFER_AGE,
+            max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         })
         .await
         .expect("serve");
@@ -2010,6 +2014,7 @@ mod tests {
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
             max_buffer_age: SINK_MAX_BUFFER_AGE,
+            max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         };
 
         // Given a node that sealed a segment and stamped past it: the second
@@ -2075,6 +2080,7 @@ mod tests {
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
             max_buffer_age: SINK_MAX_BUFFER_AGE,
+            max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         };
         let expected = Some(ourios_miner::snapshot::WalHighWater {
             segment: horizon.segment.to_string(),
@@ -2156,6 +2162,7 @@ mod tests {
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
             max_buffer_age: SINK_MAX_BUFFER_AGE,
+            max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         }
     }
 
@@ -2411,6 +2418,7 @@ mod tests {
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
             max_buffer_age: SINK_MAX_BUFFER_AGE,
+            max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         })
         .await
         .expect("serve");
@@ -2599,6 +2607,7 @@ mod tests {
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
             max_buffer_age: SINK_MAX_BUFFER_AGE,
+            max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         })
         .await
         .expect("serve");
@@ -2648,6 +2657,7 @@ mod tests {
             miner: MinerConfig::default().with_upstream_templates(UpstreamTemplates::Adopt),
             template_ids_allow_bootstrap: false,
             max_buffer_age: SINK_MAX_BUFFER_AGE,
+            max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         })
         .await
         .expect("serve");
@@ -2859,6 +2869,7 @@ mod tests {
             miner: MinerConfig::default(),
             template_ids_allow_bootstrap: false,
             max_buffer_age: SINK_MAX_BUFFER_AGE,
+            max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         })
         .await
         .expect("serve");

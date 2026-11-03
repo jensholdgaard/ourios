@@ -154,8 +154,13 @@ the data was accepted; we have lost data we promised to keep.
 - Crash-recovery test is part of CI: SIGKILL the ingester
   mid-batch, restart, assert no acknowledged data is missing. Test
   runs on every PR; failure blocks merge.
-- Replication, when added, is **in addition to** the WAL, not a
-  replacement.
+- Replication is **in addition to** the WAL, not a replacement. On
+  the replicated backend (RFC 0065) an ack waits for at least two
+  fsynced replicas (its write quorum), a replica becomes leader only
+  if it holds every acknowledged batch, a replaced leader cannot
+  commit another batch (a success it sends late is only for a batch
+  the new leader holds), and the crash-recovery test kills the leader
+  mid-batch.
 - Segments are reclaimed once the publication barrier has
   checkpointed past them, and a
   failed rotation retries in place under a bounded budget before the
@@ -335,10 +340,10 @@ acceptable, lying to the user is not.
 
 ## H8 — Replication-induced dedup under clock drift
 
-> *Forward-looking hazard.* Ourios does not currently replicate at
-> ingest, so this hazard is dormant. It is recorded here so that
-> any future RFC proposing replication starts with the failure
-> mode already understood.
+> *Forward-looking hazard.* This hazard is dormant on the local WAL
+> backend and live on the replicated one (RFC 0065). It is recorded
+> here so that any future RFC proposing replication starts with the
+> failure mode already understood.
 
 **Failure mode.** A multi-ingester replication design quietly
 introduces a storage multiplier if dedup is keyed on filename and
@@ -352,16 +357,21 @@ multiplier from exactly this failure mode, motivating a full
 re-architecture of its durability layer.
 
 **Mitigation.**
-- *Currently:* not a concern. Ourios does not replicate at ingest.
-  Per `AGENTS.md` §3.4, durability is per-ingester fsync on the
-  WAL; per §3.6, object storage is the long-term truth.
-  Replication, if introduced later, is "in addition to the WAL,
-  not instead of it."
-- *When replication is proposed:* dedup MUST be content-keyed,
-  never time-windowed. The producer (or the OTLP layer) supplies
-  an idempotency key — a content hash combined with a producer
-  identifier and a sequence number. Ingesters treat the key as
-  opaque. Clock drift becomes irrelevant to dedup correctness.
+- *Currently:* Dormant on the local backend, which does not
+  replicate. **Live on the replicated backend**: a new leader or
+  flusher replaying from the last checkpoint can write a record
+  twice, and RFC 0065 removes those copies with a key the log
+  assigns once (each record's group, sequence number and index in
+  its frame), never a time window.
+- *Replication duplicates* — copies the replication layer itself
+  makes by replay, redelivery or handoff — MUST be deduplicated by
+  a key assigned once per acknowledged record, by the producer or
+  by the log, never by a time window.
+- *Client-retry duplicates* — a client resending after a lost ack —
+  are not caused by replication and exist on the local backend too.
+  Removing them needs a producer-supplied idempotency key; until an
+  RFC adds one, they are the same as on the local backend, and a
+  replicated backend MUST NOT make them more frequent.
 - *Time-window dedup is rejected by default*, regardless of how
   cheap or convenient it appears. An RFC proposing it must read
   this hazard and address it explicitly.
@@ -378,7 +388,8 @@ re-architecture of its durability layer.
   signals that something is masking what should be visible
   duplicates.
 - Neither signal is emitted today. An RFC that proposes replication
-  must add them.
+  must add them; they are required for the replicated backend
+  (RFC 0065 §6.9).
 
 **Escalation.** Replication proposed → RFC must explicitly address
 this hazard. Time-window dedup proposed → block, redirect to a

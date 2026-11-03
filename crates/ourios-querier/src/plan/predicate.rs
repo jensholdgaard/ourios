@@ -7,6 +7,7 @@
 
 #[allow(clippy::wildcard_imports)] // parent glue after the file split
 use super::*;
+use datafusion::logical_expr::utils::disjunction;
 use ourios_core::otlp::any_value;
 
 /// The result of compiling a predicate against a known schema.
@@ -649,10 +650,14 @@ pub(super) fn numeric_attr_match(
 }
 
 /// The JSON arm of an `==` / `!=` attribute comparison against the
-/// canonical-JSON `column`. A `LIKE` on the stored key/value pair (`==`),
-/// or on the key with any value of `value`'s type (`!=`), is a cheap
-/// prefilter. It also matches the pair nested inside another attribute's
-/// map value, so [`attr_cmp`] then decides on the first top-level `key`.
+/// canonical-JSON `column`. A `LIKE` prefilter keeps the rows that can
+/// hold a matching value, and [`attr_cmp`] then applies RFC 0062 §3.1 to
+/// them. A key without dots keeps the stored key/value pair (`==`), or the
+/// key with any value of `value`'s type (`!=`). A dotted key can resolve
+/// to a pair under itself or any tail after one of its dots: `!=` takes
+/// one pattern per such key, and `==` takes the expected value's text
+/// after its type prefix, which every one of those pairs ends with and
+/// which costs one scan instead of one per key (RFC 0062 §3.3).
 fn json_arm(
     column: &str,
     key: &str,
@@ -663,17 +668,34 @@ fn json_arm(
         detail: format!("attribute {what} is not encodable: {e}"),
     };
     let expected = canonical_value(value).map_err(|e| not_encodable("value", e.to_string()))?;
-    let quoted_key = serde_json::to_string(key).map_err(|e| not_encodable("key", e.to_string()))?;
     // `{"stringValue":` / `{"intValue":`: the start of every value of this type.
     let type_prefix = expected
         .find(':')
         .map_or(expected.as_str(), |i| &expected[..=i]);
-    let pattern = if eq {
-        format!("{{\"key\":{quoted_key},\"value\":{expected}}}")
-    } else {
-        format!("{{\"key\":{quoted_key},\"value\":{type_prefix}")
+    let patterns = match (eq, key.contains('.')) {
+        (true, true) => vec![format!("{}}}", &expected[type_prefix.len()..])],
+        // One pattern per tail would build a plan quadratic in the key;
+        // every stored value of the type carries this text.
+        (false, true) if !tabled(key) => vec![format!(",\"value\":{type_prefix}")],
+        _ => std::iter::once(key)
+            .chain(key.match_indices('.').map(|(i, _)| &key[i + 1..]))
+            .map(|stored| {
+                let quoted = serde_json::to_string(stored)
+                    .map_err(|e| not_encodable("key", e.to_string()))?;
+                Ok(if eq {
+                    format!("{{\"key\":{quoted},\"value\":{expected}}}")
+                } else {
+                    format!("{{\"key\":{quoted},\"value\":{type_prefix}")
+                })
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?,
     };
-    let candidate = col(column).like(lit(format!("%{}%", like_escape(&pattern))));
+    let candidate = disjunction(
+        patterns
+            .iter()
+            .map(|pattern| col(column).like(lit(format!("%{}%", like_escape(pattern))))),
+    )
+    .unwrap_or_else(|| lit(false));
     Ok(candidate.and(attr_cmp(col(column), key, &expected, eq)))
 }
 

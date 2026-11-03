@@ -48,4 +48,5 @@ mod rfc0059_6_bootstrap_sigterm;
 mod rfc0060_refresh_config;
 mod rfc0062_8_engine_names;
 mod rfc0063_flush_age;
+mod rfc0065_replicated_wal;
 mod server_bin;

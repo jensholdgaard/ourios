@@ -88,3 +88,4 @@ mod rfc0059_refiller_shutdown;
 mod rfc0059_support;
 mod rfc0061_request_size_limit;
 mod rfc0061_support;
+mod rfc0065_replicated_wal;

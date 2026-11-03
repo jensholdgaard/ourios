@@ -1,7 +1,7 @@
 ---
 rfc: 0065
 title: Replicated WAL and a queryable tail
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-01
@@ -11,7 +11,13 @@ superseded-by: —
 
 # RFC 0065 — Replicated WAL and a queryable tail
 
-> **Status: `specified`.** Tracks #1141 (option 2). It depends on
+> **Status: `red`.** Every §5 scenario arm has an `#[ignore]`d `todo!`
+> stub naming the slice that discharges it: the in-process cluster arms
+> in `ourios-ingester` (`tests/it/rfc0065_replicated_wal.rs`), and the
+> config, served-binary and chart arms (RFC0065.1, .3, .11's latency
+> arm, .14's `require_complete` arms, .17) in `ourios-server`
+> (`tests/it/rfc0065_replicated_wal.rs`).
+> Specified 2026-11-02 (#1146). Tracks #1141 (option 2). It depends on
 > **RFC 0064** (`meta:`, `specified`), which states in `AGENTS.md` §3.4
 > what a replicated WAL must guarantee; this RFC cannot reach `red`
 > before RFC 0064 is accepted. §3 states the required behaviour without
@@ -659,8 +665,12 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **When** the deterministic simulation suite runs at least 1 000
 >   seeds in CI (and every failing seed is kept as a regression test)
 > - **Then** no run breaks B1, B5, B6, B14 or B16
-> - **And** with the §6.2–§6.4 fallback instead of `openraft`, a model
->   of the whole protocol is also model-checked to a bounded depth
+>   (B1, B5 and B6 are checked against `openraft`'s quorum commit, the
+>   design §4.3 picks; RFC0065.2, .4, .5 and .7 test the same design)
+> - **And**, only if the §6.2–§6.4 fallback is ever built to replace
+>   `openraft`, a model of the whole fallback protocol is model-checked
+>   to a bounded depth before it ships; while `openraft` is the design
+>   this arm has nothing to check and its stub stays ignored
 
 > **Scenario RFC0065.11 — a record is queryable within the allowance (B14, B15)**
 > - **Given** a replicated backend with the flush age at 300 s
@@ -722,9 +732,12 @@ the mass-failover time and vote-log batching as tuning signals.
 >   ingesting at a fixed rate
 > - **When** tail queries run at saturation against the tail replicas,
 >   and then a tail replica is paused
-> - **Then** the ack latency p99 and ingest throughput stay within the
->   noise band of the same run without queries, and no ack waits on the
->   paused tail replica
+>   (each phase runs for the same duration in the same run, after a
+>   query-free baseline phase)
+> - **Then** the ack latency p99 is within 10 % of the baseline phase's
+>   and ingest throughput within 5 % of it (starting bounds, tuned from
+>   the spike's run-to-run spread), and no ack waits on the paused tail
+>   replica
 
 > **Scenario RFC0065.19 — tail capacity scales on its own (B24)**
 > - **Given** a group with one tail replica under saturating tail load
@@ -809,10 +822,12 @@ the mass-failover time and vote-log batching as tuning signals.
 > **Scenario RFC0065.27 — a node failure with many groups fails over like one group (B7)**
 > - **Given** three voter nodes hosting 128 groups, durable fsync on,
 >   and every group led and acknowledging
+>   (the run first kills the leader of a single group alone and records
+>   that failover time, `F`)
 > - **When** one node is killed, so every group it led loses its leader
 >   at once
 > - **Then** every one of those groups acknowledges on a new leader
->   within twice the single-group failover bound (§6.9), no group is
+>   within `2 × F` of the kill, no group is
 >   left without a leader, and the node's vote log took fewer fsyncs
 >   than vote writes
 
@@ -1532,9 +1547,11 @@ from rows.
   back to the offset of the last `Wal::sync` (§4.4). These run locally
   and in CI on every PR, with no containers. `turmoil` and a
   filesystem shim in `ourios-wal` are a later refinement.
-- RFC0065.3 and RFC0065.11's latency arm: the existing WAL
-  crash-recovery job gains a multi-process variant that SIGKILLs the
-  leader, as RFC 0064 §3.2 requires.
+- RFC0065.3 and RFC0065.11's latency arm: served-binary tests in
+  `ourios-server/tests/it`, beside the existing WAL crash-recovery
+  tests, run by CI's `test` job (`cargo nextest`); RFC0065.3 adds a
+  multi-process variant that SIGKILLs the leader, as RFC 0064 §3.2
+  requires.
 - RFC0065.10: with `openraft`, election and replication rest on its
   upstream TLA+-checked design and test suite, re-run on every pin
   bump; the Ourios parts (checkpoint publication, flusher handoff,

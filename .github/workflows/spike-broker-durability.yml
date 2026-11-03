@@ -1,0 +1,84 @@
+name: spike-broker-durability
+
+# Throwaway spike: validates RFC 0066 / RFC 0067 broker-durability
+# assumptions against real Apache Kafka and Redpanda brokers, run as host
+# processes because dm-delay needs the runner's kernel. See
+# spike/broker-durability/README.md.
+
+on:
+  push:
+    branches: [spike/broker-durability]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  KAFKA_VERSION: "4.1.2"
+  W: /tmp/spike
+
+jobs:
+  scenario:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: s1-kafka-flush-messages
+            script: s1-kafka-flush-messages.sh
+            env: ""
+          - name: s2-redpanda-write-caching
+            script: s2-redpanda-write-caching.sh
+            env: ""
+          - name: s3-kafka-elr-on
+            script: s3-kafka-elr.sh
+            env: ELR=1
+          - name: s3-kafka-elr-off
+            script: s3-kafka-elr.sh
+            env: ELR=0
+          - name: s4-redpanda-wc-true
+            script: s4-redpanda-power-loss.sh
+            env: WC=true
+          - name: s4-redpanda-wc-false
+            script: s4-redpanda-power-loss.sh
+            env: WC=false
+          - name: s5-kafka-describe
+            script: s5-kafka-describe.sh
+            env: ""
+          - name: s5-redpanda-describe
+            script: s5-redpanda-describe.sh
+            env: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Kernel and dm-delay preflight
+        run: |
+          uname -a
+          java -version 2>&1 | head -1
+          sudo modprobe dm_delay || {
+            sudo apt-get update -q
+            sudo apt-get install -y -q "linux-modules-extra-$(uname -r)"
+            sudo modprobe dm_delay
+          }
+          sudo dmsetup targets
+      - name: Run ${{ matrix.name }}
+        run: env ${{ matrix.env }} bash spike/broker-durability/${{ matrix.script }} 2>&1 | tee "$RUNNER_TEMP/scenario.log"
+      - name: Verdict lines
+        if: always()
+        run: grep -E '^(S[1-5]|PROBE|=== )' "$RUNNER_TEMP/scenario.log" || true
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            /tmp/spike/out/
+            ${{ runner.temp }}/scenario.log
+          if-no-files-found: ignore

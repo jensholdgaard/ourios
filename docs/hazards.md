@@ -388,7 +388,8 @@ re-architecture of its durability layer.
   signals that something is masking what should be visible
   duplicates.
 - Neither signal is emitted today. An RFC that proposes replication
-  must add them.
+  must add them; they are required for the replicated backend
+  (RFC 0065 §6.9).
 
 **Escalation.** Replication proposed → RFC must explicitly address
 this hazard. Time-window dedup proposed → block, redirect to a

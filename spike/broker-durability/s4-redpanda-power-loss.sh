@@ -86,7 +86,7 @@ rpkx topic describe "$T" -p || true
 read_final=$(grep '^COUNT ' "$W/out/count-final.txt" | sed 's/^COUNT //' | jq -r '.read // 0')
 grep -h -i 'truncat\|election\|vote' "$W/rlogs/b$F1.out" | tail -30 || true
 
-ver=$(rpk version | head -1)
+ver=$(rpk version 2>&1 | sed -n 1p)
 echo
 echo "=== S4 summary (write.caching=$WC, $ver) ==="
 echo "acked: $acked (+1 warmup), offsets 0..$last; L=$L F1=$F1 F2=$F2"

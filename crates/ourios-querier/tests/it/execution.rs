@@ -224,8 +224,9 @@ async fn rfc0062_9_paths_stay_inside_the_tenant() {
         ],
     );
     let q = Querier::new(bucket.path());
-    let query = ourios_querier::dsl::parse(r#"attr.user.id == "u7""#).expect("parse");
-    for tenant in ["a", "b"] {
+    let query = ourios_querier::dsl::parse(r#"attr.user.id == "u7" | limit 10"#).expect("parse");
+    // Tenant `a` stores the map `user`, tenant `b` the literal key `user.id`.
+    for (tenant, own_key) in [("a", "user"), ("b", "user.id")] {
         let result = q
             .run_query(
                 &query,
@@ -240,6 +241,12 @@ async fn rfc0062_9_paths_stay_inside_the_tenant() {
             result.rows, 1,
             "tenant {tenant} matches only its own record"
         );
+        let keys: Vec<&str> = result.records[0]
+            .attributes
+            .iter()
+            .map(|kv| kv.key.as_str())
+            .collect();
+        assert_eq!(keys, [own_key], "tenant {tenant} reads its own record");
     }
 }
 

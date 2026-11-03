@@ -122,6 +122,10 @@ struct Cmp<'a> {
     /// with no needles, since the table grows with the square of the parts
     /// times the key's length.
     segments: Vec<(Range<usize>, String)>,
+    /// Every `.` of the key, at its index in `key` and in the escaped key
+    /// `needle` holds, so a rest of the key is found without rescanning
+    /// the part before it.
+    dots: Vec<(usize, usize)>,
 }
 
 /// The most dot-separated parts a [`tabled`] key may have: 136 needles at
@@ -166,6 +170,12 @@ impl<'a> Cmp<'a> {
             Vec::new()
         };
         let whole = needle(key);
+        let escaped = &whole[KEY_OPEN.len()..whole.len() - 1];
+        let dots = key
+            .match_indices('.')
+            .zip(escaped.match_indices('.'))
+            .map(|((raw, _), (esc, _))| (raw, esc))
+            .collect();
         Self {
             key,
             expected,
@@ -175,6 +185,7 @@ impl<'a> Cmp<'a> {
             typed: format!("{{{whole},\"value\":{type_prefix}"),
             needle: whole,
             segments,
+            dots,
         }
     }
 
@@ -314,16 +325,19 @@ impl<'a> Cmp<'a> {
     /// The maps the scanned heads hold, each with where the rest of the
     /// key starts inside it, shortest head first so the longest pops first.
     fn head_maps<'j>(&self, start: usize, heads: Vec<(usize, &'j str)>) -> Vec<(&'j str, usize)> {
-        let mut dots = self.key[start..].match_indices('.').map(|(i, _)| start + i);
-        let mut taken = 0;
+        let dots = &self.dots[self.dots_before(start)..];
         heads
             .into_iter()
             .filter_map(|(k, value)| {
-                let dot = dots.nth(k - taken)?;
-                taken = k + 1;
+                let &(dot, _) = dots.get(k)?;
                 map_entries(value).map(|map| (map, dot + 1))
             })
             .collect()
+    }
+
+    /// How many of the key's dots come before byte `start`.
+    fn dots_before(&self, start: usize) -> usize {
+        self.dots.partition_point(|&(raw, _)| raw < start)
     }
 
     /// The escaped text of the key from byte `start`, which follows a dot
@@ -331,12 +345,9 @@ impl<'a> Cmp<'a> {
     fn escaped_from(&self, start: usize) -> &str {
         // `needle` is `"key":"<escaped key>"`.
         let escaped = &self.needle[KEY_OPEN.len()..self.needle.len() - 1];
-        let at = match self.key[..start].matches('.').count() {
+        let at = match self.dots_before(start) {
             0 => 0,
-            dots => escaped
-                .match_indices('.')
-                .nth(dots - 1)
-                .map_or(escaped.len(), |(i, _)| i + 1),
+            n => self.dots[n - 1].1 + 1,
         };
         &escaped[at..]
     }
@@ -624,7 +635,7 @@ mod tests {
     use ourios_testgen::strategies::adversarial;
     use proptest::prelude::*;
 
-    use super::{Cmp, MAX_TABLED_SEGMENTS, canonical, canonical_value};
+    use super::{Cmp, canonical, canonical_value};
 
     thread_local! {
         /// Lists opened, and the bytes of the lists scanned for pairs.
@@ -810,12 +821,22 @@ mod tests {
     }
 
     /// Each map is resolved at most once per row, and a key of many parts
-    /// scans each list once, so the work is linear in the row.
+    /// scans each list once, so the work is linear in the row. A long
+    /// leading part, under which every map is opened, adds nothing per map.
     #[test]
     fn crafted_nested_heads_resolve_in_linear_work() {
-        for (levels, parts) in [(6, 24), (5, 16)] {
-            let key = vec!["a"; parts].join(".");
-            let attrs = branching(levels, parts, true);
+        let long_head = "h".repeat(60_000);
+        for (levels, parts, head) in [(6, 24, None), (5, 16, None), (6, 24, Some(&long_head))] {
+            let tail = vec!["a"; parts].join(".");
+            let branches = branching(levels, parts, true);
+            let (key, attrs, levels) = match head {
+                Some(head) => (
+                    format!("{head}.{tail}"),
+                    vec![kv(head, map(branches))],
+                    levels + 1,
+                ),
+                None => (tail, branches, levels),
+            };
             let json = stored(&attrs);
             let maps = (1..=levels)
                 .map(|l| 3usize.pow(u32::try_from(l).expect("small")))
@@ -838,11 +859,7 @@ mod tests {
             // once. A key of many parts scans a list once; a shorter one
             // once per part at most. Nested lists overlap, so the lists of
             // one level add up to at most the row.
-            let passes = if parts > MAX_TABLED_SEGMENTS {
-                1
-            } else {
-                parts
-            };
+            let passes = if super::tabled(&key) { parts } else { 1 };
             assert!(
                 calls <= 2 * (maps + 1),
                 "{calls} resolve calls for {maps} maps"

@@ -196,13 +196,58 @@ async fn rfc0007_5_tenant_isolation() {
 
 /// Scenario RFC0062.9 — paths stay inside the tenant (`AGENTS.md` §3.7).
 /// See `docs/rfcs/0062-attribute-map-paths.md` §5.
-#[test]
-#[ignore = "RFC0062.9 stub — implemented with the §3.1 path resolution"]
-fn rfc0062_9_paths_stay_inside_the_tenant() {
-    todo!(
-        "RFC0062.9 — tenant a's `user = {{id: \"u7\"}}` and tenant b's `user.id = \"u7\"`: \
-         `attr.user.id == \"u7\"` counts one row for each tenant"
+#[tokio::test]
+async fn rfc0062_9_paths_stay_inside_the_tenant() {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, kv, no_aliases, rec_with_attrs};
+    use ourios_core::otlp::{AnyValue, KeyValue, KeyValueList, any_value::Value};
+
+    let user = KeyValue {
+        key: "user".to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::KvlistValue(KeyValueList {
+                values: vec![kv("id", "u7")],
+            })),
+        }),
+        ..Default::default()
+    };
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(
+        bucket.path(),
+        &[
+            rec_with_attrs("a", TS0, vec![kv("service.name", "api")], vec![user]),
+            rec_with_attrs(
+                "b",
+                TS0,
+                vec![kv("service.name", "api")],
+                vec![kv("user.id", "u7")],
+            ),
+        ],
     );
+    let q = Querier::new(bucket.path());
+    let query = ourios_querier::dsl::parse(r#"attr.user.id == "u7" | limit 10"#).expect("parse");
+    // Tenant `a` stores the map `user`, tenant `b` the literal key `user.id`.
+    for (tenant, own_key) in [("a", "user"), ("b", "user.id")] {
+        let result = q
+            .run_query(
+                &query,
+                &TenantId::new(tenant),
+                NOW,
+                DEFAULT_WINDOW_NS,
+                Some(&no_aliases()),
+            )
+            .await
+            .expect("run_query");
+        assert_eq!(
+            result.rows, 1,
+            "tenant {tenant} matches only its own record"
+        );
+        let keys: Vec<&str> = result.records[0]
+            .attributes
+            .iter()
+            .map(|kv| kv.key.as_str())
+            .collect();
+        assert_eq!(keys, [own_key], "tenant {tenant} reads its own record");
+    }
 }
 
 /// A tenant directory that exists but holds no *committed*

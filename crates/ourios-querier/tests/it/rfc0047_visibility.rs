@@ -240,3 +240,31 @@ async fn masked_visibility_nulls_content_and_forbids_reading_it() {
         }
     }
 }
+
+/// RFC 0062 §3.1 meets RFC0047.8: with the map `attr.user` masked, a path
+/// into it is `Forbidden` naming the map, so a metadata reader cannot
+/// probe its values through a filter or a count. The check is on the
+/// query, so a key that some rows hold literally (`user.hash` here) is
+/// refused too: another row could hold it under the map. An unmasked
+/// sibling still answers.
+#[tokio::test]
+async fn a_masked_map_forbids_paths_into_it() {
+    let bucket = seed();
+    let masked = Visibility::Masked {
+        content_columns: vec!["attr.user".to_string()],
+    };
+    for dsl in [
+        "attr.user.id == \"u7\" | count",
+        "attr.user.id != \"u7\" | count",
+        "attr.user.hash == \"u1\"",
+    ] {
+        match run(bucket.path(), dsl, masked.clone()).await {
+            Err(QueryError::Forbidden { column }) => assert_eq!(column, "attr.user", "{dsl}"),
+            other => panic!("{dsl}: expected Forbidden, got {other:?}"),
+        }
+    }
+    let rows = run(bucket.path(), "attr.model == \"gpt\"", masked)
+        .await
+        .expect("an unmasked sibling");
+    assert_eq!(rows.rows, 6);
+}

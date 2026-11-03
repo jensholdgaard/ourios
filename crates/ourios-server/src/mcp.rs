@@ -75,6 +75,18 @@ static GRAMMAR_SECTION: std::sync::LazyLock<&'static str> = std::sync::LazyLock:
     &DSL_RFC[start..end]
 });
 
+/// How `attr.<key>` / `resource.<key>` / `service` find their value
+/// (RFC 0062 §3.1), stated in the query-schema resource.
+const ATTRIBUTE_KEY_RULE: &str = "attr.<key> and resource.<key> name the \
+    attribute called <key>, dots included; attr[\"<key>\"] is the same. When the \
+    record has no such attribute, == and != read a dotted key as a path into map \
+    values: the longest leading key is tried first, its first attribute must hold \
+    a map, and the rest of the key is resolved inside that map by the same rule. \
+    Arrays and scalars are not entered, and a key that resolves to nothing is a \
+    missing field. service is resource.service.name. Ordering, regex, grouping \
+    and aggregation read promoted columns, which hold the top-level attribute \
+    only, and a key promoted as a float has no path fallback.";
+
 /// The `ourios.query.kind` value for the registry fold (a registry
 /// member alongside `logs`/`drift`/`rejected`).
 const QUERY_KIND_TEMPLATES: &str = "templates";
@@ -131,6 +143,10 @@ fn query_schema_document(promoted: &PromotedAttributes) -> serde_json::Value {
         "promoted_attributes": {
             "resource": promoted.resource_keys().iter().map(|k| k.key.as_str()).collect::<Vec<_>>(),
             "log": promoted.log_keys().iter().map(|k| k.key.as_str()).collect::<Vec<_>>()
+        },
+        "attribute_keys": {
+            "rule": ATTRIBUTE_KEY_RULE,
+            "path_operators": ["==", "!="]
         },
         "cost_model": {
             "tiers": ["index_backed", "pruned", "scan"],

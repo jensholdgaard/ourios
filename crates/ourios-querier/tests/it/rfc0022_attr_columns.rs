@@ -642,48 +642,177 @@ async fn integer_json_arm_ignores_a_nested_pair() {
     assert_eq!(count(&q, "attr.n != 4").await, 1, "the top-level int only");
 }
 
+fn string_promoted(keys: &[&str]) -> PromotedAttributes {
+    PromotedAttributes::new([], keys.iter().map(|k| (*k).to_string()))
+}
+
+fn map_of(key: &str, entries: Vec<KeyValue>) -> KeyValue {
+    kv_value(key, Some(kvlist(entries)))
+}
+
+/// Each of `cases` against `records` written once per promoted set.
+async fn assert_counts_per_promotion(
+    records: &[MinedRecord],
+    promotions: &[PromotedAttributes],
+    cases: &[(&str, u64)],
+) {
+    for promoted in promotions {
+        let bucket = TempDir::new().expect("temp");
+        write_all_with_promoted(bucket.path(), records, promoted);
+        assert_counts(&Querier::new(bucket.path()), promoted, cases).await;
+    }
+}
+
 /// Scenario RFC0062.1 — the literal key wins.
 /// See `docs/rfcs/0062-attribute-map-paths.md` §5.
-#[test]
-#[ignore = "RFC0062.1 stub — implemented with the §3.1 path resolution"]
-fn rfc0062_1_the_literal_key_wins() {
-    todo!(
-        "RFC0062.1 — with `user.id = \"u9\"` and `user = {{id: \"u7\"}}`, promoted and \
-         not, `attr.user.id == \"u7\"` matches nothing and `!= \"u7\"` matches the record"
-    );
+#[tokio::test]
+async fn rfc0062_1_the_literal_key_wins() {
+    let records = records_with_log_attrs(vec![vec![
+        kv("user.id", "u9"),
+        map_of("user", vec![kv("id", "u7")]),
+    ]]);
+    assert_counts_per_promotion(
+        &records,
+        &[string_promoted(&["user.id"]), PromotedAttributes::default()],
+        &[
+            (r#"attr.user.id == "u7""#, 0),
+            (r#"attr.user.id != "u7""#, 1),
+            (r#"attr["user.id"] == "u7""#, 0),
+            (r#"attr["user.id"] != "u7""#, 1),
+        ],
+    )
+    .await;
 }
 
 /// Scenario RFC0062.2 — a dotted key resolves into a map.
 /// See `docs/rfcs/0062-attribute-map-paths.md` §5.
-#[test]
-#[ignore = "RFC0062.2 stub — implemented with the §3.1 path resolution"]
-fn rfc0062_2_a_dotted_key_resolves_into_a_map() {
-    todo!(
-        "RFC0062.2 — `user.id == \"u7\"`, `user.id != \"u7\"`, `a.b.c == \"x\"` and \
-         `a.b.c == \"long\"` each match one record, `a.b.c == \"short\"` none, promoted \
-         and not"
-    );
+#[tokio::test]
+async fn rfc0062_2_a_dotted_key_resolves_into_a_map() {
+    let records = records_with_log_attrs(vec![
+        vec![map_of("user", vec![kv("id", "u7")])],
+        vec![map_of("user", vec![kv("id", "u8")])],
+        vec![map_of("a", vec![map_of("b", vec![kv("c", "x")])])],
+        vec![
+            map_of("a.b", vec![kv("c", "long")]),
+            map_of("a", vec![kv("b.c", "short")]),
+        ],
+    ]);
+    assert_counts_per_promotion(
+        &records,
+        &[
+            string_promoted(&["user.id", "a.b.c"]),
+            PromotedAttributes::default(),
+        ],
+        &[
+            (r#"attr.user.id == "u7""#, 1),
+            (r#"attr.user.id != "u7""#, 1),
+            (r#"attr["user.id"] == "u7""#, 1),
+            (r#"attr.a.b.c == "x""#, 1),
+            (r#"attr.a.b.c == "long""#, 1),
+            (r#"attr.a.b.c == "short""#, 0),
+        ],
+    )
+    .await;
 }
 
 /// Scenario RFC0062.3 — what a path does not enter.
 /// See `docs/rfcs/0062-attribute-map-paths.md` §5.
-#[test]
-#[ignore = "RFC0062.3 stub — implemented with the §3.1 path resolution"]
-fn rfc0062_3_what_a_path_does_not_enter() {
-    todo!(
-        "RFC0062.3 — a string, an array, an array of maps and an absent `user` match \
-         neither `attr.user.id == \"u7\"` nor `!= \"u8\"`; an `f64`-promoted `m.n` held \
-         only as `m = {{n: 1.5}}` matches neither `== 1.5` nor `!= 2.0`"
+#[tokio::test]
+async fn rfc0062_3_what_a_path_does_not_enter() {
+    let array = |values: Vec<AvValue>| {
+        AvValue::ArrayValue(ourios_core::otlp::ArrayValue {
+            values: values
+                .into_iter()
+                .map(|v| AnyValue { value: Some(v) })
+                .collect(),
+        })
+    };
+    let records = records_with_log_attrs(vec![
+        vec![kv("user", "u7")],
+        vec![kv_value(
+            "user",
+            Some(array(vec![AvValue::StringValue("u7".into())])),
+        )],
+        vec![kv_value(
+            "user",
+            Some(array(vec![kvlist(vec![kv("id", "u7")])])),
+        )],
+        vec![kv("other", "u7")],
+    ]);
+    assert_counts_per_promotion(
+        &records,
+        &[string_promoted(&["user.id"]), PromotedAttributes::default()],
+        &[
+            (r#"attr.user.id == "u7""#, 0),
+            (r#"attr.user.id != "u8""#, 0),
+        ],
+    )
+    .await;
+
+    // An f64 key has no JSON arm (RFC 0042 §3.4), so a double held only
+    // under a map never matches.
+    let double = kv_value(
+        "m",
+        Some(kvlist(vec![kv_value("n", Some(AvValue::DoubleValue(1.5)))])),
     );
+    let f64_promoted = PromotedAttributes::new_typed(
+        [],
+        [ourios_parquet::PromotedKey {
+            key: "m.n".into(),
+            class: ourios_parquet::PromotedClass::F64,
+        }],
+    );
+    assert_counts_per_promotion(
+        &records_with_log_attrs(vec![vec![double]]),
+        &[f64_promoted],
+        &[("attr.m.n == 1.5", 0), ("attr.m.n != 2.0", 0)],
+    )
+    .await;
 }
 
 /// Scenario RFC0062.4 — resource attributes and `service`.
 /// See `docs/rfcs/0062-attribute-map-paths.md` §5.
-#[test]
-#[ignore = "RFC0062.4 stub — implemented with the §3.1 path resolution"]
-fn rfc0062_4_resource_attributes_and_service() {
-    todo!(
-        "RFC0062.4 — a resource holding `service = {{name: \"api\"}}` and no \
-         `service.name` matches `resource.service.name == \"api\"` and `service == \"api\"`"
-    );
+#[tokio::test]
+async fn rfc0062_4_resource_attributes_and_service() {
+    let records = vec![rec_with_attrs(
+        "a",
+        TS0,
+        vec![map_of("service", vec![kv("name", "api")])],
+        vec![kv("k", "v")],
+    )];
+    // `service.name` is always promoted; its cell is NULL here.
+    assert_counts_per_promotion(
+        &records,
+        &[PromotedAttributes::default()],
+        &[
+            (r#"resource.service.name == "api""#, 1),
+            (r#"service == "api""#, 1),
+            (r#"service != "web""#, 1),
+            (r#"service == "web""#, 0),
+        ],
+    )
+    .await;
+}
+
+/// RFC0062.2 for a key of more parts than the querier keeps a pattern
+/// per tail for: the path still resolves, for `==` and `!=`.
+#[tokio::test]
+async fn a_key_of_many_parts_resolves_into_a_map() {
+    let parts: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
+    let key = parts.join(".");
+    let head = parts[..19].join(".");
+    let records = records_with_log_attrs(vec![
+        vec![kv(&key, "u7")],
+        vec![map_of(&head, vec![kv("p19", "u8")])],
+        vec![kv("other", "u7")],
+    ]);
+    let eq = format!(r#"attr.{key} == "u7""#);
+    let ne = format!(r#"attr.{key} != "u7""#);
+    let eq_u8 = format!(r#"attr.{key} == "u8""#);
+    assert_counts_per_promotion(
+        &records,
+        &[PromotedAttributes::default()],
+        &[(&eq, 1), (&ne, 1), (&eq_u8, 1)],
+    )
+    .await;
 }

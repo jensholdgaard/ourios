@@ -146,7 +146,9 @@ receiver:
     returned as a topic property, so none of them is read: the floor
     comes from the replica list and leader safety from Raft, identified
     by the broker kind. The persistence key is `write.caching`
-    (`false` or `disabled` is verified).
+    (`false` or `disabled` is verified), and it is required: the opt-in
+    does not apply on `redpanda` (RFC 0067 §3.1), so any other value
+    fails the check.
   - **Both:** fails if the topic is missing, if `cleanup.policy` is anything but exactly `delete` (compaction
   would remove tenant-keyed batches before their checkpoint, leaving
   holes no log-start check sees), if `retention.ms` or
@@ -550,8 +552,8 @@ partition in place of the Raft log; there is no separate tail topic.
     `allowUnverifiedAck` is set, `flush.messages=1`, each as a topic
     override, so a value the topic only inherits is written to the
     topic. `redpanda` sets
-    no Kafka-only key (refusing `topic.replicationFactor` below 3) and,
-    unless `allowUnverifiedAck` is set, `write.caching=false`. It never
+    no Kafka-only key (refusing `topic.replicationFactor` below 3) and
+    always `write.caching=false`. It never
     weakens a setting: a higher `min.insync.replicas`, a larger
     `max.message.bytes` or an existing persistence setting is kept; a replication factor or
     partition count that differs is reported and fails the Job, since
@@ -877,9 +879,9 @@ removes only copies of the same log entry.
 >   unverified mode in its telemetry (§3.9)
 > - **And** the same fixture with ELR disabled, or with the finalized
 >   features unreadable, fails startup naming the ELR feature
-> - **And** a `redpanda` topic with the opt-in set, `write.caching=true`
->   and replicas on distinct racks starts with the same warning and
->   needs no ELR or Kafka-only key
+> - **And** a `redpanda` topic with `write.caching=true` fails startup
+>   with the opt-in set, replicas on distinct racks or not, naming
+>   `write.caching`
 > - **And** a topic whose replica floor or leader safety cannot be read
 >   for its `broker_kind` (`kafka` without `min.insync.replicas` or
 >   unclean-election keys, `redpanda` without `write.caching`, as on
@@ -908,11 +910,13 @@ removes only copies of the same log entry.
 > - **Then** exports to that topic get the retryable rejection (gRPC
 >   `UNAVAILABLE`, HTTP `503`) and none is acknowledged until a re-check
 >   finds the topic verified again
-> - **And** with the opt-in set, the same change keeps
->   acknowledgements flowing and emits a WARN event naming the topic,
+> - **And** on `kafka` with the opt-in set, resetting `flush.messages`
+>   keeps acknowledgements flowing and emits a WARN event naming the
+>   topic,
 >   provided the failure-domain and (on Apache Kafka) ELR checks pass on
 >   entering unverified mode; if either fails then, exports get the
->   retryable rejection instead
+>   retryable rejection instead; on `redpanda`, `write.caching` set to
+>   `true` stops acknowledgements whether or not the opt-in is set
 > - **And** a re-check that finds, on `kafka`, `min.insync.replicas`
 >   below 2 or unclean leader election enabled, on `redpanda`, a
 >   partition with fewer than 3 replicas, or on either the configuration
@@ -950,7 +954,8 @@ removes only copies of the same log entry.
 > - **And** `topic.manage: false` renders no hook resources;
 >   `brokerKind: redpanda` makes the Job ensure `write.caching=false` and
 >   no `min.insync.replicas`, unclean-election or `flush.messages` key;
->   `allowUnverifiedAck: true` makes it ensure no persistence key;
+>   `allowUnverifiedAck: true` makes it ensure no `flush.messages` on
+>   `kafka` and still `write.caching=false` on `redpanda`;
 >   `topic.minInsyncReplicas: 1`, `topic.replicationFactor: 1`, or
 >   `topic.replicationFactor: 2` with `brokerKind: redpanda` fails the
 >   render

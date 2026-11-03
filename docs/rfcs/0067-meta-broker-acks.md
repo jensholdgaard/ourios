@@ -42,9 +42,11 @@ This RFC lets a broker-backed WAL meet RFC 0064's bullet through the
 broker's own quorum and leader election, checked by Ourios from the
 broker's configuration at startup and periodically while running. A
 broker that verifiably persists before it acknowledges meets the bullet
-unchanged. For one that does not, only the fsync is waived, and only
-under an explicit operator opt-in, with a startup warning and replicas
-in separate failure domains; the two-replica floor, leader safety and
+unchanged. For one that does not, only the fsync is waived, only on
+Apache Kafka, and only under an explicit operator opt-in, with a startup
+warning and replicas in separate failure domains. A majority-quorum
+broker (Redpanda) must verify persistence, opt-in or not (§3.1); the
+two-replica floor, leader safety and
 fencing are never waived, so a broker on which Ourios cannot establish
 them is unsupported, opt-in or not.
 
@@ -84,6 +86,16 @@ The gap is the fourth row: a power loss that reaches the whole write
 quorum before the kernel writes its pages out. Separate failure domains
 (Kafka `broker.rack`, Redpanda `rack`) turn one rack or zone event into
 several independent ones.
+
+That holds only where the ack waits for every in-sync replica and a
+replica that restarted without its data cannot lead: Apache Kafka with
+Eligible Leader Replicas (§7 Q5). A majority-quorum broker acks once a
+majority holds the batch, so with persistence off (Redpanda write
+caching) one follower's power loss and the leader cut off from the
+network leave a majority without the batch that can elect a leader from
+itself. That is two independent events, which separate failure domains
+do not prevent, so on such a broker the opt-in does not apply and
+persistence must be verified.
 
 ### 3.2 `AGENTS.md` §3.4
 
@@ -148,7 +160,10 @@ and a bullet follows it:
   the replicas: the backend then acknowledges only when the operator
   has opted in by configuration, warns at startup, and has every
   partition's replicas in distinct failure domains, re-checked with
-  the rest. The opt-in waives the fsync only, never the two-replica
+  the rest. The opt-in is open only to a broker whose ack waits for
+  every in-sync replica and which bars a replica that restarted
+  without its data from leading; a majority-quorum broker must verify
+  persistence. The opt-in waives the fsync only, never the two-replica
   floor, leader safety or fencing. A check that fails while running
   stops acknowledgements on that topic with a retryable rejection until
   it passes again, or, for a lost fsync guarantee, until the opt-in
@@ -164,8 +179,9 @@ unchanged.
 2026-MM-DD revision adds the broker case to §3.4: a Kafka-protocol WAL
 meets the replication rule through the broker's write quorum and leader
 election, checked at startup and while running, and an acknowledgement
-the broker does not verifiably persist first needs an operator opt-in,
-a startup warning and replicas in separate failure domains, per **RFC
+the broker does not verifiably persist first is allowed only on Apache
+Kafka, with an operator opt-in, a startup warning and replicas in
+separate failure domains, per **RFC
 0067** (maintainer-approved `meta:` RFC).
 ```
 
@@ -176,8 +192,8 @@ and `*Last updated: …*` moves to the enacting date.
 - **H3, first mitigation.** "An ack is emitted **only after** fsync (or
   equivalent durability primitive) on the WAL." becomes: "An ack is
   emitted **only after** fsync (or equivalent durability primitive) on
-  the WAL. The one exception is an opted-in broker backend (RFC 0066,
-  RFC 0067) whose broker Ourios cannot verify persists before
+  the WAL. The one exception is an opted-in Apache Kafka broker backend
+  (RFC 0066, RFC 0067) whose broker Ourios cannot verify persists before
   acknowledging: there the ack waits for the broker's write quorum of
   at least two replicas, in distinct failure domains, holding the
   batch, but its persistence is unverified, so a correlated power loss
@@ -211,12 +227,12 @@ property, the same on every broker, so either source counts there.
 |---|---|---|---|
 | ≥ 2 replicas and the write quorum hold the batch (never waived) | `acks=all`, `min.insync.replicas ≥ 2`, every partition with ≥ `max(2, min.insync.replicas)` replicas | `acks=all` (Raft majority), every partition's Metadata replica list with ≥ 3 replicas (majority ≥ 2); Redpanda does not report `min.insync.replicas` or `replication.factor` as topic properties | not readable through the Kafka protocol: **unsupported** |
 | Leader holds every acked batch (never waived) | `unclean.leader.election.enable=false`; with the opt-in, also ELR enabled in the finalized features (§7 Q5) | Raft election, taken from `broker_kind: redpanda` once the `write.caching` key confirms the broker; no Kafka-only key is required | not readable: **unsupported** |
-| fsync before ack (waivable by the opt-in) | `flush.messages` exactly `1` (§7 Q4); unset or any other value is unverified | `write.caching=false` or `disabled` | — |
-| Failure domains (opt-in only, never waived once opted in) | current replica assignment, each partition's replicas on distinct non-empty `rack` labels | same | — |
+| fsync before ack (waivable by the opt-in on Kafka only) | `flush.messages` exactly `1` (§7 Q4); unset or any other value is unverified | `write.caching=false` or `disabled`, **never waived** (§3.1) | — |
+| Failure domains (opt-in only, never waived once opted in) | current replica assignment, each partition's replicas on distinct non-empty `rack` labels | — (no opt-in) | — |
 
 Classification is per row. A row marked never waived that cannot be
 read, or reads as failing, rejects the topic whatever the opt-in says;
-only the fsync row falls back to the opt-in, and conservatively: a
+only Kafka's fsync row falls back to the opt-in, and conservatively: a
 broker that does persist but cannot show it needs the opt-in, never the
 reverse. WarpStream's own documentation promises an ack only after the
 object-store commit, but Ourios cannot read its floor or leader safety,
@@ -237,8 +253,8 @@ Each check fails closed:
   partition's replicas no longer sit on distinct non-empty racks, on
   entering unverified mode or at any re-check → the same;
 - the fsync check moves from verified to unverified and the opt-in is
-  not set → the same; with the opt-in set → acknowledgements continue
-  and a WARN event is emitted.
+  not set, or the broker is Redpanda → the same; on Kafka with the
+  opt-in set → acknowledgements continue and a WARN event is emitted.
 
 Between two checks an admin change can go unseen for up to one
 interval; the opt-in's warning and H3's escalation cover that window,
@@ -334,7 +350,10 @@ All resolved by the maintainer on 2026-11-02, each as recommended.
   it cannot verify?** **Only with an explicit opt-in and a startup warning;**
   otherwise only brokers that show they persist first (§3.5). The
   default keeps "no in-memory-only acks", and an operator who opts in
-  accepts §3.1's fourth row knowingly.
+  accepts §3.1's fourth row knowingly. **Narrowed 2026-11-03
+  (maintainer):** the opt-in covers Apache Kafka only; on Redpanda an
+  unverified ack can be lost to one power loss and a network split
+  (§3.1), so `write.caching` must be `false` or `disabled` there.
 - [x] **Q2. With the opt-in, must each copy be in a different rack or
   zone?** **Yes,** checked from the brokers' rack labels at startup and
   every re-check; a missing label refuses.

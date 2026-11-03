@@ -540,7 +540,12 @@ partition in place of the Raft log; there is no separate tail topic.
     `max.message.bytes` or an existing persistence setting is kept; a replication factor or
     partition count that differs is reported and fails the Job, since
     changing either is a reassignment or migration this RFC does not
-    define. It ends by running the receiver's startup check (§3.1, RFC
+    define. An existing topic whose `cleanup.policy` includes `compact`
+    is never reconciled: compaction may already have removed frames
+    before their checkpoint, holes §3.1's check cannot see once the
+    policy reads `delete`, so the verb fails naming the topic and
+    changes nothing; recovering such a topic is likewise undefined
+    here. It ends by running the receiver's startup check (§3.1, RFC
     0067 §3.5) against the result and fails if that check would fail, so
     provisioning and the check cannot disagree: the rules live in one
     place, the receiver's code.
@@ -550,9 +555,21 @@ partition in place of the Raft log; there is no separate tail topic.
     the Job uses none of them. The chart renders, as hooks on the same
     events, a ConfigMap `<fullname>-wal-topic-ensure` from the
     *incoming* values with the same helper the receiver's ConfigMap
-    uses, and, when `receiver.serviceAccount.create` is true, a
-    ServiceAccount for the Job; both carry `helm.sh/hook-weight: "-10"`
-    and the Job `"0"`, so they exist before it runs. Broker credentials
+    uses, and, whenever the account the receiver runs as is
+    chart-created (`receiver.serviceAccount.create`, or the shared
+    `serviceAccount.create` the receiver falls back to by default), a
+    ServiceAccount `<fullname>-wal-topic-ensure` for the Job, with that
+    account's annotations (an IRSA `eks.amazonaws.com/role-arn`
+    included) and its `automountServiceAccountToken`. The Job needs
+    that identity: it reaches the brokers as the receiver does, and its
+    final check reads the store's `topic.json` (§3.3). An IAM trust
+    policy that names service accounts must also admit
+    `<fullname>-wal-topic-ensure`, which `NOTES.txt` and the operator
+    docs state. When the receiver binds an existing account by name, or
+    runs as the namespace's default account, the Job runs as that same
+    account and the chart renders none. The ConfigMap and the
+    ServiceAccount carry `helm.sh/hook-weight: "-10"` and the Job
+    `"0"`, so they exist before it runs. Broker credentials
     and TLS material reach the Job only through `receiver.extraEnv`
     `secretKeyRef`s and existing Secret names, which the operator
     creates before installing, never through a Secret the release
@@ -891,12 +908,18 @@ removes only copies of the same log entry.
 >   `durability_recheck_secs: 60` and `broker_kind: kafka`, and a
 >   `pre-install,pre-upgrade` hook Job runs `wal topic ensure` with the
 >   receiver's image and config
-> - **And** the Job's ConfigMap and (with `serviceAccount.create`) its
->   ServiceAccount are hooks on the same events rendered from the
->   incoming values, with `helm.sh/hook-weight` `-10` against the Job's
+> - **And** the Job's ConfigMap and, whenever the receiver's account is
+>   chart-created (the shared account by default, or
+>   `receiver.serviceAccount.create`), its ServiceAccount
+>   `<fullname>-wal-topic-ensure` with that account's annotations and
+>   `automountServiceAccountToken` are hooks on the same events
+>   rendered from the incoming values, with `helm.sh/hook-weight` `-10` against the Job's
 >   `0`, and every hook resource carries
 >   `hook-delete-policy: before-hook-creation,hook-succeeded`; changing a
->   value changes the hook ConfigMap in the same render
+>   value changes the hook ConfigMap in the same render; with
+>   `receiver.serviceAccount.name` binding an existing account, or with
+>   no chart-created account, the Job runs as the receiver's account and
+>   no hook ServiceAccount renders
 > - **And** `topic.manage: false` renders no hook resources;
 >   `brokerKind: redpanda` makes the Job ensure `write.caching=false` and
 >   no `min.insync.replicas`, unclean-election or `flush.messages` key;
@@ -918,8 +941,9 @@ removes only copies of the same log entry.
 >   second changes nothing; on `kafka` the third keeps
 >   `min.insync.replicas=3` and the larger `max.message.bytes`, sets
 >   unclean election to `false`, and the second run changes nothing
-> - **And** a topic whose replication factor or partition count differs
->   makes the verb fail naming it, and a result the startup check would
+> - **And** a topic whose replication factor or partition count differs,
+>   or whose `cleanup.policy` is `compact` or `compact,delete`, makes the
+>   verb fail naming it and leaves the topic unchanged, and a result the startup check would
 >   refuse (for example a broker with no rack under the opt-in) makes the
 >   verb fail with the same error the receiver would log
 

@@ -192,8 +192,14 @@ wait_isr() {
 # --- redpanda ---------------------------------------------------------------
 
 install_redpanda() {
-  curl -1sLf 'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' | sudo -E bash
+  # The GitHub releases carry only rpk; the broker ships from the apt repo the
+  # upstream README documents (dl.redpanda.com now answers 400).
+  curl -fsSL --tlsv1.2 -o "$W/setup-redpanda.deb.sh" https://linux.pkg.redpanda.com/setup-redpanda.deb.sh
+  sudo bash "$W/setup-redpanda.deb.sh"
+  apt-cache policy redpanda
   sudo apt-get install -y -q redpanda
+  dpkg -s redpanda | grep -E '^(Package|Version):'
+  command -v rpk
   rpk version
   sudo sysctl -w fs.aio-max-nr=1048576
 }

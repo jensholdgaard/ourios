@@ -235,6 +235,12 @@ rpk:
   overprovisioned: true
   tune_aio_events: false
 EOF
+    # The 4 GiB dm-delay devices sit below the 5 GiB default
+    # storage_min_free_bytes, which marks every node low on disk and keeps
+    # the cluster unhealthy.
+    cat > "$W/rcfg/b$i/.bootstrap.yaml" <<EOF
+storage_min_free_bytes: 268435456
+EOF
   done
 }
 
@@ -269,7 +275,9 @@ redpanda_cluster_up() {
   local i
   for i in 1 2 3; do redpanda_start "$i"; done
   for i in 1 2 3; do redpanda_wait_up "$i"; done
-  rpkx cluster health --watch --exit-when-healthy || true
+  timeout 90 rpk -X "brokers=${RB:-$RBOOT}" -X "admin.hosts=$RADMIN" \
+    cluster health --watch --exit-when-healthy >/dev/null || log "cluster not healthy after 90 s"
+  rpkx cluster health
   rpkx cluster config set enable_leader_balancer false
 }
 

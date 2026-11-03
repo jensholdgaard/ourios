@@ -267,9 +267,9 @@ honour §7's seven decisions: the opt-in as one explicit value, default
 off; the re-check interval rendered with its default; no value that
 turns a check off; and a topic-ensure hook, running Ourios's own verb,
 that creates or reconciles the WAL topic to conforming settings and then
-runs the startup check against it. Broker-side settings (rack labels,
-ELR) stay the broker operator's; the startup check refuses without
-them. RFC 0066 §3.10 specifies this, with criteria RFC0066.21–.22.
+runs the startup check against it. The broker-side settings the opt-in
+needs on Apache Kafka (rack labels, ELR) stay the broker operator's;
+under the opt-in, the startup check refuses without them. RFC 0066 §3.10 specifies this, with criteria RFC0066.21–.22.
 
 ### 3.7 What does not change
 

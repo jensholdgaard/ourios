@@ -230,8 +230,11 @@ existing `cargo deny` check.
   contract.
 - **The partition count is recorded** in `<bucket>/wal/<topic>/topic.json`
   (topic, topic id, partition count, broker cluster id) the first time
-  a receiver starts on the topic, with `put_if_absent` (RFC 0013). A
-  later start that sees a different count, cluster id or topic id (the
+  a receiver starts on the topic, with `put_if_absent` (RFC 0013).
+  Only an empty `<bucket>/wal/<topic>/` is a first start: a missing
+  `topic.json` beside existing checkpoints or bundles refuses to start,
+  since the record that bound them is gone and binding afresh could
+  apply them to a different layout. A later start that sees a different count, cluster id or topic id (the
   topic was deleted and recreated) refuses to start before producing or
   consuming, so an old checkpoint is never applied to a new topic's
   offsets. Checkpoints and bundles are also keyed by the topic id
@@ -558,10 +561,11 @@ partition in place of the Raft log; there is no separate tail topic.
     `max.message.bytes` or an existing persistence setting is kept; a replication factor or
     partition count that differs is reported and fails the Job, since
     changing either is a reassignment or migration this RFC does not
-    define. A store with no `topic.json` yet (§3.3), as on a first
-    install, is a first start: the final check passes that comparison
-    and writes no record, which the receiver writes when it first
-    starts. An existing topic whose `cleanup.policy` includes `compact`
+    define. A store with nothing yet under the topic's prefix (§3.3),
+    as on a first install, is a first start: the final check passes that
+    comparison and writes no record, which the receiver writes when it
+    first starts. A missing `topic.json` beside checkpoints or bundles
+    fails the Job as it fails the receiver. An existing topic whose `cleanup.policy` includes `compact`
     is never reconciled: compaction may already have removed frames
     before their checkpoint, holes §3.1's check cannot see once the
     policy reads `delete`, so the verb fails naming the topic and
@@ -594,15 +598,19 @@ partition in place of the Raft log; there is no separate tail topic.
     and TLS material reach the Job only through `receiver.extraEnv`
     `secretKeyRef`s and existing Secret names, which the operator
     creates before installing, never through a Secret the release
-    renders. Every hook resource carries
+    renders. The Job reaches the store with the receiver's credentials:
+    with `storage.s3.existingSecret`, the same `envFrom` the receiver's
+    pods carry (`ourios.s3CredentialsEnvFrom`); with IRSA, the hook
+    ServiceAccount's copied annotation. Every hook resource carries
     `helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded`.
-  - **What the chart cannot do.** Broker-side settings belong to the
-    broker's operator: `broker.rack` (Kafka) or `rack` (Redpanda) on
-    every broker, and on Apache Kafka under the opt-in, ELR enabled
+  - **What the chart cannot do.** The opt-in on Apache Kafka needs
+    broker-side settings that belong to the broker's operator:
+    `broker.rack` on every broker and ELR enabled
     (`eligible.leader.replicas.version=1`, default on new 4.1+
-    clusters). `NOTES.txt` and the operator docs state them; if they are
-    missing, the receiver's startup check refuses, as RFC0066.16–.18
-    require.
+    clusters). A verified deployment, and every Redpanda one, needs
+    neither. `NOTES.txt` and the operator docs state them; under the
+    opt-in, if they are missing, the receiver's startup check refuses,
+    as RFC0066.17–.18 require.
 
 ### 3.11 Invariants and hazards
 
@@ -703,7 +711,9 @@ removes only copies of the same log entry.
 >   compacted topic is refused), its retention is not unlimited, its
 >   `max.message.bytes` is below one maximal frame, or its partition
 >   count, cluster id or topic id differs from
->   `<bucket>/wal/<topic>/topic.json` (a recreated topic is refused)
+>   `<bucket>/wal/<topic>/topic.json` (a recreated topic is refused), or
+>   `topic.json` is missing while checkpoints or bundles exist under that
+>   prefix
 > - **And** with `broker_kind: kafka`, startup also fails when
 >   `min.insync.replicas` or `unclean.leader.election.enable` is absent
 >   or `min.insync.replicas` is below 2, the effective
@@ -946,6 +956,8 @@ removes only copies of the same log entry.
 >   `0`, and every hook resource carries
 >   `hook-delete-policy: before-hook-creation,hook-succeeded`; changing a
 >   value changes the hook ConfigMap in the same render; with
+>   `storage.s3.existingSecret` set the Job carries the same `envFrom`
+>   secret reference as the receiver; with
 >   `receiver.serviceAccount.name` binding an existing account, or with
 >   no chart-created account, the Job runs as the receiver's account and
 >   no hook ServiceAccount renders
@@ -976,6 +988,9 @@ removes only copies of the same log entry.
 > - **And** on an empty store (no topic, no `topic.json`) the first run
 >   creates the topic, passes, and writes no `topic.json`; the
 >   receiver's first start then records it
+> - **And** a store with checkpoints under the topic's prefix but no
+>   `topic.json` makes the verb fail naming `topic.json`, and writes
+>   nothing
 > - **And** on `kafka`, a topic whose `min.insync.replicas` and
 >   `flush.messages` are inherited from the broker configuration gets
 >   both as topic overrides

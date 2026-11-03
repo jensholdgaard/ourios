@@ -219,6 +219,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # The sanitizer build of every target, staged binaries included,
+      # outgrew the runner's free disk ("No space left on device").
+      - name: Free runner disk space
+        run: .github/scripts/free-disk-space.sh
       - name: Build fuzzers (address)
         id: build
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
@@ -251,6 +255,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # The sanitizer build of every target, staged binaries included,
+      # outgrew the runner's free disk ("No space left on device").
+      - name: Free runner disk space
+        run: .github/scripts/free-disk-space.sh
       - name: Build fuzzers (address)
         id: build
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
@@ -284,6 +292,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # The sanitizer build of every target, staged binaries included,
+      # outgrew the runner's free disk ("No space left on device").
+      - name: Free runner disk space
+        run: .github/scripts/free-disk-space.sh
       - name: Build fuzzers (coverage)
         id: build
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1

@@ -223,7 +223,7 @@ impl<'a> Read<'a> {
         let (prefix, key) = match self.field {
             Field::Attr(key) => (promoted::ATTR_PREFIX, key.as_str()),
             Field::Resource(key) => (promoted::RESOURCE_PREFIX, key.as_str()),
-            Field::Service if self.paths => (promoted::RESOURCE_PREFIX, "service.name"),
+            Field::Service => (promoted::RESOURCE_PREFIX, "service.name"),
             Field::Body => return (column == "body").then_some(0),
             _ => return None,
         };
@@ -378,6 +378,28 @@ mod tests {
             masked
                 .validate(&logs(statement))
                 .unwrap_or_else(|e| panic!("{statement}: {e:?}"));
+        }
+    }
+
+    /// `service` reads `resource.service.name`, so every read of it is
+    /// checked as that column is, not only the reads that resolve paths.
+    #[test]
+    fn a_masked_service_name_forbids_every_service_read() {
+        let masked = Visibility::Masked {
+            content_columns: vec!["resource.service.name".to_string()],
+        };
+        for statement in [
+            "service == \"api\"",
+            "service >= \"a\"",
+            "contains(service, \"x\")",
+            "true | count by service",
+        ] {
+            match masked.validate(&logs(statement)) {
+                Err(QueryError::Forbidden { column }) => {
+                    assert_eq!(column, "resource.service.name", "{statement}");
+                }
+                other => panic!("{statement}: expected Forbidden, got {other:?}"),
+            }
         }
     }
 

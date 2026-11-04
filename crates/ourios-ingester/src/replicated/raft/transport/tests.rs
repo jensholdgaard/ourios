@@ -643,11 +643,31 @@ async fn requests_no_leader_sends_are_refused_and_the_group_keeps_serving() {
         group: GROUP,
         node: node.id,
     };
-    let snapshot = SnapshotRequest::new(to, &vote, &snapshot_of(log(9, 5)).meta).expect("encode");
-    let refused = raw::<_, WireSnapshotResponse>(addr, INSTALL_SNAPSHOT, snapshot).await;
+    let after_vote = snapshot_of(log(9, 5)).meta;
+    let mut membership_ahead = snapshot_of(log(1, 5)).meta;
+    membership_ahead.last_membership = openraft::StoredMembership::new(
+        Some(log(1, 6)),
+        membership_ahead.last_membership.membership().clone(),
+    );
+    for (vote, meta) in [
+        (vote, after_vote),
+        (vote, membership_ahead),
+        (Vote::new(1, NodeId::from(2)), snapshot_of(log(1, 5)).meta),
+    ] {
+        let snapshot = SnapshotRequest::new(to, &vote, &meta).expect("encode");
+        let refused = raw::<_, WireSnapshotResponse>(addr, INSTALL_SNAPSHOT, snapshot).await;
+        let code = refused.map(drop).map_err(|s| s.code());
+        assert_eq!(code, Err(Code::InvalidArgument), "{vote} {meta:?}");
+    }
+
+    let uncommitted = AppendRequest {
+        header: Some(header(VERSION)),
+        vote: Some(WireVote::from(&Vote::new(1, NodeId::from(2)))),
+        ..AppendRequest::default()
+    };
     assert_eq!(
-        refused.map(drop).map_err(|s| s.code()),
-        Err(Code::InvalidArgument)
+        raw_append(addr, uncommitted).await.code(),
+        Code::InvalidArgument
     );
 
     let oversized = AppendRequest {

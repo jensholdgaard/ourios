@@ -127,6 +127,19 @@ fn vote_of(vote: Option<WireVote>) -> Result<Vote, Malformed> {
     required(vote, "vote")?.try_into()
 }
 
+/// The vote of an append or snapshot, which only an elected leader sends:
+/// `openraft` asserts that the vote it follows is committed.
+fn leader_vote_of(vote: Option<WireVote>) -> Result<Vote, Malformed> {
+    let vote = vote_of(vote)?;
+    if vote.committed {
+        Ok(vote)
+    } else {
+        Err(Malformed(format!(
+            "{vote} is not a leader's committed vote"
+        )))
+    }
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct WireMembership {
     #[prost(message, optional, tag = "1")]
@@ -253,7 +266,7 @@ impl AppendRequest {
     /// [`Malformed`] when a field is missing or an entry does not decode.
     pub fn into_raft(self) -> Result<AppendEntriesRequest<RaftTypes>, Malformed> {
         let rpc = AppendEntriesRequest {
-            vote: vote_of(self.vote)?,
+            vote: leader_vote_of(self.vote)?,
             prev_log_id: raft_id(self.prev_log_id),
             entries: self
                 .entries
@@ -465,10 +478,30 @@ impl SnapshotRequest {
             last_log_id: raft_id(self.last_log_id),
             last_membership: required(self.membership, "membership")?.into_raft()?,
         };
-        let vote = vote_of(self.vote)?;
+        let vote = leader_vote_of(self.vote)?;
         within_vote(meta.last_log_id.as_ref(), &vote)?;
+        membership_within(&meta)?;
         Ok((vote, meta))
     }
+}
+
+/// Refuse a snapshot whose membership comes from past its last log id:
+/// the snapshot would install a membership as committed that its log
+/// does not hold.
+fn membership_within(meta: &SnapshotMetaOf<RaftTypes>) -> Result<(), Malformed> {
+    let membership = *meta.last_membership.log_id();
+    let beyond = match (membership, meta.last_log_id) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(m), Some(last)) => m.leader_id.term > last.leader_id.term || m.index > last.index,
+    };
+    if beyond {
+        return Err(Malformed(format!(
+            "snapshot membership {membership:?} is past its last log id {:?}",
+            meta.last_log_id
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -528,6 +561,13 @@ mod tests {
         })
     }
 
+    fn leader_vote() -> impl Strategy<Value = Vote> {
+        vote().prop_map(|mut vote| {
+            vote.committed = true;
+            vote
+        })
+    }
+
     fn membership() -> impl Strategy<Value = Membership> {
         proptest::collection::btree_set(0..8_u64, 1..5).prop_map(|ids| {
             let voters: BTreeSet<_> = ids.iter().copied().map(node).collect();
@@ -561,7 +601,7 @@ mod tests {
     fn segment() -> impl Strategy<Value = (Vote, Option<LogId>, Vec<Entry>)> {
         let prev = proptest::option::of((any::<u64>(), 0..u64::MAX / 2));
         let entries = proptest::collection::vec((entry(), 0..3_u64), 0..6);
-        (vote(), prev, entries).prop_map(|(vote, prev, entries)| {
+        (leader_vote(), prev, entries).prop_map(|(vote, prev, entries)| {
             let top = vote.leader_id.term;
             let prev = prev.map(|(term, index)| log(term.min(top), index));
             let mut term = prev.map_or(0, |p| p.leader_id.term);
@@ -662,12 +702,19 @@ mod tests {
         #[test]
         fn a_snapshot_request_round_trips(
             to in recipient(),
-            vote in vote(),
+            vote in leader_vote(),
             last_log_id in proptest::option::of(log_id()),
             last_membership in stored_membership(),
         ) {
             let last_log_id = last_log_id
                 .map(|id| log(id.leader_id.term.min(vote.leader_id.term), id.index));
+            let within = |m: &LogId| last_log_id
+                .is_some_and(|l| m.leader_id.term <= l.leader_id.term && m.index <= l.index);
+            let membership_id = (*last_membership.log_id()).filter(within);
+            let last_membership = StoredMembershipOf::<RaftTypes>::new(
+                membership_id,
+                last_membership.membership().clone(),
+            );
             let meta = SnapshotMetaOf::<RaftTypes> { last_log_id, last_membership };
             let wire = through_wire(&SnapshotRequest::new(to, &vote, &meta).expect("encode"));
             prop_assert_eq!(wire.header.clone(), Some(Header::to(to)));
@@ -771,6 +818,50 @@ mod tests {
         let request = |term| SnapshotRequest::new(to(), &vote, &meta(term)).expect("encode");
         assert!(request(4).into_raft().is_err());
         assert!(request(3).into_raft().is_ok());
+    }
+
+    #[test]
+    fn an_append_or_snapshot_under_an_uncommitted_vote_is_refused() {
+        let candidate = Vote::new(3, node(1));
+        let append = AppendEntriesRequest::<RaftTypes> {
+            vote: candidate,
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        };
+        let (request, _) = AppendRequest::bounded(to(), &append).expect("encode");
+        assert!(request.into_raft().is_err());
+        let meta = SnapshotMetaOf::<RaftTypes>::default();
+        let snapshot = SnapshotRequest::new(to(), &candidate, &meta).expect("encode");
+        assert!(snapshot.into_raft().is_err());
+    }
+
+    #[test]
+    fn a_snapshot_membership_past_its_last_log_id_is_refused() {
+        let vote = Vote::new_committed(5, node(1));
+        let membership = Membership::new(
+            vec![BTreeSet::from([node(1)])],
+            BTreeMap::from([(node(1), "a".to_owned())]),
+        )
+        .expect("membership");
+        let decodes = |last: Option<LogId>, at: Option<LogId>| {
+            let meta = SnapshotMetaOf::<RaftTypes> {
+                last_log_id: last,
+                last_membership: StoredMembershipOf::<RaftTypes>::new(at, membership.clone()),
+            };
+            let request = SnapshotRequest::new(to(), &vote, &meta).expect("encode");
+            request.into_raft().is_ok()
+        };
+        let cases = [
+            (None, Some(log(1, 1)), false),
+            (Some(log(2, 5)), Some(log(3, 4)), false),
+            (Some(log(2, 5)), Some(log(2, 6)), false),
+            (Some(log(2, 5)), Some(log(2, 5)), true),
+            (Some(log(2, 5)), Some(log(1, 3)), true),
+        ];
+        for (last, at, ok) in cases {
+            assert_eq!(decodes(last, at), ok, "{last:?} {at:?}");
+        }
     }
 
     #[test]

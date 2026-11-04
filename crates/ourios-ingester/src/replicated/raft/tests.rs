@@ -395,3 +395,62 @@ async fn an_append_that_leaves_a_hole_is_refused() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert_eq!(indexes(&mut log).await, vec![0, 1, 2]);
 }
+
+#[tokio::test]
+async fn a_vote_waits_for_every_earlier_write_of_its_group() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut log, gate) = open(dir.path());
+    gate.close();
+    let mut flushed = std::pin::pin!(append(&mut log, entries(1, 0..=3)).await);
+    gate.wait_for_writer();
+    let vote = Vote::new(2, NodeId::from(7));
+    let mut voting = log.clone();
+    let mut saved = tokio::spawn(async move { voting.save_vote(&vote).await });
+    let stalled = tokio::time::timeout(Duration::from_millis(50), &mut saved).await;
+    assert!(stalled.is_err(), "the vote waits behind the stalled append");
+    assert_eq!(log.read_vote().await.expect("vote"), None);
+    gate.open();
+    saved.await.expect("join").expect("vote");
+    let done = futures::FutureExt::now_or_never(flushed.as_mut());
+    assert!(matches!(done, Some(Ok(()))), "the append was durable first");
+    assert_eq!(log.read_vote().await.expect("vote"), Some(vote));
+}
+
+#[tokio::test]
+async fn an_earlier_wal_fsync_failure_fails_a_later_vote() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut log, gate) = open(dir.path());
+    gate.fail();
+    let flushed = append(&mut log, entries(1, 0..=1)).await;
+    assert!(flushed.await.is_err(), "the append's fsync failed");
+    let vote = Vote::new(2, NodeId::from(7));
+    assert!(log.save_vote(&vote).await.is_err());
+    assert_eq!(log.read_vote().await.expect("vote"), None);
+}
+
+/// The group's directories are left to `Wal::open`, whose root
+/// preparation fsyncs every directory it creates and the one holding the
+/// outermost (`ourios-wal`'s `prepare_root` tests pin those fsyncs).
+#[tokio::test]
+async fn a_fresh_wal_root_gets_its_group_tree_from_the_wal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal_root = dir.path().join("node");
+    {
+        let (mut log, _) = open(&wal_root);
+        append(&mut log, entries(1, 0..=1))
+            .await
+            .await
+            .expect("fsynced");
+        log.shutdown();
+    }
+    let segments = std::fs::read_dir(group_dir(&wal_root, GROUP))
+        .expect("group dir")
+        .filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "wal"))
+        })
+        .count();
+    assert_eq!(segments, 1);
+    let (mut log, _) = open(&wal_root);
+    assert_eq!(indexes(&mut log).await, vec![0, 1]);
+}

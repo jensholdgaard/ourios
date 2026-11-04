@@ -33,7 +33,7 @@ use super::codec::{self, Replayed};
 use super::gate::SyncGate;
 use super::types::{Entry, LogId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
-use super::{Flush, writer_gone};
+use super::{Flush, sync_through, writer_gone};
 
 /// A group's WAL root under the node's `wal_root`.
 #[must_use]
@@ -172,6 +172,12 @@ enum Command {
     Lazy {
         frame: Vec<u8>,
     },
+    /// Resolves once every earlier command is done: each batch holding
+    /// an append or a marker is fsynced before the next is taken, so it
+    /// needs no fsync of its own.
+    Fence {
+        done: oneshot::Sender<io::Result<()>>,
+    },
 }
 
 impl Command {
@@ -179,17 +185,18 @@ impl Command {
         match self {
             Self::Append { frames, .. } => frames,
             Self::Durable { frame, .. } | Self::Lazy { frame } => std::slice::from_ref(frame),
+            Self::Fence { .. } => &[],
         }
     }
 
     fn needs_sync(&self) -> bool {
-        !matches!(self, Self::Lazy { .. })
+        matches!(self, Self::Append { .. } | Self::Durable { .. })
     }
 
     fn complete(self, flush: &Flush) {
         match self {
             Self::Append { done, .. } => done.io_completed(flush.reply()),
-            Self::Durable { done, .. } => {
+            Self::Durable { done, .. } | Self::Fence { done } => {
                 let _ = done.send(flush.reply());
             }
             Self::Lazy { .. } => {}
@@ -227,7 +234,6 @@ impl GroupLog {
         votes: VoteLog,
         gate: Arc<SyncGate>,
     ) -> io::Result<Self> {
-        std::fs::create_dir_all(&wal.root)?;
         let mut wal = Wal::open(wal).map_err(|e| wal_error("open the group WAL", e))?;
         let mut replay = Replay(Index::default());
         wal.replay(&mut replay)
@@ -276,6 +282,14 @@ impl GroupLog {
         self.send(Command::Durable { frame, done })?;
         rx.await.map_err(|_| writer_gone())?
     }
+
+    /// Wait until every write queued before it is durable, failing if
+    /// any of them failed.
+    async fn fence(&self) -> io::Result<()> {
+        let (done, rx) = oneshot::channel();
+        self.send(Command::Fence { done })?;
+        rx.await.map_err(|_| writer_gone())?
+    }
 }
 
 // openraft's storage traits are async; these methods answer from memory
@@ -316,7 +330,11 @@ impl RaftLogStorage<RaftTypes> for GroupLog {
         self.clone()
     }
 
+    /// openraft requires vote and log I/O serialized: the vote waits for
+    /// every earlier write of this group to be durable before it is
+    /// queued on the node's shared vote log.
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
+        self.fence().await?;
         self.votes.save(self.group, *vote).await
     }
 
@@ -420,15 +438,15 @@ impl Writer {
         if !batch.iter().any(Command::needs_sync) {
             return Flush::Done;
         }
-        if !self.gate.pass() {
-            return Flush::Crashed;
-        }
-        match self.wal.sync() {
-            Ok(offset) => {
+        let wal = &mut self.wal;
+        let sync = || wal.sync().map_err(|e| io::Error::other(e.to_string()));
+        match sync_through(&self.gate, sync) {
+            None => Flush::Crashed,
+            Some(Ok(offset)) => {
                 self.record_synced(offset);
                 Flush::Done
             }
-            Err(e) => self.fail(&e),
+            Some(Err(e)) => self.fail(&e),
         }
     }
 

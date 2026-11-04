@@ -39,17 +39,45 @@ impl Flush {
     }
 }
 
-/// Holds a writer before each fsync, so tests can stall the disk or
-/// crash a writer between its write and its fsync.
+/// Run `sync` unless the gate stops the writer first (`None`) or fails
+/// the fsync.
+fn sync_through<T>(
+    gate: &gate::SyncGate,
+    sync: impl FnOnce() -> io::Result<T>,
+) -> Option<io::Result<T>> {
+    match gate.pass() {
+        Pass::Sync => Some(sync()),
+        Pass::Crash => None,
+        Pass::Fail => Some(Err(io::Error::other("injected fsync failure"))),
+    }
+}
+
+/// What a writer does at the gate before an fsync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pass {
+    Sync,
+    /// Stop without the fsync, as a crash would (tests only).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed only by the test gate
+    Crash,
+    /// Report the fsync as failed (tests only).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed only by the test gate
+    Fail,
+}
+
+/// Holds a writer before each fsync, so tests can stall the disk, crash
+/// a writer between its write and its fsync, or fail the fsync.
 #[cfg(test)]
 pub(crate) mod gate {
     use std::sync::{Condvar, Mutex, PoisonError};
+
+    use super::Pass;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum State {
         Open,
         Closed,
         Crashed,
+        Failing,
     }
 
     #[derive(Debug)]
@@ -102,6 +130,11 @@ pub(crate) mod gate {
             self.set(State::Crashed);
         }
 
+        /// Every fsync from now on fails.
+        pub(crate) fn fail(&self) {
+            self.set(State::Failing);
+        }
+
         /// Fsyncs that went through.
         pub(crate) fn passed(&self) -> u64 {
             self.lock().passed
@@ -118,8 +151,7 @@ pub(crate) mod gate {
             }
         }
 
-        /// Whether the writer may fsync; `false` once crashed.
-        pub(crate) fn pass(&self) -> bool {
+        pub(crate) fn pass(&self) -> Pass {
             let mut inner = self.lock();
             inner.waiting += 1;
             self.changed.notify_all();
@@ -130,11 +162,14 @@ pub(crate) mod gate {
                     .unwrap_or_else(PoisonError::into_inner);
             }
             inner.waiting -= 1;
-            let open = inner.state == State::Open;
-            if open {
-                inner.passed += 1;
+            match inner.state {
+                State::Open | State::Closed => {
+                    inner.passed += 1;
+                    Pass::Sync
+                }
+                State::Crashed => Pass::Crash,
+                State::Failing => Pass::Fail,
             }
-            open
         }
     }
 }
@@ -142,13 +177,15 @@ pub(crate) mod gate {
 /// The production gate: always open.
 #[cfg(not(test))]
 pub(crate) mod gate {
+    use super::Pass;
+
     #[derive(Debug, Default)]
     pub(crate) struct SyncGate;
 
     impl SyncGate {
         #[allow(clippy::unused_self)] // the test build's gate has state
-        pub(crate) fn pass(&self) -> bool {
-            true
+        pub(crate) fn pass(&self) -> Pass {
+            Pass::Sync
         }
     }
 }

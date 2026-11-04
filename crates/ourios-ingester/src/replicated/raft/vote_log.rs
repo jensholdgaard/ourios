@@ -10,12 +10,13 @@
 //! |          | committed: u8 (0 or 1) | crc32c: u32_le (over the 29 B before it) |
 //! ```
 //!
-//! Recovery keeps the last record per group. A bad record (short, CRC
-//! mismatch, or a `committed` byte other than 0 or 1) ends the log only
-//! when no valid record follows it: that is a torn tail no `save` was
-//! answered for, and it is cut off before the next append. A valid record
-//! after a bad one is corruption, and the open fails rather than forget
-//! an acknowledged vote. Past a size threshold the log is rewritten with
+//! Recovery keeps the last record per group. Only a tail no `save` was
+//! answered for is cut off before the next append: a partial record at
+//! the end, or complete records that are all zero bytes. Any other record
+//! that fails its CRC or holds a `committed` byte other than 0 or 1 may
+//! be a damaged acknowledged vote, so the open fails, wherever the record
+//! is: the replica rejoins as a new one (RFC 0065 §6.1, B4) rather than
+//! restore an older vote. Past a size threshold the log is rewritten with
 //! each group's latest vote (tmp, fsync, rename, directory fsync).
 
 use std::collections::HashMap;
@@ -30,9 +31,9 @@ use openraft::impls::leader_id_std::LeaderId;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use super::Flush;
 use super::gate::SyncGate;
 use super::types::{NodeId, Vote};
+use super::{Flush, sync_through};
 
 /// The vote log's name under `wal_root`.
 pub const VOTES_FILE: &str = "votes.log";
@@ -63,13 +64,15 @@ impl VoteLog {
     ///
     /// # Errors
     ///
-    /// A filesystem failure, a log whose header is not this format, or a
-    /// corrupt record that a valid one follows.
+    /// A filesystem failure (including the fsync of `wal_root` and its
+    /// parent), a log whose header is not this format, or a corrupt
+    /// record.
     pub fn open(wal_root: &Path) -> io::Result<Self> {
         Self::open_with(wal_root, DEFAULT_REWRITE_BYTES, Arc::default())
     }
 
     fn open_with(wal_root: &Path, rewrite_bytes: u64, gate: Arc<SyncGate>) -> io::Result<Self> {
+        sync_root(wal_root)?;
         let path = wal_root.join(VOTES_FILE);
         let (latest, len) = match fs::read(&path) {
             Ok(bytes) => recover(&path, &bytes)?,
@@ -117,6 +120,18 @@ impl VoteLog {
             sent.map_err(|_| super::writer_gone())?;
             rx.await.map_err(|_| super::writer_gone())?
         }
+    }
+}
+
+/// Create `wal_root` if needed and fsync it and its parent, so the
+/// `votes.log` entry read next is durable even if a rewrite renamed it
+/// in and crashed before its own directory fsync.
+fn sync_root(wal_root: &Path) -> io::Result<()> {
+    ourios_wal::prepare_root(wal_root)
+        .map_err(|e| io::Error::other(format!("prepare {}: {e:?}", wal_root.display())))?;
+    match wal_root.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => File::open(parent)?.sync_all(),
+        _ => Ok(()),
     }
 }
 
@@ -168,23 +183,16 @@ fn recover(path: &Path, bytes: &[u8]) -> io::Result<(HashMap<u32, Vote>, u64)> {
             format!("{} is not an RFC 0065 vote log", path.display()),
         ));
     };
-    let mut latest = HashMap::new();
-    let mut chunks = records.chunks(RECORD_LEN);
-    let mut valid = 0;
-    for (group, vote) in chunks.by_ref().map_while(decode) {
-        latest.insert(group, vote);
-        valid += 1;
-    }
-    if chunks.any(|c| decode(c).is_some()) {
-        return Err(io::Error::new(
+    let (latest, valid) = scan(records).map_err(|n| {
+        io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} has a corrupt record {valid} before valid ones; a replica never restarts \
-                 under a vote it may have lost (RFC 0065 §4.5)",
+                "{} record {n} is corrupt and may be an acknowledged vote; rejoin this replica \
+                 as a new one (RFC 0065 §6.1, B4) rather than restore an older vote",
                 path.display()
             ),
-        ));
-    }
+        )
+    })?;
     let len = (MAGIC.len() + valid * RECORD_LEN) as u64;
     if len < bytes.len() as u64 {
         let file = OpenOptions::new().write(true).open(path)?;
@@ -192,6 +200,44 @@ fn recover(path: &Path, bytes: &[u8]) -> io::Result<(HashMap<u32, Vote>, u64)> {
         file.sync_all()?;
     }
     Ok((latest, len))
+}
+
+enum Record {
+    Vote(u32, Vote),
+    /// A crash after the file grew but before its data reached the disk
+    /// (ext4 delayed allocation) reads back as zeros: no save was
+    /// answered for those bytes.
+    Zeroed,
+    Corrupt,
+}
+
+fn classify(record: &[u8; RECORD_LEN]) -> Record {
+    if record.iter().all(|b| *b == 0) {
+        return Record::Zeroed;
+    }
+    decode(record).map_or(Record::Corrupt, |(group, vote)| Record::Vote(group, vote))
+}
+
+/// The latest vote per group and the number of valid records, or the
+/// number of the first record that cannot be an unanswered tail. A
+/// partial final chunk is an append torn before its fsync, and nothing
+/// valid may follow a zeroed record.
+fn scan(records: &[u8]) -> Result<(HashMap<u32, Vote>, usize), usize> {
+    let mut latest = HashMap::new();
+    let mut valid = 0;
+    let mut zeroed_tail = false;
+    let (complete, _torn) = records.as_chunks::<RECORD_LEN>();
+    for (n, record) in complete.iter().enumerate() {
+        match (classify(record), zeroed_tail) {
+            (Record::Zeroed, _) => zeroed_tail = true,
+            (Record::Vote(group, vote), false) => {
+                latest.insert(group, vote);
+                valid += 1;
+            }
+            _ => return Err(n),
+        }
+    }
+    Ok((latest, valid))
 }
 
 /// Replace `dir/votes.log` with `bytes`: tmp, fsync, rename, directory fsync.
@@ -258,10 +304,12 @@ impl Writer {
             .flat_map(|r| encode(r.group, &r.vote))
             .collect();
         let written = self.file.write_all(&bytes);
-        if !self.gate.pass() {
+        let file = &mut self.file;
+        let Some(synced) = sync_through(&self.gate, || written.and_then(|()| file.sync_data()))
+        else {
             return Flush::Crashed;
-        }
-        match written.and_then(|()| self.file.sync_data()) {
+        };
+        match synced {
             Ok(()) => {
                 self.len += bytes.len() as u64;
                 Flush::Done
@@ -362,37 +410,75 @@ mod tests {
         assert_eq!(log.latest(3), None);
     }
 
-    #[tokio::test]
-    async fn a_torn_tail_record_is_ignored_and_cut_off() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(VOTES_FILE);
-        {
-            let (log, _) = open(dir.path(), DEFAULT_REWRITE_BYTES);
-            log.save(1, vote(1, 1, false)).await.expect("save");
-        }
-        let mut torn = encode(1, &vote(9, 9, true)).to_vec();
-        torn.truncate(RECORD_LEN - 3);
-        let mut garbage = encode(2, &vote(9, 9, true));
-        garbage[5] ^= 0xFF;
-        let mut file = OpenOptions::new().append(true).open(&path).expect("open");
-        file.write_all(&garbage).expect("write");
-        file.write_all(&torn).expect("write");
-        drop(file);
-        let (log, _) = open(dir.path(), DEFAULT_REWRITE_BYTES);
-        assert_eq!(log.latest(1), Some(vote(1, 1, false)));
-        assert_eq!(log.latest(2), None);
-        let len = fs::metadata(&path).expect("stat").len();
-        assert_eq!(
-            len,
-            (MAGIC.len() + RECORD_LEN) as u64,
-            "the torn tail is cut off"
-        );
-        log.save(2, vote(4, 2, false))
-            .await
-            .expect("save after the cut");
+    /// One durable vote, then `tail` appended as a crash might leave it.
+    async fn with_tail(dir: &Path, tail: &[u8]) {
+        let (log, _) = open(dir, DEFAULT_REWRITE_BYTES);
+        log.save(1, vote(1, 1, false)).await.expect("save");
         drop(log);
-        let (log, _) = open(dir.path(), DEFAULT_REWRITE_BYTES);
-        assert_eq!(log.latest(2), Some(vote(4, 2, false)));
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(dir.join(VOTES_FILE))
+            .expect("open");
+        file.write_all(tail).expect("write");
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_tail_is_ignored_and_cut_off() {
+        let mut partial = encode(2, &vote(9, 9, true)).to_vec();
+        partial.truncate(RECORD_LEN - 3);
+        let mut zero_filled = vec![0u8; 2 * RECORD_LEN];
+        zero_filled.extend_from_slice(&partial[..5]);
+        for (what, tail) in [("partial", partial), ("zero-filled", zero_filled)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            with_tail(dir.path(), &tail).await;
+            let (log, _) = open(dir.path(), DEFAULT_REWRITE_BYTES);
+            assert_eq!(log.latest(1), Some(vote(1, 1, false)), "{what}");
+            assert_eq!(log.latest(2), None, "{what}");
+            let len = fs::metadata(dir.path().join(VOTES_FILE))
+                .expect("stat")
+                .len();
+            assert_eq!(
+                len,
+                (MAGIC.len() + RECORD_LEN) as u64,
+                "{what} tail cut off"
+            );
+            log.save(2, vote(4, 2, false))
+                .await
+                .expect("save after the cut");
+            drop(log);
+            let (log, _) = open(dir.path(), DEFAULT_REWRITE_BYTES);
+            assert_eq!(log.latest(2), Some(vote(4, 2, false)), "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bit_flip_in_the_last_complete_record_fails_the_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut flipped = encode(2, &vote(9, 9, true));
+        flipped[5] ^= 0x01;
+        with_tail(dir.path(), &flipped).await;
+        let err = VoteLog::open(dir.path()).err().expect("must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("new one"), "{err}");
+        assert!(err.to_string().contains(VOTES_FILE), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_valid_record_after_a_zero_filled_one_fails_the_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tail = vec![0u8; RECORD_LEN];
+        tail.extend_from_slice(&encode(2, &vote(9, 9, true)));
+        with_tail(dir.path(), &tail).await;
+        assert!(VoteLog::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_missing_wal_root_is_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("var").join("wal");
+        let log = VoteLog::open(&root).expect("open");
+        assert!(root.join(VOTES_FILE).is_file());
+        drop(log);
     }
 
     #[tokio::test]

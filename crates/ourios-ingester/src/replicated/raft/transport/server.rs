@@ -14,7 +14,7 @@ use tonic::body::Body;
 use tonic::codegen::{Body as HttpBody, BoxFuture, StdError, http};
 use tonic::server::{NamedService, UnaryService};
 use tonic::transport::server::TcpIncoming;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
 
@@ -24,7 +24,7 @@ use super::wire::{
     WireVoteRequest, WireVoteResponse,
 };
 use super::{
-    APPEND, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, Side, VERSION, VOTE, record_status, rpc_method,
+    APPEND, Call, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, Side, Traced, VERSION, VOTE, rpc_method,
 };
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
@@ -147,12 +147,16 @@ where
     }
 }
 
-/// One unary method: decode, run the handler under a gRPC server span,
-/// encode.
-struct Method<F>(F);
+/// One unary method: run the decoded request through the handler under
+/// its gRPC server span.
+struct Method<F> {
+    path: &'static str,
+    handler: F,
+}
 
 impl<Req, Resp, F, Fut> UnaryService<Req> for Method<F>
 where
+    Req: Traced,
     F: FnMut(Req) -> Fut,
     Fut: Future<Output = Result<Resp, Status>> + Send + 'static,
     Resp: Send + 'static,
@@ -161,8 +165,16 @@ where
     type Future = BoxFuture<Response<Resp>, Status>;
 
     fn call(&mut self, request: Request<Req>) -> Self::Future {
-        let handled = (self.0)(request.into_inner());
-        Box::pin(async move { handled.await.map(Response::new) })
+        let request = request.into_inner();
+        let path = self.path;
+        let span = request.traced().then(|| server_span(path));
+        let call = Call::new(Side::Server, path, None, span);
+        let handled = (self.handler)(request).instrument(call.span());
+        Box::pin(async move {
+            let result = handled.await;
+            call.finish(result.as_ref().map_or_else(Status::code, |_| Code::Ok));
+            result.map(Response::new)
+        })
     }
 }
 
@@ -188,28 +200,15 @@ fn unary<B, Req, Resp, F, Fut>(
 where
     B: HttpBody + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
-    Req: prost::Message + Default + Send + 'static,
+    Req: prost::Message + Traced + Default + Send + 'static,
     Resp: prost::Message + Send + 'static,
     F: FnMut(Req) -> Fut + Send + 'static,
     Fut: Future<Output = Result<Resp, Status>> + Send + 'static,
 {
-    let span = server_span(path);
-    let traced = span.clone();
-    Box::pin(
-        async move {
-            let mut grpc = tonic::server::Grpc::new(ProstCodec::<Resp, Req>::default());
-            let response = grpc.unary(Method(handler), request).await;
-            record_status(&traced, Side::Server, status_of(&response));
-            Ok(response)
-        }
-        .instrument(span),
-    )
-}
-
-/// The status a unary response carries in its headers: tonic writes an
-/// error status there, and a success's arrives only in the trailers.
-fn status_of(response: &http::Response<Body>) -> tonic::Code {
-    Status::from_header_map(response.headers()).map_or(tonic::Code::Ok, |s| s.code())
+    Box::pin(async move {
+        let mut grpc = tonic::server::Grpc::new(ProstCodec::<Resp, Req>::default());
+        Ok(grpc.unary(Method { path, handler }, request).await)
+    })
 }
 
 fn unimplemented() -> BoxFuture<http::Response<Body>, Infallible> {

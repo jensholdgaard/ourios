@@ -9,7 +9,8 @@
 //! unreachable peer, so it backs off rather than retrying at once.
 //!
 //! Peer RPCs are traced as gRPC client and server spans under the RPC
-//! conventions (RFC 0038 §3.5, RFC 0065 §6.9). Plaintext only: mutual TLS
+//! conventions (RFC 0038 §3.5, RFC 0065 §6.9), except an append without
+//! entries, which only warns when it fails. Plaintext only: mutual TLS
 //! (RFC 0030) arrives through [`Peers`]'s endpoint and the server's
 //! incoming stream.
 
@@ -86,11 +87,75 @@ impl Side {
     }
 }
 
-fn record_status(span: &tracing::Span, side: Side, code: Code) {
-    let name = code_name(code);
-    span.record("rpc.response.status_code", name);
-    if side.fails(code) {
-        ourios_core::telemetry::record_span_error(span, name);
+/// Whether a request gets a span. An append without entries is a
+/// heartbeat or a commit-only append, sent every heartbeat interval per
+/// group and peer: a span each would be most of a node's trace volume.
+trait Traced {
+    fn traced(&self) -> bool {
+        true
+    }
+}
+
+impl Traced for wire::AppendRequest {
+    fn traced(&self) -> bool {
+        !self.entries.is_empty()
+    }
+}
+
+impl Traced for wire::WireVoteRequest {}
+impl Traced for wire::SnapshotRequest {}
+
+/// One peer RPC's telemetry: its span, or for an untraced request only a
+/// warning when it fails, so an outage seen only by heartbeats still
+/// shows.
+struct Call<'a> {
+    side: Side,
+    path: &'static str,
+    peer: Option<&'a str>,
+    span: Option<tracing::Span>,
+}
+
+impl<'a> Call<'a> {
+    /// `peer` is the server's host on a client call; `span` is `None` for
+    /// an untraced request.
+    fn new(
+        side: Side,
+        path: &'static str,
+        peer: Option<&'a str>,
+        span: Option<tracing::Span>,
+    ) -> Self {
+        Self {
+            side,
+            path,
+            peer,
+            span,
+        }
+    }
+
+    /// The span to run the call under; a disabled one when untraced.
+    fn span(&self) -> tracing::Span {
+        self.span.clone().unwrap_or_else(tracing::Span::none)
+    }
+
+    fn finish(self, code: Code) {
+        let name = code_name(code);
+        match self.span {
+            Some(span) => {
+                span.record("rpc.response.status_code", name);
+                if self.side.fails(code) {
+                    ourios_core::telemetry::record_span_error(&span, name);
+                }
+            }
+            None if self.side.fails(code) => tracing::warn!(
+                rpc.system.name = "grpc",
+                rpc.method = rpc_method(self.path),
+                rpc.response.status_code = name,
+                server.address = self.peer,
+                error.type = name,
+                "peer RPC failed",
+            ),
+            None => {}
+        }
     }
 }
 

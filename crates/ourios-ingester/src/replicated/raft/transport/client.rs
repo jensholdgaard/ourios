@@ -25,7 +25,7 @@ use super::wire::{
     AppendRequest, AppendResponse, Malformed, Reply, SnapshotRequest, WireSnapshotResponse,
     WireVoteRequest, WireVoteResponse,
 };
-use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, Side, VOTE, record_status, rpc_method};
+use super::{APPEND, Call, INSTALL_SNAPSHOT, PRE_VOTE, Side, Traced, VOTE, rpc_method};
 
 type RpcError = RPCError<RaftTypes>;
 
@@ -106,12 +106,16 @@ fn network(e: &Malformed) -> RpcError {
     RPCError::Network(NetworkError::new(e))
 }
 
-fn client_span(path: &'static str, addr: &str) -> tracing::Span {
-    let method = rpc_method(path);
-    let (host, port) = match addr.rsplit_once(':') {
-        Some((host, port)) => (host, port.parse::<u16>().ok()),
+/// The host and port of a `host:port` peer address.
+fn host_port(addr: &str) -> (&str, Option<u16>) {
+    match addr.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse().ok()),
         None => (addr, None),
-    };
+    }
+}
+
+fn client_span(path: &'static str, host: &str, port: Option<u16>) -> tracing::Span {
+    let method = rpc_method(path);
     tracing::info_span!(
         "grpc client",
         otel.name = method,
@@ -159,7 +163,7 @@ impl PeerClient {
         option: &RPCOption,
     ) -> Result<Resp::Raft, RpcError>
     where
-        Req: prost::Message + Send + 'static,
+        Req: prost::Message + Traced + Send + 'static,
         Resp: Reply + prost::Message + Default + Send + 'static,
     {
         let request = request.map_err(|e| network(&e))?;
@@ -174,12 +178,14 @@ impl PeerClient {
         option: &RPCOption,
     ) -> Result<Resp, RpcError>
     where
-        Req: prost::Message + Send + 'static,
+        Req: prost::Message + Traced + Send + 'static,
         Resp: prost::Message + Default + Send + 'static,
     {
         let channel = self.channel.clone()?;
         let ttl = option.hard_ttl();
-        let span = client_span(rpc.path, &self.addr);
+        let (host, port) = host_port(&self.addr);
+        let span = message.traced().then(|| client_span(rpc.path, host, port));
+        let trace = Call::new(Side::Client, rpc.path, Some(host), span);
         let call = async move {
             let mut grpc = tonic::client::Grpc::new(channel);
             grpc.ready()
@@ -192,11 +198,10 @@ impl PeerClient {
                 .await
         };
         let result = tokio::time::timeout(ttl, call)
-            .instrument(span.clone())
+            .instrument(trace.span())
             .await
             .unwrap_or_else(|_| Err(Status::deadline_exceeded("peer RPC timed out")));
-        let code = result.as_ref().map_or_else(Status::code, |_| Code::Ok);
-        record_status(&span, Side::Client, code);
+        trace.finish(result.as_ref().map_or_else(Status::code, |_| Code::Ok));
         result
             .map(tonic::Response::into_inner)
             .map_err(|status| self.rpc_error(&status, rpc.action, ttl))

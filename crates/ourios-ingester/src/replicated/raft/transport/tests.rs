@@ -278,16 +278,8 @@ fn attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> 
 #[tokio::test]
 async fn a_peer_rpc_is_traced_as_grpc_client_and_server_spans() {
     use opentelemetry::trace::{SpanKind, Status as SpanStatus};
-    use tracing_subscriber::prelude::*;
 
-    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
-    let _default = tracing::subscriber::set_default(subscriber);
-
+    let (exporter, _warnings, _default) = capture();
     let (incoming, addr) = bind();
     let (_stop, _serving) = serve(ReplicationServer::default(), incoming);
     let mut network = Peers::plaintext().network(NodeId::from(1), GROUP);
@@ -324,4 +316,180 @@ async fn a_peer_rpc_is_traced_as_grpc_client_and_server_spans() {
     assert_eq!(attr(client, "error.type").as_deref(), Some("NOT_FOUND"));
     assert_eq!(server.status, SpanStatus::Unset);
     assert_eq!(attr(server, "error.type"), None);
+}
+
+type Fields = BTreeMap<String, String>;
+
+/// The `WARN` events emitted, as field name to value.
+#[derive(Clone, Default)]
+struct Warnings(Arc<std::sync::Mutex<Vec<Fields>>>);
+
+impl Warnings {
+    /// The peer-RPC failures, not `openraft`'s own warnings.
+    fn peer_rpcs(&self) -> Vec<Fields> {
+        let events = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        events
+            .iter()
+            .filter(|f| f.contains_key("rpc.method"))
+            .cloned()
+            .collect()
+    }
+}
+
+struct Visitor<'a>(&'a mut Fields);
+
+impl tracing::field::Visit for Visitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = Fields::new();
+            event.record(&mut Visitor(&mut fields));
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(fields);
+        }
+    }
+}
+
+/// Spans and `WARN` events for this thread until the guard drops; the
+/// tests run on a current-thread runtime, so every task is covered.
+fn capture() -> (
+    opentelemetry_sdk::trace::InMemorySpanExporter,
+    Warnings,
+    tracing::subscriber::DefaultGuard,
+) {
+    use tracing_subscriber::prelude::*;
+
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let warnings = Warnings::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)))
+        .with(warnings.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+    (exporter, warnings, guard)
+}
+
+/// The peer-RPC spans exported, not `openraft`'s own.
+fn peer_spans(
+    exporter: &opentelemetry_sdk::trace::InMemorySpanExporter,
+) -> Vec<opentelemetry_sdk::trace::SpanData> {
+    let spans = exporter.get_finished_spans().expect("spans");
+    spans
+        .into_iter()
+        .filter(|s| s.name.starts_with("ourios.wal.v1.Replication/"))
+        .collect()
+}
+
+fn append(
+    entries: Vec<super::super::types::Entry>,
+) -> openraft::raft::AppendEntriesRequest<RaftTypes> {
+    openraft::raft::AppendEntriesRequest {
+        vote: Vote::new_committed(1, NodeId::from(2)),
+        prev_log_id: None,
+        entries,
+        leader_commit: None,
+    }
+}
+
+/// A heartbeat is an append without entries: a successful one leaves no
+/// span and no warning on either side.
+#[tokio::test]
+async fn a_successful_empty_append_records_no_span() {
+    let (exporter, warnings, _default) = capture();
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers).await;
+    let mut network = peers.network(NodeId::from(2), GROUP);
+    let mut client = network.new_client(node.id, &addr.to_string()).await;
+    let option = RPCOption::new(Duration::from_secs(5));
+    let response = client.append_entries(append(Vec::new()), option).await;
+    assert!(response.is_ok(), "{response:?}");
+    node.kill().await;
+
+    assert!(
+        peer_spans(&exporter).is_empty(),
+        "{:?}",
+        peer_spans(&exporter)
+    );
+    assert!(
+        warnings.peer_rpcs().is_empty(),
+        "{:?}",
+        warnings.peer_rpcs()
+    );
+}
+
+/// A failing heartbeat still shows, as a warning carrying its
+/// `error.type`; an append with entries keeps its spans.
+#[tokio::test]
+async fn a_failing_empty_append_warns_and_an_append_with_entries_is_traced() {
+    let (exporter, warnings, _default) = capture();
+    let (incoming, addr) = bind();
+    let (_stop, _serving) = serve(ReplicationServer::default(), incoming);
+    let mut network = Peers::plaintext().network(NodeId::from(1), GROUP);
+    let mut client = network.new_client(NodeId::from(2), &addr.to_string()).await;
+    let option = RPCOption::new(Duration::from_secs(5));
+    let empty = client
+        .append_entries(append(Vec::new()), option.clone())
+        .await;
+    assert!(matches!(empty, Err(RPCError::Unreachable(_))), "{empty:?}");
+
+    assert!(
+        peer_spans(&exporter).is_empty(),
+        "{:?}",
+        peer_spans(&exporter)
+    );
+    let warned = warnings.peer_rpcs();
+    assert_eq!(
+        warned.len(),
+        1,
+        "only the client fails on NOT_FOUND: {warned:?}"
+    );
+    let fields = &warned[0];
+    assert_eq!(
+        fields.get("rpc.method").map(String::as_str),
+        Some("ourios.wal.v1.Replication/Append")
+    );
+    assert_eq!(
+        fields.get("error.type").map(String::as_str),
+        Some("NOT_FOUND")
+    );
+    assert_eq!(
+        fields.get("server.address").map(String::as_str),
+        Some("127.0.0.1")
+    );
+
+    let batch = TenantBatch::encode("acme", b"record").expect("batch");
+    let entry = super::super::types::Entry {
+        log_id: super::wire::WireLogId { term: 1, index: 1 }.into(),
+        payload: openraft::EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid")),
+    };
+    assert!(
+        client
+            .append_entries(append(vec![entry]), option)
+            .await
+            .is_err()
+    );
+    let spans = peer_spans(&exporter);
+    assert_eq!(spans.len(), 2, "a client and a server span: {spans:?}");
+    assert!(
+        spans
+            .iter()
+            .all(|s| s.name == "ourios.wal.v1.Replication/Append")
+    );
 }

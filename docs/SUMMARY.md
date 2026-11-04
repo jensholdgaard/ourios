@@ -96,6 +96,7 @@
 - [RFC 0065 — Replicated WAL](./rfcs/0065-replicated-wal.md)
 - [RFC 0066 — Kafka WAL backend and a queryable tail](./rfcs/0066-kafka-wal-backend.md)
 - [RFC 0067 — meta: broker-replicated acks under WAL-before-ack](./rfcs/0067-meta-broker-acks.md)
+- [RFC 0068 — WAL recovery from a zero-filled tail](./rfcs/0068-wal-zero-tail-recovery.md)
 
 # Talks
 

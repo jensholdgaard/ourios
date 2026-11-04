@@ -168,6 +168,9 @@ openraft = { git = "https://github.com/databendlabs/openraft", rev = "73273a67fd
 # Derives the serde impls openraft's `serde` feature requires of the
 # group's node id and entry data. Already in the tree.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
+# CRC32-C on each `votes.log` record (RFC 0065 §6.1), the checksum RFC
+# 0008 frames use. Already in the tree via ourios-wal.
+crc32c = "0.6"
 
 [features]
 # RFC 0029: OIDC bearer resolution in front of the RFC 0026 enforcement.

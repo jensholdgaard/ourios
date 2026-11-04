@@ -2591,6 +2591,7 @@ version = "0.16.2"
 dependencies = [
  "async-trait",
  "axum",
+ "crc32c",
  "flate2",
  "futures-core",
  "http",

@@ -3825,6 +3825,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "crc32c",
  "dhat",
  "flate2",
  "futures",

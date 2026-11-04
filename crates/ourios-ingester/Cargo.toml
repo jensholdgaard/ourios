@@ -126,7 +126,8 @@ prost = { version = "0.14", default-features = false, features = ["std"] }
 # `ExportLogsServiceRequest` in the proto3-JSON mapping.
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # The replicated WAL's recorded voting layout (RFC 0065 §6.1) is a derived
-# JSON object; already in the tree via ourios-parquet.
+# JSON object, and openraft's `serde` feature needs the group's node id
+# and entry data serialisable; already in the tree via ourios-parquet.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 # HTTP transport (RFC 0003 §6.2): the OTLP/HTTP `/v1/logs` listener.
 # `tokio` + `http1` so the router can be served; the handler + extractors
@@ -165,9 +166,6 @@ twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_
 # requires (9567ffea, 0240eca5) are on `main` only. `serde` so the Raft
 # messages the peer transport will carry are serialisable.
 openraft = { git = "https://github.com/databendlabs/openraft", rev = "73273a67fd5bee278fa2155a1ed11963a70ee789", default-features = false, features = ["tokio-rt", "serde"] }
-# Derives the serde impls openraft's `serde` feature requires of the
-# group's node id and entry data. Already in the tree.
-serde = { version = "1", default-features = false, features = ["std", "derive"] }
 # CRC32-C on each `votes.log` record (RFC 0065 §6.1), the checksum RFC
 # 0008 frames use. Already in the tree via ourios-wal.
 crc32c = "0.6"

@@ -14,7 +14,7 @@ use crate::config::file::TlsSection;
 use crate::config::resolve::{parse_addr, tls_settings};
 
 /// Default peer listener address (RFC 0065 §3.8).
-pub const DEFAULT_PEER_LISTEN_ADDR: &str = "0.0.0.0:4319";
+pub const DEFAULT_PEER_LISTEN_ADDR: &str = "0.0.0.0:4320";
 /// Default group count (RFC 0065 §3.8).
 pub const DEFAULT_GROUPS: NonZeroU32 = match NonZeroU32::new(16) {
     Some(groups) => groups,
@@ -334,11 +334,11 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::PathBuf;
 
-    const PEERS: &str = "receiver-0=receiver-0.wal:4319,receiver-1=receiver-1.wal:4319,\
-                         receiver-2=receiver-2.wal:4319";
-    const FIVE_PEERS: &str = "receiver-0=receiver-0.wal:4319,receiver-1=receiver-1.wal:4319,\
-                              receiver-2=receiver-2.wal:4319,receiver-3=receiver-3.wal:4319,\
-                              receiver-4=receiver-4.wal:4319";
+    const PEERS: &str = "receiver-0=receiver-0.wal:4320,receiver-1=receiver-1.wal:4320,\
+                         receiver-2=receiver-2.wal:4320";
+    const FIVE_PEERS: &str = "receiver-0=receiver-0.wal:4320,receiver-1=receiver-1.wal:4320,\
+                              receiver-2=receiver-2.wal:4320,receiver-3=receiver-3.wal:4320,\
+                              receiver-4=receiver-4.wal:4320";
 
     /// Every `receiver.wal.replicated` leaf set, `tls` aside.
     const LEAVES: [(&str, &str); 8] = [
@@ -347,7 +347,7 @@ mod tests {
         ("peers", PEERS),
         (
             "tail_peers",
-            "tail-0=tail-0.wal:4319,tail-1=tail-1.wal:4319",
+            "tail-0=tail-0.wal:4320,tail-1=tail-1.wal:4320",
         ),
         ("groups", "32"),
         ("replication_factor", "3"),
@@ -437,7 +437,7 @@ mod tests {
         Peer {
             id: id.to_owned(),
             host: host.to_owned(),
-            port: 4319,
+            port: 4320,
         }
     }
 
@@ -542,14 +542,14 @@ mod tests {
         ("no node_id", &[("node_id", None)], "node_id"),
         (
             "node_id in both lists",
-            &[("tail_peers", Some("receiver-0=receiver-0.wal:4319"))],
+            &[("tail_peers", Some("receiver-0=receiver-0.wal:4320"))],
             "node_id",
         ),
         (
             "another id in both lists",
             &[
                 ("peers", Some(FIVE_PEERS)),
-                ("tail_peers", Some("receiver-4=t:4319")),
+                ("tail_peers", Some("receiver-4=t:4320")),
             ],
             "tail_peers",
         ),
@@ -570,7 +570,7 @@ mod tests {
         ),
         (
             "a peer without an id",
-            &[("peers", Some("=host:4319"))],
+            &[("peers", Some("=host:4320"))],
             "peers",
         ),
         (
@@ -580,7 +580,7 @@ mod tests {
         ),
         (
             "a repeated peer id",
-            &[("peers", Some("receiver-0=a:4319,receiver-0=b:4319"))],
+            &[("peers", Some("receiver-0=a:4320,receiver-0=b:4320"))],
             "peers",
         ),
         ("no tail_peers", &[("tail_peers", None)], "tail_peers"),
@@ -661,6 +661,22 @@ mod tests {
                     "{backend}: {error}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_peer_listener_default_shares_no_port_with_another_listener() {
+        use crate::config::resolve::{
+            DEFAULT_GRPC_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_QUERIER_HTTP_ADDR,
+        };
+        let port = |addr: &str| addr.parse::<std::net::SocketAddr>().unwrap().port();
+        let peer = port(DEFAULT_PEER_LISTEN_ADDR);
+        for other in [
+            DEFAULT_GRPC_ADDR,
+            DEFAULT_HTTP_ADDR,
+            DEFAULT_QUERIER_HTTP_ADDR,
+        ] {
+            assert_ne!(peer, port(other), "{other}");
         }
     }
 

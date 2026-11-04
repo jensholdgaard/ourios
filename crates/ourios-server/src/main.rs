@@ -1009,8 +1009,8 @@ receiver:
     backend: replicated
     replicated:
       node_id: a
-      peers: a=a:4319,b=b:4319,c=c:4319
-      tail_peers: t=t:4319
+      peers: a=a:4320,b=b:4320,c=c:4320
+      tail_peers: t=t:4320
       tail_clients: querier
       tls:
         cert_file: /tls/peer.crt

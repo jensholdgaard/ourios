@@ -238,7 +238,7 @@ keys, under `receiver.wal.replicated`, are read only when it is selected:
 | Key | Meaning |
 |---|---|
 | `node_id` | required; this node's id, which must appear in exactly one of `peers` and `tail_peers` |
-| `listen_addr` | the peer listener (default `0.0.0.0:4319`) |
+| `listen_addr` | the peer listener (default `0.0.0.0:4320`) |
 | `peers` | required; the voting replicas, `id=host:port,…`, ids unique |
 | `tail_peers` | required; the tail pool, `id=host:port,…`, no id also in `peers` |
 | `groups` | integer ≥ 1 (default 16) |

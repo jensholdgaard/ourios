@@ -534,6 +534,14 @@ async fn a_failing_empty_append_records_an_error_span_and_one_with_entries_is_tr
     assert!(carrying.is_err());
     let spans = peer_spans(&exporter);
     assert_eq!(spans.len(), 3, "and a client and a server span: {spans:?}");
+    let port = opentelemetry::Value::I64(i64::from(addr.port()));
+    for span in spans.iter().filter(|s| s.span_kind == SpanKind::Client) {
+        let found = span
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "server.port");
+        assert_eq!(found.map(|kv| &kv.value), Some(&port), "{span:?}");
+    }
 }
 
 #[tokio::test]

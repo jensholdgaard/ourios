@@ -188,7 +188,7 @@ impl<'a> Call<'a> {
 
     fn tracing_span(&self) -> tracing::Span {
         let host = self.peer.map(|p| p.host);
-        let port = self.peer.and_then(|p| p.port);
+        let port = self.peer.and_then(|p| p.port).map(i64::from);
         tracing::info_span!(
             "peer rpc",
             otel.name = self.method,

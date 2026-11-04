@@ -327,13 +327,16 @@ fn valid_host(host: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
     };
-    match host
+    if let Some(v6) = host
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
     {
-        Some(v6) => v6.parse::<Ipv6Addr>().is_ok(),
-        None => host.len() <= 253 && host.split('.').all(label),
+        return v6.parse::<Ipv6Addr>().is_ok();
     }
+    // A trailing dot is the DNS root: an absolute name that skips the
+    // resolver's search suffixes.
+    let name = host.strip_suffix('.').unwrap_or(host);
+    name.len() <= 253 && name.split('.').all(label)
 }
 
 fn node_role(node_id: &str, peers: &[Peer], tail_peers: &[Peer]) -> Result<NodeRole, String> {
@@ -782,6 +785,7 @@ mod tests {
     fn peer_hosts_may_be_dns_names_ipv4_or_bracketed_ipv6() {
         for host in [
             "receiver-0.wal.svc.cluster.local",
+            "receiver-0.wal.svc.cluster.local.",
             "10.0.0.7",
             "[::1]",
             "[fd00::7]",
@@ -789,7 +793,15 @@ mod tests {
             let peer = parse_peer(&format!("receiver-0={host}:4320")).expect(host);
             assert_eq!((peer.host.as_str(), peer.port), (host, 4320));
         }
-        for host in ["::1", "[::1", "-lead.wal", "a..b", "under_score"] {
+        for host in [
+            "::1",
+            "[::1",
+            "-lead.wal",
+            "a..b",
+            "under_score",
+            ".",
+            "a.wal..",
+        ] {
             assert!(
                 parse_peer(&format!("receiver-0={host}:4320")).is_none(),
                 "{host}"

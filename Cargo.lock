@@ -3857,6 +3857,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tonic",
+ "tonic-prost",
  "tonic-types",
  "tower",
  "tracing",

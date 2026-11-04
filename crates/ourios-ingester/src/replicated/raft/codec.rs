@@ -96,7 +96,7 @@ fn put_len(out: &mut Vec<u8>, len: usize, what: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn encode_membership(m: &Membership) -> io::Result<Vec<u8>> {
+pub(super) fn encode_membership(m: &Membership) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let configs = m.get_joint_config();
     put_len(&mut out, configs.len(), "membership configs")?;
@@ -140,7 +140,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn decode_membership(bytes: &[u8]) -> io::Result<Membership> {
+pub(super) fn decode_membership(bytes: &[u8]) -> io::Result<Membership> {
     let mut c = Cursor(bytes);
     let mut configs = Vec::new();
     for _ in 0..c.len()? {

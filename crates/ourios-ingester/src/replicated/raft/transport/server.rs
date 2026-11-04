@@ -1,0 +1,262 @@
+//! The `ourios.wal.v1.Replication` server: one per node, handing each
+//! request to the `Raft` of the group it names.
+
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::future::Future;
+use std::sync::{Arc, PoisonError, RwLock};
+use std::task::{Context, Poll};
+
+use openraft::Raft;
+use openraft::errors::Fatal;
+use openraft::storage::{RaftStateMachine, Snapshot};
+use tonic::body::Body;
+use tonic::codegen::{Body as HttpBody, BoxFuture, StdError, http};
+use tonic::server::{NamedService, UnaryService};
+use tonic::transport::server::TcpIncoming;
+use tonic::{Request, Response, Status};
+use tonic_prost::ProstCodec;
+use tracing::Instrument as _;
+
+use super::super::types::RaftTypes;
+use super::wire::{
+    AppendRequest, AppendResponse, Malformed, SnapshotRequest, WireSnapshotResponse,
+    WireVoteRequest, WireVoteResponse,
+};
+use super::{
+    APPEND, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, Side, VERSION, VOTE, record_status, rpc_method,
+};
+
+type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
+
+/// Serves every group this node hosts. Clones share one registry.
+pub struct ReplicationServer<SM>
+where
+    SM: RaftStateMachine<RaftTypes>,
+{
+    groups: Arc<RwLock<Groups<SM>>>,
+}
+
+impl<SM> Clone for ReplicationServer<SM>
+where
+    SM: RaftStateMachine<RaftTypes>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            groups: Arc::clone(&self.groups),
+        }
+    }
+}
+
+impl<SM> Default for ReplicationServer<SM>
+where
+    SM: RaftStateMachine<RaftTypes>,
+{
+    fn default() -> Self {
+        Self {
+            groups: Arc::default(),
+        }
+    }
+}
+
+impl From<Malformed> for Status {
+    fn from(e: Malformed) -> Self {
+        Self::invalid_argument(e.to_string())
+    }
+}
+
+/// A stopped `Raft` is a peer that is not there: `UNAVAILABLE`, which the
+/// client reports as unreachable.
+fn stopped(e: &impl std::fmt::Display) -> Status {
+    Status::unavailable(e.to_string())
+}
+
+impl<SM> ReplicationServer<SM>
+where
+    SM: RaftStateMachine<RaftTypes, SnapshotData = ()>,
+{
+    /// Route `group`'s requests to `raft`, replacing any earlier handle.
+    pub fn insert(&self, group: u32, raft: Raft<RaftTypes, SM>) {
+        self.write().insert(group, raft);
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Groups<SM>> {
+        self.groups.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn route(&self, version: u32, group: u32) -> Result<Raft<RaftTypes, SM>, Status> {
+        if version != VERSION {
+            return Err(Status::failed_precondition(format!(
+                "peer protocol version {version} is not {VERSION}"
+            )));
+        }
+        let groups = self.groups.read().unwrap_or_else(PoisonError::into_inner);
+        groups
+            .get(&group)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("group {group} is not hosted here")))
+    }
+
+    async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Status> {
+        let raft = self.route(request.version, request.group)?;
+        let rpc = request.into_raft()?;
+        let response = raft.append_entries(rpc).await.map_err(|e| stopped(&e))?;
+        Ok(AppendResponse::from(&response))
+    }
+
+    async fn vote(&self, request: WireVoteRequest, pre: bool) -> Result<WireVoteResponse, Status> {
+        let raft = self.route(request.version, request.group)?;
+        let rpc = request.into_raft()?;
+        let response = if pre {
+            raft.pre_vote(rpc).await
+        } else {
+            raft.vote(rpc).await
+        };
+        let response = response.map_err(|e| stopped(&e))?;
+        Ok(WireVoteResponse::from(&response))
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: SnapshotRequest,
+    ) -> Result<WireSnapshotResponse, Status> {
+        let raft = self.route(request.version, request.group)?;
+        let (vote, meta) = request.into_raft()?;
+        let snapshot = Snapshot { meta, snapshot: () };
+        let response = raft
+            .install_full_snapshot(vote, snapshot)
+            .await
+            .map_err(|e: Fatal<RaftTypes>| stopped(&e))?;
+        Ok(WireSnapshotResponse::from(&response))
+    }
+
+    /// Serve until `shutdown` resolves. The incoming stream is where the
+    /// RFC 0030 TLS acceptor will sit.
+    ///
+    /// # Errors
+    ///
+    /// The transport's error when the listener fails.
+    pub async fn serve(
+        self,
+        incoming: TcpIncoming,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), tonic::transport::Error> {
+        tonic::transport::Server::builder()
+            .serve_with_incoming_shutdown(self, incoming, shutdown)
+            .await
+    }
+}
+
+/// One unary method: decode, run the handler under a gRPC server span,
+/// encode.
+struct Method<F>(F);
+
+impl<Req, Resp, F, Fut> UnaryService<Req> for Method<F>
+where
+    F: FnMut(Req) -> Fut,
+    Fut: Future<Output = Result<Resp, Status>> + Send + 'static,
+    Resp: Send + 'static,
+{
+    type Response = Resp;
+    type Future = BoxFuture<Response<Resp>, Status>;
+
+    fn call(&mut self, request: Request<Req>) -> Self::Future {
+        let handled = (self.0)(request.into_inner());
+        Box::pin(async move { handled.await.map(Response::new) })
+    }
+}
+
+fn server_span(path: &'static str) -> tracing::Span {
+    let method = rpc_method(path);
+    tracing::info_span!(
+        "grpc server",
+        otel.name = method,
+        otel.kind = "server",
+        rpc.system.name = "grpc",
+        rpc.method = method,
+        rpc.response.status_code = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    )
+}
+
+fn unary<B, Req, Resp, F, Fut>(
+    path: &'static str,
+    request: http::Request<B>,
+    handler: F,
+) -> BoxFuture<http::Response<Body>, Infallible>
+where
+    B: HttpBody + Send + 'static,
+    B::Error: Into<StdError> + Send + 'static,
+    Req: prost::Message + Default + Send + 'static,
+    Resp: prost::Message + Send + 'static,
+    F: FnMut(Req) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Resp, Status>> + Send + 'static,
+{
+    let span = server_span(path);
+    let traced = span.clone();
+    Box::pin(
+        async move {
+            let mut grpc = tonic::server::Grpc::new(ProstCodec::<Resp, Req>::default());
+            let response = grpc.unary(Method(handler), request).await;
+            record_status(&traced, Side::Server, status_of(&response));
+            Ok(response)
+        }
+        .instrument(span),
+    )
+}
+
+/// The status a unary response carries in its headers: tonic writes an
+/// error status there, and a success's arrives only in the trailers.
+fn status_of(response: &http::Response<Body>) -> tonic::Code {
+    Status::from_header_map(response.headers()).map_or(tonic::Code::Ok, |s| s.code())
+}
+
+fn unimplemented() -> BoxFuture<http::Response<Body>, Infallible> {
+    Box::pin(async { Ok(Status::unimplemented("no such method").into_http()) })
+}
+
+impl<SM, B> tonic::codegen::Service<http::Request<B>> for ReplicationServer<SM>
+where
+    SM: RaftStateMachine<RaftTypes, SnapshotData = ()>,
+    B: HttpBody + Send + 'static,
+    B::Error: Into<StdError> + Send + 'static,
+{
+    type Response = http::Response<Body>;
+    type Error = Infallible;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        let server = self.clone();
+        match request.uri().path() {
+            APPEND => unary(APPEND, request, move |r| {
+                let server = server.clone();
+                async move { server.append(r).await }
+            }),
+            VOTE => unary(VOTE, request, move |r| {
+                let server = server.clone();
+                async move { server.vote(r, false).await }
+            }),
+            PRE_VOTE => unary(PRE_VOTE, request, move |r| {
+                let server = server.clone();
+                async move { server.vote(r, true).await }
+            }),
+            INSTALL_SNAPSHOT => unary(INSTALL_SNAPSHOT, request, move |r| {
+                let server = server.clone();
+                async move { server.install_snapshot(r).await }
+            }),
+            _ => unimplemented(),
+        }
+    }
+}
+
+impl<SM> NamedService for ReplicationServer<SM>
+where
+    SM: RaftStateMachine<RaftTypes>,
+{
+    const NAME: &'static str = SERVICE;
+}

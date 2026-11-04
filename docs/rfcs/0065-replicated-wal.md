@@ -1421,10 +1421,17 @@ never count toward an ack (learners, under §4.3's shape).
 ### 6.8 The peer protocol
 
 - A gRPC service, `ourios.wal.v1.Replication`, on `listen_addr`, with
-  `Append` (leader to follower), `Fetch` (catch-up), `Forward` (any node
-  to a leader), and `Tail` and `TailScan` (querier to tail replica:
-  the read point and published keys, then the rows under that read
-  point, §6.7).
+  `openraft`'s peer calls (§4.3): `Append` (leader to follower, entries
+  and heartbeats), `Vote` and `PreVote` (candidate to voter), and
+  `InstallSnapshot` (leader to a follower behind the checkpoint); then
+  `Forward` (any node to a leader), and `Tail` and `TailScan` (querier
+  to tail replica: the read point and published keys, then the rows
+  under that read point, §6.7). Catch-up needs no call of its own: the
+  leader sends a lagging follower its missing entries by `Append`, or
+  the checkpoint by `InstallSnapshot` when they are already purged.
+- Each request names its group, and one connection per peer carries
+  every group's calls; a server answers an unknown group with
+  `NOT_FOUND`.
 - **Mutual TLS is required** (RFC 0030's `TlsSection`). A tail replica
   accepts `Tail` and `TailScan` only from a client certificate whose identity (its
   URI or DNS subject alternative name) is listed in `tail_clients`, the

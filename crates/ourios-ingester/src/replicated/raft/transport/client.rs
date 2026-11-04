@@ -268,6 +268,8 @@ impl RaftNetworkV2<RaftTypes> for PeerClient {
             .await
     }
 
+    // @codescene(disable:"Excess Number of Function Arguments")
+    // The arguments are `RaftNetworkV2::full_snapshot`'s signature.
     async fn full_snapshot(
         &mut self,
         vote: Vote,

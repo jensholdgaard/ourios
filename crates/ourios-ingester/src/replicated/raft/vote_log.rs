@@ -106,7 +106,7 @@ pub fn create(wal_root: &Path) -> io::Result<()> {
     // which `prepare_root` then fsyncs alone; its entry in the parent must
     // be durable before `replica.id` is published beside the log.
     sync_root(wal_root)?;
-    if wal_root.join(VOTES_FILE).exists() {
+    if wal_root.join(VOTES_FILE).try_exists()? {
         return Ok(());
     }
     write_durably(wal_root, &header())
@@ -298,7 +298,11 @@ fn recover(path: &Path, bytes: &[u8], gate: &SyncGate) -> io::Result<(HashMap<u3
             format!("{} is not an RFC 0065 vote log", path.display()),
         ));
     }
-    let (latest, len) = scan(bytes).map_err(|at| {
+    let Scan {
+        latest,
+        len,
+        slots_end,
+    } = scan(bytes).map_err(|at| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -310,6 +314,10 @@ fn recover(path: &Path, bytes: &[u8], gate: &SyncGate) -> io::Result<(HashMap<u3
     })?;
     let file = OpenOptions::new().write(true).open(path)?;
     if len != bytes.len() {
+        // Cut back to the last valid slot first: a torn slot after it in
+        // the same sector would otherwise survive the zero extension and
+        // be read as corrupt on the next open.
+        file.set_len(slots_end as u64)?;
         file.set_len(len as u64)?;
     }
     sync_through(gate, || file.sync_all()).unwrap_or_else(|| Err(super::writer_gone()))?;
@@ -329,12 +337,22 @@ fn classify(slot: &[u8]) -> Slot {
     decode(slot).map_or(Slot::Corrupt, |(group, vote)| Slot::Vote(group, vote))
 }
 
-/// The latest vote per group and the end of the last sector holding a
-/// valid slot, or the offset of the first byte that cannot be an
-/// unanswered tail. Nothing but zeros may follow an all-zero sector.
-fn scan(bytes: &[u8]) -> Result<(HashMap<u32, Vote>, usize), usize> {
+/// What recovery keeps of a vote log.
+struct Scan {
+    latest: HashMap<u32, Vote>,
+    /// The end of the last sector holding a valid slot: the file's length.
+    len: usize,
+    /// The end of the last valid slot.
+    slots_end: usize,
+}
+
+/// The latest vote per group and where the valid slots end, or the
+/// offset of the first byte that cannot be an unanswered tail. Nothing
+/// but zeros may follow an all-zero sector.
+fn scan(bytes: &[u8]) -> Result<Scan, usize> {
     let mut latest = HashMap::new();
     let mut valid_end = HEADER_LEN;
+    let mut slots_end = HEADER_LEN;
     let mut ended = false;
     for (n, sector) in bytes[HEADER_LEN..].chunks(SECTOR).enumerate() {
         let start = HEADER_LEN + n * SECTOR;
@@ -344,25 +362,31 @@ fn scan(bytes: &[u8]) -> Result<(HashMap<u32, Vote>, usize), usize> {
             }
             continue;
         }
-        if scan_sector(sector, start, &mut latest)? {
-            valid_end = start + SECTOR;
-        } else {
-            ended = true;
+        match scan_sector(sector, start, &mut latest)? {
+            Some(end) => {
+                valid_end = start + SECTOR;
+                slots_end = end;
+            }
+            None => ended = true,
         }
     }
-    Ok((latest, valid_end))
+    Ok(Scan {
+        latest,
+        len: valid_end,
+        slots_end,
+    })
 }
 
-/// One sector: valid slots, then only zeros. Returns whether it holds a
-/// valid slot. A partial slot can only be the end of the file, an append
-/// torn before its fsync.
+/// One sector: valid slots, then only zeros. Returns the end of its last
+/// valid slot, if it holds one. A partial slot can only be the end of the
+/// file, an append torn before its fsync.
 fn scan_sector(
     sector: &[u8],
     start: usize,
     latest: &mut HashMap<u32, Vote>,
-) -> Result<bool, usize> {
+) -> Result<Option<usize>, usize> {
     let (slots, pad) = sector.split_at(sector.len().min(SLOTS_PER_SECTOR * RECORD_LEN));
-    let mut valid = false;
+    let mut valid = None;
     let mut zeroed = false;
     let (slots, _torn) = slots.as_chunks::<RECORD_LEN>();
     for (i, slot) in slots.iter().enumerate() {
@@ -371,7 +395,7 @@ fn scan_sector(
             (Slot::Zeroed, _) => zeroed = true,
             (Slot::Vote(group, vote), false) => {
                 latest.insert(group, vote);
-                valid = true;
+                valid = Some(at + RECORD_LEN);
             }
             _ => return Err(at),
         }
@@ -605,6 +629,28 @@ mod tests {
             drop(log);
             let (log, _) = open(dir.path(), DEFAULT_REWRITE_BYTES);
             assert_eq!(log.latest(2), Some(vote(4, 2, false)), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_torn_slot_in_a_short_final_sector_is_cut_before_the_sector_is_padded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path()).expect("root");
+        let mut torn = header();
+        torn.extend_from_slice(&encode(1, &vote(1, 1, false)));
+        torn.extend_from_slice(&encode(2, &vote(9, 9, true))[..20]);
+        fs::write(dir.path().join(VOTES_FILE), &torn).expect("write");
+        for reopen in 1..=2 {
+            let (log, _) = open(dir.path(), DEFAULT_REWRITE_BYTES);
+            assert_eq!(log.latest(1), Some(vote(1, 1, false)), "reopen {reopen}");
+            assert_eq!(log.latest(2), None, "reopen {reopen}");
+            drop(log);
+            let bytes = fs::read(dir.path().join(VOTES_FILE)).expect("read");
+            assert_eq!(bytes.len(), 2 * SECTOR, "reopen {reopen}");
+            assert!(
+                bytes[HEADER_LEN + RECORD_LEN..].iter().all(|b| *b == 0),
+                "reopen {reopen}: the torn slot's bytes survived the padding"
+            );
         }
     }
 

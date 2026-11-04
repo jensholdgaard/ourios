@@ -118,7 +118,7 @@ fn cut_to(dir: &Path, synced: WalOffset) -> u64 {
 #[derive(Default)]
 pub(super) struct SmState {
     pub(super) applied: Option<LogId>,
-    membership: StoredMembershipOf<RaftTypes>,
+    pub(super) membership: StoredMembershipOf<RaftTypes>,
     snapshot: Option<SnapshotMetaOf<RaftTypes>>,
 }
 

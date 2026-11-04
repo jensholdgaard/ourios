@@ -28,8 +28,11 @@ use super::super::tests::{MemSm, wal_config};
 use super::super::types::{Entry, NodeId, RaftTypes, TenantBatchBytes, Vote};
 use super::super::vote_log::{self, VoteLog};
 use super::trace::Tracing;
-use super::wire::{AppendRequest, AppendResponse, Header, WireLogId};
-use super::{APPEND, PeerClient, Peers, ReplicationServer, VERSION};
+use super::wire::{
+    AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, SnapshotRequest, WireLogId,
+    WireSnapshotResponse, WireVote,
+};
+use super::{APPEND, INSTALL_SNAPSHOT, PeerClient, Peers, ReplicationServer, VERSION};
 
 const GROUP: u32 = 7;
 const WAIT: Option<Duration> = Some(Duration::from_secs(10));
@@ -195,21 +198,34 @@ async fn three_nodes_replicate_over_grpc_and_fail_over() {
     }
 }
 
-async fn raw_append(addr: SocketAddr, request: AppendRequest) -> Status {
+/// A request sent as is, past `PeerClient`'s own encoding.
+async fn raw<Req, Resp>(addr: SocketAddr, path: &'static str, request: Req) -> Result<Resp, Status>
+where
+    Req: prost::Message + Send + 'static,
+    Resp: prost::Message + Default + Send + 'static,
+{
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint")
         .connect()
         .await
         .expect("connect");
-    let mut grpc = tonic::client::Grpc::new(channel);
+    let mut grpc = tonic::client::Grpc::new(channel).max_encoding_message_size(MAX_MESSAGE_BYTES);
     grpc.ready().await.expect("ready");
-    grpc.unary::<_, AppendResponse, _>(
-        Request::new(request),
-        PathAndQuery::from_static(APPEND),
-        ProstCodec::default(),
-    )
-    .await
-    .expect_err("refused")
+    let codec = ProstCodec::<Req, Resp>::default();
+    let response = grpc
+        .unary(
+            Request::new(request),
+            PathAndQuery::from_static(path),
+            codec,
+        )
+        .await?;
+    Ok(response.into_inner())
+}
+
+async fn raw_append(addr: SocketAddr, request: AppendRequest) -> Status {
+    raw::<_, AppendResponse>(addr, APPEND, request)
+        .await
+        .expect_err("refused")
 }
 
 fn header(version: u32) -> Header {
@@ -544,4 +560,113 @@ async fn a_failing_empty_append_records_a_server_error_span_too() {
         &SpanKind::Server,
         "UNAVAILABLE",
     );
+}
+
+fn log(term: u64, index: u64) -> openraft::type_config::alias::LogIdOf<RaftTypes> {
+    WireLogId { term, index }.into()
+}
+
+/// A peer that accepts the connection and never answers.
+fn silent_peer() -> (std::net::TcpListener, SocketAddr) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    (listener, addr)
+}
+
+fn snapshot_of(
+    last: openraft::type_config::alias::LogIdOf<RaftTypes>,
+) -> openraft::type_config::alias::SnapshotOf<RaftTypes, ()> {
+    let voters = std::collections::BTreeSet::from([NodeId::from(1), NodeId::from(2)]);
+    let nodes = BTreeMap::from([
+        (NodeId::from(1), "127.0.0.1:1".to_owned()),
+        (NodeId::from(2), "127.0.0.1:2".to_owned()),
+    ]);
+    let membership = super::super::types::Membership::new(vec![voters], nodes).expect("membership");
+    openraft::type_config::alias::SnapshotOf::<RaftTypes, ()> {
+        meta: openraft::type_config::alias::SnapshotMetaOf::<RaftTypes> {
+            last_log_id: Some(last),
+            last_membership: openraft::StoredMembership::new(Some(last), membership),
+        },
+        snapshot: (),
+    }
+}
+
+#[tokio::test]
+async fn a_full_snapshot_installs_over_grpc() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    let vote = Vote::new_committed(2, NodeId::from(2));
+    let snapshot = snapshot_of(log(2, 5));
+    let meta = snapshot.meta.clone();
+    let never = std::future::pending::<openraft::errors::ReplicationClosed>();
+    let response = client.full_snapshot(vote, snapshot, never, option()).await;
+    assert_eq!(response.expect("installed").vote, vote);
+    node.applied_through(5).await;
+    let installed = {
+        let state = node.sm.state();
+        (state.applied, state.membership.clone())
+    };
+    assert_eq!(installed, (meta.last_log_id, meta.last_membership));
+    node.kill().await;
+}
+
+#[tokio::test]
+async fn a_pending_snapshot_install_ends_when_replication_closes() {
+    let (_listener, addr) = silent_peer();
+    let mut client = client_to(&Peers::plaintext(), NodeId::from(1), addr).await;
+    let closed = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        openraft::errors::ReplicationClosed::new("replication stopped")
+    };
+    let vote = Vote::new_committed(2, NodeId::from(2));
+    let response = client
+        .full_snapshot(vote, snapshot_of(log(2, 5)), closed, option())
+        .await;
+    assert!(
+        matches!(response, Err(openraft::errors::StreamingError::Closed(_))),
+        "{response:?}"
+    );
+}
+
+/// Requests a leader never sends, which `openraft` would assert on or
+/// the group log fail on, are refused before dispatch and leave the group
+/// serving.
+#[tokio::test]
+async fn requests_no_leader_sends_are_refused_and_the_group_keeps_serving() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let vote = Vote::new_committed(1, NodeId::from(2));
+    let to = super::wire::Recipient {
+        group: GROUP,
+        node: node.id,
+    };
+    let snapshot = SnapshotRequest::new(to, &vote, &snapshot_of(log(9, 5)).meta).expect("encode");
+    let refused = raw::<_, WireSnapshotResponse>(addr, INSTALL_SNAPSHOT, snapshot).await;
+    assert_eq!(
+        refused.map(drop).map_err(|s| s.code()),
+        Err(Code::InvalidArgument)
+    );
+
+    let oversized = AppendRequest {
+        header: Some(header(VERSION)),
+        vote: Some(WireVote::from(&vote)),
+        entries: vec![vec![0; ourios_wal::MAX_FRAME_BYTES + 1]],
+        ..AppendRequest::default()
+    };
+    assert_eq!(
+        raw_append(addr, oversized).await.code(),
+        Code::InvalidArgument
+    );
+
+    let mut client = client_to(&peers, node.id, addr).await;
+    let gap = append(vec![entry(3, 16)]);
+    assert!(client.append_entries(gap, option()).await.is_err());
+
+    let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
+    let granted = client.vote(higher, option()).await.expect("still serving");
+    assert!(granted.vote_granted);
+    node.kill().await;
 }

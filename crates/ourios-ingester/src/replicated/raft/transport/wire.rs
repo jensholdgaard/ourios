@@ -188,6 +188,12 @@ impl Header {
 }
 
 fn decode_entry(bytes: &[u8]) -> Result<Entry, Malformed> {
+    if bytes.len() > ourios_wal::MAX_FRAME_BYTES {
+        return Err(Malformed(format!(
+            "an entry of {} bytes exceeds the WAL frame limit",
+            bytes.len()
+        )));
+    }
     match codec::decode(bytes)? {
         Replayed::Entry(entry) => Ok(entry),
         other => Err(Malformed(format!("expected an entry, got {other:?}"))),
@@ -246,7 +252,7 @@ impl AppendRequest {
     ///
     /// [`Malformed`] when a field is missing or an entry does not decode.
     pub fn into_raft(self) -> Result<AppendEntriesRequest<RaftTypes>, Malformed> {
-        Ok(AppendEntriesRequest {
+        let rpc = AppendEntriesRequest {
             vote: vote_of(self.vote)?,
             prev_log_id: raft_id(self.prev_log_id),
             entries: self
@@ -255,8 +261,41 @@ impl AppendRequest {
                 .map(|bytes| decode_entry(bytes))
                 .collect::<Result<_, _>>()?,
             leader_commit: raft_id(self.leader_commit),
-        })
+        };
+        check_segment(&rpc)?;
+        Ok(rpc)
     }
+}
+
+/// Refuse a log id from a term after the sender's vote: no leader can
+/// send one, and `openraft` asserts against it.
+fn within_vote(id: Option<&LogId>, vote: &Vote) -> Result<(), Malformed> {
+    match id {
+        Some(id) if id.leader_id.term > vote.leader_id.term => Err(Malformed(format!(
+            "log id {id} is after the sender's vote {vote}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse what a leader never sends and `openraft` or the group log
+/// would fail on rather than reject: entries that do not follow
+/// `prev_log_id` one index at a time in non-decreasing terms, or a log id
+/// after the sender's vote.
+fn check_segment(rpc: &AppendEntriesRequest<RaftTypes>) -> Result<(), Malformed> {
+    within_vote(rpc.prev_log_id.as_ref(), &rpc.vote)?;
+    let mut last = rpc.prev_log_id;
+    for entry in &rpc.entries {
+        let id = entry.log_id;
+        let next = last.map_or(Some(0), |l| l.index.checked_add(1));
+        let term_back = last.is_some_and(|l| id.leader_id.term < l.leader_id.term);
+        if next != Some(id.index) || term_back {
+            return Err(Malformed(format!("entry {id} does not follow {last:?}")));
+        }
+        within_vote(Some(&id), &rpc.vote)?;
+        last = Some(id);
+    }
+    Ok(())
 }
 
 /// `PartialSuccess`'s matched log id, which may itself be absent.
@@ -426,7 +465,9 @@ impl SnapshotRequest {
             last_log_id: raft_id(self.last_log_id),
             last_membership: required(self.membership, "membership")?.into_raft()?,
         };
-        Ok((vote_of(self.vote)?, meta))
+        let vote = vote_of(self.vote)?;
+        within_vote(meta.last_log_id.as_ref(), &vote)?;
+        Ok((vote, meta))
     }
 }
 
@@ -511,6 +552,35 @@ mod tests {
         (log_id(), payload).prop_map(|(log_id, payload)| Entry { log_id, payload })
     }
 
+    fn log(term: u64, index: u64) -> LogId {
+        LogId::from(WireLogId { term, index })
+    }
+
+    /// A vote and entries a leader could send under it: consecutive
+    /// after `prev`, in non-decreasing terms no later than the vote's.
+    fn segment() -> impl Strategy<Value = (Vote, Option<LogId>, Vec<Entry>)> {
+        let prev = proptest::option::of((any::<u64>(), 0..u64::MAX / 2));
+        let entries = proptest::collection::vec((entry(), 0..3_u64), 0..6);
+        (vote(), prev, entries).prop_map(|(vote, prev, entries)| {
+            let top = vote.leader_id.term;
+            let prev = prev.map(|(term, index)| log(term.min(top), index));
+            let mut term = prev.map_or(0, |p| p.leader_id.term);
+            let first = prev.map_or(0, |p| p.index + 1);
+            let entries = entries
+                .into_iter()
+                .zip(first..)
+                .map(|((entry, step), index)| {
+                    term = term.saturating_add(step).min(top);
+                    Entry {
+                        log_id: log(term, index),
+                        payload: entry.payload,
+                    }
+                })
+                .collect();
+            (vote, prev, entries)
+        })
+    }
+
     fn stored_membership() -> impl Strategy<Value = StoredMembershipOf<RaftTypes>> {
         prop_oneof![
             Just(StoredMembershipOf::<RaftTypes>::default()),
@@ -544,9 +614,7 @@ mod tests {
         #[test]
         fn an_append_request_round_trips(
             to in recipient(),
-            vote in vote(),
-            prev_log_id in proptest::option::of(log_id()),
-            entries in proptest::collection::vec(entry(), 0..6),
+            (vote, prev_log_id, entries) in segment(),
             leader_commit in proptest::option::of(log_id()),
         ) {
             let rpc = AppendEntriesRequest::<RaftTypes> { vote, prev_log_id, entries, leader_commit };
@@ -598,6 +666,8 @@ mod tests {
             last_log_id in proptest::option::of(log_id()),
             last_membership in stored_membership(),
         ) {
+            let last_log_id = last_log_id
+                .map(|id| log(id.leader_id.term.min(vote.leader_id.term), id.index));
             let meta = SnapshotMetaOf::<RaftTypes> { last_log_id, last_membership };
             let wire = through_wire(&SnapshotRequest::new(to, &vote, &meta).expect("encode"));
             prop_assert_eq!(wire.header.clone(), Some(Header::to(to)));
@@ -653,6 +723,61 @@ mod tests {
         let (request, cut) = AppendRequest::bounded(to(), &rpc).expect("encode");
         assert_eq!((request.entries.len(), cut), (1, None));
         assert!(request.encoded_len() <= MAX_MESSAGE_BYTES);
+    }
+
+    fn blank(term: u64, index: u64) -> Entry {
+        Entry {
+            log_id: log(term, index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    fn decoded(prev: Option<LogId>, entries: Vec<Entry>) -> Result<(), Malformed> {
+        let rpc = AppendEntriesRequest {
+            vote: Vote::new_committed(3, node(1)),
+            prev_log_id: prev,
+            entries,
+            leader_commit: None,
+        };
+        let (request, _) = AppendRequest::bounded(to(), &rpc).expect("encode");
+        request.into_raft().map(drop)
+    }
+
+    #[test]
+    fn an_append_no_leader_would_send_is_refused() {
+        let refused = [
+            (None, vec![blank(1, 1)]),
+            (Some(log(1, 4)), vec![blank(1, 6)]),
+            (Some(log(2, 4)), vec![blank(1, 5)]),
+            (None, vec![blank(1, 0), blank(1, 0)]),
+            (None, vec![blank(4, 0)]),
+            (Some(log(4, 4)), vec![]),
+            (Some(log(1, u64::MAX)), vec![blank(1, 0)]),
+        ];
+        for (prev, entries) in refused {
+            let shown = format!("{prev:?} {entries:?}");
+            assert!(decoded(prev, entries).is_err(), "{shown}");
+        }
+        assert!(decoded(Some(log(1, 4)), vec![blank(1, 5), blank(3, 6)]).is_ok());
+    }
+
+    #[test]
+    fn a_snapshot_after_the_senders_vote_is_refused() {
+        let vote = Vote::new_committed(3, node(1));
+        let meta = |term| SnapshotMetaOf::<RaftTypes> {
+            last_log_id: Some(log(term, 9)),
+            last_membership: StoredMembershipOf::<RaftTypes>::default(),
+        };
+        let request = |term| SnapshotRequest::new(to(), &vote, &meta(term)).expect("encode");
+        assert!(request(4).into_raft().is_err());
+        assert!(request(3).into_raft().is_ok());
+    }
+
+    #[test]
+    fn an_entry_over_the_frame_limit_is_refused_before_decoding() {
+        let oversized = vec![0; ourios_wal::MAX_FRAME_BYTES + 1];
+        let error = decode_entry(&oversized).expect_err("refused");
+        assert!(error.to_string().contains("frame limit"), "{error}");
     }
 
     #[test]

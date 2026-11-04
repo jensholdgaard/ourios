@@ -41,7 +41,8 @@ during an append that had not yet been fsynced can leave the file
 behind it were never written, so they read back as zeros. Today's
 `replay_segment` reads 12 zero bytes as a header with `len = 0` and
 `kind = 0x00`, and stops with `RecoveryError::Corrupt { UnknownKind }`.
-`Wal::open` then fails, and the ingester stays down until an operator
+`Wal::replay` then returns that error, the receiver does not start, and
+the ingester stays down until an operator
 intervenes (#1165).
 
 Those bytes belong to an append whose `sync` never returned, so no
@@ -163,8 +164,13 @@ synced, which is what §4.3 provides.
 
 ### 4.3 Record a synced offset
 
-After each `Wal::sync`, persist the synced offset, for example in the
-RFC 0052 reclaim sidecar or a small per-segment trailer. Recovery could
+Make the synced offset durable as part of each `Wal::sync`, before it
+returns, for example in the RFC 0052 reclaim sidecar or a small
+per-segment trailer. If that write fails, the sync fails and its turns
+are not acknowledged, so every acknowledged frame lies below a durable
+offset. Persisting it only after `sync` returns would leave a crash
+window in which a batch is acknowledged but the recorded offset is
+still the previous one. Recovery could
 then cut any damaged tail that starts past that offset, including §4.2's
 shape, and fail closed on any damage before it. That would also remove
 §3.4's residual risk. The price is a second durable write per sync on
@@ -176,8 +182,11 @@ follow-up if §7 decides either gap matters.
 WALs that preallocate their segments, such as PostgreSQL's, zero them
 (or `fallocate` and zero) before use. The end of the log is then the
 first header that reads as zero, and the file size never changes after
-a crash, so T2 is the only shape. That does not remove the ambiguity
-between the end of the log and a zeroed frame, though. It also costs a
+a crash. That removes the zero tail, but not the other shapes: a header
+that reached disk ahead of its payload still leaves a complete frame
+with a CRC mismatch, which is §4.2's case, and only atomic frame
+persistence or §4.3 would heal it. Nor does it remove the ambiguity
+between the end of the log and a zeroed frame. It also costs a
 full segment write at rotation (128 MiB by default) and changes RFC
 0008's segment layout, while §3.1 gets the same availability without a
 format change.
@@ -198,7 +207,7 @@ remove. It may still be worth having for real corruption, separately.
 > - **Given** a newest segment with valid frames ending at `B`, followed
 >   by `n` zero bytes to EOF, for `n` in {12, 13, 511, 512, 4096,
 >   4096 + 7}
-> - **When** `Wal::open` runs recovery
+> - **When** the WAL is opened and `Wal::replay` runs recovery
 > - **Then** it opens, every frame before `B` is replayed, and the
 >   segment is truncated to `B`
 > - **And** the next append lands at `B` and survives a reopen
@@ -212,14 +221,14 @@ remove. It may still be worth having for real corruption, separately.
 >   512-aligned offset to EOF (corruption, §4.2); zeros followed by one
 >   non-zero byte (corruption); or zeros followed by a valid frame
 >   (corruption)
-> - **When** `Wal::open` runs recovery
+> - **When** the WAL is opened and `Wal::replay` runs recovery
 > - **Then** the healed arms open and truncate to `B`, and the
 >   corruption arms fail with `RecoveryError::Corrupt` naming the
 >   segment and offset, with no segment modified
 
 > **Scenario RFC0068.3 — closed segments are unchanged `[H3]`**
 > - **Given** a closed (non-newest) segment ending in a T2 zero tail
-> - **When** `Wal::open` runs recovery
+> - **When** the WAL is opened and `Wal::replay` runs recovery
 > - **Then** it fails as RFC0008.5 corruption, exactly as today
 
 > **Scenario RFC0068.4 — a crash test with a zero-extended tail `[H3]`**

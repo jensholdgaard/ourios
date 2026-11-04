@@ -125,6 +125,9 @@ prost = { version = "0.14", default-features = false, features = ["std"] }
 # `Deserialize` impls — the `application/json` transport body is an
 # `ExportLogsServiceRequest` in the proto3-JSON mapping.
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# The replicated WAL's recorded voting layout (RFC 0065 §6.1) is a derived
+# JSON object; already in the tree via ourios-parquet.
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
 # HTTP transport (RFC 0003 §6.2): the OTLP/HTTP `/v1/logs` listener.
 # `tokio` + `http1` so the router can be served; the handler + extractors
 # (`State`, `Bytes`, `HeaderMap`) are core. On hyper 1.x, already in the

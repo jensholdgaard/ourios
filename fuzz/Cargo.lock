@@ -2450,6 +2450,7 @@ dependencies = [
  "ourios-wal",
  "prost",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-rustls",

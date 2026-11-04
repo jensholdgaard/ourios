@@ -156,15 +156,15 @@ impl FrameSink for Scan {
         let len = u64::try_from(payload.len())
             .expect("payload.len() fits u64 (read_frame capped it at MAX_FRAME_BYTES)");
         let bytes = frame::FRAME_HEADER_LEN as u64 + len;
-        if kind != FrameKind::TenantOtlpBatch {
-            // §3.2: only `TenantOtlpBatch` frames carry tenant
-            // membership. Every other kind is governed by the
-            // checkpoint alone, so it contributes bytes and a highest
-            // offset and pins nothing.
+        let Some(batch) = crate::replicated::tenant_batch_payload(kind, payload) else {
+            // §3.2: only `TenantOtlpBatch` frames (and the replicated
+            // entries that carry one) hold tenant membership. Every
+            // other frame is governed by the checkpoint alone, so it
+            // contributes bytes and a highest offset and pins nothing.
             self.record(offset, bytes, None);
             return Ok(());
-        }
-        match TenantBatch::decode(payload) {
+        };
+        match TenantBatch::decode(batch) {
             Err(TenantBatchError::TenantTooLong { found }) => {
                 self.overlong_tenant = Some((offset, found));
                 Err(RecoveryError::SinkRejected {

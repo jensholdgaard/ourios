@@ -49,6 +49,7 @@ pub(crate) mod pass;
 pub(crate) mod reclaim;
 pub(crate) mod reclaim_store;
 pub(crate) mod reconcile;
+pub(crate) mod replicated;
 pub(crate) mod retain;
 pub(crate) mod rotation;
 pub(crate) mod segment;
@@ -63,6 +64,7 @@ pub use reclaim::{
     DEFAULT_MAX_TENANTS, DEFAULT_MAX_UNLINKS_PER_PASS, MAX_TENANTS_CEILING,
     MAX_UNLINKS_PER_PASS_CEILING,
 };
+pub use replicated::{EntryBody, RaftLogId, ReplicatedRecord, ReplicatedRecordError};
 pub use retain::{RetainFloor, SnapshotHorizons, TenantHorizon};
 use rotation::DirFsync;
 pub use rotation::{RotationFault, RotationFaults, RotationKind, RotationSite, RotationState};
@@ -124,9 +126,9 @@ pub enum FrameKind {
     /// then the `ExportLogsServiceRequest` protobuf bytes —
     /// [`TenantBatch`] is the payload codec.
     TenantOtlpBatch = 0x03,
-    /// RFC 0065 §4.3: one record of a replicated group's Raft log.
-    /// Written only to a group's own WAL, never to the local
-    /// backend's.
+    /// RFC 0065 §4.3: one record of a replicated group's Raft log —
+    /// [`ReplicatedRecord`] is the payload codec. Written only to a
+    /// group's own WAL, never to the local backend's.
     ReplicatedEntry = 0x04,
 }
 
@@ -771,12 +773,9 @@ impl Wal {
         // membership here would leave its segments governed by the
         // checkpoint alone. `TenantBatch::decode` has already bounded
         // the length and checked UTF-8.
-        let tenant = match kind {
-            FrameKind::TenantOtlpBatch => TenantBatch::decode(payload)
-                .ok()
-                .map(|batch| ourios_core::tenant::TenantId::new(batch.tenant)),
-            FrameKind::OtlpBatch | FrameKind::AuditEvent | FrameKind::ReplicatedEntry => None,
-        };
+        let tenant = replicated::tenant_batch_payload(kind, payload)
+            .and_then(|bytes| TenantBatch::decode(bytes).ok())
+            .map(|batch| ourios_core::tenant::TenantId::new(batch.tenant));
         self.ledger.observe(retain::FrameAt {
             offset,
             bytes: frame_len,

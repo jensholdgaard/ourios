@@ -72,6 +72,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # futures-core supplies the `Stream` bound on the gRPC TLS adapter.
 futures-core = { version = "0.3", default-features = false }
+# Stream combinators for the Raft peer transport's `StreamAppend` (already
+# in the tree via openraft and tonic).
+futures-util = { version = "0.3", default-features = false }
 # The object-store seam (`Store::wrap_backend`): the RFC 0052 §3.1
 # publisher legs hold a PUT there, and template_ids_crash_fixture parks its
 # bootstrap scan there. A [[bin]] fixture cannot use dev-dependencies; both

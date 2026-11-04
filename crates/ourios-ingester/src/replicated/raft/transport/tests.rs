@@ -6,10 +6,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt as _;
 use openraft::async_runtime::WatchReceiver as _;
 use openraft::errors::RPCError;
 use openraft::network::{RPCOption, RaftNetworkFactory, v2::RaftNetworkV2};
-use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest};
+use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, StreamAppendError, VoteRequest};
 use openraft::{Raft, RaftMetrics};
 use opentelemetry::global::BoxedTracer;
 use opentelemetry::trace::{SpanKind, Status as SpanStatus};
@@ -29,10 +30,12 @@ use super::super::types::{Entry, NodeId, RaftTypes, TenantBatchBytes, Vote};
 use super::super::vote_log::{self, VoteLog};
 use super::trace::Tracing;
 use super::wire::{
-    AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, SnapshotRequest, WireLogId,
-    WireSnapshotResponse, WireVote,
+    AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, SnapshotRequest,
+    StreamAppendResponse, WireLogId, WireSnapshotResponse, WireVote,
 };
-use super::{APPEND, INSTALL_SNAPSHOT, PeerClient, Peers, ReplicationServer, VERSION};
+use super::{
+    APPEND, INSTALL_SNAPSHOT, PeerClient, Peers, ReplicationServer, STREAM_APPEND, VERSION,
+};
 
 const GROUP: u32 = 7;
 const WAIT: Option<Duration> = Some(Duration::from_secs(10));
@@ -697,4 +700,361 @@ async fn requests_no_leader_sends_are_refused_and_the_group_keeps_serving() {
     let granted = client.vote(higher, option()).await.expect("still serving");
     assert!(granted.vote_granted);
     node.kill().await;
+}
+
+/// The replies to `requests` sent as one `StreamAppend` stream past
+/// `PeerClient`'s encoding, up to and including the status it ends on;
+/// `Err` when the stream is refused before it opens.
+async fn raw_stream(
+    addr: SocketAddr,
+    requests: Vec<AppendRequest>,
+) -> Result<Vec<Result<StreamAppendResponse, Code>>, Code> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.expect("ready");
+    let codec = ProstCodec::<AppendRequest, StreamAppendResponse>::default();
+    let request = Request::new(futures_util::stream::iter(requests));
+    let path = PathAndQuery::from_static(STREAM_APPEND);
+    let mut replies = grpc
+        .streaming(request, path, codec)
+        .await
+        .map_err(|s| s.code())?
+        .into_inner();
+    let mut seen = Vec::new();
+    loop {
+        match replies.message().await {
+            Ok(Some(reply)) => seen.push(Ok(reply)),
+            Ok(None) => return Ok(seen),
+            Err(status) => {
+                seen.push(Err(status.code()));
+                return Ok(seen);
+            }
+        }
+    }
+}
+
+fn wire_append(to: NodeId, rpc: &AppendEntriesRequest<RaftTypes>) -> AppendRequest {
+    let to = super::wire::Recipient {
+        group: GROUP,
+        node: to,
+    };
+    AppendRequest::bounded(to, rpc).expect("encode").0
+}
+
+/// Appends of `runs` entries each, every one following the last.
+fn consecutive(runs: &[u64]) -> Vec<AppendEntriesRequest<RaftTypes>> {
+    let mut next = 0_u64;
+    runs.iter()
+        .map(|&run| {
+            let prev = next.checked_sub(1).map(|i| log(1, i));
+            let entries = (next..next + run).map(|i| entry(i, 16)).collect();
+            next += run;
+            AppendEntriesRequest {
+                prev_log_id: prev,
+                ..append(entries)
+            }
+        })
+        .collect()
+}
+
+type StreamAnswer = Result<openraft::raft::StreamAppendResult<RaftTypes>, RPCError<RaftTypes>>;
+
+async fn streamed(
+    client: &mut PeerClient,
+    requests: Vec<AppendEntriesRequest<RaftTypes>>,
+    option: RPCOption,
+) -> Result<Vec<StreamAnswer>, RPCError<RaftTypes>> {
+    let input = futures_util::stream::iter(requests);
+    let answers = client.stream_append(input, option).await?;
+    Ok(answers.collect().await)
+}
+
+fn matched(answers: &[StreamAnswer]) -> Vec<Option<u64>> {
+    answers
+        .iter()
+        .map(|a| match a {
+            Ok(Ok(id)) => id.map(|id| id.index),
+            other => panic!("not a match: {other:?}"),
+        })
+        .collect()
+}
+
+/// Replication runs over the pipelined stream, not unary `Append`: the
+/// peer-RPC spans the group records are `StreamAppend`'s. On one thread,
+/// so the `tracing` layer would see a unary span too.
+#[tokio::test]
+async fn three_nodes_replicate_through_stream_append() {
+    let (exporter, tracing, _default) = capture();
+    let peers = Peers::traced_by(tracing.clone());
+    let mut listeners = Vec::new();
+    let mut members = BTreeMap::new();
+    for n in 1..=3 {
+        let (incoming, addr) = bind();
+        members.insert(NodeId::from(n), addr.to_string());
+        listeners.push((n, incoming));
+    }
+    let mut nodes = Vec::new();
+    for (n, incoming) in listeners {
+        let server = ReplicationServer::traced_by(tracing.clone());
+        nodes.push(Node::start(n, incoming, &peers, server).await);
+    }
+    nodes[0].raft.initialize(members).await.expect("initialize");
+    let first = leader(&nodes.iter().collect::<Vec<_>>(), None).await;
+    let at = nodes.iter().position(|n| n.id == first).expect("leader");
+    let mut last = 0;
+    for n in 0..5 {
+        last = write(&nodes[at].raft, n).await;
+    }
+    for node in &nodes {
+        node.applied_through(last).await;
+    }
+    for node in &mut nodes {
+        node.kill().await;
+    }
+
+    let spans = peer_spans(&exporter);
+    let unary = spans
+        .iter()
+        .filter(|s| s.name == "ourios.wal.v1.Replication/Append");
+    assert_eq!(unary.count(), 0, "{spans:?}");
+    let streamed_ok = |kind: SpanKind| {
+        spans.iter().any(|s| {
+            s.span_kind == kind
+                && s.name == "ourios.wal.v1.Replication/StreamAppend"
+                && attr(s, "rpc.response.status_code").as_deref() == Some("OK")
+        })
+    };
+    assert!(streamed_ok(SpanKind::Client), "{spans:?}");
+    assert!(streamed_ok(SpanKind::Server), "{spans:?}");
+}
+
+/// Every message is answered in order with the log id it matched
+/// through; the unary path still serves alongside.
+#[tokio::test]
+async fn a_stream_answers_each_append_in_order() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    let answers = streamed(&mut client, consecutive(&[3, 2, 1, 0]), option())
+        .await
+        .expect("stream");
+    assert_eq!(matched(&answers), [Some(2), Some(4), Some(5), Some(5)]);
+
+    let next = consecutive(&[3, 2, 1, 1]).remove(3);
+    let unary = client.append_entries(next, option()).await;
+    assert_eq!(unary.expect("unary"), AppendEntriesResponse::Success);
+    node.kill().await;
+}
+
+/// An append over the byte budget goes out as follow-on pieces, each
+/// answered within the append's range, rather than as a partial success
+/// that would end the stream.
+#[tokio::test]
+async fn a_streamed_append_over_the_byte_budget_is_split_and_fully_matched() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    let rpc = append((0..3).map(|i| entry(i, 7 * MIB)).collect());
+    let answers = streamed(&mut client, vec![rpc], option())
+        .await
+        .expect("stream");
+    assert_eq!(matched(&answers), [Some(1), Some(2)]);
+    node.kill().await;
+}
+
+#[tokio::test]
+async fn a_conflict_ends_the_stream() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    let ahead = AppendEntriesRequest {
+        prev_log_id: Some(log(1, 5)),
+        ..append(vec![entry(6, 16)])
+    };
+    let mut requests = vec![ahead];
+    requests.extend(consecutive(&[1]));
+    let answers = streamed(&mut client, requests, option())
+        .await
+        .expect("stream");
+    assert!(
+        matches!(
+            answers.as_slice(),
+            [Ok(Err(StreamAppendError::Conflict(id)))] if *id == log(1, 5)
+        ),
+        "{answers:?}"
+    );
+    node.kill().await;
+}
+
+#[tokio::test]
+async fn a_higher_vote_ends_the_stream() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    let higher = VoteRequest::new(Vote::new(5, NodeId::from(3)), None);
+    let granted = client.vote(higher, option()).await.expect("vote");
+    assert!(granted.vote_granted);
+    let answers = streamed(&mut client, consecutive(&[1, 1]), option())
+        .await
+        .expect("stream");
+    assert!(
+        matches!(
+            answers.as_slice(),
+            [Ok(Err(StreamAppendError::HigherVote(v)))] if v.leader_id.term == 5
+        ),
+        "{answers:?}"
+    );
+    node.kill().await;
+}
+
+/// The first message routes the stream, so its refusals are the unary
+/// ones, before the stream opens. A malformed message, or one addressed
+/// elsewhere than the first, ends an open stream after the answers to the
+/// messages before it, and the group keeps serving.
+#[tokio::test]
+async fn a_stream_is_refused_as_unary_append_is() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let valid = wire_append(node.id, &consecutive(&[1])[0]);
+    let headed = |header: Header| AppendRequest {
+        header: Some(header),
+        ..valid.clone()
+    };
+    let unknown_group = Header {
+        group: GROUP + 1,
+        ..header(VERSION)
+    };
+    let stranger = wire_append(NodeId::from(9), &consecutive(&[1])[0]);
+    let refused = [
+        (headed(header(VERSION + 1)), Code::FailedPrecondition),
+        (headed(unknown_group.clone()), Code::NotFound),
+        (stranger, Code::NotFound),
+    ];
+    for (request, code) in refused {
+        assert_eq!(raw_stream(addr, vec![request]).await, Err(code));
+    }
+
+    let uncommitted = AppendRequest {
+        vote: Some(WireVote::from(&Vote::new(1, NodeId::from(2)))),
+        ..valid.clone()
+    };
+    let gap = wire_append(node.id, &append(vec![entry(3, 16)]));
+    let elsewhere = AppendRequest {
+        header: Some(unknown_group),
+        ..wire_append(node.id, &consecutive(&[1, 1])[1])
+    };
+    for bad in [uncommitted, gap, elsewhere] {
+        let replies = raw_stream(addr, vec![valid.clone(), bad])
+            .await
+            .expect("open");
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert!(replies[0].is_ok(), "{replies:?}");
+        assert_eq!(replies[1], Err(Code::InvalidArgument));
+    }
+
+    let mut client = client_to(&peers, node.id, addr).await;
+    let answers = streamed(&mut client, consecutive(&[1, 1]), option())
+        .await
+        .expect("still serving");
+    assert_eq!(matched(&answers), [Some(0), Some(1)]);
+    node.kill().await;
+}
+
+#[tokio::test]
+async fn a_stream_to_a_group_the_peer_does_not_host_is_unreachable() {
+    let (incoming, addr) = bind();
+    let (_stop, _serving) = serve(ReplicationServer::default(), incoming);
+    let mut client = client_to(&Peers::plaintext(), NodeId::from(1), addr).await;
+    let result = streamed(&mut client, consecutive(&[1]), option()).await;
+    assert!(
+        matches!(result, Err(RPCError::Unreachable(_))),
+        "{result:?}"
+    );
+}
+
+/// A stopped `Raft` leaves admitted appends unanswered: the stream ends
+/// `UNAVAILABLE`, an unreachable peer, not a clean end.
+#[tokio::test]
+async fn a_stream_to_a_stopped_group_is_unreachable() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    node.raft.shutdown().await.expect("shutdown");
+    let mut client = client_to(&peers, node.id, addr).await;
+    let answers = streamed(&mut client, consecutive(&[1]), option())
+        .await
+        .expect("opens");
+    assert!(
+        matches!(answers.as_slice(), [Err(RPCError::Unreachable(_))]),
+        "{answers:?}"
+    );
+    node.kill().await;
+}
+
+/// A leader holds its stream open while it has nothing to send; the
+/// follower stopping still ends it, and its server can shut down.
+#[tokio::test]
+async fn an_idle_stream_ends_when_the_group_stops() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    let input =
+        futures_util::stream::iter(consecutive(&[1])).chain(futures_util::stream::pending());
+    let mut answers = client.stream_append(input, option()).await.expect("open");
+    let first = answers.next().await.expect("an answer");
+    assert!(matches!(first, Ok(Ok(Some(_)))), "{first:?}");
+    let idle = tokio::time::timeout(Duration::from_millis(200), answers.next()).await;
+    assert!(idle.is_err(), "an idle stream is not a timeout: {idle:?}");
+
+    node.raft.shutdown().await.expect("shutdown");
+    let ended = answers.next().await.expect("an end");
+    assert!(matches!(ended, Err(RPCError::Unreachable(_))), "{ended:?}");
+    drop(answers);
+    node.kill().await;
+}
+
+#[tokio::test]
+async fn a_stream_to_a_silent_peer_times_out() {
+    let (_listener, addr) = silent_peer();
+    let mut client = client_to(&Peers::plaintext(), NodeId::from(1), addr).await;
+    let option = RPCOption::new(Duration::from_millis(200));
+    let result = streamed(&mut client, consecutive(&[1]), option).await;
+    assert!(matches!(result, Err(RPCError::Timeout(_))), "{result:?}");
+}
+
+/// A heartbeat is a stream of one entry-less append: a successful one
+/// leaves no span, and a stream that carries entries leaves one span on
+/// each side.
+#[tokio::test]
+async fn a_stream_is_traced_once_and_only_when_it_carries_entries() {
+    let (exporter, tracing, _default) = capture();
+    let (incoming, addr) = bind();
+    let peers = Peers::traced_by(tracing.clone());
+    let server = ReplicationServer::traced_by(tracing);
+    let mut node = Node::start(1, incoming, &peers, server).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    let heartbeat = streamed(&mut client, consecutive(&[0]), option()).await;
+    assert_eq!(matched(&heartbeat.expect("heartbeat")), [None]);
+
+    let carrying = streamed(&mut client, consecutive(&[2, 1]), option()).await;
+    assert_eq!(matched(&carrying.expect("stream")), [Some(1), Some(2)]);
+    node.kill().await;
+
+    let spans = peer_spans(&exporter);
+    assert_eq!(spans.len(), 2, "{spans:?}");
+    for kind in [SpanKind::Client, SpanKind::Server] {
+        let span = of_kind(&spans, &kind);
+        assert_eq!(rpc_of(&span), expected_rpc("StreamAppend", "OK"));
+        assert!(!failure_of(&span).0, "{span:?}");
+    }
 }

@@ -267,6 +267,19 @@ Each invalid value fails startup with an error naming its
 `receiver.wal.*` key. Because `tls` is file-only, `replicated` cannot be
 selected from the environment alone.
 
+`replicated` needs S3 or an S3-compatible store: on the local filesystem
+store, which has no conditional updates, startup fails naming
+`storage.backend`. The first start records the voting layout (the `peers`
+ids, `groups` and `replication_factor`) in the store at
+`wal/replicated/cluster.json`, and every later start compares its
+configuration with that record. A difference fails startup with an error
+naming the key and both values; the order of `peers` does not matter.
+Changing the voting layout is not supported yet. `tail_peers`,
+`tail_replicas` and `tail_clients` are not part of the layout and may
+change at any time. Each replica also writes its identity to
+`wal_root/replica.id` on its first start; a start that finds that file
+unreadable or malformed fails rather than replacing it.
+
 ## Listener TLS
 
 TLS is **file-only** too ([RFC 0030](../rfcs/0030-tls-mtls-listeners.md));

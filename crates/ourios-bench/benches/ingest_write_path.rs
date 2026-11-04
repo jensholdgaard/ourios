@@ -28,7 +28,7 @@ use ourios_core::record::{BodyKind, MinedRecord, Param, RecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink};
 use ourios_parquet::Store;
-use ourios_wal::{FrameKind, Wal, WalConfig};
+use ourios_wal::{FrameKind, SyncedOffsetMode, Wal, WalConfig};
 
 /// A representative ack unit: a single batch frame (~one small OTLP export).
 const FRAME_LEN: usize = 4 * 1024;
@@ -115,6 +115,55 @@ fn wal_append(c: &mut Criterion) {
     group.finish();
 }
 
+/// SPIKE (RFC 0068 §4.3): the same durable-ack unit with and without a
+/// durable synced offset, over three batch shapes `(frame bytes, frames per
+/// sync)`. `off` is the baseline, measured in the same process so the
+/// overhead is a same-runner comparison.
+fn wal_append_synced_offset(c: &mut Criterion) {
+    const SHAPES: [(usize, usize); 3] = [(4 * 1024, 1), (64 * 1024, 1), (4 * 1024, 16)];
+    const MODES: [(&str, Option<SyncedOffsetMode>); 4] = [
+        ("off", None),
+        ("sidecar_seq", Some(SyncedOffsetMode::SidecarSequential)),
+        (
+            "sidecar_concurrent",
+            Some(SyncedOffsetMode::SidecarConcurrent),
+        ),
+        ("in_segment", Some(SyncedOffsetMode::InSegment)),
+    ];
+    let mut group = c.benchmark_group("wal_append_synced_offset");
+    for (frame_len, frames) in SHAPES {
+        let payload = vec![0xA5u8; frame_len];
+        group.throughput(Throughput::Bytes((frame_len * frames) as u64));
+        for (name, mode) in MODES {
+            let id = BenchmarkId::new(format!("{}k_x{frames}", frame_len / 1024), name);
+            group.bench_function(id, |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let dir = tempfile::TempDir::new().expect("temp");
+                        let mut wal = Wal::open(wal_config(dir.path())).expect("open");
+                        if let Some(mode) = mode {
+                            wal.enable_synced_offset_spike(mode).expect("synced offset");
+                        }
+                        wal.append(FrameKind::OtlpBatch, &payload)
+                            .expect("warm append");
+                        wal.sync().expect("warm sync");
+
+                        let start = Instant::now();
+                        for _ in 0..frames {
+                            wal.append(FrameKind::OtlpBatch, &payload).expect("append");
+                        }
+                        black_box(wal.sync().expect("sync"));
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 /// WAL → Parquet: feed `N` records to the sink and flush to one object.
 fn sink_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("sink_write");
@@ -165,5 +214,5 @@ fn sink_write(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, wal_append, sink_write);
+criterion_group!(benches, wal_append, wal_append_synced_offset, sink_write);
 criterion_main!(benches);

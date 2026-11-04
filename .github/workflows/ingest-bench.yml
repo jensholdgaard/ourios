@@ -44,8 +44,10 @@ jobs:
           # criterion results — clear so the artifact holds only this run.
           # (`pipefail` so a bench failure isn't masked by the `tee` pipe.)
           rm -rf target/criterion
-          cargo bench -p ourios-bench --bench ingest_write_path --bench recovery -- \
-            --warm-up-time 1 --measurement-time 3 2>&1 | tee ingest-bench.log
+          # SPIKE (RFC 0068 §4.3): only the WAL append groups, longer
+          # measurement for a tighter interval on the overhead.
+          cargo bench -p ourios-bench --bench ingest_write_path -- \
+            --warm-up-time 2 --measurement-time 10 wal_append 2>&1 | tee ingest-bench.log
       - name: Write job summary
         if: always()
         shell: bash

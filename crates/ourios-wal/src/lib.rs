@@ -53,6 +53,8 @@ pub(crate) mod replicated;
 pub(crate) mod retain;
 pub(crate) mod rotation;
 pub(crate) mod segment;
+mod synced_offset;
+pub use synced_offset::SyncedOffsetMode;
 
 pub use ledger::LedgerError;
 pub use pass::{
@@ -493,6 +495,7 @@ pub struct Wal {
     syncs_total: u64,
     unflushed_bytes: u64,
     corrupt_frames_total: u64,
+    synced_offset: Option<synced_offset::SyncedOffset>,
 }
 
 impl Wal {
@@ -592,6 +595,7 @@ impl Wal {
             syncs_total: 0,
             unflushed_bytes: 0,
             corrupt_frames_total: 0,
+            synced_offset: None,
         })
     }
 
@@ -1082,7 +1086,10 @@ impl Wal {
         {
             return Err(SyncError::RotationTerminal(fault.clone()));
         }
-        self.sync_segment_data()?;
+        match self.synced_offset.as_ref().map(|s| s.mode) {
+            None => self.sync_segment_data()?,
+            Some(mode) => self.sync_with_offset(mode)?,
+        }
         self.discharge_dir_fsync()?;
         // Everything written so far is now durable; the highest
         // durable byte is the segment's current length. Re-stat
@@ -1102,6 +1109,66 @@ impl Wal {
             segment: self.current_segment_uuid,
             byte,
         })
+    }
+
+    /// SPIKE (RFC 0068 §4.3): make every later [`Self::sync`] also persist
+    /// a synced-offset record before it returns.
+    ///
+    /// # Errors
+    ///
+    /// The sidecar could not be created and fsynced.
+    pub fn enable_synced_offset_spike(&mut self, mode: SyncedOffsetMode) -> std::io::Result<()> {
+        self.synced_offset = Some(synced_offset::SyncedOffset::new(&self.config.root, mode)?);
+        Ok(())
+    }
+
+    fn sync_with_offset(&mut self, mode: SyncedOffsetMode) -> Result<(), SyncError> {
+        let io = |op: &'static str| move |source| SyncError::Io { op, source };
+        let byte = self
+            .current_segment
+            .metadata()
+            .map_err(io("stat(current_segment)"))?
+            .len();
+        let segment = self.current_segment_uuid;
+        let full = self.config.macos_full_fsync;
+        let Some(state) = self.synced_offset.as_mut() else {
+            return self.sync_segment_data();
+        };
+        match mode {
+            SyncedOffsetMode::InSegment => {
+                state
+                    .write_in_segment(segment, &self.current_segment_path)
+                    .map_err(io("pwrite(segment_slot)"))?;
+                self.sync_segment_data()
+            }
+            SyncedOffsetMode::SidecarSequential => {
+                sync_file_data(&self.current_segment, full).map_err(io("sync(current_segment)"))?;
+                if let Some((file, rec, pos)) = state.sidecar_write(segment, byte) {
+                    synced_offset::SyncedOffset::write_sidecar(file, &rec, pos, full)
+                        .map_err(io("sync(synced_sidecar)"))?;
+                }
+                Ok(())
+            }
+            SyncedOffsetMode::SidecarConcurrent => {
+                let seg = &self.current_segment;
+                let side = state.sidecar_write(segment, byte);
+                let (a, b) = std::thread::scope(|s| {
+                    let h = s.spawn(|| match side {
+                        Some((file, rec, pos)) => {
+                            synced_offset::SyncedOffset::write_sidecar(file, &rec, pos, full)
+                        }
+                        None => Ok(()),
+                    });
+                    let a = sync_file_data(seg, full);
+                    let b = h.join().unwrap_or_else(|_| {
+                        Err(std::io::Error::other("synced-offset thread panicked"))
+                    });
+                    (a, b)
+                });
+                a.map_err(io("sync(current_segment)"))?;
+                b.map_err(io("sync(synced_sidecar)"))
+            }
+        }
     }
 
     /// Make the current segment's directory entry durable when one of

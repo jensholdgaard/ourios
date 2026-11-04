@@ -1685,7 +1685,15 @@ fn rotation_record_failed(e: reclaim_store::StoreError) -> AppendError {
 /// directory it created along with the one holding the outermost —
 /// makes every entry the listing saw durable, and any of those fsyncs
 /// failing is a fault to surface rather than to continue past.
-fn prepare_root(root: &std::path::Path) -> Result<(), OpenError> {
+///
+/// Public so other files under `wal_root` (RFC 0065's `replica.id`) get
+/// the same durable creation.
+///
+/// # Errors
+///
+/// [`OpenError::Io`] if creating `root` or fsyncing it or a created
+/// ancestor fails.
+pub fn prepare_root(root: &std::path::Path) -> Result<(), OpenError> {
     prepare_root_with(root, sync_parent_dir)
 }
 

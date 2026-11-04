@@ -16,3 +16,4 @@ pub mod env_subst;
 pub mod file;
 
 pub mod resolve;
+pub mod wal;

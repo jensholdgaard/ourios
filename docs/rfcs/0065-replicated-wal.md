@@ -231,7 +231,7 @@ receiver:
     backend: replicated           # local (default) | replicated | kafka (RFC 0066)
     replicated:
       node_id: "${env:OURIOS_NODE_ID}"          # stable and unique, e.g. the pod name
-      listen_addr: 0.0.0.0:4319                 # the peer listener
+      listen_addr: 0.0.0.0:4320                 # the peer listener
       peers: "${env:OURIOS_RECEIVER_WAL_PEERS}"           # voting replicas: id=host:port,…
       tail_peers: "${env:OURIOS_RECEIVER_WAL_TAIL_PEERS}" # tail pool: id=host:port,… (B24)
       groups: 16
@@ -244,7 +244,10 @@ receiver:
 Every leaf is `${env:VAR}`-substitutable like `ReceiverSection`, with
 bare env under `OURIOS_RECEIVER_WAL_*`. A node is a voter if its
 `node_id` is in `peers` and a tail replica if it is in `tail_peers`,
-never both. `replication_factor` is 3 or 5 and at most `peers`; its
+never both, so no id appears in both lists; each list is a
+comma-separated `id=host:port` string, so one `${env:…}` carries it.
+The peer port defaults to 4320, beside OTLP's 4317 and 4318 and the
+querier's 4319. `replication_factor` is 3 or 5 and at most `peers`; its
 majority is the write quorum (B1), so the durability floor is derived,
 not set (an even factor would add a copy without raising the floor, and
 1 is the local backend). `tail_replicas` is `1..=tail_peers`: one tail
@@ -343,9 +346,13 @@ testing and without membership change.
 
 The shape, replacing §6.2–§6.4:
 - **Storage:** `RaftLogStorage` over RFC 0008 segments; frame kind
-  `0x04` carries the Raft log id `(term, index)` where §6.3 has
-  `(epoch, seq)`; votes go in one group-committed vote log per node
-  (§4.7, §6.1).
+  `0x04` (`ReplicatedEntry`) carries the Raft log id `(term, index)`
+  where §6.3 has `(epoch, seq)`, as a tagged record: a blank, normal or
+  membership entry, or a truncation, purge or commit marker. The log id
+  is `(term, index)` because the type config uses `openraft`'s
+  standard leader id (`impls::leader_id_std::LeaderId`); its default
+  would add the node id. Votes go in one group-committed vote log per
+  node (§4.7, §6.1).
 - **Transport:** `RaftNetworkV2` over tonic with RFC 0030 mTLS.
 - **Checkpoint:** a metadata-only snapshot `{index, term, Parquet
   manifest reference}`; purging follows it, and a lagging follower
@@ -353,8 +360,11 @@ The shape, replacing §6.2–§6.4:
 - **Tail (B23, B24):** served by non-voting **learners**, which receive
   and apply the committed log but never count toward an ack, so adding
   them scales query capacity without touching the write path. A learner
-  confirms it is current with one `read_log_id` call to the leader per
-  batch of reads (openraft's documented follower-read flow), then reads
+  confirms it is current with one read-index confirmation from the
+  leader per batch of reads, an Ourios peer RPC over openraft's
+  follower-read flow (the leader's `get_read_linearizer(ReadIndex)`
+  returns the read log id; the learner's `Linearizer` waits until it
+  has applied through it), then reads
   locally. Learners mine the raw frames themselves with a deterministic
   miner (§6.7), and one of them, the flusher, writes Parquet (§6.5);
   the leader does not mine.
@@ -367,7 +377,7 @@ The shape, replacing §6.2–§6.4:
 disk and fsync per group), though acks wait for the fastest majority,
 not the slowest in-sync member. `client_write` resolves after apply, so
 apply only queues frames for the miner. Clock-free tail reads cost a
-`read_log_id` round trip to the leader per read batch.
+read-index round trip to the leader per read batch.
 
 **Risks.** 0.10 is alpha and still receiving safety fixes, so we would
 pin a reviewed git revision; 0.9 is frozen and may lack the latest
@@ -886,7 +896,12 @@ the mass-failover time and vote-log batching as tuning signals.
   fixed by this RFC and pinned by golden values (RFC0065.8).
 - **A group's voters** are the `replication_factor` members of `peers`
   with the highest `xxh3_64(group, node_id)` (rendezvous hashing):
-  deterministic, spread across nodes, with no record of its own.
+  deterministic, spread across nodes, with no record of its own. Here
+  `xxh3_64(group, node_id)` hashes, with seed 0, the group number as a
+  4-byte big-endian `u32` followed by the `node_id`'s UTF-8 bytes; equal
+  scores rank the smaller `node_id` (bytewise) first. The tail
+  placement uses the same score, and both are pinned by golden values
+  (RFC0065.8).
 - **A replica's identity lives on its disk (B4, B6).** The first start
   on an empty `wal_root` writes a `replica.id` file holding a fresh
   UUIDv7, fsynced, and the Raft node id is that UUID, not `node_id`
@@ -922,8 +937,15 @@ the mass-failover time and vote-log batching as tuning signals.
   passes a size threshold. Recovery takes the last record per group.
 - **No storage operation blocks the Raft runtime's workers.** Vote
   writes, `sync`, truncation and purge markers run on the WAL's own
-  threads and complete through callbacks; a blocking call on a worker
-  thread caused §4.7's election storm.
+  threads. An append completes through `openraft`'s `IOFlushed`
+  callback once the fsync covering it returns; `save_vote`,
+  `truncate_after` and `purge` are async calls whose futures resolve
+  after that thread's fsync, so they park only their group's Raft
+  task, never a worker; a blocking call on a worker thread caused
+  §4.7's election storm. `save_committed` only queues its marker,
+  which rides a later fsync: the commit index is not durable on
+  return, which is safe only with `enable_leader_restore = false`
+  (§4.5).
 
 ### 6.2 The group record
 
@@ -1247,7 +1269,7 @@ never count toward an ack (learners, under §4.3's shape).
   flusher's anyway is a bug B16 catches (RFC0065.20).
 - **Read your acks (B14) without touching ingest (B23).** A `Tail` call
   to a tail replica first obtains a **quorum-confirmed** read point:
-  the replica asks the leader for its `read_log_id`, which the leader
+  the replica asks the leader for its read log id, which the leader
   returns only after confirming its leadership with a quorum (ReadIndex,
   not a lease), so a deposed leader or one whose commit point lags
   cannot answer. One confirmation serves every read queued before it
@@ -1458,7 +1480,7 @@ rest of this section.
 - `receiver.wal.backend: replicated` keeps the receiver StatefulSet and
   its volume claims as the voters, and renders `peers` from
   `receiver.replicas` and the existing `-receiver-headless` Service
-  (`ourios-receiver-<i>.<service>:4319`), with `node_id` from the pod
+  (`ourios-receiver-<i>.<service>:4320`), with `node_id` from the pod
   name.
 - The tail pool is a second StatefulSet, `-wal-tail`, with its own
   `walTail.replicas`, volume claims (by default twice 24 hours of the

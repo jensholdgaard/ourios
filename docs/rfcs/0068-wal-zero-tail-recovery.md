@@ -122,6 +122,16 @@ a torn shared sector would damage an acknowledged frame today.
 RFC 0008 would then fail closed with a CRC mismatch, whereas T2 would
 cut the frame if the torn sector read back as zeros.
 
+The storage Ourios targets documents the guarantee. AWS EBS prevents
+torn writes for aligned 4, 8 and 16 KiB writes on Nitro instances. GCP
+Hyperdisk writes 128 KB units atomically within 1 MB boundaries. NVMe
+encodes AWUPF from zero, so every drive declares at least one block.
+Consumer drives without power-loss protection give no such promise,
+and on them RFC 0008 is not safe either, since they can lose data that
+was already fsynced. The operations docs therefore state sector-write
+atomicity as a deployment requirement, beside the existing
+local-filesystem requirement.
+
 Under that guarantee, a zero run a crash leaves lies wholly after the
 last synced offset. T2 only removes bytes at or after `B`, the end of
 the last complete, valid frame, so every acknowledged frame ends at or
@@ -132,7 +142,8 @@ that zeroes every byte from the start of an acknowledged frame through
 EOF on the newest segment would be healed instead of reported. A fault
 that zeroes only part of a frame leaves a complete frame with a CRC
 mismatch, or a non-zero byte inside the run, and both stay corruption.
-§7 asks whether to accept the whole-frames-zeroed case.
+This RFC accepts that risk. Closing it needs §4.3's synced offset,
+whose measured cost is a second flush on every sync.
 
 ### 3.5 Amendments to RFC 0008
 
@@ -188,9 +199,42 @@ window in which a batch is acknowledged but the recorded offset is
 still the previous one. Recovery could
 then cut any damaged tail that starts past that offset, including §4.2's
 shape, and fail closed on any damage before it. That would also remove
-§3.4's residual risk. The price is a second durable write per sync on
-the ingest hot path, which the `criterion` benchmarks gate. It is the
-follow-up if §7 decides either gap matters.
+§3.4's residual risk.
+
+A spike measured the price (branch `spike/rfc0068-synced-offset`, not
+for merge). Each record is a segment UUID, an offset, a sequence number
+and a CRC, written to one of two slots in turn, so a torn record write
+damages only the slot of a batch not yet acknowledged. Three designs
+were built:
+
+| Design | Order of the writes | Never claims unsynced data | Heals §4.2 |
+|---|---|---|---|
+| Sequential sidecar | fdatasync the segment, then write and fdatasync a `SYNCED` file | yes | yes |
+| Concurrent sidecar | both fdatasyncs at once | no | only if the record misses the crash |
+| In-segment slot | the record shares the segment's one fdatasync | no | only if the record misses the crash |
+
+Within one flush the device may persist blocks in any order, so a
+record flushed with its data can reach disk while the data does not.
+Recovery then cannot tell an unacknowledged batch from a device fault,
+and must fail closed on it. Only the sequential design both covers
+every acknowledged frame and never names data that was not synced. No
+single-flush design does both: writing the previous batch's offset
+instead never overclaims, but leaves the last acknowledged batch above
+the record.
+
+Per-sync latency, interleaved A/B runs, 4 KiB to 64 KiB batches:
+
+| Platform | Without | Sequential | Concurrent | In-segment |
+|---|---|---|---|---|
+| Linux CI runner, fdatasync, p50 | 375–474 µs | +30–40% (about +140 µs) | +3–12% | +24–29% |
+| macOS, `F_FULLFSYNC`, p50 | 4.0–5.0 ms | +80–100% (about +4 ms) | +80–100% | 0% |
+
+The cost is per sync, so group commit only spreads it over more frames.
+Each cheap design is cheap on one platform only, and neither is precise.
+This RFC does not adopt §4.3. The replicated backend's fault tests
+(RFC 0065) revisit it: there, a replica that silently loses an
+acknowledged entry still votes under its old identity, so the loss can
+reach the whole group.
 
 ### 4.4 Preallocate and zero every segment
 
@@ -280,20 +324,16 @@ remove. It may still be worth having for real corruption, separately.
 
 ## 7. Open questions
 
-- [ ] **Require sector-write atomicity (§3.4)?** On storage that lacks
-  it, a power cut during a later append could zero a shared sector and
-  T2 would cut an acknowledged frame. The draft states the guarantee
-  as a deployment requirement in the operations docs, beside the
-  existing local-filesystem requirement. The alternative, §4.3's synced
-  offset, removes the dependency.
-- [ ] **Accept §3.4's residual risk?** A device fault that zeroes every
-  byte from the start of an acknowledged frame through EOF on the
-  newest segment would be healed instead of reported. The draft accepts
-  it. The alternative, §4.3's synced offset, costs a durable write per
-  sync.
-- [ ] **Heal §4.2's shape later?** A frame whose payload block was never
-  written stays corruption under this RFC. Should a follow-up add §4.3
-  to heal it as well?
+- [x] **Require sector-write atomicity (§3.4)?** Yes, as a deployment
+  requirement in the operations docs. EBS, Hyperdisk and NVMe document
+  it, and RFC 0008 already depends on it (§3.4).
+- [x] **Accept §3.4's residual risk?** Yes. Closing it costs 30–40% of
+  sync latency on Linux and doubles it on macOS (§4.3), to guard
+  against a device fault on hardware that already breaks the first
+  answer's requirement.
+- [x] **Heal §4.2's shape later?** Not in this RFC. Only §4.3's
+  sequential design heals it, so it is revisited with §4.3 in RFC
+  0065's fault tests.
 - [ ] **The counter's name and unit.** These go through the
   `ourios-semconv` registry.
 
@@ -309,6 +349,12 @@ remove. It may still be worth having for real corruption, separately.
 - #1165, the issue this RFC answers.
 - AGENTS.md §3.4 (WAL-before-ack) and §4 hazard 3 (WAL durability
   versus latency); `docs/hazards.md` H3.
+- Sector-write atomicity: AWS EBS supported block sizes and torn write
+  prevention (<https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-block-sizes.html>);
+  GCP Hyperdisk atomic writes
+  (<https://cloud.google.com/compute/docs/disks/hyperdisks>); the NVMe
+  base specification's AWUPF field; Zheng et al., "Understanding the
+  Robustness of SSDs under Power Fault", FAST '13.
 - ext4 delayed allocation and the zero-length-file-after-crash
   behaviour: `Documentation/admin-guide/ext4.rst`, the `auto_da_alloc`
   mount option.

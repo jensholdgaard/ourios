@@ -107,10 +107,25 @@ audit event being deferred (RFC 0008 §5, 2026-06-13 amendment).
 
 A frame is acknowledged only after a `Wal::sync` covering it has
 returned (RFC 0008 §6.3). By then its bytes are on stable storage, and
-delayed allocation cannot later turn them into zeros. A zero run a
-crash leaves therefore lies wholly after the last synced offset, and T2
-only removes bytes at or after `B`, the end of the last complete, valid
-frame. Every acknowledged frame ends at or before `B` and is replayed.
+delayed allocation cannot later turn them into zeros, because it zeroes
+only blocks that were never written.
+
+Frames are packed, though, so an acknowledged frame can share a sector
+with a later, unsynced append. Writing that append back rewrites the
+shared sector. The argument therefore rests on a **storage guarantee**:
+a sector write interrupted by power loss leaves that sector holding its
+old contents or its new contents, never zeros or a mix. This is the
+sector-atomicity guarantee that SCSI and SATA drives give, and that
+NVMe states as its power-fail atomic write unit (AWUPF, at least one
+logical block). It is also what RFC 0008 already relies on: without it,
+a torn shared sector would damage an acknowledged frame today.
+RFC 0008 would then fail closed with a CRC mismatch, whereas T2 would
+cut the frame if the torn sector read back as zeros.
+
+Under that guarantee, a zero run a crash leaves lies wholly after the
+last synced offset. T2 only removes bytes at or after `B`, the end of
+the last complete, valid frame, so every acknowledged frame ends at or
+before `B` and is replayed.
 
 The residual risk is narrower than a damaged frame: a **device fault**
 that zeroes every byte from the start of an acknowledged frame through
@@ -238,6 +253,9 @@ remove. It may still be worth having for real corruption, separately.
 >   a partial sector
 > - **Then** recovery opens and every acknowledged record is present, as
 >   RFC0008.2 already requires
+> - **And** the zero extension starts at or after the last synced
+>   offset. The shared-sector power-loss case lies outside §3.4's
+>   storage guarantee and is not simulated
 
 > **Scenario RFC0068.5 — a heal is reported**
 > - **Given** a recovery that heals a tail as T1 or T2
@@ -262,6 +280,12 @@ remove. It may still be worth having for real corruption, separately.
 
 ## 7. Open questions
 
+- [ ] **Require sector-write atomicity (§3.4)?** On storage that lacks
+  it, a power cut during a later append could zero a shared sector and
+  T2 would cut an acknowledged frame. The draft states the guarantee
+  as a deployment requirement in the operations docs, beside the
+  existing local-filesystem requirement. The alternative, §4.3's synced
+  offset, removes the dependency.
 - [ ] **Accept §3.4's residual risk?** A device fault that zeroes every
   byte from the start of an acknowledged frame through EOF on the
   newest segment would be healed instead of reported. The draft accepts

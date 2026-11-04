@@ -886,7 +886,12 @@ the mass-failover time and vote-log batching as tuning signals.
   fixed by this RFC and pinned by golden values (RFC0065.8).
 - **A group's voters** are the `replication_factor` members of `peers`
   with the highest `xxh3_64(group, node_id)` (rendezvous hashing):
-  deterministic, spread across nodes, with no record of its own.
+  deterministic, spread across nodes, with no record of its own. Here
+  `xxh3_64(group, node_id)` hashes, with seed 0, the group number as a
+  4-byte big-endian `u32` followed by the `node_id`'s UTF-8 bytes; equal
+  scores rank the smaller `node_id` (bytewise) first. The tail
+  placement uses the same score, and both are pinned by golden values
+  (RFC0065.8).
 - **A replica's identity lives on its disk (B4, B6).** The first start
   on an empty `wal_root` writes a `replica.id` file holding a fresh
   UUIDv7, fsynced, and the Raft node id is that UUID, not `node_id`

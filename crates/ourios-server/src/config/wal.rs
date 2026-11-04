@@ -5,7 +5,7 @@
 //! block (TLS is config-file only, RFC 0030 §3.1), the file path passes
 //! `receiver.wal.*`. Every error names the offending key.
 
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
 use ourios_serving::tls::TlsSettings;
@@ -186,12 +186,75 @@ pub fn build_wal_backend(inputs: WalInputs<'_>) -> Result<WalBackend, String> {
     }
 }
 
+/// One `receiver.wal.replicated` leaf: its YAML key and the suffix of its
+/// `OURIOS_RECEIVER_WAL_*` variable, which every error names together.
+#[derive(Clone, Copy)]
+struct Leaf {
+    field: &'static str,
+    env: &'static str,
+}
+
+const PEERS: Leaf = Leaf {
+    field: "peers",
+    env: "PEERS",
+};
+const TAIL_PEERS: Leaf = Leaf {
+    field: "tail_peers",
+    env: "TAIL_PEERS",
+};
+const NODE_ID: Leaf = Leaf {
+    field: "node_id",
+    env: "NODE_ID",
+};
+const TAIL_CLIENTS: Leaf = Leaf {
+    field: "tail_clients",
+    env: "TAIL_CLIENTS",
+};
+
+impl Leaf {
+    fn error(self, detail: impl std::fmt::Display) -> String {
+        format!(
+            "receiver.wal.replicated.{} (OURIOS_RECEIVER_WAL_{}) {detail}",
+            self.field, self.env
+        )
+    }
+
+    fn required(self, raw: Option<&str>) -> Result<&str, String> {
+        present(raw)
+            .ok_or_else(|| self.error("is required when receiver.wal.backend is \"replicated\""))
+    }
+
+    /// Split a comma-separated list, rejecting an empty entry (a stray
+    /// comma is more likely a typo than an intent).
+    fn list(self, raw: &str) -> Result<Vec<&str>, String> {
+        raw.split(',')
+            .map(str::trim)
+            .map(|entry| match entry {
+                "" => Err(self.error(format_args!("has an empty entry in {raw:?}"))),
+                entry => Ok(entry),
+            })
+            .collect()
+    }
+
+    fn peers(self, raw: Option<&str>) -> Result<Vec<Peer>, String> {
+        let mut peers: Vec<Peer> = Vec::new();
+        for entry in self.list(self.required(raw)?)? {
+            let peer = parse_peer(entry).ok_or_else(|| {
+                self.error(format_args!("entries must be id=host:port, got {entry:?}"))
+            })?;
+            if peers.iter().any(|seen| seen.id == peer.id) {
+                return Err(self.error(format_args!("lists the id {:?} more than once", peer.id)));
+            }
+            peers.push(peer);
+        }
+        Ok(peers)
+    }
+}
+
 fn build_replicated(inputs: WalInputs<'_>) -> Result<ReplicatedWal, String> {
-    let peers = required(inputs.peers, "peers", "PEERS")
-        .and_then(|raw| parse_peers(raw, "peers", "PEERS"))?;
-    let tail_peers = required(inputs.tail_peers, "tail_peers", "TAIL_PEERS")
-        .and_then(|raw| parse_peers(raw, "tail_peers", "TAIL_PEERS"))?;
-    let node_id = required(inputs.node_id, "node_id", "NODE_ID")?.to_owned();
+    let peers = PEERS.peers(inputs.peers)?;
+    let tail_peers = TAIL_PEERS.peers(inputs.tail_peers)?;
+    let node_id = NODE_ID.required(inputs.node_id)?.to_owned();
     let role = node_role(&node_id, &peers, &tail_peers)?;
     if let Some(shared) = peers
         .iter()
@@ -215,8 +278,8 @@ fn build_replicated(inputs: WalInputs<'_>) -> Result<ReplicatedWal, String> {
     let replication_factor =
         parse_replication_factor(present(inputs.replication_factor), peers.len())?;
     let tail_replicas = parse_tail_replicas(present(inputs.tail_replicas), tail_peers.len())?;
-    let tail_clients = required(inputs.tail_clients, "tail_clients", "TAIL_CLIENTS")
-        .and_then(|raw| list(raw, "tail_clients", "TAIL_CLIENTS"))?
+    let tail_clients = TAIL_CLIENTS
+        .list(TAIL_CLIENTS.required(inputs.tail_clients)?)?
         .into_iter()
         .map(str::to_owned)
         .collect();
@@ -239,64 +302,38 @@ fn present(raw: Option<&str>) -> Option<&str> {
     raw.map(str::trim).filter(|s| !s.is_empty())
 }
 
-fn required<'a>(raw: Option<&'a str>, field: &str, env: &str) -> Result<&'a str, String> {
-    present(raw).ok_or_else(|| {
-        format!(
-            "receiver.wal.replicated.{field} (OURIOS_RECEIVER_WAL_{env}) is required when \
-             receiver.wal.backend is \"replicated\""
-        )
-    })
-}
-
-/// Split a comma-separated list, rejecting an empty entry (a stray comma
-/// is more likely a typo than an intent).
-fn list<'a>(raw: &'a str, field: &str, env: &str) -> Result<Vec<&'a str>, String> {
-    raw.split(',')
-        .map(str::trim)
-        .map(|entry| match entry {
-            "" => Err(format!(
-                "receiver.wal.replicated.{field} (OURIOS_RECEIVER_WAL_{env}) has an empty \
-                 entry in {raw:?}"
-            )),
-            entry => Ok(entry),
-        })
-        .collect()
-}
-
-fn parse_peers(raw: &str, field: &str, env: &str) -> Result<Vec<Peer>, String> {
-    let mut peers: Vec<Peer> = Vec::new();
-    for entry in list(raw, field, env)? {
-        let peer = parse_peer(entry).ok_or_else(|| {
-            format!(
-                "receiver.wal.replicated.{field} (OURIOS_RECEIVER_WAL_{env}) entries must be \
-                 id=host:port, got {entry:?}"
-            )
-        })?;
-        if peers.iter().any(|seen| seen.id == peer.id) {
-            return Err(format!(
-                "receiver.wal.replicated.{field} (OURIOS_RECEIVER_WAL_{env}) lists the id {:?} \
-                 more than once",
-                peer.id
-            ));
-        }
-        peers.push(peer);
-    }
-    Ok(peers)
-}
-
 fn parse_peer(entry: &str) -> Option<Peer> {
     let (id, addr) = entry.split_once('=')?;
     let (host, port) = addr.rsplit_once(':')?;
+    let (id, host) = (id.trim(), host.trim());
     let port = port.trim().parse::<NonZeroU16>().ok()?;
+    let valid_id = !id.is_empty() && !id.contains(|c: char| c == '=' || c.is_whitespace());
     Some(Peer {
-        id: non_empty(id)?.to_owned(),
-        host: non_empty(host)?.to_owned(),
+        id: valid_id.then(|| id.to_owned())?,
+        host: valid_host(host).then(|| host.to_owned())?,
         port: port.get(),
     })
 }
 
-fn non_empty(raw: &str) -> Option<&str> {
-    Some(raw.trim()).filter(|trimmed| !trimmed.is_empty())
+/// A DNS name, an IPv4 address or a bracketed IPv6 address: anything
+/// else (a scheme, a space, a second `=` from a missing comma) is a typo
+/// that would otherwise only surface as a failed dial.
+fn valid_host(host: &str) -> bool {
+    let label = |label: &str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    match host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        Some(v6) => v6.parse::<Ipv6Addr>().is_ok(),
+        None => host.len() <= 253 && host.split('.').all(label),
+    }
 }
 
 fn node_role(node_id: &str, peers: &[Peer], tail_peers: &[Peer]) -> Result<NodeRole, String> {
@@ -484,10 +521,10 @@ mod tests {
         .map(|params| params.expect("enabled").wal)
     }
 
-    fn peer(id: &str, host: &str) -> Peer {
+    fn peer(id: &str) -> Peer {
         Peer {
             id: id.to_owned(),
-            host: host.to_owned(),
+            host: format!("{id}.wal"),
             port: 4320,
         }
     }
@@ -511,12 +548,8 @@ mod tests {
                 node_id: "receiver-0".to_owned(),
                 role: NodeRole::Voter,
                 listen_addr: "0.0.0.0:4400".parse().expect("addr"),
-                peers: vec![
-                    peer("receiver-0", "receiver-0.wal"),
-                    peer("receiver-1", "receiver-1.wal"),
-                    peer("receiver-2", "receiver-2.wal"),
-                ],
-                tail_peers: vec![peer("tail-0", "tail-0.wal"), peer("tail-1", "tail-1.wal")],
+                peers: vec![peer("receiver-0"), peer("receiver-1"), peer("receiver-2"),],
+                tail_peers: vec![peer("tail-0"), peer("tail-1")],
                 groups: NonZeroU32::new(32).expect("nonzero"),
                 replication_factor: ReplicationFactor::Three,
                 tail_replicas: NonZeroUsize::new(2).expect("nonzero"),
@@ -566,7 +599,7 @@ mod tests {
     }
 
     /// Each invalid input, with the field its error must name.
-    const INVALID: [(&str, &[Edit], &str); 23] = [
+    const INVALID: [(&str, &[Edit], &str); 28] = [
         // The criterion's inputs.
         ("no peers", &[("peers", None)], "peers"),
         (
@@ -613,6 +646,40 @@ mod tests {
             "a peer without a port",
             &[("peers", Some("receiver-0=host"))],
             "peers",
+        ),
+        (
+            "a peer with a scheme",
+            &[(
+                "peers",
+                Some("receiver-0=https://receiver-0.wal:4320,receiver-1=b:4320,receiver-2=c:4320"),
+            )],
+            "peers",
+        ),
+        (
+            "a peer host with a space",
+            &[(
+                "peers",
+                Some("receiver-0=bad host:4320,receiver-1=b:4320,receiver-2=c:4320"),
+            )],
+            "peers",
+        ),
+        (
+            "peers missing a comma",
+            &[(
+                "peers",
+                Some("receiver-0=a:4320receiver-1=b:4320,receiver-2=c:4320,receiver-3=d:4320"),
+            )],
+            "peers",
+        ),
+        (
+            "tail_peers missing a comma",
+            &[("tail_peers", Some("tail-0=t0:4320tail-1=t1:4320"))],
+            "tail_peers",
+        ),
+        (
+            "a tail peer with a scheme",
+            &[("tail_peers", Some("tail-0=http://t0:4320"))],
+            "tail_peers",
         ),
         (
             "a peer on port 0",
@@ -670,9 +737,9 @@ mod tests {
     /// through both front-ends.
     #[test]
     fn rfc0065_1_invalid_replicated_configs_fail_naming_the_field() {
-        for (case, edits, field) in INVALID {
+        for (_, edits, field) in INVALID {
             let key = format!("receiver.wal.replicated.{field} ");
-            assert_both_front_ends_fail(case, "replicated", edits, &key);
+            assert_both_front_ends_fail("replicated", edits, &key);
         }
 
         let tls_cases = [
@@ -696,17 +763,37 @@ mod tests {
         assert!(error.starts_with("receiver.wal.replicated.tls "), "{error}");
 
         for backend in ["kafka", "Replicated", "raft"] {
-            assert_both_front_ends_fail(backend, backend, &[], "receiver.wal.backend ");
+            assert_both_front_ends_fail(backend, &[], "receiver.wal.backend ");
         }
     }
 
-    fn assert_both_front_ends_fail(case: &str, backend: &str, edits: &[Edit], key: &str) {
+    fn assert_both_front_ends_fail(backend: &str, edits: &[Edit], key: &str) {
         for (front_end, result) in [
             ("file", from_file(Some(backend), edits, Some(MTLS))),
             ("env", from_env(Some(backend), edits)),
         ] {
-            let error = result.expect_err(case);
-            assert!(error.starts_with(key), "{case} ({front_end}): {error}");
+            let case = format!("{backend} {edits:?} ({front_end})");
+            let error = result.expect_err(&case);
+            assert!(error.starts_with(key), "{case}: {error}");
+        }
+    }
+
+    #[test]
+    fn peer_hosts_may_be_dns_names_ipv4_or_bracketed_ipv6() {
+        for host in [
+            "receiver-0.wal.svc.cluster.local",
+            "10.0.0.7",
+            "[::1]",
+            "[fd00::7]",
+        ] {
+            let peer = parse_peer(&format!("receiver-0={host}:4320")).expect(host);
+            assert_eq!((peer.host.as_str(), peer.port), (host, 4320));
+        }
+        for host in ["::1", "[::1", "-lead.wal", "a..b", "under_score"] {
+            assert!(
+                parse_peer(&format!("receiver-0={host}:4320")).is_none(),
+                "{host}"
+            );
         }
     }
 

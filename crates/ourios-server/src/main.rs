@@ -45,6 +45,7 @@ use ourios_server::config::resolve::{
     ServerConfig, config_from_env, config_from_file, preflight_tls, validate_graph_columns,
     wal_config, warn_if_open_mode, warn_if_plaintext_credentials,
 };
+use ourios_server::config::wal::WalBackend;
 
 use ourios_telemetry::TelemetryConfig;
 use tracing::Instrument as _;
@@ -516,6 +517,7 @@ async fn start_receiver(
     let Some(params) = &config.receiver else {
         return Ok(None);
     };
+    check_wal_backend(&params.wal)?;
     let receiver_config = receiver::ReceiverConfig {
         grpc_addr: params.grpc_addr,
         grpc_tls: params.grpc_tls.clone(),
@@ -612,6 +614,20 @@ fn listen_for_shutdown(
         std::sync::Arc::clone(&stopping),
     ));
     (stopping, signalled)
+}
+
+/// The replicated WAL (RFC 0065) resolves and validates but is not built
+/// yet, so a receiver configured for it refuses to start rather than
+/// silently running on the local WAL.
+fn check_wal_backend(wal: &WalBackend) -> Result<(), receiver::StartError> {
+    match wal {
+        WalBackend::Local => Ok(()),
+        WalBackend::Replicated(_) => Err(receiver::StartError::Failed(
+            "receiver.wal.backend \"replicated\" is not available yet (RFC 0065); \
+             use \"local\""
+                .to_owned(),
+        )),
+    }
 }
 
 /// What a failed receiver startup means for the process: a bootstrap scan
@@ -976,6 +992,43 @@ mod tests {
                 "template-id bootstrap scan: read data/x.parquet".to_owned()
             )),
             Err("template-id bootstrap scan: read data/x.parquet".to_owned())
+        );
+    }
+
+    #[test]
+    fn only_the_local_wal_backend_starts() {
+        assert!(check_wal_backend(&WalBackend::Local).is_ok());
+        let yaml = "\
+storage:
+  local:
+    bucket_root: /data
+receiver:
+  enabled: true
+  wal_root: /wal
+  wal:
+    backend: replicated
+    replicated:
+      node_id: a
+      peers: a=a:4320,b=b:4320,c=c:4320
+      tail_peers: t=t:4320
+      tail_clients: querier
+      tls:
+        cert_file: /tls/peer.crt
+        key_file: /tls/peer.key
+        client_ca_file: /tls/ca.crt
+";
+        let file = ourios_server::config::file::parse(yaml, &|_| None).expect("parses");
+        let config = ourios_server::config::resolve::server_config_from_file(&file)
+            .expect("a valid replicated config resolves");
+        let wal = config.receiver.expect("enabled").wal;
+        assert!(matches!(wal, WalBackend::Replicated(_)));
+        let refusal = check_wal_backend(&wal).expect_err("the replicated backend refuses");
+        assert_eq!(
+            startup_exit(refusal),
+            Err(
+                "receiver.wal.backend \"replicated\" is not available yet (RFC 0065); use \"local\""
+                    .to_owned()
+            )
         );
     }
 

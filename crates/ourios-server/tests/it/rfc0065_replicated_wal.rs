@@ -6,32 +6,6 @@
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC is
 //! red; each names the slice that discharges it.
 
-/// Scenario RFC0065.1 — the backend is configurable and checked at start.
-/// Given `receiver.wal.backend` unset, `local`, and `replicated` with every
-/// field set, then they start as local, local and replicated. The RFC
-/// places the config arms as unit tests in `src/config`.
-#[test]
-#[ignore = "RFC0065.1 stub — implemented with the `receiver.wal` config section"]
-fn rfc0065_1_valid_backends_start() {
-    todo!(
-        "RFC0065.1 — unset and `local` resolve to the local backend, `replicated` \
-         with every field set to the replicated one"
-    );
-}
-
-/// Scenario RFC0065.1 — the backend is configurable and checked at start,
-/// the invalid arm. Each of: no `peers`, a `node_id` in neither `peers`
-/// nor `tail_peers`, `replication_factor` 4 or above `peers`,
-/// `tail_replicas` 0, no `tls` — fails startup naming the field.
-#[test]
-#[ignore = "RFC0065.1 stub — implemented with the `receiver.wal` config section"]
-fn rfc0065_1_invalid_replicated_configs_fail_naming_the_field() {
-    todo!(
-        "RFC0065.1 — each invalid `replicated` config fails startup with an error \
-         naming `peers`, `node_id`, `replication_factor`, `tail_replicas` or `tls`"
-    );
-}
-
 /// Scenario RFC0065.1 — the backend is configurable and checked at start,
 /// the layout arm. A node whose `peers`, `groups` or `replication_factor`
 /// differs from the recorded `cluster.json` fails startup naming the field.

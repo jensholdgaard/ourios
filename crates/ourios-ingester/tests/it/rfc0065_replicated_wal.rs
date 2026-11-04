@@ -81,19 +81,6 @@ fn rfc0065_7_a_diverged_follower_is_repaired() {
     );
 }
 
-/// Scenario RFC0065.8 — routing and tenancy, the hash arm.
-/// Given the tenant and placement hashes on a fixed set of tenant ids and
-/// peers, then they return the golden values committed with the
-/// implementation. The RFC places this as a unit test next to the hashes.
-#[test]
-#[ignore = "RFC0065.8 stub — implemented with the tenant and placement hashes"]
-fn rfc0065_8_the_hashes_return_their_golden_values() {
-    todo!(
-        "RFC0065.8 — `xxh3_64(tenant_bytes) mod groups` and the rendezvous \
-         placement return the committed golden values"
-    );
-}
-
 /// Scenario RFC0065.8 — routing and tenancy (B9, B11, B12).
 /// Given two tenants in one group exporting to a node that does not hold
 /// their group, then both are acked and mined in log-position order.

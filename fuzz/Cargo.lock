@@ -2457,6 +2457,7 @@ dependencies = [
  "tonic-types",
  "tower",
  "tracing",
+ "twox-hash",
  "uuid",
 ]
 

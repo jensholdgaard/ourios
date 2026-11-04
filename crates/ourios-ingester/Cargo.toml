@@ -126,7 +126,8 @@ prost = { version = "0.14", default-features = false, features = ["std"] }
 # `ExportLogsServiceRequest` in the proto3-JSON mapping.
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # The replicated WAL's recorded voting layout (RFC 0065 §6.1) is a derived
-# JSON object; already in the tree via ourios-parquet.
+# JSON object, and openraft's `serde` feature needs the group's node id
+# and entry data serialisable; already in the tree via ourios-parquet.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 # HTTP transport (RFC 0003 §6.2): the OTLP/HTTP `/v1/logs` listener.
 # `tokio` + `http1` so the router can be served; the handler + extractors
@@ -155,11 +156,19 @@ tonic-types = { version = "0.14", default-features = false }
 # Parse the snapshot-recorded WAL high-water segment id back into the
 # `uuid::Uuid` of `ourios_wal::WalOffset` (RFC 0001 §6.9 / RFC 0008
 # §6.6). Same major as ourios-wal's, so the types unify.
-uuid = { version = "1", default-features = false, features = ["std", "v7"] }
+uuid = { version = "1", default-features = false, features = ["std", "v7", "serde"] }
 # XXH3-64 for the replicated WAL's tenant-to-group and rendezvous
 # placement hashes (RFC 0065 §6.1). Already in the tree via parquet and
 # lz4_flex; only the one hash is enabled.
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
+# The replicated WAL's per-group consensus (RFC 0065 §4.3). An exact
+# `main` revision, not a crates.io release: the safety fixes §4.5
+# requires (9567ffea, 0240eca5) are on `main` only. `serde` so the Raft
+# messages the peer transport will carry are serialisable.
+openraft = { git = "https://github.com/databendlabs/openraft", rev = "73273a67fd5bee278fa2155a1ed11963a70ee789", default-features = false, features = ["tokio-rt", "serde"] }
+# CRC32-C on each `votes.log` record (RFC 0065 §6.1), the checksum RFC
+# 0008 frames use. Already in the tree via ourios-wal.
+crc32c = "0.6"
 
 [features]
 # RFC 0029: OIDC bearer resolution in front of the RFC 0026 enforcement.

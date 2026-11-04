@@ -65,8 +65,8 @@ complete, valid frame. `B` is then the last valid frame boundary. Let
 `E` be the segment's length. Recovery treats `[B, E)` as a **torn
 tail**, the shapes RFC0008.4 heals, when either of these holds:
 
-- **T1, a partial frame (today's RFC0008.4).** Fewer than 12 bytes
-  remain at `B`, or the header at `B` is well-formed and its declared
+- **T1, a partial frame (today's RFC0008.4).** Between 1 and 11
+  bytes remain at `B` (`0 < E - B < 12`), or the header at `B` is well-formed and its declared
   payload runs past `E`.
 - **T2, a zero tail (new).** `E - B ≥ 12` and every byte in `[B, E)` is
   zero.
@@ -74,6 +74,8 @@ tail**, the shapes RFC0008.4 heals, when either of these holds:
 T2 is tested first. A zero header is otherwise read as T1's "header
 whose payload runs past `E`" only by accident, and it fails the
 well-formed check anyway, since kind `0x00` is unknown.
+
+When `E = B` the tail is clean and nothing is healed.
 
 A torn tail is healed by RFC 0008 §6.6 step 4, unchanged:
 `ftruncate(2)` to `B`, `fdatasync` the segment, then `fsync` the parent
@@ -292,19 +294,34 @@ remove. It may still be worth having for real corruption, separately.
 
 > **Scenario RFC0068.4 — a crash test with a zero-extended tail `[H3]`**
 > - **Given** the RFC0008.2 crash-recovery test
-> - **When**, after the kill, the newest segment is zero-extended past
->   its last synced offset, by a whole number of 512-byte sectors and by
->   a partial sector
+> - **When**, after the kill, the newest segment is cut back to the end
+>   `B` of its last valid frame, which is at or after its last synced
+>   offset, and every byte from `B` to a new end `E` is zero, with
+>   `E - B` a whole number of 512-byte sectors in one run and a partial
+>   sector in another
 > - **Then** recovery opens and every acknowledged record is present, as
 >   RFC0008.2 already requires
-> - **And** the zero extension starts at or after the last synced
->   offset. The shared-sector power-loss case lies outside §3.4's
->   storage guarantee and is not simulated
+> - **And** the segment is truncated to `B`. This scenario does not
+>   simulate a sector shared with a later append; RFC0068.6 does
+
+> **Scenario RFC0068.6 — a sector shared with an unsynced append `[H3]`**
+> - **Given** a newest segment whose last acknowledged frame ends at `X`
+>   inside a 512-byte sector, followed by an unsynced append that starts
+>   at `X` and runs past that sector
+> - **When** the segment is forged as a power cut under §3.4's guarantee
+>   leaves it: the shared sector holds its old contents (zeros after
+>   `X`) or its new contents, and every later byte of the append is zero
+> - **Then** recovery never truncates below `X`: it either opens with
+>   the acknowledged frame replayed, or fails as RFC0008.5 corruption
+>   with no segment modified
+> - **And** the old-contents arm is healed as T2 at `X`
 
 > **Scenario RFC0068.5 — a heal is reported**
-> - **Given** a recovery that heals a tail as T1 or T2
+> - **Given** a newest segment whose tail is torn as T1 or T2
+> - **When** `Wal::replay` completes recovery
 > - **Then** exactly one structured `WARN` event names the segment, `B`,
->   `E` and the shape, and the healed-bytes counter grows by `E - B`
+>   `E` and the shape
+> - **And** the healed-bytes counter grows by `E - B`
 
 ## 6. Testing strategy
 
@@ -315,6 +332,8 @@ remove. It may still be worth having for real corruption, separately.
   bytes and where any zeros start, and asserts the partition: healed
   exactly when T1 or T2 holds, corruption otherwise. T1 is today's
   RFC0008.4 rule, so the property also pins that it is unchanged.
+- **RFC0068.6:** an integration test beside RFC0068.1, forging both
+  sector outcomes with the same helpers.
 - **RFC0068.4:** extend the existing RFC0008.2 crash test (AGENTS.md
   §6.2, the WAL crash-recovery test), which runs on every PR.
 - **RFC0068.5:** a unit test on the recovery driver's event and

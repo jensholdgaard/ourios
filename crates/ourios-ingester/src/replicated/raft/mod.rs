@@ -8,6 +8,7 @@
 
 mod codec;
 pub mod log_store;
+pub mod transport;
 pub mod types;
 pub mod vote_log;
 
@@ -20,6 +21,27 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+/// The `openraft` settings §4.5 fixes for every group; the timeouts start
+/// at `openraft`'s defaults (§6.9).
+///
+/// Leader restore stays off: the group log's committed marker rides a
+/// later fsync, and `openraft`'s restore is unsafe without a synced
+/// commit index (§4.4, §6.1).
+///
+/// # Errors
+///
+/// [`openraft::ConfigError`] when the settings do not validate.
+pub fn group_config() -> Result<openraft::Config, openraft::ConfigError> {
+    openraft::Config {
+        enable_leader_restore: Some(false),
+        allow_log_reversion: Some(false),
+        enable_pre_vote: Some(true),
+        snapshot_policy: openraft::SnapshotPolicy::Never,
+        ..openraft::Config::default()
+    }
+    .validate()
+}
 
 /// How long an open waits for a retiring writer, whose last fsync may be
 /// slow (§4.7 saw drive-cache flushes of seconds), before refusing.

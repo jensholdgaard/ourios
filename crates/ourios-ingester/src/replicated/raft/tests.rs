@@ -30,7 +30,7 @@ use super::vote_log::{self, VoteLog};
 
 const GROUP: u32 = 3;
 
-fn wal_config(root: &Path) -> WalConfig {
+pub(super) fn wal_config(root: &Path) -> WalConfig {
     WalConfig {
         root: root.to_path_buf(),
         batch_window_ms: 2,
@@ -116,18 +116,18 @@ fn cut_to(dir: &Path, synced: WalOffset) -> u64 {
 }
 
 #[derive(Default)]
-struct SmState {
-    applied: Option<LogId>,
-    membership: StoredMembershipOf<RaftTypes>,
+pub(super) struct SmState {
+    pub(super) applied: Option<LogId>,
+    pub(super) membership: StoredMembershipOf<RaftTypes>,
     snapshot: Option<SnapshotMetaOf<RaftTypes>>,
 }
 
 /// The suite needs a state machine; this one holds only what it asserts.
 #[derive(Clone, Default)]
-struct MemSm(Arc<Mutex<SmState>>);
+pub(super) struct MemSm(Arc<Mutex<SmState>>);
 
 impl MemSm {
-    fn state(&self) -> std::sync::MutexGuard<'_, SmState> {
+    pub(super) fn state(&self) -> std::sync::MutexGuard<'_, SmState> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

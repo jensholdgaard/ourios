@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! | len:   u32_le   (payload length, excluding header + CRC)              |
-//! | kind:  u8       (0x01 OtlpBatch, 0x02 AuditEvent, 0x03 TenantOtlpBatch; reserved >0x03) |
+//! | kind:  u8       (0x01 OtlpBatch, 0x02 AuditEvent, 0x03 TenantOtlpBatch, 0x04 ReplicatedEntry; reserved >0x04) |
 //! | _pad:  [u8; 3]  (reserved, MUST be zero, validated on read)           |
 //! | crc32: u32_le   (CRC32-C over kind || pad || payload, Castagnoli)     |
 //! | payload: [u8; len]                                                    |
@@ -53,7 +53,7 @@ pub enum FrameError {
     /// payload bytes landed partially.
     CrcMismatch { stored: u32, computed: u32 },
     /// `kind` byte was outside the defined range
-    /// (`0x01..=0x03` today). The reserved range is reserved
+    /// (`0x01..=0x04` today). The reserved range is reserved
     /// for future kinds; current readers MUST refuse rather
     /// than guess.
     UnknownKind { found: u8 },
@@ -83,7 +83,7 @@ impl std::fmt::Display for FrameError {
             ),
             Self::UnknownKind { found } => write!(
                 f,
-                "unknown frame kind 0x{found:02x} (this build understands 0x01, 0x02, 0x03)",
+                "unknown frame kind 0x{found:02x} (this build understands 0x01, 0x02, 0x03, 0x04)",
             ),
             Self::NonZeroPad { found } => {
                 write!(f, "frame `_pad` bytes MUST be zero; found {found:?}")
@@ -182,6 +182,7 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<(FrameKind, Vec<u8>), FrameError
         0x01 => FrameKind::OtlpBatch,
         0x02 => FrameKind::AuditEvent,
         0x03 => FrameKind::TenantOtlpBatch,
+        0x04 => FrameKind::ReplicatedEntry,
         found => return Err(FrameError::UnknownKind { found }),
     };
     let pad = [header[5], header[6], header[7]];
@@ -229,12 +230,45 @@ mod tests {
         assert_eq!(&buf[12..], payload, "payload follows header verbatim");
     }
 
+    /// RFC 0065 §4.3: a replicated group's record is an ordinary frame
+    /// with kind byte `0x04`; the header and CRC rules do not change.
+    #[test]
+    fn replicated_entry_frame_golden_bytes() {
+        let payload = [0x11];
+        let mut buf = Vec::new();
+        write_frame(&mut buf, FrameKind::ReplicatedEntry, &payload).expect("write");
+        let crc = checksum_input(0x04, &[0x11]).to_le_bytes();
+        let mut expected = vec![1, 0, 0, 0, 0x04, 0, 0, 0];
+        expected.extend_from_slice(&crc);
+        expected.push(0x11);
+        assert_eq!(buf, expected);
+        let (kind, read) = read_frame(&mut Cursor::new(&buf[..])).expect("read");
+        assert_eq!(kind, FrameKind::ReplicatedEntry);
+        assert_eq!(read, payload);
+    }
+
+    /// The reserved range now starts above `0x04`.
+    #[test]
+    fn read_frame_rejects_the_first_reserved_kind() {
+        let mut buf = vec![0, 0, 0, 0, 0x05, 0, 0, 0];
+        buf.extend_from_slice(&checksum_input(0x05, &[]).to_le_bytes());
+        match read_frame(&mut Cursor::new(&buf[..])).expect_err("must reject") {
+            FrameError::UnknownKind { found } => assert_eq!(found, 0x05),
+            other => panic!("expected UnknownKind, got {other:?}"),
+        }
+    }
+
     /// Round-trip: write → read → identical kind + payload.
     /// Property: any frame the writer produces is one the
     /// reader accepts without complaint.
     #[test]
     fn frame_round_trips_through_write_then_read() {
-        for kind in [FrameKind::OtlpBatch, FrameKind::AuditEvent] {
+        for kind in [
+            FrameKind::OtlpBatch,
+            FrameKind::AuditEvent,
+            FrameKind::TenantOtlpBatch,
+            FrameKind::ReplicatedEntry,
+        ] {
             for payload in [
                 &b""[..],
                 &b"x"[..],

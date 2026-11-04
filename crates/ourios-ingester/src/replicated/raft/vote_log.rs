@@ -12,15 +12,20 @@
 //!
 //! Recovery keeps the last record per group. Only a tail no `save` was
 //! answered for is cut off before the next append: a partial record at
-//! the end, or complete records that are all zero bytes. Any other record
-//! that fails its CRC or holds a `committed` byte other than 0 or 1 may
-//! be a damaged acknowledged vote, so the open fails, wherever the record
-//! is: the replica rejoins as a new one (RFC 0065 §6.1, B4) rather than
-//! restore an older vote. Past a size threshold the log is rewritten with
-//! each group's latest vote (tmp, fsync, rename, directory fsync).
+//! the end, and complete records that read back as zeros from a record
+//! boundary, or from a 512-byte-aligned offset inside the first of them,
+//! to the end. Any other record that fails its CRC or holds a `committed`
+//! byte other than 0 or 1 may be a damaged acknowledged vote, so the open
+//! fails, wherever the record is: the replica rejoins as a new one (RFC
+//! 0065 §6.1, B4) rather than restore an older vote. Past a size threshold
+//! the log is rewritten with each group's latest vote (tmp, fsync,
+//! rename, directory fsync).
 //!
-//! One writer owns a root at a time, through an OS lock on
-//! `wal_root/votes.lock` that its thread holds until it exits.
+//! [`create`] makes the empty log in the same first-start step that
+//! writes the replica's identity, before it; a later open that finds no
+//! log fails, since the node's votes are lost. One writer owns a root at
+//! a time, through an OS lock on `wal_root/votes.lock` that its thread
+//! holds until it exits. The WAL root must be on a local filesystem.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -37,7 +42,7 @@ use uuid::Uuid;
 
 use super::gate::SyncGate;
 use super::types::{NodeId, Vote};
-use super::{Flush, OWNER_WAIT, sync_through, take_ownership};
+use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership};
 
 /// The vote log's name under `wal_root`.
 pub const VOTES_FILE: &str = "votes.log";
@@ -73,6 +78,33 @@ struct Request {
     done: oneshot::Sender<io::Result<()>>,
 }
 
+/// Create an empty `wal_root/votes.log` unless one exists. The replica's
+/// first start calls this before it publishes `replica.id`.
+///
+/// # Errors
+///
+/// A filesystem failure, or another writer owning the root.
+pub fn create(wal_root: &Path) -> io::Result<()> {
+    ourios_wal::prepare_root(wal_root)
+        .map_err(|e| io::Error::other(format!("prepare {}: {e:?}", wal_root.display())))?;
+    let _owner = take_ownership(&wal_root.join(LOCK_FILE), OWNER_WAIT, "vote log")?;
+    if wal_root.join(VOTES_FILE).exists() {
+        return Ok(());
+    }
+    write_durably(wal_root, &MAGIC)
+}
+
+fn lost(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{} is missing on a replica that has started before; rejoin it as a new replica \
+             (RFC 0065 §6.1, B4) rather than vote again under the same identity",
+            path.display()
+        ),
+    )
+}
+
 /// A handle on the node's vote log, shared by every group.
 #[derive(Clone)]
 pub struct VoteLog {
@@ -81,15 +113,15 @@ pub struct VoteLog {
 }
 
 impl VoteLog {
-    /// Recover `wal_root/votes.log`, creating it on first start, and
-    /// start its writer thread. Blocking.
+    /// Recover `wal_root/votes.log`, which [`create`] made on the
+    /// replica's first start, and start its writer thread. Blocking.
     ///
     /// # Errors
     ///
     /// A filesystem failure (including the fsyncs of `wal_root`, its
-    /// parent and the recovered log), a log whose header is not this
-    /// format, a corrupt record, or another writer still owning the root
-    /// after 30 seconds.
+    /// parent and the recovered log), a missing log, a log whose header
+    /// is not this format, a corrupt record, or another writer still
+    /// owning the root after 30 seconds.
     pub fn open(wal_root: &Path) -> io::Result<Self> {
         Self::open_with(wal_root, Options::default())
     }
@@ -108,12 +140,11 @@ impl VoteLog {
             ..
         } = options;
         let path = wal_root.join(VOTES_FILE);
+        // `create` runs before `replica.id` is published, so a log missing
+        // here was lost after this replica's first start, not never made.
         let (latest, len) = match fs::read(&path) {
             Ok(bytes) => recover(&path, &bytes, &gate)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                write_durably(wal_root, &MAGIC)?;
-                (HashMap::new(), MAGIC.len() as u64)
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(lost(&path)),
             Err(e) => return Err(e),
         };
         let file = OpenOptions::new().append(true).open(&path)?;
@@ -214,67 +245,62 @@ fn decode(record: &[u8]) -> Option<(u32, Vote)> {
 /// reached the disk, and `openraft` grants a retried vote it already
 /// holds without saving it again.
 fn recover(path: &Path, bytes: &[u8], gate: &SyncGate) -> io::Result<(HashMap<u32, Vote>, u64)> {
-    let Some(records) = bytes.strip_prefix(&MAGIC) else {
+    if !bytes.starts_with(&MAGIC) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{} is not an RFC 0065 vote log", path.display()),
         ));
-    };
-    let (latest, valid) = scan(records).map_err(|n| {
-        io::Error::new(
+    }
+    let (latest, valid) = valid_prefix(&bytes[MAGIC.len()..]);
+    let len = MAGIC.len() + valid * RECORD_LEN;
+    if !unanswered_tail(bytes, len) {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} record {n} is corrupt and may be an acknowledged vote; rejoin this replica \
-                 as a new one (RFC 0065 §6.1, B4) rather than restore an older vote",
+                "{} record {valid} is corrupt and may be an acknowledged vote; rejoin this \
+                 replica as a new one (RFC 0065 §6.1, B4) rather than restore an older vote",
                 path.display()
             ),
-        )
-    })?;
-    let len = (MAGIC.len() + valid * RECORD_LEN) as u64;
+        ));
+    }
     let file = OpenOptions::new().write(true).open(path)?;
-    if len < bytes.len() as u64 {
-        file.set_len(len)?;
+    if len < bytes.len() {
+        file.set_len(len as u64)?;
     }
     sync_through(gate, || file.sync_all()).unwrap_or_else(|| Err(super::writer_gone()))?;
-    Ok((latest, len))
+    Ok((latest, len as u64))
 }
 
-enum Record {
-    Vote(u32, Vote),
-    /// A crash after the file grew but before its data reached the disk
-    /// (ext4 delayed allocation) reads back as zeros: no save was
-    /// answered for those bytes.
-    Zeroed,
-    Corrupt,
-}
-
-fn classify(record: &[u8; RECORD_LEN]) -> Record {
-    if record.iter().all(|b| *b == 0) {
-        return Record::Zeroed;
-    }
-    decode(record).map_or(Record::Corrupt, |(group, vote)| Record::Vote(group, vote))
-}
-
-/// The latest vote per group and the number of valid records, or the
-/// number of the first record that cannot be an unanswered tail. A
-/// partial final chunk is an append torn before its fsync, and nothing
-/// valid may follow a zeroed record.
-fn scan(records: &[u8]) -> Result<(HashMap<u32, Vote>, usize), usize> {
+/// The latest vote per group over the leading valid records, and their
+/// count.
+fn valid_prefix(records: &[u8]) -> (HashMap<u32, Vote>, usize) {
+    let (complete, _) = records.as_chunks::<RECORD_LEN>();
     let mut latest = HashMap::new();
     let mut valid = 0;
-    let mut zeroed_tail = false;
-    let (complete, _torn) = records.as_chunks::<RECORD_LEN>();
-    for (n, record) in complete.iter().enumerate() {
-        match (classify(record), zeroed_tail) {
-            (Record::Zeroed, _) => zeroed_tail = true,
-            (Record::Vote(group, vote), false) => {
-                latest.insert(group, vote);
-                valid += 1;
-            }
-            _ => return Err(n),
-        }
+    for (group, vote) in complete.iter().map_while(|r| decode(r)) {
+        latest.insert(group, vote);
+        valid += 1;
     }
-    Ok((latest, valid))
+    (latest, valid)
+}
+
+const SECTOR: usize = 512;
+
+/// Whether everything from `from`, the end of the valid records, is a
+/// tail no `save` was answered for. A partial final record was torn
+/// before its fsync. Complete records past `from` qualify only if they
+/// read as zeros to the end from `from` itself, or from a sector boundary
+/// inside the first of them: a crash after the file grew but before its
+/// data reached the disk (ext4 delayed allocation) reads back as zeros
+/// from the old end of file or from the first block the write never
+/// reached, so any other byte pattern is damage.
+fn unanswered_tail(bytes: &[u8], from: usize) -> bool {
+    let complete_end = from + (bytes.len() - from) / RECORD_LEN * RECORD_LEN;
+    let first_record_end = (from + RECORD_LEN).min(complete_end);
+    let boundaries = (from.next_multiple_of(SECTOR)..first_record_end).step_by(SECTOR);
+    std::iter::once(from)
+        .chain(boundaries)
+        .any(|start| bytes[start..complete_end].iter().all(|b| *b == 0))
 }
 
 /// Replace `dir/votes.log` with `bytes`: tmp, fsync, rename, directory fsync.
@@ -298,7 +324,7 @@ struct Writer {
     failed: Option<String>,
     gate: Arc<SyncGate>,
     /// Released when the thread exits; see [`VoteLog::open`].
-    _owner: File,
+    _owner: Owner,
 }
 
 impl Writer {
@@ -402,6 +428,7 @@ mod tests {
     }
 
     fn open(dir: &Path, rewrite_bytes: u64) -> (VoteLog, Arc<SyncGate>) {
+        create(dir).expect("create");
         let gate = Arc::new(SyncGate::default());
         let options = Options {
             rewrite_bytes,
@@ -428,6 +455,7 @@ mod tests {
     async fn one_fsync_covers_every_vote_queued_while_the_previous_ran() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (log, gate) = open(dir.path(), DEFAULT_REWRITE_BYTES);
+        let opened = gate.passed();
         gate.close();
         let first = log.save(0, vote(1, 1, false));
         gate.wait_for_writer();
@@ -438,7 +466,11 @@ mod tests {
         for saved in queued {
             saved.await.expect("queued");
         }
-        assert_eq!(gate.passed(), 2, "the 50 queued votes shared one fsync");
+        assert_eq!(
+            gate.passed() - opened,
+            2,
+            "the 50 queued votes shared one fsync"
+        );
         assert_eq!(log.latest(50), Some(vote(2, 2, true)));
     }
 
@@ -520,12 +552,89 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_wal_root_is_created() {
+    fn a_first_start_creates_the_root_and_an_empty_log() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("var").join("wal");
+        create(&root).expect("create");
+        assert_eq!(fs::read(root.join(VOTES_FILE)).expect("read"), MAGIC);
         let log = VoteLog::open(&root).expect("open");
-        assert!(root.join(VOTES_FILE).is_file());
-        drop(log);
+        assert_eq!(log.latest(0), None);
+    }
+
+    #[tokio::test]
+    async fn create_keeps_an_existing_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let (log, _) = open(dir.path(), DEFAULT_REWRITE_BYTES);
+            log.save(1, vote(1, 1, false)).await.expect("save");
+        }
+        create(dir.path()).expect("create again");
+        let log = VoteLog::open(dir.path()).expect("open");
+        assert_eq!(log.latest(1), Some(vote(1, 1, false)));
+    }
+
+    #[test]
+    fn a_lost_log_after_the_first_start_fails_the_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create(dir.path()).expect("create");
+        fs::remove_file(dir.path().join(VOTES_FILE)).expect("lose it");
+        let err = VoteLog::open(dir.path()).err().expect("must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("new replica"), "{err}");
+    }
+
+    /// `n` valid records after the header, as one file.
+    fn records(n: u32) -> Vec<u8> {
+        let mut bytes = MAGIC.to_vec();
+        for group in 0..n {
+            bytes.extend_from_slice(&encode(group, &vote(u64::from(group), 1, false)));
+        }
+        bytes
+    }
+
+    fn reopen_with(dir: &Path, bytes: &[u8]) -> io::Result<VoteLog> {
+        create(dir).expect("create");
+        fs::write(dir.join(VOTES_FILE), bytes).expect("write");
+        VoteLog::open(dir)
+    }
+
+    #[test]
+    fn a_record_zeroed_from_a_sector_boundary_is_an_unanswered_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bytes = records(123);
+        let straddling = encode(123, &vote(9, 9, true));
+        assert!(bytes.len() < 4096 && bytes.len() + RECORD_LEN > 4096);
+        bytes.extend_from_slice(&straddling);
+        bytes[4096..].fill(0);
+        let log = reopen_with(dir.path(), &bytes).expect("open");
+        assert_eq!(log.latest(122), Some(vote(122, 1, false)));
+        assert_eq!(log.latest(123), None);
+        let len = fs::metadata(dir.path().join(VOTES_FILE))
+            .expect("stat")
+            .len();
+        assert_eq!(len, (MAGIC.len() + 123 * RECORD_LEN) as u64);
+    }
+
+    #[test]
+    fn a_non_zero_byte_after_the_sector_boundary_fails_the_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bytes = records(123);
+        bytes.extend_from_slice(&encode(123, &vote(9, 9, true)));
+        bytes[4096..].fill(0);
+        bytes[4099] = 1;
+        let err = reopen_with(dir.path(), &bytes).err().expect("must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_record_zeroed_off_any_sector_boundary_fails_the_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bytes = records(3);
+        let at = bytes.len();
+        bytes.extend_from_slice(&encode(3, &vote(9, 9, true)));
+        bytes[at + 10..].fill(0);
+        let err = reopen_with(dir.path(), &bytes).err().expect("must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
@@ -603,7 +712,7 @@ mod tests {
     #[test]
     fn a_failed_recovery_fsync_fails_the_open() {
         let dir = tempfile::tempdir().expect("tempdir");
-        drop(VoteLog::open(dir.path()).expect("create"));
+        create(dir.path()).expect("create");
         let gate = Arc::new(SyncGate::default());
         gate.fail();
         let options = Options {
@@ -657,6 +766,7 @@ mod tests {
     #[test]
     fn a_second_live_vote_log_on_one_root_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
+        create(dir.path()).expect("create");
         let live = VoteLog::open(dir.path()).expect("open");
         let options = Options {
             owner_wait: Duration::from_millis(50),

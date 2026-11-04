@@ -26,7 +26,7 @@ use super::codec::raft_id;
 use super::gate::SyncGate;
 use super::log_store::{GroupLog, group_dir};
 use super::types::{Entry, LogId, Membership, NodeId, RaftTypes, TenantBatchBytes, Vote};
-use super::vote_log::VoteLog;
+use super::vote_log::{self, VoteLog};
 
 const GROUP: u32 = 3;
 
@@ -44,6 +44,7 @@ fn wal_config(root: &Path) -> WalConfig {
 }
 
 fn open(wal_root: &Path) -> (GroupLog, Arc<SyncGate>) {
+    vote_log::create(wal_root).expect("create");
     let votes = VoteLog::open(wal_root).expect("vote log");
     let gate = Arc::new(SyncGate::default());
     let config = wal_config(&group_dir(wal_root, GROUP));
@@ -207,6 +208,7 @@ impl StoreBuilder<RaftTypes, GroupLog, MemSm, TempDir> for Builder {
     async fn build(&self) -> Result<(TempDir, GroupLog, MemSm), StorageError<RaftTypes>> {
         let store_err = |e| StorageError::from_io_error(ErrorSubject::Store, ErrorVerb::Read, e);
         let dir = tempfile::tempdir().map_err(store_err)?;
+        vote_log::create(dir.path()).map_err(store_err)?;
         let votes = VoteLog::open(dir.path()).map_err(store_err)?;
         let config = wal_config(&group_dir(dir.path(), GROUP));
         let log = GroupLog::open(config, GROUP, votes).map_err(store_err)?;
@@ -479,6 +481,7 @@ async fn a_recovered_log_is_fsynced_before_its_index_is_exposed() {
 #[test]
 fn a_failed_recovery_fsync_fails_the_open() {
     let dir = tempfile::tempdir().expect("tempdir");
+    vote_log::create(dir.path()).expect("create");
     let votes = VoteLog::open(dir.path()).expect("vote log");
     let gate = Arc::new(SyncGate::default());
     gate.fail();
@@ -530,6 +533,7 @@ async fn a_reopen_waits_for_a_retiring_group_writer_with_queued_appends() {
 #[tokio::test]
 async fn a_group_reopen_waits_for_its_retiring_writer_while_the_vote_log_lives() {
     let dir = tempfile::tempdir().expect("tempdir");
+    vote_log::create(dir.path()).expect("create");
     let votes = VoteLog::open(dir.path()).expect("vote log");
     let gate = Arc::new(SyncGate::default());
     let config = wal_config(&group_dir(dir.path(), GROUP));
@@ -553,4 +557,81 @@ async fn a_group_reopen_waits_for_its_retiring_writer_while_the_vote_log_lives()
     let read = log.try_get_log_entries(..).await.expect("read");
     assert_eq!(read, entries(1, 0..=5));
     drop(votes);
+}
+
+#[tokio::test]
+async fn a_lost_group_wal_with_a_surviving_vote_fails_the_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let (mut log, _) = open(dir.path());
+        append(&mut log, entries(1, 0..=1))
+            .await
+            .await
+            .expect("fsynced");
+        log.save_vote(&Vote::new_committed(3, NodeId::from(1)))
+            .await
+            .expect("vote");
+        log.shutdown();
+    }
+    std::fs::remove_dir_all(group_dir(dir.path(), GROUP)).expect("lose the group WAL");
+    let votes = VoteLog::open(dir.path()).expect("vote log");
+    let config = wal_config(&group_dir(dir.path(), GROUP));
+    let err = GroupLog::open(config, GROUP, votes)
+        .err()
+        .expect("must refuse");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert!(err.to_string().contains("new replica"), "{err}");
+    assert!(
+        !group_dir(dir.path(), GROUP).exists(),
+        "no fresh WAL was made"
+    );
+}
+
+#[tokio::test]
+async fn a_vote_with_an_empty_log_opens_while_its_segments_exist() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vote = Vote::new(2, NodeId::from(1));
+    {
+        let (mut log, _) = open(dir.path());
+        log.save_vote(&vote).await.expect("vote");
+        log.shutdown();
+    }
+    let (mut log, _) = open(dir.path());
+    assert_eq!(log.read_vote().await.expect("vote"), Some(vote));
+    assert!(indexes(&mut log).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_purged_empty_log_admits_only_the_index_after_the_purge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut log, _) = open(dir.path());
+    append(&mut log, entries(1, 0..=3))
+        .await
+        .await
+        .expect("fsynced");
+    log.purge(log_id(1, 3)).await.expect("purge");
+    let (tx, _rx) = RaftTypes::oneshot();
+    let err = log
+        .append(entries(1, 5..=5), IOFlushed::signal(tx))
+        .await
+        .expect_err("index 5 after a purge to 3");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    append(&mut log, entries(1, 4..=4))
+        .await
+        .await
+        .expect("fsynced");
+    assert_eq!(indexes(&mut log).await, vec![4]);
+}
+
+#[tokio::test]
+async fn a_panicking_writer_fails_the_queued_callbacks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut log, gate) = open(dir.path());
+    gate.panic();
+    let flushed = append(&mut log, entries(1, 0..=1)).await;
+    let err = flushed.await.expect_err("the writer panicked");
+    assert!(
+        err.to_string().contains("writer thread has stopped"),
+        "the guard completed the callback: {err}"
+    );
 }

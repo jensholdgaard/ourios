@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::fs::File;
 use std::io;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
@@ -34,7 +33,7 @@ use super::codec::{self, Replayed};
 use super::gate::SyncGate;
 use super::types::{Entry, LogId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
-use super::{Flush, OWNER_WAIT, sync_through, take_ownership, writer_gone};
+use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership, writer_gone};
 
 /// The group's ownership lock, inside its WAL root (the WAL reads only
 /// `*.wal` names there).
@@ -55,14 +54,18 @@ struct Index {
 }
 
 impl Index {
-    /// An entry above the next index would leave a hole, which
-    /// `openraft` forbids.
+    /// An entry may replace a kept one or follow the last, and never sits
+    /// at or below the purge point: an empty, purged log takes only the
+    /// index after it. An empty log with nothing purged takes any first
+    /// index, since `openraft`'s storage suite starts logs above 0.
     fn admits(&self, index: u64) -> io::Result<()> {
-        let last = self.entries.keys().next_back().copied();
-        match last.or(self.last_purged.map(|p| p.index)) {
-            Some(last) if index > last + 1 => {
-                Err(invalid(format!("entry {index} leaves a hole after {last}")))
-            }
+        let floor = self.last_purged.map(|p| p.index + 1);
+        let next = self.entries.keys().next_back().map(|last| last + 1);
+        match next.or(floor) {
+            Some(next) if !(floor.unwrap_or(0)..=next).contains(&index) => Err(invalid(format!(
+                "entry {index} is outside {}..={next}, which would leave a hole",
+                floor.unwrap_or(0)
+            ))),
             _ => Ok(()),
         }
     }
@@ -136,6 +139,35 @@ impl Index {
     }
 }
 
+/// Whether `root` holds a WAL segment; a missing root holds none.
+fn holds_segments(root: &Path) -> io::Result<bool> {
+    let dir = match std::fs::read_dir(root) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for entry in dir {
+        if entry?.path().extension().is_some_and(|x| x == "wal") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A group whose vote survived but whose log did not: coming up with an
+/// empty log under the same identity could vote away entries this replica
+/// acknowledged (RFC 0065 §4.5).
+fn lost(root: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{} holds no WAL segment but this replica has voted in its group; rejoin it as \
+             a new replica (RFC 0065 §6.1, B4) rather than restart with an empty log",
+            root.display()
+        ),
+    )
+}
+
 fn invalid(detail: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, detail)
 }
@@ -186,10 +218,31 @@ impl FrameSink for Replay {
     }
 }
 
+/// An append's callback, completed with an error if the writer drops it
+/// unanswered (a panic unwinding the writer thread, or the thread gone
+/// with the command still queued), so `openraft` never waits on it.
+struct Flushed(Option<IOFlushed<RaftTypes>>);
+
+impl Flushed {
+    fn complete(mut self, result: io::Result<()>) {
+        if let Some(callback) = self.0.take() {
+            callback.io_completed(result);
+        }
+    }
+}
+
+impl Drop for Flushed {
+    fn drop(&mut self) {
+        if let Some(callback) = self.0.take() {
+            callback.io_completed(Err(writer_gone()));
+        }
+    }
+}
+
 enum Command {
     Append {
         frames: Vec<Vec<u8>>,
-        done: IOFlushed<RaftTypes>,
+        done: Flushed,
     },
     Durable {
         frame: Vec<u8>,
@@ -221,7 +274,7 @@ impl Command {
 
     fn complete(self, flush: &Flush) {
         match self {
-            Self::Append { done, .. } => done.io_completed(flush.reply()),
+            Self::Append { done, .. } => done.complete(flush.reply()),
             Self::Durable { done, .. } | Self::Fence { done } => {
                 let _ = done.send(flush.reply());
             }
@@ -260,6 +313,9 @@ impl GroupLog {
         votes: VoteLog,
         gate: Arc<SyncGate>,
     ) -> io::Result<Self> {
+        if votes.latest(group).is_some() && !holds_segments(&wal.root)? {
+            return Err(lost(&wal.root));
+        }
         ourios_wal::prepare_root(&wal.root)
             .map_err(|e| wal_error("prepare the group WAL root", e))?;
         // The writer thread holds this lock and a vote-log handle until it
@@ -412,7 +468,7 @@ impl RaftLogStorage<RaftTypes> for GroupLog {
         self.index().extend(entries)?;
         self.send(Command::Append {
             frames,
-            done: callback,
+            done: Flushed(Some(callback)),
         })
     }
 
@@ -436,7 +492,7 @@ struct Writer {
     failed: Option<String>,
     gate: Arc<SyncGate>,
     /// Both released when the thread exits; see [`GroupLog::open`].
-    _owner: File,
+    _owner: Owner,
     _votes: VoteLog,
     #[cfg(test)]
     synced: Arc<Mutex<Option<WalOffset>>>,

@@ -14,27 +14,62 @@ pub mod vote_log;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How long an open waits for a retiring writer, whose last fsync may be
 /// slow (§4.7 saw drive-cache flushes of seconds), before refusing.
 const OWNER_WAIT: Duration = Duration::from_secs(30);
 
-/// Take the OS lock at `path`, polling for up to `wait`: a retiring
-/// writer releases it within one fsync, a live one never does.
-fn take_ownership(path: &Path, wait: Duration, owner: &str) -> io::Result<File> {
+/// The lock paths this process owns. An OS lock excludes another open
+/// file description on a local filesystem, but over NFS `flock` becomes a
+/// per-process POSIX lock that a second open in the same process would
+/// pass, so ownership needs both.
+static OWNED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Exclusive ownership of a lock path, released on drop.
+pub(crate) struct Owner {
+    path: PathBuf,
+    _file: File,
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        OWNED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.path);
+    }
+}
+
+fn try_own(path: &Path, file: &File) -> Result<(), TryLockError> {
+    let mut owned = OWNED.lock().unwrap_or_else(PoisonError::into_inner);
+    if owned.contains(path) {
+        return Err(TryLockError::WouldBlock);
+    }
+    file.try_lock()?;
+    owned.insert(path.to_path_buf());
+    Ok(())
+}
+
+/// Take the lock at `path`, in this process and in the OS, polling for up
+/// to `wait`: a retiring writer releases it within one fsync, a live one
+/// never does. The WAL root must be on a local filesystem.
+fn take_ownership(path: &Path, wait: Duration, owner: &str) -> io::Result<Owner> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(path)?;
+    let path = path.canonicalize()?;
     let deadline = Instant::now() + wait;
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
+        match try_own(&path, &file) {
+            Ok(()) => return Ok(Owner { path, _file: file }),
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -111,6 +146,7 @@ pub(crate) mod gate {
         Closed,
         Crashed,
         Failing,
+        Panicking,
     }
 
     #[derive(Debug)]
@@ -184,6 +220,11 @@ pub(crate) mod gate {
             self.set(State::Failing);
         }
 
+        /// The next writer to reach the gate panics.
+        pub(crate) fn panic(&self) {
+            self.set(State::Panicking);
+        }
+
         /// Fsyncs that went through.
         pub(crate) fn passed(&self) -> u64 {
             self.lock().passed
@@ -213,6 +254,7 @@ pub(crate) mod gate {
             inner.waiting -= 1;
             inner.budget = inner.budget.map(|n| n.saturating_sub(1));
             match inner.state {
+                State::Panicking => panic!("injected writer panic"),
                 State::Open | State::Closed => {
                     inner.passed += 1;
                     Pass::Sync

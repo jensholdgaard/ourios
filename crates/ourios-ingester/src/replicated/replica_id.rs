@@ -166,6 +166,13 @@ fn read(path: &Path) -> Result<Option<ReplicaId>, ReplicaIdError> {
 
 fn create(wal_root: &Path, path: &Path, id: ReplicaId) -> Result<Identity, ReplicaIdError> {
     prepare_root(wal_root)?;
+    // The vote log exists before the identity does, so a later start that
+    // finds `replica.id` but no `votes.log` knows the votes were lost.
+    crate::replicated::raft::vote_log::create(wal_root).map_err(|source| ReplicaIdError::Io {
+        op: "create(votes.log)",
+        path: wal_root.join(crate::replicated::raft::vote_log::VOTES_FILE),
+        source,
+    })?;
     let tmp = wal_root.join(format!("{REPLICA_ID_FILE}.{}.tmp", Uuid::now_v7().simple()));
     let published = write_synced(&tmp, id).and_then(|()| publish(&tmp, path));
     let _ = std::fs::remove_file(&tmp);
@@ -252,6 +259,15 @@ mod tests {
                 name.to_string_lossy().ends_with(".tmp")
             })
             .count()
+    }
+
+    #[test]
+    fn the_first_start_creates_the_vote_log_with_the_identity() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let root = dir.path().join("wal");
+        load_or_create(&root).expect("create");
+        let votes = crate::replicated::raft::vote_log::VoteLog::open(&root);
+        assert!(votes.is_ok(), "a first start leaves an openable vote log");
     }
 
     #[test]

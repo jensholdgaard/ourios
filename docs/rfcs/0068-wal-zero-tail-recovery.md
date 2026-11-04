@@ -13,7 +13,7 @@ superseded-by: —
 
 > **Status: `drafted`.** Tracks #1165. This RFC **amends RFC 0008**
 > (`accepted`). It amends the three-bucket rule of §5 RFC0008.2 and
-> §7's testing text for it, and §5 RFC0008.4 and RFC0008.5, and §6.6
+> §8's testing text for it, and §5 RFC0008.4 and RFC0008.5, and §6.6
 > steps 3 and 4. RFC 0008 gets a dated pointer here once this RFC is
 > accepted. RFC 0065 (`red`) inherits the change, because its
 > per-group WALs are RFC 0008 segments.
@@ -150,7 +150,7 @@ whose measured cost is a second flush on every sync.
 
 ### 3.5 Amendments to RFC 0008
 
-- **§5 RFC0008.2** and its **§7 testing text** sort a complete but
+- **§5 RFC0008.2** and its **§8 testing text** sort a complete but
   unsynced frame into three buckets. A fourth is added: "**or healed as
   a zero-filled tail (RFC 0068 §3.1 T2)** when every byte from the last
   valid frame boundary to EOF on the newest segment is zero". The rule
@@ -361,8 +361,8 @@ remove. It may still be worth having for real corruption, separately.
 ## 8. References
 
 - RFC 0008 (`accepted`): §5 RFC0008.2, .4 and .5; §6.3, the fsync
-  policy; §6.6, crash recovery; §7, testing. This RFC amends RFC0008.2
-  and its §7 text, RFC0008.4 and .5, and §6.6 step 3.
+  policy; §6.6, crash recovery; §8, testing. This RFC amends RFC0008.2
+  and its §8 text, RFC0008.4 and .5, and §6.6 step 3.
 - RFC 0052 (`green`): the reclaim sidecar, a possible home for §4.3's
   synced offset.
 - RFC 0065 (`red`) §6.1, which runs one RFC 0008 WAL per group; #1162,

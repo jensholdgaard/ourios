@@ -6,13 +6,37 @@
 //! the writer's reply, so one fsync completes every record queued while
 //! the previous one ran.
 
+mod codec;
+pub mod log_store;
 pub mod types;
 pub mod vote_log;
+
+#[cfg(test)]
+mod tests;
 
 use std::io;
 
 fn writer_gone() -> io::Error {
     io::Error::other("the storage writer thread has stopped")
+}
+
+/// How a writer thread's batch ended.
+enum Flush {
+    /// Written, and fsynced when the batch asked for it.
+    Done,
+    Failed(io::Error),
+    /// The test gate stopped the writer before its fsync.
+    Crashed,
+}
+
+impl Flush {
+    fn reply(&self) -> io::Result<()> {
+        match self {
+            Self::Done => Ok(()),
+            Self::Failed(e) => Err(io::Error::new(e.kind(), e.to_string())),
+            Self::Crashed => Err(writer_gone()),
+        }
+    }
 }
 
 /// Holds a writer before each fsync, so tests can stall the disk or

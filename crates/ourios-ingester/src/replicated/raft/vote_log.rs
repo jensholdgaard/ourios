@@ -30,6 +30,7 @@ use openraft::impls::leader_id_std::LeaderId;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use super::Flush;
 use super::gate::SyncGate;
 use super::types::{NodeId, Vote};
 
@@ -203,23 +204,6 @@ fn write_durably(dir: &Path, bytes: &[u8]) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-enum Outcome {
-    Synced,
-    Failed(io::Error),
-    /// The test gate stopped the writer before its fsync.
-    Crashed,
-}
-
-impl Outcome {
-    fn reply(&self) -> io::Result<()> {
-        match self {
-            Self::Synced => Ok(()),
-            Self::Failed(e) => Err(io::Error::new(e.kind(), e.to_string())),
-            Self::Crashed => Err(super::writer_gone()),
-        }
-    }
-}
-
 struct Writer {
     file: File,
     dir: PathBuf,
@@ -246,7 +230,7 @@ impl Writer {
     /// One fsync for the whole batch; `false` when the writer must stop.
     fn commit(&mut self, batch: Vec<Request>) -> bool {
         let outcome = self.write(&batch);
-        if let Outcome::Synced = outcome {
+        if let Flush::Done = outcome {
             let mut latest = lock(&self.latest);
             latest.extend(batch.iter().map(|r| (r.group, r.vote)));
         }
@@ -254,18 +238,18 @@ impl Writer {
             let _ = r.done.send(outcome.reply());
         }
         match outcome {
-            Outcome::Synced => {
+            Flush::Done => {
                 self.rewrite_if_due();
                 true
             }
-            Outcome::Failed(_) => true,
-            Outcome::Crashed => false,
+            Flush::Failed(_) => true,
+            Flush::Crashed => false,
         }
     }
 
-    fn write(&mut self, batch: &[Request]) -> Outcome {
+    fn write(&mut self, batch: &[Request]) -> Flush {
         if let Some(reason) = &self.failed {
-            return Outcome::Failed(io::Error::other(format!(
+            return Flush::Failed(io::Error::other(format!(
                 "the vote log failed earlier: {reason}"
             )));
         }
@@ -275,16 +259,16 @@ impl Writer {
             .collect();
         let written = self.file.write_all(&bytes);
         if !self.gate.pass() {
-            return Outcome::Crashed;
+            return Flush::Crashed;
         }
         match written.and_then(|()| self.file.sync_data()) {
             Ok(()) => {
                 self.len += bytes.len() as u64;
-                Outcome::Synced
+                Flush::Done
             }
             Err(e) => {
                 self.failed = Some(e.to_string());
-                Outcome::Failed(e)
+                Flush::Failed(e)
             }
         }
     }

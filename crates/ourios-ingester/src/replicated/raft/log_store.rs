@@ -1,0 +1,523 @@
+//! One group's Raft log over its own RFC 0008 WAL (RFC 0065 §4.3, §4.4,
+//! §6.1), at `wal_root/groups/<group>/`.
+//!
+//! Every record is a `0x04` frame. Replay rebuilds the log in WAL order:
+//! an entry at index `i` replaces everything from `i` up, a truncate or
+//! purge marker drops what it names, and the latest committed marker is
+//! kept. The whole log above the purge point is held in memory, so reads
+//! never touch the disk.
+//!
+//! A writer thread owns the WAL. `append` makes its entries readable at
+//! once and hands their frames to the writer, which appends every command
+//! queued while the previous fsync ran, fsyncs once, and only then
+//! completes each `append`'s callback; truncate and purge markers resolve
+//! after the fsync that covers them. A committed marker is written
+//! without one of its own and rides the next.
+
+use std::collections::BTreeMap;
+use std::fmt::Debug;
+use std::io;
+use std::ops::RangeBounds;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use openraft::OptionalSend;
+use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
+use ourios_wal::{
+    FrameKind, FrameSink, RecoveryError, ReplicatedRecord, Wal, WalConfig, WalOffset,
+};
+use tokio::sync::oneshot;
+
+use super::codec::{self, Replayed};
+use super::gate::SyncGate;
+use super::types::{Entry, LogId, RaftTypes, Vote};
+use super::vote_log::VoteLog;
+use super::{Flush, writer_gone};
+
+/// A group's WAL root under the node's `wal_root`.
+#[must_use]
+pub fn group_dir(wal_root: &Path, group: u32) -> PathBuf {
+    wal_root.join("groups").join(group.to_string())
+}
+
+/// The log as the WAL holds it.
+#[derive(Debug, Default)]
+struct Index {
+    entries: BTreeMap<u64, Entry>,
+    last_purged: Option<LogId>,
+    committed: Option<LogId>,
+}
+
+impl Index {
+    /// An entry above the next index would leave a hole, which
+    /// `openraft` forbids.
+    fn admits(&self, index: u64) -> io::Result<()> {
+        let last = self.entries.keys().next_back().copied();
+        match last.or(self.last_purged.map(|p| p.index)) {
+            Some(last) if index > last + 1 => {
+                Err(invalid(format!("entry {index} leaves a hole after {last}")))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// An entry replaces every entry at or above its index.
+    fn place(&mut self, entry: Entry) {
+        let index = entry.log_id.index;
+        self.entries.split_off(&index);
+        if self.last_purged.is_none_or(|p| index > p.index) {
+            self.entries.insert(index, entry);
+        }
+    }
+
+    /// Admit a contiguous run of entries, all or none.
+    fn extend(&mut self, entries: Vec<Entry>) -> io::Result<()> {
+        let mut next = None;
+        for entry in &entries {
+            let index = entry.log_id.index;
+            match next {
+                None => self.admits(index)?,
+                Some(n) if n != index => {
+                    return Err(invalid(format!("entry {index} does not follow {}", n - 1)));
+                }
+                Some(_) => {}
+            }
+            next = Some(index + 1);
+        }
+        for entry in entries {
+            self.place(entry);
+        }
+        Ok(())
+    }
+
+    fn truncate_after(&mut self, last: Option<LogId>) {
+        let from = last.map_or(0, |l| l.index + 1);
+        self.entries.split_off(&from);
+    }
+
+    fn purge(&mut self, upto: LogId) {
+        self.entries = self.entries.split_off(&(upto.index + 1));
+        if self.last_purged.is_none_or(|p| upto > p) {
+            self.last_purged = Some(upto);
+        }
+    }
+
+    fn commit(&mut self, committed: LogId) {
+        if self.committed.is_none_or(|c| committed > c) {
+            self.committed = Some(committed);
+        }
+    }
+
+    fn apply(&mut self, record: Replayed) -> io::Result<()> {
+        match record {
+            Replayed::Entry(entry) => {
+                self.admits(entry.log_id.index)?;
+                self.place(entry);
+            }
+            Replayed::TruncateAfter(last) => self.truncate_after(last),
+            Replayed::Purge(upto) => self.purge(upto),
+            Replayed::Committed(c) => self.commit(c),
+        }
+        Ok(())
+    }
+
+    fn last_log_id(&self) -> Option<LogId> {
+        self.entries
+            .values()
+            .next_back()
+            .map(|e| e.log_id)
+            .or(self.last_purged)
+    }
+}
+
+fn invalid(detail: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, detail)
+}
+
+fn wal_error(op: &str, e: impl Debug) -> io::Error {
+    io::Error::other(format!("{op}: {e:?}"))
+}
+
+struct Replay(Index);
+
+impl FrameSink for Replay {
+    fn consume(
+        &mut self,
+        offset: WalOffset,
+        kind: FrameKind,
+        payload: &[u8],
+    ) -> Result<(), RecoveryError> {
+        let applied = match kind {
+            FrameKind::ReplicatedEntry => codec::decode(payload).and_then(|r| self.0.apply(r)),
+            other => Err(invalid(format!(
+                "a group WAL holds only 0x04 frames, not {other:?}"
+            ))),
+        };
+        applied.map_err(|e| RecoveryError::SinkRejected {
+            detail: format!("group log frame at {}+{}: {e}", offset.segment, offset.byte),
+        })
+    }
+}
+
+enum Command {
+    Append {
+        frames: Vec<Vec<u8>>,
+        done: IOFlushed<RaftTypes>,
+    },
+    Durable {
+        frame: Vec<u8>,
+        done: oneshot::Sender<io::Result<()>>,
+    },
+    Lazy {
+        frame: Vec<u8>,
+    },
+}
+
+impl Command {
+    fn frames(&self) -> &[Vec<u8>] {
+        match self {
+            Self::Append { frames, .. } => frames,
+            Self::Durable { frame, .. } | Self::Lazy { frame } => std::slice::from_ref(frame),
+        }
+    }
+
+    fn needs_sync(&self) -> bool {
+        !matches!(self, Self::Lazy { .. })
+    }
+
+    fn complete(self, flush: &Flush) {
+        match self {
+            Self::Append { done, .. } => done.io_completed(flush.reply()),
+            Self::Durable { done, .. } => {
+                let _ = done.send(flush.reply());
+            }
+            Self::Lazy { .. } => {}
+        }
+    }
+}
+
+/// `RaftLogStorage` and `RaftLogReader` for one group. Clones share the
+/// log and its writer.
+#[derive(Clone)]
+pub struct GroupLog {
+    group: u32,
+    index: Arc<Mutex<Index>>,
+    votes: VoteLog,
+    tx: Sender<Command>,
+    #[cfg(test)]
+    hooks: Arc<test_hooks::Hooks>,
+}
+
+impl GroupLog {
+    /// Recover the group's log from `wal.root` (see [`group_dir`]) and
+    /// start its writer thread. Blocking: it replays the whole WAL.
+    ///
+    /// # Errors
+    ///
+    /// The WAL cannot be opened or replayed, or holds a record this
+    /// build cannot read or a log with a hole.
+    pub fn open(wal: WalConfig, group: u32, votes: VoteLog) -> io::Result<Self> {
+        Self::open_with(wal, group, votes, Arc::default())
+    }
+
+    fn open_with(
+        wal: WalConfig,
+        group: u32,
+        votes: VoteLog,
+        gate: Arc<SyncGate>,
+    ) -> io::Result<Self> {
+        std::fs::create_dir_all(&wal.root)?;
+        let mut wal = Wal::open(wal).map_err(|e| wal_error("open the group WAL", e))?;
+        let mut replay = Replay(Index::default());
+        wal.replay(&mut replay)
+            .map_err(|e| wal_error("replay the group WAL", e))?;
+        wal.rebuild_ledger()
+            .map_err(|e| wal_error("rebuild the group WAL ledger", e))?;
+        let (tx, rx) = mpsc::channel();
+        #[cfg(test)]
+        let hooks_gate = Arc::clone(&gate);
+        let writer = Writer {
+            wal,
+            failed: None,
+            gate,
+            #[cfg(test)]
+            synced: Arc::default(),
+        };
+        #[cfg(test)]
+        let synced = Arc::clone(&writer.synced);
+        let thread = std::thread::Builder::new()
+            .name(format!("ourios-wal-g{group}"))
+            .spawn(move || writer.run(&rx))?;
+        #[cfg(not(test))]
+        drop(thread);
+        Ok(Self {
+            group,
+            index: Arc::new(Mutex::new(replay.0)),
+            votes,
+            tx,
+            #[cfg(test)]
+            hooks: Arc::new(test_hooks::Hooks::new(hooks_gate, synced, thread)),
+        })
+    }
+
+    fn index(&self) -> std::sync::MutexGuard<'_, Index> {
+        self.index.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn send(&self, command: Command) -> io::Result<()> {
+        self.tx.send(command).map_err(|_| writer_gone())
+    }
+
+    /// Queue a marker and wait for the fsync that covers it.
+    async fn durable(&self, record: ReplicatedRecord<'_>) -> io::Result<()> {
+        let frame = codec::encode_marker(record)?;
+        let (done, rx) = oneshot::channel();
+        self.send(Command::Durable { frame, done })?;
+        rx.await.map_err(|_| writer_gone())?
+    }
+}
+
+// openraft's storage traits are async; these methods answer from memory
+// or hand off to the writer thread, so most never await.
+#[allow(clippy::unused_async_trait_impl)]
+impl RaftLogReader<RaftTypes> for GroupLog {
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<Entry>, io::Error> {
+        Ok(self
+            .index()
+            .entries
+            .range(range)
+            .map(|(_, e)| e.clone())
+            .collect())
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote>, io::Error> {
+        Ok(self.votes.latest(self.group))
+    }
+}
+
+// As above: only the vote and the markers wait for an fsync.
+#[allow(clippy::unused_async_trait_impl)]
+impl RaftLogStorage<RaftTypes> for GroupLog {
+    type LogReader = Self;
+
+    async fn get_log_state(&mut self) -> Result<LogState<RaftTypes>, io::Error> {
+        let index = self.index();
+        Ok(LogState {
+            last_purged_log_id: index.last_purged,
+            last_log_id: index.last_log_id(),
+        })
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        self.clone()
+    }
+
+    async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
+        self.votes.save(self.group, *vote).await
+    }
+
+    /// Not fsynced on its own: `enable_leader_restore = false` (RFC 0065
+    /// §4.5) means a stale committed id only delays re-applying the log
+    /// until the leader's next commit, and it can never run ahead of the
+    /// entries, which precede it in the WAL.
+    async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), io::Error> {
+        let Some(c) = committed else {
+            return Ok(());
+        };
+        let frame = codec::encode_marker(ReplicatedRecord::Committed(codec::wal_id(&c)))?;
+        self.index().commit(c);
+        self.send(Command::Lazy { frame })
+    }
+
+    async fn read_committed(&mut self) -> Result<Option<LogId>, io::Error> {
+        Ok(self.index().committed)
+    }
+
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: IOFlushed<RaftTypes>,
+    ) -> Result<(), io::Error>
+    where
+        I: IntoIterator<Item = Entry> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        let entries: Vec<Entry> = entries.into_iter().collect();
+        let frames = entries
+            .iter()
+            .map(codec::encode_entry)
+            .collect::<io::Result<Vec<_>>>()?;
+        if let Some(big) = frames
+            .iter()
+            .find(|f| f.len() > ourios_wal::MAX_FRAME_BYTES)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a {}-byte entry exceeds the WAL frame cap", big.len()),
+            ));
+        }
+        self.index().extend(entries)?;
+        self.send(Command::Append {
+            frames,
+            done: callback,
+        })
+    }
+
+    async fn truncate_after(&mut self, last: Option<LogId>) -> Result<(), io::Error> {
+        self.index().truncate_after(last);
+        let last = last.as_ref().map(codec::wal_id);
+        self.durable(ReplicatedRecord::TruncateAfter(last)).await
+    }
+
+    async fn purge(&mut self, upto: LogId) -> Result<(), io::Error> {
+        self.index().purge(upto);
+        self.durable(ReplicatedRecord::Purge(codec::wal_id(&upto)))
+            .await
+    }
+}
+
+struct Writer {
+    wal: Wal,
+    /// Set by the first failed append or sync: the WAL's tail is then
+    /// unknown, so every later command fails.
+    failed: Option<String>,
+    gate: Arc<SyncGate>,
+    #[cfg(test)]
+    synced: Arc<Mutex<Option<WalOffset>>>,
+}
+
+impl Writer {
+    fn run(mut self, rx: &Receiver<Command>) {
+        while let Ok(first) = rx.recv() {
+            let mut batch = vec![first];
+            batch.extend(rx.try_iter());
+            let flush = self.flush(&batch);
+            let crashed = matches!(flush, Flush::Crashed);
+            for command in batch {
+                command.complete(&flush);
+            }
+            if crashed {
+                return;
+            }
+        }
+    }
+
+    fn flush(&mut self, batch: &[Command]) -> Flush {
+        if let Some(reason) = &self.failed {
+            return Flush::Failed(io::Error::other(format!(
+                "the group WAL failed earlier: {reason}"
+            )));
+        }
+        for frame in batch.iter().flat_map(Command::frames) {
+            if let Err(e) = self.wal.append(FrameKind::ReplicatedEntry, frame) {
+                return self.fail(&e);
+            }
+        }
+        if !batch.iter().any(Command::needs_sync) {
+            return Flush::Done;
+        }
+        if !self.gate.pass() {
+            return Flush::Crashed;
+        }
+        match self.wal.sync() {
+            Ok(offset) => {
+                self.record_synced(offset);
+                Flush::Done
+            }
+            Err(e) => self.fail(&e),
+        }
+    }
+
+    #[cfg(test)]
+    fn record_synced(&self, offset: WalOffset) {
+        *self.synced.lock().unwrap_or_else(PoisonError::into_inner) = Some(offset);
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)] // the test build records the offset for its crash model
+    fn record_synced(&self, _: WalOffset) {}
+
+    fn fail(&mut self, e: &impl std::fmt::Display) -> Flush {
+        let reason = e.to_string();
+        self.failed = Some(reason.clone());
+        Flush::Failed(io::Error::other(reason))
+    }
+}
+
+#[cfg(test)]
+mod test_hooks {
+    use std::thread::JoinHandle;
+
+    use super::*;
+
+    /// What the crash tests need from a running log.
+    pub(in crate::replicated::raft) struct Hooks {
+        gate: Arc<SyncGate>,
+        synced: Arc<Mutex<Option<WalOffset>>>,
+        thread: Mutex<Option<JoinHandle<()>>>,
+    }
+
+    impl Hooks {
+        pub(super) fn new(
+            gate: Arc<SyncGate>,
+            synced: Arc<Mutex<Option<WalOffset>>>,
+            thread: JoinHandle<()>,
+        ) -> Self {
+            Self {
+                gate,
+                synced,
+                thread: Mutex::new(Some(thread)),
+            }
+        }
+    }
+
+    impl GroupLog {
+        pub(in crate::replicated::raft) fn open_gated(
+            wal: WalConfig,
+            group: u32,
+            votes: VoteLog,
+            gate: Arc<SyncGate>,
+        ) -> io::Result<Self> {
+            Self::open_with(wal, group, votes, gate)
+        }
+
+        /// Stop the writer once every command it holds is done; no other
+        /// handle on the log may be alive.
+        pub(in crate::replicated::raft) fn shutdown(self) {
+            let thread = self
+                .hooks
+                .thread
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            drop(self);
+            if let Some(thread) = thread {
+                let _ = thread.join();
+            }
+        }
+
+        /// Stop the writer, held at the gate, before its fsync, and
+        /// return the boundary the last successful sync made durable.
+        pub(in crate::replicated::raft) fn crash(&self) -> Option<WalOffset> {
+            self.hooks.gate.crash();
+            let thread = self
+                .hooks
+                .thread
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(thread) = thread {
+                let _ = thread.join();
+            }
+            *self
+                .hooks
+                .synced
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+}

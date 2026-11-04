@@ -104,7 +104,7 @@ impl PartialOrd for WalOffset {
 }
 
 /// Frame-kind discriminator per RFC 0008 §6.2.2. The reserved
-/// range (`0x04..=0xFF`) is rejected on read as RFC0008.5
+/// range (`0x05..=0xFF`) is rejected on read as RFC0008.5
 /// corruption — the format admits future kinds without a
 /// version bump but only when they're added here.
 #[repr(u8)]
@@ -124,6 +124,10 @@ pub enum FrameKind {
     /// then the `ExportLogsServiceRequest` protobuf bytes —
     /// [`TenantBatch`] is the payload codec.
     TenantOtlpBatch = 0x03,
+    /// RFC 0065 §4.3: one record of a replicated group's Raft log.
+    /// Written only to a group's own WAL, never to the local
+    /// backend's.
+    ReplicatedEntry = 0x04,
 }
 
 /// The `TenantOtlpBatch` payload (RFC 0046 §3.3):
@@ -771,7 +775,7 @@ impl Wal {
             FrameKind::TenantOtlpBatch => TenantBatch::decode(payload)
                 .ok()
                 .map(|batch| ourios_core::tenant::TenantId::new(batch.tenant)),
-            FrameKind::OtlpBatch | FrameKind::AuditEvent => None,
+            FrameKind::OtlpBatch | FrameKind::AuditEvent | FrameKind::ReplicatedEntry => None,
         };
         self.ledger.observe(retain::FrameAt {
             offset,

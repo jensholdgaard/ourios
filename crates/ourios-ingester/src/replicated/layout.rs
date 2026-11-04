@@ -66,11 +66,20 @@ impl VotingLayout {
     /// [`LayoutError::Malformed`] if they are not a layout, or
     /// [`LayoutError::UnsupportedFormat`] if they are another format's.
     pub fn decode(bytes: &[u8]) -> Result<Self, LayoutError> {
-        let layout: Self = serde_json::from_slice(bytes).map_err(|e| LayoutError::Malformed {
+        // The format is read on its own first: another format may add or
+        // drop fields, and that is a version mismatch, not a corrupt file.
+        #[derive(Deserialize)]
+        struct Header {
+            format: u32,
+        }
+        let malformed = |e: serde_json::Error| LayoutError::Malformed {
             detail: e.to_string(),
-        })?;
-        match layout.format {
-            LAYOUT_FORMAT => Ok(layout),
+        };
+        match serde_json::from_slice::<Header>(bytes)
+            .map_err(malformed)?
+            .format
+        {
+            LAYOUT_FORMAT => serde_json::from_slice(bytes).map_err(malformed),
             found => Err(LayoutError::UnsupportedFormat(found)),
         }
     }
@@ -316,6 +325,11 @@ mod tests {
         let later = br#"{"format":2,"peers":["a"],"groups":1,"replication_factor":3}"#;
         assert!(matches!(
             VotingLayout::decode(later),
+            Err(LayoutError::UnsupportedFormat(2))
+        ));
+        let reshaped = br#"{"format":2,"voters":["a"],"groups":1,"zones":2}"#;
+        assert!(matches!(
+            VotingLayout::decode(reshaped),
             Err(LayoutError::UnsupportedFormat(2))
         ));
         let extra = br#"{"format":1,"peers":["a"],"groups":1,"replication_factor":3,"x":1}"#;

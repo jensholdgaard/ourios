@@ -121,50 +121,107 @@ impl std::error::Error for ReplicaIdError {
 const READ: &str = "read";
 
 /// Read this replica's identity from `wal_root`, or create it there on
-/// the first start: temp file, fsync, rename, then fsync `wal_root` and
-/// its parent.
+/// the first start. Creation writes a uniquely named temp file, fsyncs
+/// it and publishes it with a hard link, which fails if another start
+/// published first; that start's identity is then the one returned.
+/// Either way `wal_root` is fsynced before returning, so an identity a
+/// crashed start left visible but not yet durable is made durable too.
 ///
 /// # Errors
 ///
 /// [`ReplicaIdError::Io`] or [`ReplicaIdError::Malformed`] naming the
 /// file when it exists but cannot be read or decoded; otherwise a
-/// failure creating it.
+/// failure creating it or making it durable.
 pub fn load_or_create(wal_root: &Path) -> Result<Identity, ReplicaIdError> {
     let path = wal_root.join(REPLICA_ID_FILE);
-    match std::fs::read(&path) {
-        Ok(bytes) => ReplicaId::decode(&bytes)
-            .map(Identity::Existing)
-            .map_err(|detail| ReplicaIdError::Malformed { path, detail }),
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            create(wal_root, &path, ReplicaId(Uuid::now_v7())).map(Identity::Created)
+    let identity = match read(&path)? {
+        Some(id) => Identity::Existing(id),
+        None => create(wal_root, &path, ReplicaId(Uuid::now_v7()))?,
+    };
+    snapshot_store::fsync_root(wal_root).map_err(|source| ReplicaIdError::Sync {
+        path: wal_root.to_path_buf(),
+        source,
+    })?;
+    Ok(identity)
+}
+
+fn read(path: &Path) -> Result<Option<ReplicaId>, ReplicaIdError> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            ReplicaId::decode(&bytes)
+                .map(Some)
+                .map_err(|detail| ReplicaIdError::Malformed {
+                    path: path.to_path_buf(),
+                    detail,
+                })
         }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(source) => Err(ReplicaIdError::Io {
             op: READ,
-            path,
+            path: path.to_path_buf(),
             source,
         }),
     }
 }
 
-fn create(wal_root: &Path, path: &Path, id: ReplicaId) -> Result<ReplicaId, ReplicaIdError> {
-    let io = |op: &'static str, at: &Path| {
-        let path = at.to_path_buf();
-        move |source| ReplicaIdError::Io { op, path, source }
-    };
-    let tmp = wal_root.join(format!("{REPLICA_ID_FILE}.tmp"));
-    std::fs::create_dir_all(wal_root).map_err(io("create_dir_all", wal_root))?;
-    let mut file = std::fs::File::create(&tmp).map_err(io("create", &tmp))?;
-    file.write_all(id.encode().as_bytes())
-        .map_err(io("write", &tmp))?;
-    file.sync_all().map_err(io("fsync", &tmp))?;
-    std::fs::rename(&tmp, path).map_err(io("rename", path))?;
-    snapshot_store::fsync_root(wal_root).map_err(|source| ReplicaIdError::Sync {
-        path: wal_root.to_path_buf(),
-        source,
-    })?;
-    Ok(id)
+fn create(wal_root: &Path, path: &Path, id: ReplicaId) -> Result<Identity, ReplicaIdError> {
+    prepare_root(wal_root)?;
+    let tmp = wal_root.join(format!("{REPLICA_ID_FILE}.{}.tmp", Uuid::now_v7().simple()));
+    let published = write_synced(&tmp, id).and_then(|()| publish(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    if published? {
+        return Ok(Identity::Created(id));
+    }
+    read(path)?
+        .map(Identity::Existing)
+        .ok_or_else(|| ReplicaIdError::Io {
+            op: READ,
+            path: path.to_path_buf(),
+            source: ErrorKind::NotFound.into(),
+        })
 }
 
+/// Create `wal_root` and fsync every directory that made, as the WAL
+/// does for its own root.
+fn prepare_root(wal_root: &Path) -> Result<(), ReplicaIdError> {
+    let path = wal_root.to_path_buf();
+    match ourios_wal::prepare_root(wal_root) {
+        Ok(()) => Ok(()),
+        Err(ourios_wal::OpenError::Io { op, source }) => {
+            Err(ReplicaIdError::Io { op, path, source })
+        }
+        Err(other) => Err(ReplicaIdError::Io {
+            op: "create_dir_all",
+            path,
+            source: std::io::Error::other(format!("{other:?}")),
+        }),
+    }
+}
+
+fn write_synced(tmp: &Path, id: ReplicaId) -> Result<(), ReplicaIdError> {
+    let io = |op: &'static str| {
+        let path = tmp.to_path_buf();
+        move |source| ReplicaIdError::Io { op, path, source }
+    };
+    let mut file = std::fs::File::create_new(tmp).map_err(io("create"))?;
+    file.write_all(id.encode().as_bytes())
+        .map_err(io("write"))?;
+    file.sync_all().map_err(io("fsync"))
+}
+
+/// `true` if this start published `tmp` as `path`, `false` if another
+/// start already had.
+fn publish(tmp: &Path, path: &Path) -> Result<bool, ReplicaIdError> {
+    match std::fs::hard_link(tmp, path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(source) => Err(ReplicaIdError::Io {
+            op: "link",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,11 +237,81 @@ mod tests {
         assert_eq!(created.uuid().get_version(), Some(Version::SortRand));
         let on_disk = std::fs::read_to_string(root.join(REPLICA_ID_FILE)).expect("read");
         assert_eq!(on_disk, format!("{created}\n"));
-        assert!(!root.join("replica.id.tmp").exists());
+        assert_eq!(leftover_temp_files(&root), 0);
         assert_eq!(
             load_or_create(&root).expect("reuse"),
             Identity::Existing(created)
         );
+    }
+
+    fn leftover_temp_files(root: &Path) -> usize {
+        std::fs::read_dir(root)
+            .expect("list")
+            .filter(|entry| {
+                let name = entry.as_ref().expect("entry").file_name();
+                name.to_string_lossy().ends_with(".tmp")
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_start_that_loses_the_race_returns_the_published_identity() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let root = dir.path();
+        let path = root.join(REPLICA_ID_FILE);
+        let first = ReplicaId(Uuid::now_v7());
+        let second = ReplicaId(Uuid::now_v7());
+        assert_eq!(
+            create(root, &path, first).expect("win"),
+            Identity::Created(first)
+        );
+        assert_eq!(
+            create(root, &path, second).expect("lose"),
+            Identity::Existing(first)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            first.encode()
+        );
+        assert_eq!(leftover_temp_files(root), 0);
+    }
+
+    #[test]
+    fn overlapping_first_starts_agree_on_one_identity() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let root = dir.path().join("wal");
+        let barrier = std::sync::Barrier::new(8);
+        let ids: Vec<Identity> = std::thread::scope(|scope| {
+            let starts: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        load_or_create(&root).expect("start")
+                    })
+                })
+                .collect();
+            starts
+                .into_iter()
+                .map(|s| s.join().expect("join"))
+                .collect()
+        });
+        let created = ids
+            .iter()
+            .filter(|id| matches!(id, Identity::Created(_)))
+            .count();
+        assert_eq!(created, 1, "{ids:?}");
+        let on_disk = read(&root.join(REPLICA_ID_FILE))
+            .expect("read")
+            .expect("present");
+        assert!(ids.iter().all(|id| id.id() == on_disk), "{ids:?}");
+    }
+
+    #[test]
+    fn a_missing_wal_root_and_its_ancestors_are_created() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let root = dir.path().join("new-parent").join("wal");
+        let id = load_or_create(&root).expect("create").id();
+        assert_eq!(read(&root.join(REPLICA_ID_FILE)).expect("read"), Some(id));
     }
 
     #[test]

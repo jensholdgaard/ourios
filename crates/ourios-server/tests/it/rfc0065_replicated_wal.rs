@@ -4,19 +4,9 @@
 //! `tests/it/rfc0065_replicated_wal.rs`.
 //!
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC is
-//! red; each names the slice that discharges it.
-
-/// Scenario RFC0065.1 — the backend is configurable and checked at start,
-/// the layout arm. A node whose `peers`, `groups` or `replication_factor`
-/// differs from the recorded `cluster.json` fails startup naming the field.
-#[test]
-#[ignore = "RFC0065.1 stub — implemented with the recorded cluster layout"]
-fn rfc0065_1_a_layout_mismatch_fails_naming_the_field() {
-    todo!(
-        "RFC0065.1 — a `peers`, `groups` or `replication_factor` that differs from \
-         the recorded layout fails startup naming the field"
-    );
-}
+//! red; each names the slice that discharges it. RFC0065.1's layout arm is
+//! a unit test in `src/main.rs`: the replicated backend needs a store with
+//! conditional updates, and the local store these tests serve on has none.
 
 /// Scenario RFC0065.3 — crash recovery on the replicated backend (B2, B7).
 /// Given a three-node cluster ingesting steadily, when the acknowledging

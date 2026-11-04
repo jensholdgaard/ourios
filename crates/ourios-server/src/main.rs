@@ -39,13 +39,15 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use ourios_ingester::Compactor;
+use ourios_ingester::replicated::layout::{self, VotingLayout};
+use ourios_ingester::replicated::replica_id;
 
 use ourios_parquet::{CompactionPolicy, ParquetAuditSink, StoreConfig};
 use ourios_server::config::resolve::{
     ServerConfig, config_from_env, config_from_file, preflight_tls, validate_graph_columns,
     wal_config, warn_if_open_mode, warn_if_plaintext_credentials,
 };
-use ourios_server::config::wal::WalBackend;
+use ourios_server::config::wal::{ReplicatedWal, WalBackend};
 
 use ourios_telemetry::TelemetryConfig;
 use tracing::Instrument as _;
@@ -517,7 +519,7 @@ async fn start_receiver(
     let Some(params) = &config.receiver else {
         return Ok(None);
     };
-    check_wal_backend(&params.wal)?;
+    check_wal_backend(&params.wal, store, &params.wal_root)?;
     let receiver_config = receiver::ReceiverConfig {
         grpc_addr: params.grpc_addr,
         grpc_tls: params.grpc_tls.clone(),
@@ -618,16 +620,42 @@ fn listen_for_shutdown(
 
 /// The replicated WAL (RFC 0065) resolves and validates but is not built
 /// yet, so a receiver configured for it refuses to start rather than
-/// silently running on the local WAL.
-fn check_wal_backend(wal: &WalBackend) -> Result<(), receiver::StartError> {
+/// silently running on the local WAL. Its layout and identity checks run
+/// first, so a node that could never join is told why.
+fn check_wal_backend(
+    wal: &WalBackend,
+    store: &ourios_parquet::Store,
+    wal_root: &Path,
+) -> Result<(), receiver::StartError> {
     match wal {
         WalBackend::Local => Ok(()),
-        WalBackend::Replicated(_) => Err(receiver::StartError::Failed(
-            "receiver.wal.backend \"replicated\" is not available yet (RFC 0065); \
-             use \"local\""
-                .to_owned(),
-        )),
+        WalBackend::Replicated(replicated) => {
+            check_replicated_layout(replicated, store, wal_root)?;
+            Err(receiver::StartError::Failed(
+                "receiver.wal.backend \"replicated\" is not available yet (RFC 0065); \
+                 use \"local\""
+                    .to_owned(),
+            ))
+        }
     }
+}
+
+/// Check the configured voting layout against the recorded one, then
+/// read or create this replica's identity (RFC 0065 §6.1).
+fn check_replicated_layout(
+    replicated: &ReplicatedWal,
+    store: &ourios_parquet::Store,
+    wal_root: &Path,
+) -> Result<(), receiver::StartError> {
+    let failed = |e: &dyn std::fmt::Display| receiver::StartError::Failed(e.to_string());
+    let configured = VotingLayout::new(
+        replicated.peers.iter().map(|peer| peer.id.as_str()),
+        replicated.groups,
+        replicated.replication_factor.voters(),
+    );
+    layout::record_or_check(store, &configured).map_err(|e| failed(&e))?;
+    replica_id::load_or_create(wal_root).map_err(|e| failed(&e))?;
+    Ok(())
 }
 
 /// What a failed receiver startup means for the process: a bootstrap scan
@@ -995,10 +1023,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_the_local_wal_backend_starts() {
-        assert!(check_wal_backend(&WalBackend::Local).is_ok());
-        let yaml = "\
+    /// A replicated `receiver.wal` with `node_id: a`, peer TLS, and `leaves`.
+    fn replicated_wal(leaves: &str) -> WalBackend {
+        let yaml = format!(
+            "\
 storage:
   local:
     bucket_root: /data
@@ -1009,27 +1037,126 @@ receiver:
     backend: replicated
     replicated:
       node_id: a
-      peers: a=a:4320,b=b:4320,c=c:4320
-      tail_peers: t=t:4320
-      tail_clients: querier
-      tls:
+{leaves}      tls:
         cert_file: /tls/peer.crt
         key_file: /tls/peer.key
         client_ca_file: /tls/ca.crt
-";
-        let file = ourios_server::config::file::parse(yaml, &|_| None).expect("parses");
+"
+        );
+        let file = ourios_server::config::file::parse(&yaml, &|_| None).expect("parses");
         let config = ourios_server::config::resolve::server_config_from_file(&file)
             .expect("a valid replicated config resolves");
-        let wal = config.receiver.expect("enabled").wal;
-        assert!(matches!(wal, WalBackend::Replicated(_)));
-        let refusal = check_wal_backend(&wal).expect_err("the replicated backend refuses");
-        assert_eq!(
-            startup_exit(refusal),
-            Err(
-                "receiver.wal.backend \"replicated\" is not available yet (RFC 0065); use \"local\""
-                    .to_owned()
-            )
+        config.receiver.expect("enabled").wal
+    }
+
+    const NOT_AVAILABLE: &str =
+        "receiver.wal.backend \"replicated\" is not available yet (RFC 0065); use \"local\"";
+
+    const THREE_VOTERS: &str = "      peers: a=a:4320,b=b:4320,c=c:4320
+      tail_peers: t=t:4320
+      tail_clients: querier
+";
+
+    #[test]
+    fn only_the_local_wal_backend_starts() {
+        let store = ourios_parquet::Store::in_memory();
+        let wal_root = tempfile::TempDir::new().expect("temp");
+        assert!(check_wal_backend(&WalBackend::Local, &store, wal_root.path()).is_ok());
+        assert!(
+            store
+                .get_blocking_opt(layout::LAYOUT_KEY)
+                .expect("read")
+                .is_none()
         );
+        assert!(!wal_root.path().join(replica_id::REPLICA_ID_FILE).exists());
+        let wal = replicated_wal(THREE_VOTERS);
+        assert!(matches!(wal, WalBackend::Replicated(_)));
+        let refusal = check_wal_backend(&wal, &store, wal_root.path())
+            .expect_err("the replicated backend refuses");
+        assert_eq!(startup_exit(refusal), Err(NOT_AVAILABLE.to_owned()));
+    }
+
+    /// RFC0065.1, the layout arm: a node whose `peers`, `groups` or
+    /// `replication_factor` differs from the recorded layout fails startup
+    /// naming the field, while a change to the tail pool does not (B24).
+    /// The store is the in-memory one: the replicated backend needs
+    /// conditional updates, which the local store the served-binary tests
+    /// run on lacks.
+    #[test]
+    fn rfc0065_1_a_layout_mismatch_fails_naming_the_field() {
+        let store = ourios_parquet::Store::in_memory();
+        let wal_root = tempfile::TempDir::new().expect("temp");
+        let start = |leaves: &str| {
+            startup_exit(
+                check_wal_backend(&replicated_wal(leaves), &store, wal_root.path())
+                    .expect_err("the replicated backend refuses"),
+            )
+        };
+        assert_eq!(start(THREE_VOTERS), Err(NOT_AVAILABLE.to_owned()));
+        let tail_changed = "      peers: c=c:4321,b=b:4320,a=a:4320
+      tail_peers: t=t:4320,u=u:4320
+      tail_replicas: 2
+      tail_clients: querier,other
+";
+        assert_eq!(start(tail_changed), Err(NOT_AVAILABLE.to_owned()));
+        let mismatches = [
+            (
+                "      peers: a=a:4320,b=b:4320,d=d:4320\n",
+                "receiver.wal.replicated.peers",
+                "recorded {\"a\", \"b\", \"c\"}, configured {\"a\", \"b\", \"d\"}",
+            ),
+            (
+                "      peers: a=a:4320,b=b:4320,c=c:4320\n      groups: 32\n",
+                "receiver.wal.replicated.groups",
+                "recorded 16, configured 32",
+            ),
+            (
+                "      peers: a=a:4320,b=b:4320,c=c:4320,d=d:4320,e=e:4320\n      replication_factor: 5\n",
+                "receiver.wal.replicated.replication_factor",
+                "recorded 3, configured 5",
+            ),
+        ];
+        for (voters, field, values) in mismatches {
+            let leaves =
+                format!("{voters}      tail_peers: t=t:4320\n      tail_clients: querier\n");
+            let error = start(&leaves).expect_err("a mismatch fails startup");
+            assert!(error.contains(&format!("{field} differs")), "{error}");
+            assert!(error.contains(values), "{error}");
+        }
+    }
+
+    /// RFC 0065 §6.2: the replicated backend needs conditional updates,
+    /// which the local filesystem store does not have.
+    #[test]
+    fn the_replicated_backend_refuses_a_store_without_conditional_updates() {
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = ourios_parquet::Store::local(bucket.path()).expect("local store");
+        let wal_root = tempfile::TempDir::new().expect("temp");
+        let refusal = check_wal_backend(&replicated_wal(THREE_VOTERS), &store, wal_root.path())
+            .expect_err("refused");
+        let error = startup_exit(refusal).expect_err("a failure");
+        assert!(error.starts_with("storage.backend:"), "{error}");
+        assert!(!wal_root.path().join(replica_id::REPLICA_ID_FILE).exists());
+    }
+
+    /// The replicated backend keeps its identity in `wal_root/replica.id`
+    /// across starts and refuses one it cannot read (RFC 0065 §6.1).
+    #[test]
+    fn the_replicated_backend_keeps_its_replica_id() {
+        let store = ourios_parquet::Store::in_memory();
+        let wal_root = tempfile::TempDir::new().expect("temp");
+        let path = wal_root.path().join(replica_id::REPLICA_ID_FILE);
+        let wal = replicated_wal(THREE_VOTERS);
+        check_wal_backend(&wal, &store, wal_root.path()).expect_err("not available yet");
+        let first = std::fs::read(&path).expect("created");
+        check_wal_backend(&wal, &store, wal_root.path()).expect_err("not available yet");
+        assert_eq!(std::fs::read(&path).expect("kept"), first);
+        std::fs::write(&path, b"garbage").expect("corrupt");
+        let error =
+            startup_exit(check_wal_backend(&wal, &store, wal_root.path()).expect_err("refused"))
+                .expect_err("a failure");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert_eq!(std::fs::read(&path).expect("kept"), b"garbage");
     }
 
     /// RFC0048.3 — the promoted-set check is per identity list: a partial

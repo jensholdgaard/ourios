@@ -153,6 +153,10 @@ tonic-types = { version = "0.14", default-features = false }
 # `uuid::Uuid` of `ourios_wal::WalOffset` (RFC 0001 §6.9 / RFC 0008
 # §6.6). Same major as ourios-wal's, so the types unify.
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
+# XXH3-64 for the replicated WAL's tenant-to-group and rendezvous
+# placement hashes (RFC 0065 §6.1). Already in the tree via parquet and
+# lz4_flex; only the one hash is enabled.
+twox-hash = { version = "=2.1.2", default-features = false, features = ["xxhash3_64"] }
 
 [features]
 # RFC 0029: OIDC bearer resolution in front of the RFC 0026 enforcement.

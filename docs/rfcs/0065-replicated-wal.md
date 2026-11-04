@@ -346,9 +346,13 @@ testing and without membership change.
 
 The shape, replacing §6.2–§6.4:
 - **Storage:** `RaftLogStorage` over RFC 0008 segments; frame kind
-  `0x04` carries the Raft log id `(term, index)` where §6.3 has
-  `(epoch, seq)`; votes go in one group-committed vote log per node
-  (§4.7, §6.1).
+  `0x04` (`ReplicatedEntry`) carries the Raft log id `(term, index)`
+  where §6.3 has `(epoch, seq)`, as a tagged record: a blank, normal or
+  membership entry, or a truncation, purge or commit marker. The log id
+  is `(term, index)` because the type config uses `openraft`'s
+  standard leader id (`impls::leader_id_std::LeaderId`); its default
+  would add the node id. Votes go in one group-committed vote log per
+  node (§4.7, §6.1).
 - **Transport:** `RaftNetworkV2` over tonic with RFC 0030 mTLS.
 - **Checkpoint:** a metadata-only snapshot `{index, term, Parquet
   manifest reference}`; purging follows it, and a lagging follower
@@ -356,8 +360,11 @@ The shape, replacing §6.2–§6.4:
 - **Tail (B23, B24):** served by non-voting **learners**, which receive
   and apply the committed log but never count toward an ack, so adding
   them scales query capacity without touching the write path. A learner
-  confirms it is current with one `read_log_id` call to the leader per
-  batch of reads (openraft's documented follower-read flow), then reads
+  confirms it is current with one read-index confirmation from the
+  leader per batch of reads, an Ourios peer RPC over openraft's
+  follower-read flow (the leader's `get_read_linearizer(ReadIndex)`
+  returns the read log id; the learner's `Linearizer` waits until it
+  has applied through it), then reads
   locally. Learners mine the raw frames themselves with a deterministic
   miner (§6.7), and one of them, the flusher, writes Parquet (§6.5);
   the leader does not mine.
@@ -370,7 +377,7 @@ The shape, replacing §6.2–§6.4:
 disk and fsync per group), though acks wait for the fastest majority,
 not the slowest in-sync member. `client_write` resolves after apply, so
 apply only queues frames for the miner. Clock-free tail reads cost a
-`read_log_id` round trip to the leader per read batch.
+read-index round trip to the leader per read batch.
 
 **Risks.** 0.10 is alpha and still receiving safety fixes, so we would
 pin a reviewed git revision; 0.9 is frozen and may lack the latest
@@ -930,7 +937,11 @@ the mass-failover time and vote-log batching as tuning signals.
   passes a size threshold. Recovery takes the last record per group.
 - **No storage operation blocks the Raft runtime's workers.** Vote
   writes, `sync`, truncation and purge markers run on the WAL's own
-  threads and complete through callbacks; a blocking call on a worker
+  threads. An append completes through `openraft`'s `IOFlushed`
+  callback once the fsync covering it returns; `save_vote`,
+  `truncate_after`, `purge` and `save_committed` are async calls whose
+  futures resolve after that thread's fsync, so they park only their
+  group's Raft task, never a worker; a blocking call on a worker
   thread caused §4.7's election storm.
 
 ### 6.2 The group record
@@ -1255,7 +1266,7 @@ never count toward an ack (learners, under §4.3's shape).
   flusher's anyway is a bug B16 catches (RFC0065.20).
 - **Read your acks (B14) without touching ingest (B23).** A `Tail` call
   to a tail replica first obtains a **quorum-confirmed** read point:
-  the replica asks the leader for its `read_log_id`, which the leader
+  the replica asks the leader for its read log id, which the leader
   returns only after confirming its leadership with a quorum (ReadIndex,
   not a lease), so a deposed leader or one whose commit point lags
   cannot answer. One confirmation serves every read queued before it

@@ -449,6 +449,46 @@ pub struct ReceiverSection {
     /// 16773120).
     #[serde(deserialize_with = "scalar_opt")]
     pub max_request_bytes: Option<String>,
+    /// RFC 0065 §3.8 — the WAL backend (`receiver.wal`).
+    pub wal: WalSection,
+}
+
+/// `receiver.wal.*` — the WAL backend (RFC 0065 §3.8).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct WalSection {
+    /// `local` (default) or `replicated`.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub backend: Option<String>,
+    pub replicated: ReplicatedWalSection,
+}
+
+/// `receiver.wal.replicated.*` — read only when `backend` is
+/// `replicated` (RFC 0065 §3.8). Peer and client lists are
+/// comma-separated scalars, so a whole list rides one `${env:…}`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct ReplicatedWalSection {
+    #[serde(deserialize_with = "scalar_opt")]
+    pub node_id: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub listen_addr: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub peers: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub tail_peers: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub groups: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub replication_factor: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub tail_replicas: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub tail_clients: Option<String>,
+    /// Peer mTLS (RFC 0030's `TlsSection` leaves).
+    pub tls: TlsSection,
 }
 
 /// One `*_tls` block (RFC 0030 §3.1). Raw string leaves — the §3.1
@@ -995,7 +1035,27 @@ impl ReceiverSection {
         substitute(&mut self.encode_workers, lookup)?;
         substitute(&mut self.template_ids_allow_bootstrap, lookup)?;
         substitute(&mut self.max_buffer_age_secs, lookup)?;
-        substitute(&mut self.max_request_bytes, lookup)
+        substitute(&mut self.max_request_bytes, lookup)?;
+        self.wal.substitute(lookup)
+    }
+}
+
+impl WalSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.backend, lookup)?;
+        let replicated = &mut self.replicated;
+        substitute(&mut replicated.node_id, lookup)?;
+        substitute(&mut replicated.listen_addr, lookup)?;
+        substitute(&mut replicated.peers, lookup)?;
+        substitute(&mut replicated.tail_peers, lookup)?;
+        substitute(&mut replicated.groups, lookup)?;
+        substitute(&mut replicated.replication_factor, lookup)?;
+        substitute(&mut replicated.tail_replicas, lookup)?;
+        substitute(&mut replicated.tail_clients, lookup)?;
+        replicated.tls.substitute(lookup)
     }
 }
 
@@ -1918,6 +1978,23 @@ receiver:
   encode_workers: ${env:L28}
   max_buffer_age_secs: ${env:L72}
   max_request_bytes: ${env:L73}
+  wal:
+    backend: ${env:L74}
+    replicated:
+      node_id: ${env:L75}
+      listen_addr: ${env:L76}
+      peers: ${env:L77}
+      tail_peers: ${env:L78}
+      groups: ${env:L79}
+      replication_factor: ${env:L80}
+      tail_replicas: ${env:L81}
+      tail_clients: ${env:L82}
+      tls:
+        cert_file: ${env:L83}
+        key_file: ${env:L84}
+        client_ca_file: ${env:L85}
+        min_version: ${env:L86}
+        reload_interval_secs: ${env:L87}
 querier:
   enabled: ${env:L29}
   http_addr: ${env:L30}

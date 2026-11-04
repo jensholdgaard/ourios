@@ -155,6 +155,8 @@ auth:
 | `OURIOS_RECEIVER_ENCODE_WORKERS` | concurrent encode pool size (RFC 0035; default: all cores) |
 | `OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS` / `receiver.max_buffer_age_secs` | flush age in seconds, `1`–`300` (RFC 0063; default 300) |
 | `OURIOS_RECEIVER_MAX_REQUEST_BYTES` / `receiver.max_request_bytes` | OTLP request-size limit in bytes for both listeners, `1`–`16773120` (RFC 0061; default 16773120, 16 MiB − 4 KiB) |
+| `OURIOS_RECEIVER_WAL_BACKEND` / `receiver.wal.backend` | `local` (default) or `replicated`; see [the WAL backend](#the-wal-backend) |
+| `OURIOS_RECEIVER_WAL_NODE_ID` / `_LISTEN_ADDR` / `_PEERS` / `_TAIL_PEERS` / `_GROUPS` / `_REPLICATION_FACTOR` / `_TAIL_REPLICAS` / `_TAIL_CLIENTS` | the `receiver.wal.replicated.*` keys of the same names |
 | `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` / `receiver.template_ids_allow_bootstrap` | authorise the one-time template-id bootstrap over existing data, for the upgrade to RFC 0059 only (default off); see [the bootstrap's cost](#the-template-id-bootstrap) |
 | `OURIOS_QUERIER_ENABLED` / `OURIOS_QUERIER_HTTP_ADDR` / `OURIOS_QUERIER_DEFAULT_WINDOW_SECS` | querier role |
 | `OURIOS_QUERIER_MCP_ENABLED` | the `/mcp` agent surface (RFC 0027) |
@@ -224,6 +226,46 @@ until it ends:
 - **Done.** Remove the setting only once the receiver has logged
   `ourios.receiver.template_ids.bootstrapped` or written
   `snapshots/TEMPLATE_IDS_SEATED` under its WAL root.
+
+## The WAL backend
+
+`receiver.wal.backend` chooses where the receiver's write-ahead log
+lives. `local` (the default) keeps one WAL under `wal_root`. `replicated`
+([RFC 0065](../rfcs/0065-replicated-wal.md)) is validated at startup but
+not available yet: a receiver configured for it refuses to start. Its
+keys, under `receiver.wal.replicated`, are read only when it is selected:
+
+| Key | Meaning |
+|---|---|
+| `node_id` | required; this node's id, which must appear in exactly one of `peers` and `tail_peers` |
+| `listen_addr` | the peer listener (default `0.0.0.0:4320`) |
+| `peers` | required; the voting replicas, `id=host:port,…`, ids unique |
+| `tail_peers` | required; the tail pool, `id=host:port,…`, no id also in `peers` |
+| `groups` | integer ≥ 1 (default 16) |
+| `replication_factor` | voters per group, `3` (default) or `5`, at most the number of `peers` |
+| `tail_replicas` | tail replicas per group, `1` (default) up to the number of `tail_peers` |
+| `tail_clients` | required; comma-separated querier certificate identities allowed to read the tail |
+| `tls` | required, file-only; a [TLS block](#listener-tls) whose `client_ca_file` is set (peer mTLS) |
+
+```yaml
+receiver:
+  wal_root: /var/lib/ourios/wal
+  wal:
+    backend: replicated
+    replicated:
+      node_id: ${env:POD_NAME}
+      peers: ${env:OURIOS_RECEIVER_WAL_PEERS}
+      tail_peers: ${env:OURIOS_RECEIVER_WAL_TAIL_PEERS}
+      tail_clients: querier
+      tls:
+        cert_file: /etc/ourios/peer-tls/tls.crt
+        key_file: /etc/ourios/peer-tls/tls.key
+        client_ca_file: /etc/ourios/peer-tls/ca.crt
+```
+
+Each invalid value fails startup with an error naming its
+`receiver.wal.*` key. Because `tls` is file-only, `replicated` cannot be
+selected from the environment alone.
 
 ## Listener TLS
 

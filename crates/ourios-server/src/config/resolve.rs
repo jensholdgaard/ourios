@@ -6,6 +6,7 @@
 //! module so it stops re-growing inside the binary.
 
 use crate::config::file::{FileConfig, PromotedEntry, TlsSection};
+use crate::config::wal::{WalBackend, WalInputs, build_wal_backend};
 use ourios_config::{MinerConfig, UpstreamTemplates};
 pub use ourios_ingester::receiver::MAX_REQUEST_BYTES;
 use ourios_parquet::{PromotedAttributes, S3Config, StoreConfig};
@@ -122,6 +123,9 @@ pub struct ReceiverParams {
     /// `OURIOS_RECEIVER_MAX_REQUEST_BYTES`; default and ceiling
     /// [`MAX_REQUEST_BYTES`]).
     pub max_request_bytes: usize,
+    /// RFC 0065 §3.8 — the WAL backend (`receiver.wal.*` /
+    /// `OURIOS_RECEIVER_WAL_*`; default local).
+    pub wal: WalBackend,
 }
 
 /// RFC 0063 §3.1 — the receiver's flush age default, which is also its
@@ -200,6 +204,8 @@ pub struct ReceiverInputs<'a> {
     /// `OURIOS_RECEIVER_MAX_REQUEST_BYTES` / `receiver.max_request_bytes`
     /// (`1..=16773120`; default 16773120 — RFC 0061 §3.1).
     pub max_request_bytes: Option<&'a str>,
+    /// `OURIOS_RECEIVER_WAL_*` / `receiver.wal.*` (RFC 0065 §3.8).
+    pub wal: WalInputs<'a>,
 }
 
 /// Raw inputs for [`build_querier_config`].
@@ -298,9 +304,20 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
     let allow_bootstrap = std::env::var("OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP").ok();
     let max_buffer_age = std::env::var("OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS").ok();
     let max_request_bytes = std::env::var("OURIOS_RECEIVER_MAX_REQUEST_BYTES").ok();
+    let wal_env = |key: &str| std::env::var(format!("OURIOS_RECEIVER_WAL_{key}")).ok();
+    let wal_backend = wal_env("BACKEND");
+    let wal_node_id = wal_env("NODE_ID");
+    let wal_listen_addr = wal_env("LISTEN_ADDR");
+    let wal_peers = wal_env("PEERS");
+    let wal_tail_peers = wal_env("TAIL_PEERS");
+    let wal_groups = wal_env("GROUPS");
+    let wal_replication_factor = wal_env("REPLICATION_FACTOR");
+    let wal_tail_replicas = wal_env("TAIL_REPLICAS");
+    let wal_tail_clients = wal_env("TAIL_CLIENTS");
     // TLS and the miner dial are config-file only (RFC 0030 §3.1 /
     // RFC 0050 §3.2): the env path takes the defaults (plaintext,
-    // `ignore` mode).
+    // `ignore` mode), so a replicated WAL needs the config file for
+    // its peer mTLS.
     let receiver = build_receiver_config(ReceiverInputs {
         enabled: receiver_enabled.as_deref(),
         grpc_addr: grpc_addr.as_deref(),
@@ -310,6 +327,18 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
         template_ids_allow_bootstrap: allow_bootstrap.as_deref(),
         max_buffer_age_secs: max_buffer_age.as_deref(),
         max_request_bytes: max_request_bytes.as_deref(),
+        wal: WalInputs {
+            backend: wal_backend.as_deref(),
+            node_id: wal_node_id.as_deref(),
+            listen_addr: wal_listen_addr.as_deref(),
+            peers: wal_peers.as_deref(),
+            tail_peers: wal_tail_peers.as_deref(),
+            groups: wal_groups.as_deref(),
+            replication_factor: wal_replication_factor.as_deref(),
+            tail_replicas: wal_tail_replicas.as_deref(),
+            tail_clients: wal_tail_clients.as_deref(),
+            tls: None,
+        },
         ..ReceiverInputs::default()
     })?;
     let querier_enabled = std::env::var("OURIOS_QUERIER_ENABLED").ok();
@@ -404,6 +433,7 @@ pub fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String
         template_ids_allow_bootstrap: file.receiver.template_ids_allow_bootstrap.as_deref(),
         max_buffer_age_secs: file.receiver.max_buffer_age_secs.as_deref(),
         max_request_bytes: file.receiver.max_request_bytes.as_deref(),
+        wal: wal_inputs_from_file(&file.receiver.wal),
     })?;
     let querier = build_querier_config(QuerierInputs {
         enabled: file.querier.enabled.as_deref(),
@@ -430,6 +460,22 @@ pub fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String
         promoted,
         auth,
     )
+}
+
+fn wal_inputs_from_file(wal: &crate::config::file::WalSection) -> WalInputs<'_> {
+    let replicated = &wal.replicated;
+    WalInputs {
+        backend: wal.backend.as_deref(),
+        node_id: replicated.node_id.as_deref(),
+        listen_addr: replicated.listen_addr.as_deref(),
+        peers: replicated.peers.as_deref(),
+        tail_peers: replicated.tail_peers.as_deref(),
+        groups: replicated.groups.as_deref(),
+        replication_factor: replicated.replication_factor.as_deref(),
+        tail_replicas: replicated.tail_replicas.as_deref(),
+        tail_clients: replicated.tail_clients.as_deref(),
+        tls: Some(&replicated.tls),
+    }
 }
 
 /// Pure storage-backend resolution (env reads live in [`config_from_env`];
@@ -631,7 +677,8 @@ pub fn parse_duration(raw: &str) -> Option<Duration> {
 ///
 /// Only when enabled (a disabled role validates nothing): a malformed
 /// address, a missing/empty WAL root, an encode-worker count below 1,
-/// an invalid TLS block, or a bad miner dial.
+/// an invalid TLS block, a bad miner dial, or an invalid `receiver.wal`
+/// section (see [`build_wal_backend`]).
 pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<ReceiverParams>, String> {
     if !matches!(inputs.enabled, Some("1" | "true" | "yes")) {
         return Ok(None);
@@ -658,6 +705,7 @@ pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<Receiv
     );
     let max_buffer_age = parse_max_buffer_age(inputs.max_buffer_age_secs)?;
     let max_request_bytes = parse_max_request_bytes(inputs.max_request_bytes)?;
+    let wal = build_wal_backend(inputs.wal)?;
     Ok(Some(ReceiverParams {
         grpc_addr,
         grpc_tls,
@@ -669,6 +717,7 @@ pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<Receiv
         template_ids_allow_bootstrap,
         max_buffer_age,
         max_request_bytes,
+        wal,
     }))
 }
 

@@ -139,6 +139,27 @@ fn wal_error(op: &str, e: impl Debug) -> io::Error {
     io::Error::other(format!("{op}: {e:?}"))
 }
 
+/// Open and replay the group's WAL, then fsync it before its index is
+/// exposed: after a process crash, replay may read frames that are still
+/// only in the page cache, and `openraft` skips the I/O for a retried
+/// entry it already holds, so this replica could count toward a quorum
+/// for an entry a power loss would then take. Older segments were synced
+/// when they rotated, so the current one is all that can be unsynced.
+fn recover(config: WalConfig, gate: &SyncGate) -> io::Result<(Wal, Index, WalOffset)> {
+    let mut wal = Wal::open(config).map_err(|e| wal_error("open the group WAL", e))?;
+    let mut replay = Replay(Index::default());
+    wal.replay(&mut replay)
+        .map_err(|e| wal_error("replay the group WAL", e))?;
+    wal.rebuild_ledger()
+        .map_err(|e| wal_error("rebuild the group WAL ledger", e))?;
+    let sync = || {
+        wal.sync()
+            .map_err(|e| wal_error("sync the recovered group WAL", e))
+    };
+    let synced = sync_through(gate, sync).unwrap_or_else(|| Err(writer_gone()))?;
+    Ok((wal, replay.0, synced))
+}
+
 struct Replay(Index);
 
 impl FrameSink for Replay {
@@ -234,12 +255,7 @@ impl GroupLog {
         votes: VoteLog,
         gate: Arc<SyncGate>,
     ) -> io::Result<Self> {
-        let mut wal = Wal::open(wal).map_err(|e| wal_error("open the group WAL", e))?;
-        let mut replay = Replay(Index::default());
-        wal.replay(&mut replay)
-            .map_err(|e| wal_error("replay the group WAL", e))?;
-        wal.rebuild_ledger()
-            .map_err(|e| wal_error("rebuild the group WAL ledger", e))?;
+        let (wal, index, recovered) = recover(wal, &gate)?;
         let (tx, rx) = mpsc::channel();
         #[cfg(test)]
         let hooks_gate = Arc::clone(&gate);
@@ -250,6 +266,7 @@ impl GroupLog {
             #[cfg(test)]
             synced: Arc::default(),
         };
+        writer.record_synced(recovered);
         #[cfg(test)]
         let synced = Arc::clone(&writer.synced);
         let thread = std::thread::Builder::new()
@@ -259,7 +276,7 @@ impl GroupLog {
         drop(thread);
         Ok(Self {
             group,
-            index: Arc::new(Mutex::new(replay.0)),
+            index: Arc::new(Mutex::new(index)),
             votes,
             tx,
             #[cfg(test)]

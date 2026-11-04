@@ -334,6 +334,7 @@ async fn a_crash_keeps_fsynced_markers() {
 async fn one_fsync_completes_every_append_queued_behind_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut log, gate) = open(dir.path());
+    let opened = gate.passed();
     gate.close();
     let first = append(&mut log, entries(1, 0..=0)).await;
     gate.wait_for_writer();
@@ -351,7 +352,11 @@ async fn one_fsync_completes_every_append_queued_behind_it() {
     for flushed in queued {
         flushed.await.expect("queued");
     }
-    assert_eq!(gate.passed(), 2, "the 200 queued appends shared one fsync");
+    assert_eq!(
+        gate.passed() - opened,
+        2,
+        "the 200 queued appends shared one fsync"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -453,4 +458,30 @@ async fn a_fresh_wal_root_gets_its_group_tree_from_the_wal() {
     assert_eq!(segments, 1);
     let (mut log, _) = open(&wal_root);
     assert_eq!(indexes(&mut log).await, vec![0, 1]);
+}
+
+#[tokio::test]
+async fn a_recovered_log_is_fsynced_before_its_index_is_exposed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let (mut log, _) = open(dir.path());
+        append(&mut log, entries(1, 0..=2))
+            .await
+            .await
+            .expect("fsynced");
+        log.shutdown();
+    }
+    let (mut log, gate) = open(dir.path());
+    assert_eq!(gate.passed(), 1, "the open fsynced the replayed WAL");
+    assert_eq!(indexes(&mut log).await, vec![0, 1, 2]);
+}
+
+#[test]
+fn a_failed_recovery_fsync_fails_the_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let votes = VoteLog::open(dir.path()).expect("vote log");
+    let gate = Arc::new(SyncGate::default());
+    gate.fail();
+    let config = wal_config(&group_dir(dir.path(), GROUP));
+    assert!(GroupLog::open_gated(config, GROUP, votes, gate).is_err());
 }

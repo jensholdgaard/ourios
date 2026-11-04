@@ -91,6 +91,14 @@ pub(crate) mod gate {
         state: State,
         waiting: usize,
         passed: u64,
+        /// Fsyncs still let through before the gate closes itself.
+        budget: Option<u64>,
+    }
+
+    impl Inner {
+        fn holds(&self) -> bool {
+            self.state == State::Closed || (self.state == State::Open && self.budget == Some(0))
+        }
     }
 
     impl Default for SyncGate {
@@ -100,6 +108,7 @@ pub(crate) mod gate {
                     state: State::Open,
                     waiting: 0,
                     passed: 0,
+                    budget: None,
                 }),
                 changed: Condvar::new(),
             }
@@ -121,7 +130,14 @@ pub(crate) mod gate {
         }
 
         pub(crate) fn open(&self) {
+            self.lock().budget = None;
             self.set(State::Open);
+        }
+
+        /// Let `n` more fsyncs through, then hold every later one.
+        pub(crate) fn close_after(&self, n: u64) {
+            self.lock().budget = Some(n);
+            self.changed.notify_all();
         }
 
         /// Every writer held here, and every later one, stops without
@@ -155,13 +171,14 @@ pub(crate) mod gate {
             let mut inner = self.lock();
             inner.waiting += 1;
             self.changed.notify_all();
-            while inner.state == State::Closed {
+            while inner.holds() {
                 inner = self
                     .changed
                     .wait(inner)
                     .unwrap_or_else(PoisonError::into_inner);
             }
             inner.waiting -= 1;
+            inner.budget = inner.budget.map(|n| n.saturating_sub(1));
             match inner.state {
                 State::Open | State::Closed => {
                     inner.passed += 1;

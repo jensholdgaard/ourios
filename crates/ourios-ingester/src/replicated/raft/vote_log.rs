@@ -18,6 +18,9 @@
 //! is: the replica rejoins as a new one (RFC 0065 §6.1, B4) rather than
 //! restore an older vote. Past a size threshold the log is rewritten with
 //! each group's latest vote (tmp, fsync, rename, directory fsync).
+//!
+//! One writer owns a root at a time, through an OS lock on
+//! `wal_root/votes.lock` that its thread holds until it exits.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -26,6 +29,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use openraft::impls::leader_id_std::LeaderId;
 use tokio::sync::oneshot;
@@ -42,6 +46,27 @@ const BODY_LEN: usize = 4 + 8 + 16 + 1;
 const RECORD_LEN: usize = BODY_LEN + 4;
 /// About 31 000 records; a node's latest votes are a few KiB.
 const DEFAULT_REWRITE_BYTES: u64 = 1 << 20;
+/// The ownership lock's name under `wal_root`.
+pub const LOCK_FILE: &str = "votes.lock";
+/// How long an open waits for a retiring writer, whose last fsync may be
+/// slow (§4.7 saw drive-cache flushes of seconds), before refusing.
+const DEFAULT_OWNER_WAIT: Duration = Duration::from_secs(30);
+
+struct Options {
+    rewrite_bytes: u64,
+    owner_wait: Duration,
+    gate: Arc<SyncGate>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            rewrite_bytes: DEFAULT_REWRITE_BYTES,
+            owner_wait: DEFAULT_OWNER_WAIT,
+            gate: Arc::default(),
+        }
+    }
+}
 
 type Latest = Arc<Mutex<HashMap<u32, Vote>>>;
 
@@ -64,18 +89,30 @@ impl VoteLog {
     ///
     /// # Errors
     ///
-    /// A filesystem failure (including the fsync of `wal_root` and its
-    /// parent), a log whose header is not this format, or a corrupt
-    /// record.
+    /// A filesystem failure (including the fsyncs of `wal_root`, its
+    /// parent and the recovered log), a log whose header is not this
+    /// format, a corrupt record, or another writer still owning the root
+    /// after 30 seconds.
     pub fn open(wal_root: &Path) -> io::Result<Self> {
-        Self::open_with(wal_root, DEFAULT_REWRITE_BYTES, Arc::default())
+        Self::open_with(wal_root, Options::default())
     }
 
-    fn open_with(wal_root: &Path, rewrite_bytes: u64, gate: Arc<SyncGate>) -> io::Result<Self> {
+    fn open_with(wal_root: &Path, options: Options) -> io::Result<Self> {
+        ourios_wal::prepare_root(wal_root)
+            .map_err(|e| io::Error::other(format!("prepare {}: {e:?}", wal_root.display())))?;
+        // The writer keeps this lock until its thread exits, after any
+        // rewrite it started, so `votes.log` is never read while a retiring
+        // writer may still replace it, and two live logs never share a root.
+        let owner = take_ownership(wal_root, options.owner_wait)?;
         sync_root(wal_root)?;
+        let Options {
+            rewrite_bytes,
+            gate,
+            ..
+        } = options;
         let path = wal_root.join(VOTES_FILE);
         let (latest, len) = match fs::read(&path) {
-            Ok(bytes) => recover(&path, &bytes)?,
+            Ok(bytes) => recover(&path, &bytes, &gate)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 write_durably(wal_root, &MAGIC)?;
                 (HashMap::new(), MAGIC.len() as u64)
@@ -93,6 +130,7 @@ impl VoteLog {
             latest: Arc::clone(&latest),
             failed: None,
             gate,
+            _owner: owner,
         };
         std::thread::Builder::new()
             .name("ourios-votes".to_owned())
@@ -123,12 +161,38 @@ impl VoteLog {
     }
 }
 
-/// Create `wal_root` if needed and fsync it and its parent, so the
-/// `votes.log` entry read next is durable even if a rewrite renamed it
-/// in and crashed before its own directory fsync.
+/// Wait up to `wait` for the root's lock, polling: a retiring writer
+/// releases it within one fsync, a live one never does.
+fn take_ownership(wal_root: &Path, wait: Duration) -> io::Result<File> {
+    let path = wal_root.join(LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("{} is held by another live vote log", path.display()),
+                ));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+}
+
+/// Fsync `wal_root` and its parent, so the `votes.log` entry read next is
+/// durable even if a rewrite renamed it in and crashed before its own
+/// directory fsync.
 fn sync_root(wal_root: &Path) -> io::Result<()> {
-    ourios_wal::prepare_root(wal_root)
-        .map_err(|e| io::Error::other(format!("prepare {}: {e:?}", wal_root.display())))?;
+    File::open(wal_root)?.sync_all()?;
     match wal_root.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => File::open(parent)?.sync_all(),
         _ => Ok(()),
@@ -175,8 +239,11 @@ fn decode(record: &[u8]) -> Option<(u32, Vote)> {
 }
 
 /// The latest vote per group and the length of the valid prefix, which
-/// is made the file's length.
-fn recover(path: &Path, bytes: &[u8]) -> io::Result<(HashMap<u32, Vote>, u64)> {
+/// is made the file's length. The file is fsynced either way: a record
+/// recovered from the page cache after a process crash may never have
+/// reached the disk, and `openraft` grants a retried vote it already
+/// holds without saving it again.
+fn recover(path: &Path, bytes: &[u8], gate: &SyncGate) -> io::Result<(HashMap<u32, Vote>, u64)> {
     let Some(records) = bytes.strip_prefix(&MAGIC) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -194,11 +261,11 @@ fn recover(path: &Path, bytes: &[u8]) -> io::Result<(HashMap<u32, Vote>, u64)> {
         )
     })?;
     let len = (MAGIC.len() + valid * RECORD_LEN) as u64;
+    let file = OpenOptions::new().write(true).open(path)?;
     if len < bytes.len() as u64 {
-        let file = OpenOptions::new().write(true).open(path)?;
         file.set_len(len)?;
-        file.sync_all()?;
     }
+    sync_through(gate, || file.sync_all()).unwrap_or_else(|| Err(super::writer_gone()))?;
     Ok((latest, len))
 }
 
@@ -260,6 +327,8 @@ struct Writer {
     /// unknown, so every later save fails.
     failed: Option<String>,
     gate: Arc<SyncGate>,
+    /// Released when the thread exits; see [`VoteLog::open`].
+    _owner: File,
 }
 
 impl Writer {
@@ -284,10 +353,7 @@ impl Writer {
             let _ = r.done.send(outcome.reply());
         }
         match outcome {
-            Flush::Done => {
-                self.rewrite_if_due();
-                true
-            }
+            Flush::Done => self.rewrite_if_due(),
             Flush::Failed(_) => true,
             Flush::Crashed => false,
         }
@@ -321,13 +387,19 @@ impl Writer {
         }
     }
 
-    fn rewrite_if_due(&mut self) {
+    /// `false` when the gate crashed the writer before the rewrite.
+    fn rewrite_if_due(&mut self) -> bool {
         if self.len <= self.rewrite_bytes {
-            return;
+            return true;
         }
-        if let Err(e) = self.rewrite() {
+        let gate = Arc::clone(&self.gate);
+        let Some(rewritten) = sync_through(&gate, || self.rewrite()) else {
+            return false;
+        };
+        if let Err(e) = rewritten {
             self.failed = Some(format!("rewrite {VOTES_FILE}: {e}"));
         }
+        true
     }
 
     fn rewrite(&mut self) -> io::Result<()> {
@@ -361,7 +433,12 @@ mod tests {
 
     fn open(dir: &Path, rewrite_bytes: u64) -> (VoteLog, Arc<SyncGate>) {
         let gate = Arc::new(SyncGate::default());
-        let log = VoteLog::open_with(dir, rewrite_bytes, Arc::clone(&gate)).expect("open");
+        let options = Options {
+            rewrite_bytes,
+            gate: Arc::clone(&gate),
+            ..Options::default()
+        };
+        let log = VoteLog::open_with(dir, options).expect("open");
         (log, gate)
     }
 
@@ -539,5 +616,86 @@ mod tests {
         gate.crash();
         assert!(saved.await.is_err());
         assert_eq!(log.latest(1), None);
+    }
+
+    #[tokio::test]
+    async fn a_recovered_log_is_fsynced_before_it_is_trusted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let (log, _) = open(dir.path(), DEFAULT_REWRITE_BYTES);
+            log.save(1, vote(1, 1, false)).await.expect("save");
+        }
+        let (log, gate) = open(dir.path(), DEFAULT_REWRITE_BYTES);
+        assert_eq!(gate.passed(), 1, "recovery fsynced the log it read");
+        assert_eq!(log.latest(1), Some(vote(1, 1, false)));
+    }
+
+    #[test]
+    fn a_failed_recovery_fsync_fails_the_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        drop(VoteLog::open(dir.path()).expect("create"));
+        let gate = Arc::new(SyncGate::default());
+        gate.fail();
+        let options = Options {
+            gate,
+            ..Options::default()
+        };
+        assert!(VoteLog::open_with(dir.path(), options).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_reopen_waits_for_a_retiring_writer_to_finish_its_rewrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let threshold = (MAGIC.len() + 2 * RECORD_LEN) as u64;
+        let (log, gate) = open(dir.path(), threshold);
+        gate.close_after(3);
+        for group in 1..=3 {
+            log.save(group, vote(u64::from(group), 1, false))
+                .await
+                .expect("save");
+        }
+        gate.wait_for_writer();
+        drop(log);
+        let root = dir.path().to_path_buf();
+        let (opened_tx, opened) = mpsc::channel();
+        let reopen = std::thread::spawn(move || {
+            let reopened = VoteLog::open(&root);
+            let _ = opened_tx.send(());
+            reopened
+        });
+        assert!(
+            opened.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the reopen waits while the retiring writer's rewrite is paused"
+        );
+        gate.open();
+        let log = reopen.join().expect("join").expect("reopen");
+        for group in 1..=3 {
+            assert_eq!(log.latest(group), Some(vote(u64::from(group), 1, false)));
+        }
+        log.save(4, vote(4, 1, true))
+            .await
+            .expect("save after the reopen");
+        drop(log);
+        let log = VoteLog::open(dir.path()).expect("reopen again");
+        assert_eq!(
+            log.latest(4),
+            Some(vote(4, 1, true)),
+            "no vote went to an unlinked file"
+        );
+    }
+
+    #[test]
+    fn a_second_live_vote_log_on_one_root_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = VoteLog::open(dir.path()).expect("open");
+        let options = Options {
+            owner_wait: Duration::from_millis(50),
+            ..Options::default()
+        };
+        let err = VoteLog::open_with(dir.path(), options)
+            .err()
+            .expect("must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(live);
     }
 }

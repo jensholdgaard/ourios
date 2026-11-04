@@ -139,6 +139,19 @@ impl Index {
     }
 }
 
+/// Fsync `groups/` and `wal_root`, the directories holding the group
+/// root's entry and `groups/`'s, on every open: `prepare_root` fsyncs them
+/// only when it creates them, so a first open interrupted after creating
+/// the tree would otherwise leave a retry with an entry a power loss can
+/// still drop.
+fn sync_ancestors(root: &Path, gate: &SyncGate) -> io::Result<()> {
+    for dir in root.ancestors().skip(1).take(2) {
+        let sync = || std::fs::File::open(dir)?.sync_all();
+        sync_through(gate, sync).unwrap_or_else(|| Err(writer_gone()))?;
+    }
+    Ok(())
+}
+
 /// Whether `root` holds a WAL segment; a missing root holds none.
 fn holds_segments(root: &Path) -> io::Result<bool> {
     let dir = match std::fs::read_dir(root) {
@@ -346,6 +359,7 @@ impl GroupLog {
         }
         ourios_wal::prepare_root(&wal.root)
             .map_err(|e| wal_error("prepare the group WAL root", e))?;
+        sync_ancestors(&wal.root, &gate)?;
         // The writer thread holds this lock and a vote-log handle until it
         // exits, after its last queued command, so the group's WAL is never
         // replayed while a retiring writer may still append to it, and the

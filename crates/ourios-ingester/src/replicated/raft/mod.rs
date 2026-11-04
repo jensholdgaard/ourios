@@ -220,6 +220,12 @@ pub(crate) mod gate {
             self.set(State::Failing);
         }
 
+        /// Let `n` more fsyncs through, then fail every later one.
+        pub(crate) fn fail_after(&self, n: u64) {
+            self.lock().budget = Some(n);
+            self.set(State::Failing);
+        }
+
         /// The next writer to reach the gate panics.
         pub(crate) fn panic(&self) {
             self.set(State::Panicking);
@@ -252,10 +258,15 @@ pub(crate) mod gate {
                     .unwrap_or_else(PoisonError::into_inner);
             }
             inner.waiting -= 1;
+            let spared = inner.budget.is_some_and(|n| n > 0);
             inner.budget = inner.budget.map(|n| n.saturating_sub(1));
             match inner.state {
                 State::Panicking => panic!("injected writer panic"),
                 State::Open | State::Closed => {
+                    inner.passed += 1;
+                    Pass::Sync
+                }
+                State::Failing if spared => {
                     inner.passed += 1;
                     Pass::Sync
                 }

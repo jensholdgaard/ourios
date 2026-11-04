@@ -472,7 +472,11 @@ async fn a_recovered_log_is_fsynced_before_its_index_is_exposed() {
         log.shutdown();
     }
     let (mut log, gate) = open(dir.path());
-    assert_eq!(gate.passed(), 1, "the open fsynced the replayed WAL");
+    assert_eq!(
+        gate.passed(),
+        3,
+        "the open fsynced groups/, wal_root and the replayed WAL"
+    );
     assert_eq!(indexes(&mut log).await, vec![0, 1, 2]);
 }
 
@@ -482,9 +486,14 @@ fn a_failed_recovery_fsync_fails_the_open() {
     vote_log::create(dir.path()).expect("create");
     let votes = VoteLog::open(dir.path()).expect("vote log");
     let gate = Arc::new(SyncGate::default());
-    gate.fail();
+    gate.fail_after(2);
     let config = wal_config(&group_dir(dir.path(), GROUP));
-    assert!(GroupLog::open_gated(config, GROUP, votes, gate).is_err());
+    assert!(GroupLog::open_gated(config, GROUP, votes, Arc::clone(&gate)).is_err());
+    assert_eq!(
+        gate.passed(),
+        2,
+        "the directory fsyncs passed; the WAL's failed"
+    );
 }
 
 /// Run `open` on a thread and report whether it is still waiting after
@@ -631,5 +640,40 @@ async fn a_panicking_writer_fails_the_queued_callbacks() {
     assert!(
         err.to_string().contains("writer thread has stopped"),
         "the guard completed the callback: {err}"
+    );
+}
+
+/// A first open interrupted after creating `groups/<g>/` but before its
+/// fsyncs leaves the retry with an existing root, which `prepare_root`
+/// fsyncs alone; the open itself must fsync the two directories above it.
+#[tokio::test]
+async fn a_retried_first_open_fsyncs_the_group_roots_ancestors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(group_dir(dir.path(), GROUP)).expect("an interrupted first open");
+    let (mut log, gate) = open(dir.path());
+    assert_eq!(
+        gate.passed(),
+        3,
+        "groups/ and wal_root are fsynced before the replayed WAL"
+    );
+    append(&mut log, entries(1, 0..=0))
+        .await
+        .await
+        .expect("fsynced");
+}
+
+#[test]
+fn a_failed_ancestor_fsync_fails_the_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    vote_log::create(dir.path()).expect("create");
+    let votes = VoteLog::open(dir.path()).expect("vote log");
+    let gate = Arc::new(SyncGate::default());
+    gate.fail_after(1);
+    let config = wal_config(&group_dir(dir.path(), GROUP));
+    assert!(GroupLog::open_gated(config, GROUP, votes, Arc::clone(&gate)).is_err());
+    assert_eq!(
+        gate.passed(),
+        1,
+        "groups/ was fsynced; wal_root's fsync failed"
     );
 }

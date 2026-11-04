@@ -48,6 +48,11 @@ jobs:
           # measurement for a tighter interval on the overhead.
           cargo bench -p ourios-bench --bench ingest_write_path -- \
             --warm-up-time 2 --measurement-time 10 wal_append 2>&1 | tee ingest-bench.log
+      - name: Interleaved synced-offset A/B (RFC 0068 spike)
+        run: |
+          set -euo pipefail
+          cargo run --release -p ourios-bench --example rfc0068_ab -- 2000 2>&1 | tee rfc0068-ab.log
+          { echo '## RFC 0068 synced-offset interleaved A/B'; echo '```'; cat rfc0068-ab.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Write job summary
         if: always()
         shell: bash
@@ -72,4 +77,5 @@ jobs:
           path: |
             target/criterion
             ingest-bench.log
+            rfc0068-ab.log
           if-no-files-found: warn

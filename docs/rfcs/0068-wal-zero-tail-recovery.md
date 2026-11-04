@@ -91,8 +91,9 @@ corruption, on the all-segments-stop path, exactly as today:
   truncation" still holds without exception;
 - an unknown kind, a non-zero pad, or an oversize `len`, unless every
   byte from `B` to `E` is zero (T2);
-- a zero run that does not reach EOF, for example zeros followed by any
-  non-zero byte;
+- a tail of 12 bytes or more holding a zero run that does not reach
+  EOF, for example zeros followed by any non-zero byte. A shorter tail
+  is T1 whatever its bytes;
 - any torn or zero tail on a **closed** segment.
 
 ### 3.3 Operator visibility
@@ -274,14 +275,15 @@ remove. It may still be worth having for real corruption, separately.
 > - **And** the next append lands at `B` and survives a reopen
 
 > **Scenario RFC0068.2 — every other tail shape keeps today's outcome `[H3]`**
-> - **Given**, each in its own arm, a newest segment ending at `B` with:
+> - **Given**, each in its own arm, a newest segment whose valid frames
+>   end at `B`, followed by:
 >   1–11 bytes of any value (healed, as RFC0008.4); a well-formed header
 >   whose payload runs past EOF (healed, as RFC0008.4); a complete frame
 >   with a CRC mismatch whose payload ends in zeros (corruption); a
 >   frame whose header is intact and whose payload is zeroed from a
->   512-aligned offset to EOF (corruption, §4.2); zeros followed by one
->   non-zero byte (corruption); or zeros followed by a valid frame
->   (corruption)
+>   512-aligned offset to EOF (corruption, §4.2); a tail of 12 bytes or
+>   more that is zeros followed by one non-zero byte (corruption); or
+>   zeros followed by a valid frame (corruption)
 > - **When** the WAL is opened and `Wal::replay` runs recovery
 > - **Then** the healed arms open and truncate to `B`, and the
 >   corruption arms fail with `RecoveryError::Corrupt` naming the

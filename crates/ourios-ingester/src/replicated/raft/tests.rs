@@ -281,11 +281,10 @@ async fn a_crash_keeps_every_fsynced_record_and_nothing_else() {
         gate.close();
         let unsynced = append(&mut log, entries(1, 6..=8)).await;
         gate.wait_for_writer();
-        let mut truncating = log.clone();
-        let truncate =
-            tokio::spawn(async move { truncating.truncate_after(Some(log_id(1, 2))).await });
+        let hooks = log.hooks();
+        let truncate = tokio::spawn(async move { log.truncate_after(Some(log_id(1, 2))).await });
         tokio::task::yield_now().await;
-        let synced = log.crash().expect("a sync happened");
+        let synced = hooks.crash().expect("a sync happened");
         assert!(
             unsynced.await.is_err(),
             "the cut append was never acknowledged"
@@ -368,17 +367,16 @@ async fn a_stalled_fsync_does_not_block_the_runtime() {
     gate.close();
     let mut flushed = std::pin::pin!(append(&mut log, entries(1, 0..=3)).await);
     gate.wait_for_writer();
-    let mut truncating = log.clone();
-    let mut truncate =
-        tokio::spawn(async move { truncating.truncate_after(Some(log_id(1, 1))).await });
+    let mut reader = log.get_log_reader().await;
+    let mut truncate = tokio::spawn(async move { log.truncate_after(Some(log_id(1, 1))).await });
     let stalled = tokio::time::timeout(Duration::from_millis(50), &mut flushed).await;
     assert!(stalled.is_err(), "no callback before the fsync");
     let stalled = tokio::time::timeout(Duration::from_millis(50), &mut truncate).await;
     assert!(stalled.is_err(), "no truncate return before its fsync");
-    let state = log.get_log_state().await.expect("state");
+    let read = reader.try_get_log_entries(..).await.expect("read");
     assert_eq!(
-        state.last_log_id,
-        Some(log_id(1, 1)),
+        read,
+        entries(1, 0..=1),
         "reads answer while the disk stalls"
     );
     gate.open();
@@ -411,16 +409,16 @@ async fn a_vote_waits_for_every_earlier_write_of_its_group() {
     let mut flushed = std::pin::pin!(append(&mut log, entries(1, 0..=3)).await);
     gate.wait_for_writer();
     let vote = Vote::new(2, NodeId::from(7));
-    let mut voting = log.clone();
-    let mut saved = tokio::spawn(async move { voting.save_vote(&vote).await });
+    let mut reader = log.get_log_reader().await;
+    let mut saved = tokio::spawn(async move { log.save_vote(&vote).await });
     let stalled = tokio::time::timeout(Duration::from_millis(50), &mut saved).await;
     assert!(stalled.is_err(), "the vote waits behind the stalled append");
-    assert_eq!(log.read_vote().await.expect("vote"), None);
+    assert_eq!(reader.read_vote().await.expect("vote"), None);
     gate.open();
     saved.await.expect("join").expect("vote");
     let done = futures::FutureExt::now_or_never(flushed.as_mut());
     assert!(matches!(done, Some(Ok(()))), "the append was durable first");
-    assert_eq!(log.read_vote().await.expect("vote"), Some(vote));
+    assert_eq!(reader.read_vote().await.expect("vote"), Some(vote));
 }
 
 #[tokio::test]

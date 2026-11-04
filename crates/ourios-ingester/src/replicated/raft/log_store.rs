@@ -283,9 +283,17 @@ impl Command {
     }
 }
 
-/// `RaftLogStorage` and `RaftLogReader` for one group. Clones share the
-/// log and its writer.
-#[derive(Clone)]
+/// `RaftLogStorage` for one group: its only writer. It is not `Clone`,
+/// and every write takes `&mut self`, so writes reach the WAL thread in
+/// the order they change the index; readers come from
+/// [`RaftLogStorage::get_log_reader`].
+///
+/// ```compile_fail
+/// use ourios_ingester::replicated::raft::log_store::GroupLog;
+/// fn second_writer(log: &GroupLog) -> GroupLog {
+///     log.clone()
+/// }
+/// ```
 pub struct GroupLog {
     group: u32,
     index: Arc<Mutex<Index>>,
@@ -293,6 +301,26 @@ pub struct GroupLog {
     tx: Sender<Command>,
     #[cfg(test)]
     hooks: Arc<test_hooks::Hooks>,
+}
+
+/// A read-only view of a group's log, sharing the writer's index.
+#[derive(Clone)]
+pub struct GroupLogReader {
+    group: u32,
+    index: Arc<Mutex<Index>>,
+    votes: VoteLog,
+}
+
+fn lock_index(index: &Mutex<Index>) -> std::sync::MutexGuard<'_, Index> {
+    index.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn entries_in(index: &Mutex<Index>, range: impl RangeBounds<u64>) -> Vec<Entry> {
+    lock_index(index)
+        .entries
+        .range(range)
+        .map(|(_, e)| e.clone())
+        .collect()
 }
 
 impl GroupLog {
@@ -355,26 +383,44 @@ impl GroupLog {
     }
 
     fn index(&self) -> std::sync::MutexGuard<'_, Index> {
-        self.index.lock().unwrap_or_else(PoisonError::into_inner)
+        lock_index(&self.index)
     }
 
-    fn send(&self, command: Command) -> io::Result<()> {
+    /// Change the index and queue the command under one index lock, so
+    /// the WAL always receives writes in the order the index saw them.
+    /// The channel is unbounded, so the send never blocks under the lock.
+    fn write(
+        &mut self,
+        mutate: impl FnOnce(&mut Index) -> io::Result<()>,
+        command: Command,
+    ) -> io::Result<()> {
+        let mut index = lock_index(&self.index);
+        mutate(&mut index)?;
         self.tx.send(command).map_err(|_| writer_gone())
     }
 
-    /// Queue a marker and wait for the fsync that covers it.
-    async fn durable(&self, record: ReplicatedRecord<'_>) -> io::Result<()> {
+    /// Change the index, queue a marker and wait for the fsync that
+    /// covers it.
+    async fn durable(
+        &mut self,
+        mutate: impl FnOnce(&mut Index),
+        record: ReplicatedRecord<'_>,
+    ) -> io::Result<()> {
         let frame = codec::encode_marker(record)?;
         let (done, rx) = oneshot::channel();
-        self.send(Command::Durable { frame, done })?;
+        let mutate = |index: &mut Index| {
+            mutate(index);
+            Ok(())
+        };
+        self.write(mutate, Command::Durable { frame, done })?;
         rx.await.map_err(|_| writer_gone())?
     }
 
     /// Wait until every write queued before it is durable, failing if
     /// any of them failed.
-    async fn fence(&self) -> io::Result<()> {
+    async fn fence(&mut self) -> io::Result<()> {
         let (done, rx) = oneshot::channel();
-        self.send(Command::Fence { done })?;
+        self.write(|_| Ok(()), Command::Fence { done })?;
         rx.await.map_err(|_| writer_gone())?
     }
 }
@@ -382,17 +428,27 @@ impl GroupLog {
 // openraft's storage traits are async; these methods answer from memory
 // or hand off to the writer thread, so most never await.
 #[allow(clippy::unused_async_trait_impl)]
+impl RaftLogReader<RaftTypes> for GroupLogReader {
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<Entry>, io::Error> {
+        Ok(entries_in(&self.index, range))
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote>, io::Error> {
+        Ok(self.votes.latest(self.group))
+    }
+}
+
+// As above.
+#[allow(clippy::unused_async_trait_impl)]
 impl RaftLogReader<RaftTypes> for GroupLog {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry>, io::Error> {
-        Ok(self
-            .index()
-            .entries
-            .range(range)
-            .map(|(_, e)| e.clone())
-            .collect())
+        Ok(entries_in(&self.index, range))
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote>, io::Error> {
@@ -403,7 +459,7 @@ impl RaftLogReader<RaftTypes> for GroupLog {
 // As above: only the vote and the markers wait for an fsync.
 #[allow(clippy::unused_async_trait_impl)]
 impl RaftLogStorage<RaftTypes> for GroupLog {
-    type LogReader = Self;
+    type LogReader = GroupLogReader;
 
     async fn get_log_state(&mut self) -> Result<LogState<RaftTypes>, io::Error> {
         let index = self.index();
@@ -414,7 +470,11 @@ impl RaftLogStorage<RaftTypes> for GroupLog {
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.clone()
+        GroupLogReader {
+            group: self.group,
+            index: Arc::clone(&self.index),
+            votes: self.votes.clone(),
+        }
     }
 
     /// openraft requires vote and log I/O serialized: the vote waits for
@@ -434,8 +494,11 @@ impl RaftLogStorage<RaftTypes> for GroupLog {
             return Ok(());
         };
         let frame = codec::encode_marker(ReplicatedRecord::Committed(codec::wal_id(&c)))?;
-        self.index().commit(c);
-        self.send(Command::Lazy { frame })
+        let commit = |index: &mut Index| {
+            index.commit(c);
+            Ok(())
+        };
+        self.write(commit, Command::Lazy { frame })
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId>, io::Error> {
@@ -465,23 +528,22 @@ impl RaftLogStorage<RaftTypes> for GroupLog {
                 format!("a {}-byte entry exceeds the WAL frame cap", big.len()),
             ));
         }
-        self.index().extend(entries)?;
-        self.send(Command::Append {
+        let command = Command::Append {
             frames,
             done: Flushed(Some(callback)),
-        })
+        };
+        self.write(|index| index.extend(entries), command)
     }
 
     async fn truncate_after(&mut self, last: Option<LogId>) -> Result<(), io::Error> {
-        self.index().truncate_after(last);
-        let last = last.as_ref().map(codec::wal_id);
-        self.durable(ReplicatedRecord::TruncateAfter(last)).await
+        let record = ReplicatedRecord::TruncateAfter(last.as_ref().map(codec::wal_id));
+        self.durable(|index| index.truncate_after(last), record)
+            .await
     }
 
     async fn purge(&mut self, upto: LogId) -> Result<(), io::Error> {
-        self.index().purge(upto);
-        self.durable(ReplicatedRecord::Purge(codec::wal_id(&upto)))
-            .await
+        let record = ReplicatedRecord::Purge(codec::wal_id(&upto));
+        self.durable(|index| index.purge(upto), record).await
     }
 }
 
@@ -608,12 +670,23 @@ mod test_hooks {
             }
         }
 
+        /// A handle that can crash the writer after the log itself has
+        /// moved into a task.
+        pub(in crate::replicated::raft) fn hooks(&self) -> Arc<Hooks> {
+            Arc::clone(&self.hooks)
+        }
+
+        pub(in crate::replicated::raft) fn crash(&self) -> Option<WalOffset> {
+            self.hooks.crash()
+        }
+    }
+
+    impl Hooks {
         /// Stop the writer, held at the gate, before its fsync, and
         /// return the boundary the last successful sync made durable.
         pub(in crate::replicated::raft) fn crash(&self) -> Option<WalOffset> {
-            self.hooks.gate.crash();
+            self.gate.crash();
             let thread = self
-                .hooks
                 .thread
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -621,11 +694,7 @@ mod test_hooks {
             if let Some(thread) = thread {
                 let _ = thread.join();
             }
-            *self
-                .hooks
-                .synced
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+            *self.synced.lock().unwrap_or_else(PoisonError::into_inner)
         }
     }
 }

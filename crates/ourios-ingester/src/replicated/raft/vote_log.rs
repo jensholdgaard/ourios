@@ -4,22 +4,25 @@
 //! costs one fsync per batch rather than one per group. It sits outside
 //! the group WALs, so segment reclamation never touches it.
 //!
+//! The file is a sequence of 512-byte sectors:
+//!
 //! ```text
-//! | magic: [u8; 8] = "OURVOTE\x01"                                     |
-//! | record*: group: u32_le | term: u64_le | voted_for: [u8; 16] (UUID) |
-//! |          | committed: u8 (0 or 1) | crc32c: u32_le (over the 29 B before it) |
+//! | sector 0: magic: [u8; 8] = "OURVOTE\x02" | 504 zero bytes                    |
+//! | sector n: slot * 15 | 17 zero bytes (pad)                                    |
+//! | slot:     group: u32_le | term: u64_le | voted_for: [u8; 16] (UUID)         |
+//! |           | committed: u8 (0 or 1) | crc32c: u32_le (over the 29 B before it) |
 //! ```
 //!
+//! Records are appended in order; the last sector may end early.
 //! Recovery keeps the last record per group. Only a tail no `save` was
-//! answered for is cut off before the next append: a partial record at
-//! the end, and complete records that read back as zeros from a record
-//! boundary, or from a 512-byte-aligned offset inside the first of them,
-//! to the end. Any other record that fails its CRC or holds a `committed`
-//! byte other than 0 or 1 may be a damaged acknowledged vote, so the open
-//! fails, wherever the record is: the replica rejoins as a new one (RFC
-//! 0065 §6.1, B4) rather than restore an older vote. Past a size threshold
-//! the log is rewritten with each group's latest vote (tmp, fsync,
-//! rename, directory fsync).
+//! answered for is cut off before the next append: slots that are all
+//! zero bytes, and a partial slot at the end of the file. Any other slot
+//! that fails its CRC or holds a `committed` byte other than 0 or 1, a
+//! valid slot after a zero one, or a non-zero pad byte may be a damaged
+//! acknowledged vote, so the open fails, wherever it is: the replica
+//! rejoins as a new one (RFC 0065 §6.1, B4) rather than restore an older
+//! vote. Past a size threshold the log is rewritten with each group's
+//! latest vote (tmp, fsync, rename, directory fsync).
 //!
 //! [`create`] makes the empty log in the same first-start step that
 //! writes the replica's identity, before it; a later open that finds no
@@ -46,9 +49,14 @@ use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership};
 
 /// The vote log's name under `wal_root`.
 pub const VOTES_FILE: &str = "votes.log";
-const MAGIC: [u8; 8] = *b"OURVOTE\x01";
+const MAGIC: [u8; 8] = *b"OURVOTE\x02";
 const BODY_LEN: usize = 4 + 8 + 16 + 1;
 const RECORD_LEN: usize = BODY_LEN + 4;
+// No slot straddles a sector, so a torn write, which loses whole sectors,
+// can only leave whole slots zero: a slot that is partly valid is damage.
+const SECTOR: usize = 512;
+/// The header sector, which holds no slot.
+const HEADER_LEN: usize = SECTOR;
 /// About 31 000 records; a node's latest votes are a few KiB.
 const DEFAULT_REWRITE_BYTES: u64 = 1 << 20;
 /// The ownership lock's name under `wal_root`.
@@ -91,7 +99,34 @@ pub fn create(wal_root: &Path) -> io::Result<()> {
     if wal_root.join(VOTES_FILE).exists() {
         return Ok(());
     }
-    write_durably(wal_root, &MAGIC)
+    write_durably(wal_root, &header())
+}
+
+/// The magic, zero-padded to its own sector.
+fn header() -> Vec<u8> {
+    let mut sector = vec![0u8; HEADER_LEN];
+    sector[..MAGIC.len()].copy_from_slice(&MAGIC);
+    sector
+}
+
+/// Append `records` to `out`, which continues a file `len` bytes long,
+/// zero-padding to the next sector before a slot that would straddle
+/// one. Returns the new file length.
+fn lay_out(
+    out: &mut Vec<u8>,
+    mut len: usize,
+    records: impl IntoIterator<Item = [u8; RECORD_LEN]>,
+) -> usize {
+    for record in records {
+        let room = SECTOR - len % SECTOR;
+        if room < RECORD_LEN {
+            out.resize(out.len() + room, 0);
+            len += room;
+        }
+        out.extend_from_slice(&record);
+        len += RECORD_LEN;
+    }
+    len
 }
 
 fn lost(path: &Path) -> io::Error {
@@ -239,68 +274,80 @@ fn decode(record: &[u8]) -> Option<(u32, Vote)> {
     ))
 }
 
-/// The latest vote per group and the length of the valid prefix, which
+/// The latest vote per group and the end of the last valid slot, which
 /// is made the file's length. The file is fsynced either way: a record
 /// recovered from the page cache after a process crash may never have
 /// reached the disk, and `openraft` grants a retried vote it already
 /// holds without saving it again.
-fn recover(path: &Path, bytes: &[u8], gate: &SyncGate) -> io::Result<(HashMap<u32, Vote>, u64)> {
-    if !bytes.starts_with(&MAGIC) {
+fn recover(path: &Path, bytes: &[u8], gate: &SyncGate) -> io::Result<(HashMap<u32, Vote>, usize)> {
+    if bytes.get(..HEADER_LEN) != Some(header().as_slice()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{} is not an RFC 0065 vote log", path.display()),
         ));
     }
-    let (latest, valid) = valid_prefix(&bytes[MAGIC.len()..]);
-    let len = MAGIC.len() + valid * RECORD_LEN;
-    if !unanswered_tail(bytes, len) {
-        return Err(io::Error::new(
+    let (latest, len) = scan(bytes).map_err(|at| {
+        io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} record {valid} is corrupt and may be an acknowledged vote; rejoin this \
+                "{} is corrupt at byte {at} and may hold an acknowledged vote; rejoin this \
                  replica as a new one (RFC 0065 §6.1, B4) rather than restore an older vote",
                 path.display()
             ),
-        ));
-    }
+        )
+    })?;
     let file = OpenOptions::new().write(true).open(path)?;
     if len < bytes.len() {
         file.set_len(len as u64)?;
     }
     sync_through(gate, || file.sync_all()).unwrap_or_else(|| Err(super::writer_gone()))?;
-    Ok((latest, len as u64))
+    Ok((latest, len))
 }
 
-/// The latest vote per group over the leading valid records, and their
-/// count.
-fn valid_prefix(records: &[u8]) -> (HashMap<u32, Vote>, usize) {
-    let (complete, _) = records.as_chunks::<RECORD_LEN>();
-    let mut latest = HashMap::new();
-    let mut valid = 0;
-    for (group, vote) in complete.iter().map_while(|r| decode(r)) {
-        latest.insert(group, vote);
-        valid += 1;
+enum Slot {
+    Vote(u32, Vote),
+    Zeroed,
+    Corrupt,
+}
+
+fn classify(slot: &[u8]) -> Slot {
+    if slot.iter().all(|b| *b == 0) {
+        return Slot::Zeroed;
     }
-    (latest, valid)
+    decode(slot).map_or(Slot::Corrupt, |(group, vote)| Slot::Vote(group, vote))
 }
 
-const SECTOR: usize = 512;
-
-/// Whether everything from `from`, the end of the valid records, is a
-/// tail no `save` was answered for. A partial final record was torn
-/// before its fsync. Complete records past `from` qualify only if they
-/// read as zeros to the end from `from` itself, or from a sector boundary
-/// inside the first of them: a crash after the file grew but before its
-/// data reached the disk (ext4 delayed allocation) reads back as zeros
-/// from the old end of file or from the first block the write never
-/// reached, so any other byte pattern is damage.
-fn unanswered_tail(bytes: &[u8], from: usize) -> bool {
-    let complete_end = from + (bytes.len() - from) / RECORD_LEN * RECORD_LEN;
-    let first_record_end = (from + RECORD_LEN).min(complete_end);
-    let boundaries = (from.next_multiple_of(SECTOR)..first_record_end).step_by(SECTOR);
-    std::iter::once(from)
-        .chain(boundaries)
-        .any(|start| bytes[start..complete_end].iter().all(|b| *b == 0))
+/// The latest vote per group and the end of the last valid slot, or the
+/// offset of the first byte that cannot be an unanswered tail.
+fn scan(bytes: &[u8]) -> Result<(HashMap<u32, Vote>, usize), usize> {
+    let mut latest = HashMap::new();
+    let mut valid_end = HEADER_LEN;
+    let mut zeroed = false;
+    let mut at = HEADER_LEN;
+    while at < bytes.len() {
+        let room = SECTOR - at % SECTOR;
+        if room < RECORD_LEN {
+            let pad = &bytes[at..(at + room).min(bytes.len())];
+            if pad.iter().any(|b| *b != 0) {
+                return Err(at);
+            }
+            at += room;
+            continue;
+        }
+        let Some(slot) = bytes.get(at..at + RECORD_LEN) else {
+            break;
+        };
+        match (classify(slot), zeroed) {
+            (Slot::Zeroed, _) => zeroed = true,
+            (Slot::Vote(group, vote), false) => {
+                latest.insert(group, vote);
+                valid_end = at + RECORD_LEN;
+            }
+            _ => return Err(at),
+        }
+        at += RECORD_LEN;
+    }
+    Ok((latest, valid_end))
 }
 
 /// Replace `dir/votes.log` with `bytes`: tmp, fsync, rename, directory fsync.
@@ -316,7 +363,7 @@ fn write_durably(dir: &Path, bytes: &[u8]) -> io::Result<()> {
 struct Writer {
     file: File,
     dir: PathBuf,
-    len: u64,
+    len: usize,
     rewrite_bytes: u64,
     latest: Latest,
     /// Set by the first failed write: after it the file's tail is
@@ -361,10 +408,9 @@ impl Writer {
                 "the vote log failed earlier: {reason}"
             )));
         }
-        let bytes: Vec<u8> = batch
-            .iter()
-            .flat_map(|r| encode(r.group, &r.vote))
-            .collect();
+        let mut bytes = Vec::new();
+        let records = batch.iter().map(|r| encode(r.group, &r.vote));
+        let len = lay_out(&mut bytes, self.len, records);
         let written = self.file.write_all(&bytes);
         let file = &mut self.file;
         let Some(synced) = sync_through(&self.gate, || written.and_then(|()| file.sync_data()))
@@ -373,7 +419,7 @@ impl Writer {
         };
         match synced {
             Ok(()) => {
-                self.len += bytes.len() as u64;
+                self.len = len;
                 Flush::Done
             }
             Err(e) => {
@@ -385,7 +431,7 @@ impl Writer {
 
     /// `false` when the gate crashed the writer before the rewrite.
     fn rewrite_if_due(&mut self) -> bool {
-        if self.len <= self.rewrite_bytes {
+        if self.len as u64 <= self.rewrite_bytes {
             return true;
         }
         let gate = Arc::clone(&self.gate);
@@ -402,13 +448,17 @@ impl Writer {
         let mut groups: Vec<(u32, Vote)> =
             lock(&self.latest).iter().map(|(g, v)| (*g, *v)).collect();
         groups.sort_unstable_by_key(|(g, _)| *g);
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend(groups.iter().flat_map(|(g, v)| encode(*g, v)));
+        let mut bytes = header();
+        let len = lay_out(
+            &mut bytes,
+            HEADER_LEN,
+            groups.iter().map(|(g, v)| encode(*g, v)),
+        );
         write_durably(&self.dir, &bytes)?;
         self.file = OpenOptions::new()
             .append(true)
             .open(self.dir.join(VOTES_FILE))?;
-        self.len = bytes.len() as u64;
+        self.len = len;
         Ok(())
     }
 }
@@ -516,11 +566,7 @@ mod tests {
             let len = fs::metadata(dir.path().join(VOTES_FILE))
                 .expect("stat")
                 .len();
-            assert_eq!(
-                len,
-                (MAGIC.len() + RECORD_LEN) as u64,
-                "{what} tail cut off"
-            );
+            assert_eq!(len, (HEADER_LEN + RECORD_LEN) as u64, "{what} tail cut off");
             log.save(2, vote(4, 2, false))
                 .await
                 .expect("save after the cut");
@@ -556,7 +602,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("var").join("wal");
         create(&root).expect("create");
-        assert_eq!(fs::read(root.join(VOTES_FILE)).expect("read"), MAGIC);
+        assert_eq!(fs::read(root.join(VOTES_FILE)).expect("read"), header());
         let log = VoteLog::open(&root).expect("open");
         assert_eq!(log.latest(0), None);
     }
@@ -583,12 +629,12 @@ mod tests {
         assert!(err.to_string().contains("new replica"), "{err}");
     }
 
-    /// `n` valid records after the header, as one file.
-    fn records(n: u32) -> Vec<u8> {
-        let mut bytes = MAGIC.to_vec();
-        for group in 0..n {
-            bytes.extend_from_slice(&encode(group, &vote(u64::from(group), 1, false)));
-        }
+    /// A log of `n` valid records, laid out as the writer lays them out.
+    fn log_bytes(n: u32) -> Vec<u8> {
+        let mut bytes = header();
+        let records = (0..n).map(|g| encode(g, &vote(u64::from(g), 1, false)));
+        let len = lay_out(&mut bytes, HEADER_LEN, records);
+        assert_eq!(len, bytes.len());
         bytes
     }
 
@@ -599,40 +645,80 @@ mod tests {
     }
 
     #[test]
-    fn a_record_zeroed_from_a_sector_boundary_is_an_unanswered_tail() {
+    fn slots_are_packed_fifteen_to_a_sector_and_never_straddle_one() {
+        let bytes = log_bytes(16);
+        assert_eq!(&bytes[..8], b"OURVOTE\x02");
+        assert!(bytes[8..HEADER_LEN].iter().all(|b| *b == 0));
+        let first = &bytes[HEADER_LEN..HEADER_LEN + RECORD_LEN];
+        assert_eq!(first, encode(0, &vote(0, 1, false)));
+        let pad = HEADER_LEN + 15 * RECORD_LEN;
+        assert_eq!(pad, 1007);
+        assert!(
+            bytes[pad..2 * SECTOR].iter().all(|b| *b == 0),
+            "17-byte pad"
+        );
+        let sixteenth = &bytes[2 * SECTOR..2 * SECTOR + RECORD_LEN];
+        assert_eq!(sixteenth, encode(15, &vote(15, 1, false)));
+        assert_eq!(bytes.len(), 2 * SECTOR + RECORD_LEN);
+    }
+
+    #[tokio::test]
+    async fn appends_and_rewrites_keep_the_layout() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut bytes = records(123);
-        let straddling = encode(123, &vote(9, 9, true));
-        assert!(bytes.len() < 4096 && bytes.len() + RECORD_LEN > 4096);
-        bytes.extend_from_slice(&straddling);
-        bytes[4096..].fill(0);
+        let threshold = (HEADER_LEN + 20 * RECORD_LEN) as u64;
+        {
+            let (log, _) = open(dir.path(), threshold);
+            for group in 0..40 {
+                let v = vote(u64::from(group), 1, false);
+                log.save(group, v).await.expect("save");
+            }
+        }
+        let bytes = fs::read(dir.path().join(VOTES_FILE)).expect("read");
+        assert_eq!(bytes, log_bytes(40), "the rewrite laid every slot out");
+        let log = VoteLog::open(dir.path()).expect("reopen");
+        assert_eq!(log.latest(39), Some(vote(39, 1, false)));
+    }
+
+    #[test]
+    fn a_zero_extended_tail_is_cut() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bytes = log_bytes(16);
+        let valid = bytes.len();
+        bytes.resize(5 * SECTOR, 0);
         let log = reopen_with(dir.path(), &bytes).expect("open");
-        assert_eq!(log.latest(122), Some(vote(122, 1, false)));
-        assert_eq!(log.latest(123), None);
+        assert_eq!(log.latest(15), Some(vote(15, 1, false)));
         let len = fs::metadata(dir.path().join(VOTES_FILE))
             .expect("stat")
             .len();
-        assert_eq!(len, (MAGIC.len() + 123 * RECORD_LEN) as u64);
+        assert_eq!(len, valid as u64);
     }
 
     #[test]
-    fn a_non_zero_byte_after_the_sector_boundary_fails_the_open() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut bytes = records(123);
-        bytes.extend_from_slice(&encode(123, &vote(9, 9, true)));
-        bytes[4096..].fill(0);
-        bytes[4099] = 1;
-        let err = reopen_with(dir.path(), &bytes).err().expect("must refuse");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    fn a_partially_zeroed_slot_fails_the_open() {
+        let slot = HEADER_LEN + 3 * RECORD_LEN;
+        for from in [1, 16, RECORD_LEN - 1] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut bytes = log_bytes(4);
+            bytes[slot + from..slot + RECORD_LEN].fill(0);
+            let err = reopen_with(dir.path(), &bytes).err().expect("must refuse");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "zeroed from {from}");
+        }
     }
 
     #[test]
-    fn a_record_zeroed_off_any_sector_boundary_fails_the_open() {
+    fn a_crc_byte_flipped_to_zero_fails_the_open() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut bytes = records(3);
-        let at = bytes.len();
-        bytes.extend_from_slice(&encode(3, &vote(9, 9, true)));
-        bytes[at + 10..].fill(0);
+        let mut bytes = log_bytes(4);
+        let last_crc_byte = HEADER_LEN + 4 * RECORD_LEN - 1;
+        bytes[last_crc_byte] = u8::from(bytes[last_crc_byte] == 0);
+        assert!(reopen_with(dir.path(), &bytes).is_err());
+    }
+
+    #[test]
+    fn a_non_zero_pad_byte_fails_the_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bytes = log_bytes(16);
+        bytes[HEADER_LEN + 15 * RECORD_LEN + 3] = 1;
         let err = reopen_with(dir.path(), &bytes).err().expect("must refuse");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -647,7 +733,7 @@ mod tests {
         }
         let path = dir.path().join(VOTES_FILE);
         let mut bytes = fs::read(&path).expect("read");
-        bytes[MAGIC.len() + 6] ^= 0xFF;
+        bytes[HEADER_LEN + 6] ^= 0xFF;
         fs::write(&path, &bytes).expect("write");
         let err = VoteLog::open(dir.path()).err().expect("must refuse");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -664,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn past_the_threshold_the_log_is_rewritten_to_each_groups_latest_vote() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let threshold = (MAGIC.len() + 10 * RECORD_LEN) as u64;
+        let threshold = (HEADER_LEN + 10 * RECORD_LEN) as u64;
         {
             let (log, _) = open(dir.path(), threshold);
             for term in 1..=20u64 {
@@ -725,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn a_reopen_waits_for_a_retiring_writer_to_finish_its_rewrite() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let threshold = (MAGIC.len() + 2 * RECORD_LEN) as u64;
+        let threshold = (HEADER_LEN + 2 * RECORD_LEN) as u64;
         let (log, gate) = open(dir.path(), threshold);
         gate.close_after(3);
         for group in 1..=3 {

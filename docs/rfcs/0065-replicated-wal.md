@@ -231,7 +231,7 @@ receiver:
     backend: replicated           # local (default) | replicated | kafka (RFC 0066)
     replicated:
       node_id: "${env:OURIOS_NODE_ID}"          # stable and unique, e.g. the pod name
-      listen_addr: 0.0.0.0:4319                 # the peer listener
+      listen_addr: 0.0.0.0:4320                 # the peer listener
       peers: "${env:OURIOS_RECEIVER_WAL_PEERS}"           # voting replicas: id=host:port,…
       tail_peers: "${env:OURIOS_RECEIVER_WAL_TAIL_PEERS}" # tail pool: id=host:port,… (B24)
       groups: 16
@@ -244,7 +244,10 @@ receiver:
 Every leaf is `${env:VAR}`-substitutable like `ReceiverSection`, with
 bare env under `OURIOS_RECEIVER_WAL_*`. A node is a voter if its
 `node_id` is in `peers` and a tail replica if it is in `tail_peers`,
-never both. `replication_factor` is 3 or 5 and at most `peers`; its
+never both, so no id appears in both lists; each list is a
+comma-separated `id=host:port` string, so one `${env:…}` carries it.
+The peer port defaults to 4320, beside OTLP's 4317 and 4318 and the
+querier's 4319. `replication_factor` is 3 or 5 and at most `peers`; its
 majority is the write quorum (B1), so the durability floor is derived,
 not set (an even factor would add a copy without raising the floor, and
 1 is the local backend). `tail_replicas` is `1..=tail_peers`: one tail
@@ -1463,7 +1466,7 @@ rest of this section.
 - `receiver.wal.backend: replicated` keeps the receiver StatefulSet and
   its volume claims as the voters, and renders `peers` from
   `receiver.replicas` and the existing `-receiver-headless` Service
-  (`ourios-receiver-<i>.<service>:4319`), with `node_id` from the pod
+  (`ourios-receiver-<i>.<service>:4320`), with `node_id` from the pod
   name.
 - The tail pool is a second StatefulSet, `-wal-tail`, with its own
   `walTail.replicas`, volume claims (by default twice 24 hours of the

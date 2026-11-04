@@ -485,3 +485,72 @@ fn a_failed_recovery_fsync_fails_the_open() {
     let config = wal_config(&group_dir(dir.path(), GROUP));
     assert!(GroupLog::open_gated(config, GROUP, votes, gate).is_err());
 }
+
+/// Run `open` on a thread and report whether it is still waiting after
+/// `patience`; the caller then releases the old writer and joins.
+fn open_in_background<T: Send + 'static>(
+    open: impl FnOnce() -> T + Send + 'static,
+    patience: Duration,
+) -> (bool, std::thread::JoinHandle<T>) {
+    let (opened_tx, opened) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let value = open();
+        let _ = opened_tx.send(());
+        value
+    });
+    (opened.recv_timeout(patience).is_err(), handle)
+}
+
+async fn queue_behind_a_stalled_fsync(log: &mut GroupLog, gate: &SyncGate) {
+    append(log, entries(1, 0..=2)).await.await.expect("fsynced");
+    gate.close();
+    let queued = append(log, entries(1, 3..=5)).await;
+    gate.wait_for_writer();
+    drop(queued);
+}
+
+#[tokio::test]
+async fn a_reopen_waits_for_a_retiring_group_writer_with_queued_appends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut log, gate) = open(dir.path());
+    queue_behind_a_stalled_fsync(&mut log, &gate).await;
+    drop(log);
+    let root = dir.path().to_path_buf();
+    let (waiting, reopen) = open_in_background(move || open(&root).0, Duration::from_millis(200));
+    assert!(
+        waiting,
+        "the reopen waits while the old writer holds queued appends"
+    );
+    gate.open();
+    let mut log = reopen.join().expect("join");
+    let read = log.try_get_log_entries(..).await.expect("read");
+    assert_eq!(read, entries(1, 0..=5), "nothing lost or reordered");
+}
+
+#[tokio::test]
+async fn a_group_reopen_waits_for_its_retiring_writer_while_the_vote_log_lives() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let votes = VoteLog::open(dir.path()).expect("vote log");
+    let gate = Arc::new(SyncGate::default());
+    let config = wal_config(&group_dir(dir.path(), GROUP));
+    let open_group = {
+        let votes = votes.clone();
+        move |gate| GroupLog::open_gated(config, GROUP, votes, gate).expect("group log")
+    };
+    let mut log = open_group.clone()(Arc::clone(&gate));
+    queue_behind_a_stalled_fsync(&mut log, &gate).await;
+    drop(log);
+    let (waiting, reopen) = open_in_background(
+        move || open_group(Arc::default()),
+        Duration::from_millis(200),
+    );
+    assert!(
+        waiting,
+        "the group lock holds the reopen, though the vote log is live"
+    );
+    gate.open();
+    let mut log = reopen.join().expect("join");
+    let read = log.try_get_log_entries(..).await.expect("read");
+    assert_eq!(read, entries(1, 0..=5));
+    drop(votes);
+}

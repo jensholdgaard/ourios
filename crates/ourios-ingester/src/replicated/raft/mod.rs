@@ -14,7 +14,40 @@ pub mod vote_log;
 #[cfg(test)]
 mod tests;
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// How long an open waits for a retiring writer, whose last fsync may be
+/// slow (§4.7 saw drive-cache flushes of seconds), before refusing.
+const OWNER_WAIT: Duration = Duration::from_secs(30);
+
+/// Take the OS lock at `path`, polling for up to `wait`: a retiring
+/// writer releases it within one fsync, a live one never does.
+fn take_ownership(path: &Path, wait: Duration, owner: &str) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("{} is held by another live {owner}", path.display()),
+                ));
+            }
+            Err(TryLockError::Error(e)) => return Err(e),
+        }
+    }
+}
 
 fn writer_gone() -> io::Error {
     io::Error::other("the storage writer thread has stopped")

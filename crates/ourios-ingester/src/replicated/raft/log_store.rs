@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::fs::File;
 use std::io;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,11 @@ use super::codec::{self, Replayed};
 use super::gate::SyncGate;
 use super::types::{Entry, LogId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
-use super::{Flush, sync_through, writer_gone};
+use super::{Flush, OWNER_WAIT, sync_through, take_ownership, writer_gone};
+
+/// The group's ownership lock, inside its WAL root (the WAL reads only
+/// `*.wal` names there).
+pub const GROUP_LOCK_FILE: &str = "group.lock";
 
 /// A group's WAL root under the node's `wal_root`.
 #[must_use]
@@ -255,6 +260,13 @@ impl GroupLog {
         votes: VoteLog,
         gate: Arc<SyncGate>,
     ) -> io::Result<Self> {
+        ourios_wal::prepare_root(&wal.root)
+            .map_err(|e| wal_error("prepare the group WAL root", e))?;
+        // The writer thread holds this lock and a vote-log handle until it
+        // exits, after its last queued command, so the group's WAL is never
+        // replayed while a retiring writer may still append to it, and the
+        // node's `votes.lock` outlives every group writer.
+        let owner = take_ownership(&wal.root.join(GROUP_LOCK_FILE), OWNER_WAIT, "group log")?;
         let (wal, index, recovered) = recover(wal, &gate)?;
         let (tx, rx) = mpsc::channel();
         #[cfg(test)]
@@ -263,6 +275,8 @@ impl GroupLog {
             wal,
             failed: None,
             gate,
+            _owner: owner,
+            _votes: votes.clone(),
             #[cfg(test)]
             synced: Arc::default(),
         };
@@ -421,6 +435,9 @@ struct Writer {
     /// unknown, so every later command fails.
     failed: Option<String>,
     gate: Arc<SyncGate>,
+    /// Both released when the thread exits; see [`GroupLog::open`].
+    _owner: File,
+    _votes: VoteLog,
     #[cfg(test)]
     synced: Arc<Mutex<Option<WalOffset>>>,
 }

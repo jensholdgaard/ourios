@@ -29,7 +29,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use openraft::impls::leader_id_std::LeaderId;
 use tokio::sync::oneshot;
@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use super::gate::SyncGate;
 use super::types::{NodeId, Vote};
-use super::{Flush, sync_through};
+use super::{Flush, OWNER_WAIT, sync_through, take_ownership};
 
 /// The vote log's name under `wal_root`.
 pub const VOTES_FILE: &str = "votes.log";
@@ -48,9 +48,6 @@ const RECORD_LEN: usize = BODY_LEN + 4;
 const DEFAULT_REWRITE_BYTES: u64 = 1 << 20;
 /// The ownership lock's name under `wal_root`.
 pub const LOCK_FILE: &str = "votes.lock";
-/// How long an open waits for a retiring writer, whose last fsync may be
-/// slow (§4.7 saw drive-cache flushes of seconds), before refusing.
-const DEFAULT_OWNER_WAIT: Duration = Duration::from_secs(30);
 
 struct Options {
     rewrite_bytes: u64,
@@ -62,7 +59,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             rewrite_bytes: DEFAULT_REWRITE_BYTES,
-            owner_wait: DEFAULT_OWNER_WAIT,
+            owner_wait: OWNER_WAIT,
             gate: Arc::default(),
         }
     }
@@ -103,7 +100,7 @@ impl VoteLog {
         // The writer keeps this lock until its thread exits, after any
         // rewrite it started, so `votes.log` is never read while a retiring
         // writer may still replace it, and two live logs never share a root.
-        let owner = take_ownership(wal_root, options.owner_wait)?;
+        let owner = take_ownership(&wal_root.join(LOCK_FILE), options.owner_wait, "vote log")?;
         sync_root(wal_root)?;
         let Options {
             rewrite_bytes,
@@ -157,33 +154,6 @@ impl VoteLog {
         async move {
             sent.map_err(|_| super::writer_gone())?;
             rx.await.map_err(|_| super::writer_gone())?
-        }
-    }
-}
-
-/// Wait up to `wait` for the root's lock, polling: a retiring writer
-/// releases it within one fsync, a live one never does.
-fn take_ownership(wal_root: &Path, wait: Duration) -> io::Result<File> {
-    let path = wal_root.join(LOCK_FILE);
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)?;
-    let deadline = Instant::now() + wait;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!("{} is held by another live vote log", path.display()),
-                ));
-            }
-            Err(fs::TryLockError::Error(e)) => return Err(e),
         }
     }
 }

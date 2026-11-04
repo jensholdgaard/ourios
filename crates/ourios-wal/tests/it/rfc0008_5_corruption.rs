@@ -235,12 +235,41 @@ fn rfc0008_5_payload_bit_flip_is_crc_mismatch_corruption() {
     );
 }
 
+/// Arm 2 — unknown kind: forge a frame header with `kind = 0x04`
+/// (reserved range) and a CRC recomputed over the tampered bytes,
+/// so `UnknownKind` fires rather than `CrcMismatch`.
+#[test]
+#[ignore = "superseded: RFC 0065 defines kind 0x04 (ReplicatedEntry), so it is no \
+            longer unknown; rfc0008_5_unknown_kind_0x05_is_corruption covers this arm"]
+fn rfc0008_5_unknown_kind_is_corruption() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let payload = b"unknown-kind-payload";
+    let kind = 0x04u8;
+    let crc = checksum_input(kind, FRAME_PAD_ZEROS, payload);
+    let header = frame_header(
+        u32::try_from(payload.len()).expect("fits u32"),
+        kind,
+        FRAME_PAD_ZEROS,
+        crc,
+    );
+    let seg = build_segment_with_forged_frame(tmp.path(), &header, payload);
+    let _newer = build_closed_segment(tmp.path(), &[b"later-frame"]);
+    let uuid = segment_uuid(&seg);
+
+    assert_corrupt(
+        tmp.path(),
+        uuid,
+        SEGMENT_HEADER_LEN as u64,
+        CorruptionReason::UnknownKind,
+    );
+}
+
 /// Arm 2 — unknown kind: forge a frame header with `kind = 0x05`
 /// (the first reserved byte since RFC 0065 defined `0x04`) and a CRC
 /// recomputed over the tampered bytes, so `UnknownKind` fires rather
 /// than `CrcMismatch`.
 #[test]
-fn rfc0008_5_unknown_kind_is_corruption() {
+fn rfc0008_5_unknown_kind_0x05_is_corruption() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let payload = b"unknown-kind-payload";
     let kind = 0x05u8;

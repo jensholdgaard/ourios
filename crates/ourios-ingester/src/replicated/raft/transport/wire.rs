@@ -13,6 +13,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
 };
 use openraft::type_config::alias::{SnapshotMetaOf, StoredMembershipOf};
+use prost::Message as _;
 use uuid::Uuid;
 
 use super::super::codec::{self, Replayed};
@@ -151,6 +152,41 @@ impl WireMembership {
     }
 }
 
+/// The largest message a peer sends or accepts: one maximum-sized WAL
+/// frame, which an entry's payload never exceeds, plus room for the
+/// envelope (header, vote, log ids, field tags).
+pub const MAX_MESSAGE_BYTES: usize = ourios_wal::MAX_FRAME_BYTES + 64 * 1024;
+
+/// The group and replica a request is addressed to.
+#[derive(Clone, Copy, Debug)]
+pub struct Recipient {
+    pub group: u32,
+    pub node: NodeId,
+}
+
+/// What every request carries before its body: the protocol version
+/// (B22), the group, and the replica it is meant for.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Header {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(uint32, tag = "2")]
+    pub group: u32,
+    /// The recipient's UUID, 16 big-endian bytes.
+    #[prost(bytes = "vec", tag = "3")]
+    pub target: Vec<u8>,
+}
+
+impl Header {
+    fn to(recipient: Recipient) -> Self {
+        Self {
+            version: super::VERSION,
+            group: recipient.group,
+            target: recipient.node.uuid().as_bytes().to_vec(),
+        }
+    }
+}
+
 fn decode_entry(bytes: &[u8]) -> Result<Entry, Malformed> {
     match codec::decode(bytes)? {
         Replayed::Entry(entry) => Ok(entry),
@@ -160,39 +196,50 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry, Malformed> {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct AppendRequest {
-    #[prost(uint32, tag = "1")]
-    pub version: u32,
-    #[prost(uint32, tag = "2")]
-    pub group: u32,
-    #[prost(message, optional, tag = "3")]
+    #[prost(message, optional, tag = "1")]
+    pub header: Option<Header>,
+    #[prost(message, optional, tag = "2")]
     pub vote: Option<WireVote>,
-    #[prost(message, optional, tag = "4")]
+    #[prost(message, optional, tag = "3")]
     pub prev_log_id: Option<WireLogId>,
     /// Each entry's frame kind `0x04` payload.
-    #[prost(bytes = "vec", repeated, tag = "5")]
+    #[prost(bytes = "vec", repeated, tag = "4")]
     pub entries: Vec<Vec<u8>>,
-    #[prost(message, optional, tag = "6")]
+    #[prost(message, optional, tag = "5")]
     pub leader_commit: Option<WireLogId>,
 }
 
 impl AppendRequest {
+    /// The request for `rpc`, holding the longest prefix of its entries
+    /// that fits [`MAX_MESSAGE_BYTES`] and always at least one, with the
+    /// last log id it carries when that prefix is not all of them.
+    ///
     /// # Errors
     ///
     /// [`Malformed`] when an entry has no frame encoding.
-    pub fn new(group: u32, rpc: &AppendEntriesRequest<RaftTypes>) -> Result<Self, Malformed> {
-        let entries = rpc
-            .entries
-            .iter()
-            .map(codec::encode_entry)
-            .collect::<io::Result<_>>()?;
-        Ok(Self {
-            version: super::VERSION,
-            group,
+    pub fn bounded(
+        to: Recipient,
+        rpc: &AppendEntriesRequest<RaftTypes>,
+    ) -> Result<(Self, Option<LogId>), Malformed> {
+        let mut request = Self {
+            header: Some(Header::to(to)),
             vote: Some(WireVote::from(&rpc.vote)),
             prev_log_id: wire_id(rpc.prev_log_id.as_ref()),
-            entries,
+            entries: Vec::new(),
             leader_commit: wire_id(rpc.leader_commit.as_ref()),
-        })
+        };
+        let mut len = request.encoded_len();
+        let mut last = None;
+        for entry in &rpc.entries {
+            let bytes = codec::encode_entry(entry)?;
+            len += prost::encoding::bytes::encoded_len(4, &bytes);
+            if len > MAX_MESSAGE_BYTES && last.is_some() {
+                return Ok((request, last));
+            }
+            request.entries.push(bytes);
+            last = Some(entry.log_id);
+        }
+        Ok((request, None))
     }
 
     /// # Errors
@@ -273,24 +320,21 @@ impl Reply for AppendResponse {
 /// A vote or pre-vote request; the method tells them apart.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct WireVoteRequest {
-    #[prost(uint32, tag = "1")]
-    pub version: u32,
-    #[prost(uint32, tag = "2")]
-    pub group: u32,
-    #[prost(message, optional, tag = "3")]
+    #[prost(message, optional, tag = "1")]
+    pub header: Option<Header>,
+    #[prost(message, optional, tag = "2")]
     pub vote: Option<WireVote>,
-    #[prost(message, optional, tag = "4")]
+    #[prost(message, optional, tag = "3")]
     pub last_log_id: Option<WireLogId>,
-    #[prost(message, optional, tag = "5")]
+    #[prost(message, optional, tag = "4")]
     pub leadership_transfer_from: Option<WireVote>,
 }
 
 impl WireVoteRequest {
     #[must_use]
-    pub fn new(group: u32, rpc: &VoteRequest<RaftTypes>) -> Self {
+    pub fn new(to: Recipient, rpc: &VoteRequest<RaftTypes>) -> Self {
         Self {
-            version: super::VERSION,
-            group,
+            header: Some(Header::to(to)),
             vote: Some(WireVote::from(&rpc.vote)),
             last_log_id: wire_id(rpc.last_log_id.as_ref()),
             leadership_transfer_from: rpc.leadership_transfer_from.as_ref().map(WireVote::from),
@@ -347,15 +391,13 @@ impl Reply for WireVoteResponse {
 /// A metadata-only snapshot (§4.3): the checkpoint carries no data.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct SnapshotRequest {
-    #[prost(uint32, tag = "1")]
-    pub version: u32,
-    #[prost(uint32, tag = "2")]
-    pub group: u32,
-    #[prost(message, optional, tag = "3")]
+    #[prost(message, optional, tag = "1")]
+    pub header: Option<Header>,
+    #[prost(message, optional, tag = "2")]
     pub vote: Option<WireVote>,
-    #[prost(message, optional, tag = "4")]
+    #[prost(message, optional, tag = "3")]
     pub last_log_id: Option<WireLogId>,
-    #[prost(message, optional, tag = "5")]
+    #[prost(message, optional, tag = "4")]
     pub membership: Option<WireMembership>,
 }
 
@@ -364,13 +406,12 @@ impl SnapshotRequest {
     ///
     /// [`Malformed`] when the membership has no encoding.
     pub fn new(
-        group: u32,
+        to: Recipient,
         vote: &Vote,
         meta: &SnapshotMetaOf<RaftTypes>,
     ) -> Result<Self, Malformed> {
         Ok(Self {
-            version: super::VERSION,
-            group,
+            header: Some(Header::to(to)),
             vote: Some(WireVote::from(vote)),
             last_log_id: wire_id(meta.last_log_id.as_ref()),
             membership: Some(WireMembership::new(&meta.last_membership)?),
@@ -478,6 +519,13 @@ mod tests {
         ]
     }
 
+    fn recipient() -> impl Strategy<Value = Recipient> {
+        (any::<u32>(), any::<u64>()).prop_map(|(group, n)| Recipient {
+            group,
+            node: node(n),
+        })
+    }
+
     fn append_response() -> impl Strategy<Value = AppendEntriesResponse<RaftTypes>> {
         prop_oneof![
             Just(AppendEntriesResponse::Success),
@@ -495,15 +543,17 @@ mod tests {
 
         #[test]
         fn an_append_request_round_trips(
-            group in any::<u32>(),
+            to in recipient(),
             vote in vote(),
             prev_log_id in proptest::option::of(log_id()),
             entries in proptest::collection::vec(entry(), 0..6),
             leader_commit in proptest::option::of(log_id()),
         ) {
             let rpc = AppendEntriesRequest::<RaftTypes> { vote, prev_log_id, entries, leader_commit };
-            let wire = through_wire(&AppendRequest::new(group, &rpc).expect("encode"));
-            prop_assert_eq!((wire.version, wire.group), (super::super::VERSION, group));
+            let (request, cut) = AppendRequest::bounded(to, &rpc).expect("encode");
+            prop_assert_eq!(cut, None);
+            let wire = through_wire(&request);
+            prop_assert_eq!(wire.header.clone(), Some(Header::to(to)));
             let back = wire.into_raft().expect("decode");
             prop_assert_eq!(back.vote, rpc.vote);
             prop_assert_eq!(back.prev_log_id, rpc.prev_log_id);
@@ -519,14 +569,14 @@ mod tests {
 
         #[test]
         fn a_vote_request_round_trips(
-            group in any::<u32>(),
+            to in recipient(),
             vote in vote(),
             last_log_id in proptest::option::of(log_id()),
             transfer in proptest::option::of(vote()),
         ) {
             let rpc = VoteRequest::<RaftTypes> { vote, last_log_id, leadership_transfer_from: transfer };
-            let wire = through_wire(&WireVoteRequest::new(group, &rpc));
-            prop_assert_eq!((wire.version, wire.group), (super::super::VERSION, group));
+            let wire = through_wire(&WireVoteRequest::new(to, &rpc));
+            prop_assert_eq!(wire.header.clone(), Some(Header::to(to)));
             prop_assert_eq!(wire.into_raft().expect("decode"), rpc);
         }
 
@@ -543,14 +593,14 @@ mod tests {
 
         #[test]
         fn a_snapshot_request_round_trips(
-            group in any::<u32>(),
+            to in recipient(),
             vote in vote(),
             last_log_id in proptest::option::of(log_id()),
             last_membership in stored_membership(),
         ) {
             let meta = SnapshotMetaOf::<RaftTypes> { last_log_id, last_membership };
-            let wire = through_wire(&SnapshotRequest::new(group, &vote, &meta).expect("encode"));
-            prop_assert_eq!((wire.version, wire.group), (super::super::VERSION, group));
+            let wire = through_wire(&SnapshotRequest::new(to, &vote, &meta).expect("encode"));
+            prop_assert_eq!(wire.header.clone(), Some(Header::to(to)));
             prop_assert_eq!(wire.into_raft().expect("decode"), (vote, meta));
         }
 
@@ -560,6 +610,49 @@ mod tests {
             let wire = through_wire(&WireSnapshotResponse::from(&response));
             prop_assert_eq!(wire.into_raft().expect("decode"), response);
         }
+    }
+
+    fn large_entry(index: u64, bytes: usize) -> Entry {
+        let batch = TenantBatch::encode("acme", &vec![7; bytes]).expect("batch");
+        Entry {
+            log_id: LogId::from(WireLogId { term: 1, index }),
+            payload: EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid")),
+        }
+    }
+
+    fn append_of(entries: Vec<Entry>) -> AppendEntriesRequest<RaftTypes> {
+        AppendEntriesRequest {
+            vote: Vote::new_committed(1, node(1)),
+            prev_log_id: None,
+            entries,
+            leader_commit: None,
+        }
+    }
+
+    fn to() -> Recipient {
+        Recipient {
+            group: 1,
+            node: node(2),
+        }
+    }
+
+    #[test]
+    fn an_append_holds_the_longest_prefix_under_the_byte_budget() {
+        let seven_mib = 7 * 1024 * 1024;
+        let rpc = append_of((0..3).map(|i| large_entry(i, seven_mib)).collect());
+        let (request, cut) = AppendRequest::bounded(to(), &rpc).expect("encode");
+        assert_eq!(request.entries.len(), 2);
+        assert_eq!(cut, Some(rpc.entries[1].log_id));
+        assert!(request.encoded_len() <= MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn a_maximum_sized_entry_fits_one_message() {
+        let frame = ourios_wal::MAX_FRAME_BYTES;
+        let rpc = append_of(vec![large_entry(0, frame - 1024)]);
+        let (request, cut) = AppendRequest::bounded(to(), &rpc).expect("encode");
+        assert_eq!((request.entries.len(), cut), (1, None));
+        assert!(request.encoded_len() <= MAX_MESSAGE_BYTES);
     }
 
     #[test]

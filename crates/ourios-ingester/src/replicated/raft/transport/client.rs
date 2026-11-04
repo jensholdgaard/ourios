@@ -21,11 +21,12 @@ use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
 
 use super::super::types::{NodeId, RaftTypes, Vote};
+use super::trace::{Call, Peer, Traced, Tracing};
 use super::wire::{
-    AppendRequest, AppendResponse, Malformed, Reply, SnapshotRequest, WireSnapshotResponse,
-    WireVoteRequest, WireVoteResponse,
+    AppendRequest, AppendResponse, MAX_MESSAGE_BYTES, Malformed, Recipient, Reply, SnapshotRequest,
+    WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
 };
-use super::{APPEND, Call, INSTALL_SNAPSHOT, PRE_VOTE, Side, Traced, VOTE, rpc_method};
+use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, VOTE};
 
 type RpcError = RPCError<RaftTypes>;
 
@@ -33,6 +34,7 @@ type RpcError = RPCError<RaftTypes>;
 #[derive(Clone, Default)]
 pub struct Peers {
     channels: Arc<Mutex<HashMap<String, Channel>>>,
+    tracing: Tracing,
 }
 
 impl Peers {
@@ -40,6 +42,14 @@ impl Peers {
     #[must_use]
     pub fn plaintext() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub(super) fn traced_by(tracing: Tracing) -> Self {
+        Self {
+            channels: Arc::default(),
+            tracing,
+        }
     }
 
     /// The network `openraft` uses for `group` on the node `id`.
@@ -84,10 +94,13 @@ impl RaftNetworkFactory<RaftTypes> for GroupNetwork {
         let channel = self.peers.channel(node).map_err(|e| Unreachable::new(&e));
         PeerClient {
             id: self.id,
-            target,
-            group: self.group,
+            to: Recipient {
+                group: self.group,
+                node: target,
+            },
             addr: node.clone(),
             channel,
+            tracing: self.peers.tracing.clone(),
         }
     }
 }
@@ -95,39 +108,15 @@ impl RaftNetworkFactory<RaftTypes> for GroupNetwork {
 /// One group's connection to one peer.
 pub struct PeerClient {
     id: NodeId,
-    target: NodeId,
-    group: u32,
+    to: Recipient,
     addr: String,
     /// An address that does not parse is a peer that cannot be reached.
     channel: Result<Channel, Unreachable<RaftTypes>>,
+    tracing: Tracing,
 }
 
 fn network(e: &Malformed) -> RpcError {
     RPCError::Network(NetworkError::new(e))
-}
-
-/// The host and port of a `host:port` peer address.
-fn host_port(addr: &str) -> (&str, Option<u16>) {
-    match addr.rsplit_once(':') {
-        Some((host, port)) => (host, port.parse().ok()),
-        None => (addr, None),
-    }
-}
-
-fn client_span(path: &'static str, host: &str, port: Option<u16>) -> tracing::Span {
-    let method = rpc_method(path);
-    tracing::info_span!(
-        "grpc client",
-        otel.name = method,
-        otel.kind = "client",
-        rpc.system.name = "grpc",
-        rpc.method = method,
-        server.address = host,
-        server.port = port,
-        rpc.response.status_code = tracing::field::Empty,
-        otel.status_code = tracing::field::Empty,
-        error.type = tracing::field::Empty,
-    )
 }
 
 /// One method of the service and the RPC kind `openraft` names it by.
@@ -182,12 +171,13 @@ impl PeerClient {
         Resp: prost::Message + Default + Send + 'static,
     {
         let channel = self.channel.clone()?;
-        let ttl = option.hard_ttl();
-        let (host, port) = host_port(&self.addr);
-        let span = message.traced().then(|| client_span(rpc.path, host, port));
-        let trace = Call::new(Side::Client, rpc.path, Some(host), span);
+        let ttl = option.soft_ttl();
+        let peer = Peer::parse(&self.addr);
+        let trace = Call::client(self.tracing.clone(), rpc.path, peer, message.traced());
         let call = async move {
-            let mut grpc = tonic::client::Grpc::new(channel);
+            let mut grpc = tonic::client::Grpc::new(channel)
+                .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_MESSAGE_BYTES);
             grpc.ready()
                 .await
                 .map_err(|e| Status::unavailable(e.to_string()))?;
@@ -207,20 +197,25 @@ impl PeerClient {
             .map_err(|status| self.rpc_error(&status, rpc.action, ttl))
     }
 
-    /// Transport failures, a version the peer refuses and a group it does
-    /// not host are all an unreachable peer, which `openraft` backs off
-    /// from; anything else is a network error it retries sooner.
+    /// Transport failures, a version the peer refuses, a group or replica
+    /// it does not host, and a message over a size limit (a peer whose
+    /// limit differs, until it is upgraded) are all an unreachable peer,
+    /// which `openraft` backs off from; anything else is a network error
+    /// it retries sooner.
     fn rpc_error(&self, status: &Status, action: RPCTypes, ttl: Duration) -> RpcError {
         match status.code() {
             Code::DeadlineExceeded => RPCError::Timeout(Timeout {
                 action,
                 id: self.id,
-                target: self.target,
+                target: self.to.node,
                 timeout: ttl,
             }),
-            Code::Unavailable | Code::FailedPrecondition | Code::NotFound | Code::Unimplemented => {
-                RPCError::Unreachable(Unreachable::new(status))
-            }
+            Code::Unavailable
+            | Code::FailedPrecondition
+            | Code::NotFound
+            | Code::Unimplemented
+            | Code::OutOfRange
+            | Code::ResourceExhausted => RPCError::Unreachable(Unreachable::new(status)),
             _ => RPCError::Network(NetworkError::new(status)),
         }
     }
@@ -243,9 +238,16 @@ impl RaftNetworkV2<RaftTypes> for PeerClient {
         rpc: AppendEntriesRequest<RaftTypes>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<RaftTypes>, RpcError> {
-        let request = AppendRequest::new(self.group, &rpc);
-        self.exchange::<_, AppendResponse>(APPEND_RPC, request, &option)
-            .await
+        let (request, cut) = AppendRequest::bounded(self.to, &rpc).map_err(|e| network(&e))?;
+        let response = self
+            .exchange::<_, AppendResponse>(APPEND_RPC, Ok(request), &option)
+            .await?;
+        Ok(match (response, cut) {
+            (AppendEntriesResponse::Success, Some(last)) => {
+                AppendEntriesResponse::PartialSuccess(Some(last))
+            }
+            (response, _) => response,
+        })
     }
 
     async fn vote(
@@ -253,7 +255,7 @@ impl RaftNetworkV2<RaftTypes> for PeerClient {
         rpc: VoteRequest<RaftTypes>,
         option: RPCOption,
     ) -> Result<VoteResponse<RaftTypes>, RpcError> {
-        let request = Ok(WireVoteRequest::new(self.group, &rpc));
+        let request = Ok(WireVoteRequest::new(self.to, &rpc));
         self.exchange::<_, WireVoteResponse>(VOTE_RPC, request, &option)
             .await
     }
@@ -263,7 +265,7 @@ impl RaftNetworkV2<RaftTypes> for PeerClient {
         rpc: VoteRequest<RaftTypes>,
         option: RPCOption,
     ) -> Result<VoteResponse<RaftTypes>, RpcError> {
-        let request = Ok(WireVoteRequest::new(self.group, &rpc));
+        let request = Ok(WireVoteRequest::new(self.to, &rpc));
         self.exchange::<_, WireVoteResponse>(PRE_VOTE_RPC, request, &option)
             .await
     }
@@ -277,7 +279,7 @@ impl RaftNetworkV2<RaftTypes> for PeerClient {
         cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<RaftTypes>, StreamingError<RaftTypes>> {
-        let request = SnapshotRequest::new(self.group, &vote, &snapshot.meta);
+        let request = SnapshotRequest::new(self.to, &vote, &snapshot.meta);
         let install =
             self.exchange::<_, WireSnapshotResponse>(INSTALL_SNAPSHOT_RPC, request, &option);
         tokio::select! {
@@ -294,10 +296,13 @@ mod tests {
     fn client() -> PeerClient {
         PeerClient {
             id: NodeId::from(1),
-            target: NodeId::from(2),
-            group: 0,
+            to: Recipient {
+                group: 0,
+                node: NodeId::from(2),
+            },
             addr: "127.0.0.1:1".to_owned(),
             channel: Err(Unreachable::new(&Status::unavailable("unused"))),
+            tracing: Tracing::default(),
         }
     }
 
@@ -313,6 +318,8 @@ mod tests {
             Code::NotFound,
             Code::Unavailable,
             Code::Unimplemented,
+            Code::OutOfRange,
+            Code::ResourceExhausted,
         ] {
             assert!(matches!(mapped(code), RPCError::Unreachable(_)), "{code:?}");
         }

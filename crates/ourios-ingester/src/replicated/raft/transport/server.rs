@@ -19,13 +19,12 @@ use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
 
 use super::super::types::RaftTypes;
+use super::trace::{Call, Traced, Tracing};
 use super::wire::{
-    AppendRequest, AppendResponse, Malformed, SnapshotRequest, WireSnapshotResponse,
-    WireVoteRequest, WireVoteResponse,
+    AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, Malformed, SnapshotRequest,
+    WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
 };
-use super::{
-    APPEND, Call, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, Side, Traced, VERSION, VOTE, rpc_method,
-};
+use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, VERSION, VOTE};
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
 
@@ -35,6 +34,7 @@ where
     SM: RaftStateMachine<RaftTypes>,
 {
     groups: Arc<RwLock<Groups<SM>>>,
+    tracing: Tracing,
 }
 
 impl<SM> Clone for ReplicationServer<SM>
@@ -44,6 +44,7 @@ where
     fn clone(&self) -> Self {
         Self {
             groups: Arc::clone(&self.groups),
+            tracing: self.tracing.clone(),
         }
     }
 }
@@ -55,6 +56,7 @@ where
     fn default() -> Self {
         Self {
             groups: Arc::default(),
+            tracing: Tracing::default(),
         }
     }
 }
@@ -84,28 +86,55 @@ where
         self.groups.write().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn route(&self, version: u32, group: u32) -> Result<Raft<RaftTypes, SM>, Status> {
+    #[cfg(test)]
+    pub(super) fn traced_by(tracing: Tracing) -> Self {
+        Self {
+            groups: Arc::default(),
+            tracing,
+        }
+    }
+
+    /// The `Raft` a request is for. A replica other than the one this node
+    /// hosts for the group is `NOT_FOUND` like an unknown group: a reply
+    /// from it would be credited to a voter that never received the
+    /// request.
+    fn route(&self, header: Option<Header>) -> Result<Raft<RaftTypes, SM>, Status> {
+        let Header {
+            version,
+            group,
+            target,
+        } = header.unwrap_or_default();
         if version != VERSION {
             return Err(Status::failed_precondition(format!(
                 "peer protocol version {version} is not {VERSION}"
             )));
         }
         let groups = self.groups.read().unwrap_or_else(PoisonError::into_inner);
-        groups
-            .get(&group)
-            .cloned()
-            .ok_or_else(|| Status::not_found(format!("group {group} is not hosted here")))
+        match groups.get(&group) {
+            Some(raft) if target == raft.node_id().uuid().as_bytes() => Ok(raft.clone()),
+            Some(raft) => Err(Status::not_found(format!(
+                "group {group} has replica {} here, not the one addressed",
+                raft.node_id()
+            ))),
+            None => Err(Status::not_found(format!(
+                "group {group} is not hosted here"
+            ))),
+        }
     }
 
-    async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Status> {
-        let raft = self.route(request.version, request.group)?;
+    async fn append(&self, mut request: AppendRequest) -> Result<AppendResponse, Status> {
+        let raft = self.route(request.header.take())?;
         let rpc = request.into_raft()?;
         let response = raft.append_entries(rpc).await.map_err(|e| stopped(&e))?;
         Ok(AppendResponse::from(&response))
     }
 
-    async fn vote(&self, request: WireVoteRequest, pre: bool) -> Result<WireVoteResponse, Status> {
-        let raft = self.route(request.version, request.group)?;
+    async fn vote(
+        &self,
+        mut request: WireVoteRequest,
+        pre: bool,
+    ) -> Result<WireVoteResponse, Status> {
+        let raft = self.route(request.header.take())?;
         let rpc = request.into_raft()?;
         let response = if pre {
             raft.pre_vote(rpc).await
@@ -118,9 +147,9 @@ where
 
     async fn install_snapshot(
         &self,
-        request: SnapshotRequest,
+        mut request: SnapshotRequest,
     ) -> Result<WireSnapshotResponse, Status> {
-        let raft = self.route(request.version, request.group)?;
+        let raft = self.route(request.header.take())?;
         let (vote, meta) = request.into_raft()?;
         let snapshot = Snapshot { meta, snapshot: () };
         let response = raft
@@ -151,6 +180,7 @@ where
 /// its gRPC server span.
 struct Method<F> {
     path: &'static str,
+    tracing: Tracing,
     handler: F,
 }
 
@@ -166,9 +196,7 @@ where
 
     fn call(&mut self, request: Request<Req>) -> Self::Future {
         let request = request.into_inner();
-        let path = self.path;
-        let span = request.traced().then(|| server_span(path));
-        let call = Call::new(Side::Server, path, None, span);
+        let call = Call::server(self.tracing.clone(), self.path, request.traced());
         let handled = (self.handler)(request).instrument(call.span());
         Box::pin(async move {
             let result = handled.await;
@@ -178,22 +206,9 @@ where
     }
 }
 
-fn server_span(path: &'static str) -> tracing::Span {
-    let method = rpc_method(path);
-    tracing::info_span!(
-        "grpc server",
-        otel.name = method,
-        otel.kind = "server",
-        rpc.system.name = "grpc",
-        rpc.method = method,
-        rpc.response.status_code = tracing::field::Empty,
-        otel.status_code = tracing::field::Empty,
-        error.type = tracing::field::Empty,
-    )
-}
-
 fn unary<B, Req, Resp, F, Fut>(
     path: &'static str,
+    tracing: Tracing,
     request: http::Request<B>,
     handler: F,
 ) -> BoxFuture<http::Response<Body>, Infallible>
@@ -206,8 +221,14 @@ where
     Fut: Future<Output = Result<Resp, Status>> + Send + 'static,
 {
     Box::pin(async move {
-        let mut grpc = tonic::server::Grpc::new(ProstCodec::<Resp, Req>::default());
-        Ok(grpc.unary(Method { path, handler }, request).await)
+        let mut grpc = tonic::server::Grpc::new(ProstCodec::<Resp, Req>::default())
+            .apply_max_message_size_config(Some(MAX_MESSAGE_BYTES), Some(MAX_MESSAGE_BYTES));
+        let method = Method {
+            path,
+            tracing,
+            handler,
+        };
+        Ok(grpc.unary(method, request).await)
     })
 }
 
@@ -231,20 +252,21 @@ where
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         let server = self.clone();
+        let tracing = self.tracing.clone();
         match request.uri().path() {
-            APPEND => unary(APPEND, request, move |r| {
+            APPEND => unary(APPEND, tracing, request, move |r| {
                 let server = server.clone();
                 async move { server.append(r).await }
             }),
-            VOTE => unary(VOTE, request, move |r| {
+            VOTE => unary(VOTE, tracing, request, move |r| {
                 let server = server.clone();
                 async move { server.vote(r, false).await }
             }),
-            PRE_VOTE => unary(PRE_VOTE, request, move |r| {
+            PRE_VOTE => unary(PRE_VOTE, tracing, request, move |r| {
                 let server = server.clone();
                 async move { server.vote(r, true).await }
             }),
-            INSTALL_SNAPSHOT => unary(INSTALL_SNAPSHOT, request, move |r| {
+            INSTALL_SNAPSHOT => unary(INSTALL_SNAPSHOT, tracing, request, move |r| {
                 let server = server.clone();
                 async move { server.install_snapshot(r).await }
             }),

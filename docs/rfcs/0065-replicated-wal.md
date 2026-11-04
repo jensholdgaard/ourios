@@ -939,10 +939,13 @@ the mass-failover time and vote-log batching as tuning signals.
   writes, `sync`, truncation and purge markers run on the WAL's own
   threads. An append completes through `openraft`'s `IOFlushed`
   callback once the fsync covering it returns; `save_vote`,
-  `truncate_after`, `purge` and `save_committed` are async calls whose
-  futures resolve after that thread's fsync, so they park only their
-  group's Raft task, never a worker; a blocking call on a worker
-  thread caused §4.7's election storm.
+  `truncate_after` and `purge` are async calls whose futures resolve
+  after that thread's fsync, so they park only their group's Raft
+  task, never a worker; a blocking call on a worker thread caused
+  §4.7's election storm. `save_committed` only queues its marker,
+  which rides a later fsync: the commit index is not durable on
+  return, which is safe only with `enable_leader_restore = false`
+  (§4.5).
 
 ### 6.2 The group record
 

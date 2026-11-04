@@ -6,7 +6,7 @@
 //! module so it stops re-growing inside the binary.
 
 use crate::config::file::{FileConfig, PromotedEntry, TlsSection};
-use crate::config::wal::{WalBackend, WalInputs, build_wal_backend};
+use crate::config::wal::{WalBackend, WalEnv, WalInputs, build_wal_backend};
 use ourios_config::{MinerConfig, UpstreamTemplates};
 pub use ourios_ingester::receiver::MAX_REQUEST_BYTES;
 use ourios_parquet::{PromotedAttributes, S3Config, StoreConfig};
@@ -304,16 +304,7 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
     let allow_bootstrap = std::env::var("OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP").ok();
     let max_buffer_age = std::env::var("OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS").ok();
     let max_request_bytes = std::env::var("OURIOS_RECEIVER_MAX_REQUEST_BYTES").ok();
-    let wal_env = |key: &str| std::env::var(format!("OURIOS_RECEIVER_WAL_{key}")).ok();
-    let wal_backend = wal_env("BACKEND");
-    let wal_node_id = wal_env("NODE_ID");
-    let wal_listen_addr = wal_env("LISTEN_ADDR");
-    let wal_peers = wal_env("PEERS");
-    let wal_tail_peers = wal_env("TAIL_PEERS");
-    let wal_groups = wal_env("GROUPS");
-    let wal_replication_factor = wal_env("REPLICATION_FACTOR");
-    let wal_tail_replicas = wal_env("TAIL_REPLICAS");
-    let wal_tail_clients = wal_env("TAIL_CLIENTS");
+    let wal_env = WalEnv::from_env();
     // TLS and the miner dial are config-file only (RFC 0030 §3.1 /
     // RFC 0050 §3.2): the env path takes the defaults (plaintext,
     // `ignore` mode), so a replicated WAL needs the config file for
@@ -327,18 +318,7 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
         template_ids_allow_bootstrap: allow_bootstrap.as_deref(),
         max_buffer_age_secs: max_buffer_age.as_deref(),
         max_request_bytes: max_request_bytes.as_deref(),
-        wal: WalInputs {
-            backend: wal_backend.as_deref(),
-            node_id: wal_node_id.as_deref(),
-            listen_addr: wal_listen_addr.as_deref(),
-            peers: wal_peers.as_deref(),
-            tail_peers: wal_tail_peers.as_deref(),
-            groups: wal_groups.as_deref(),
-            replication_factor: wal_replication_factor.as_deref(),
-            tail_replicas: wal_tail_replicas.as_deref(),
-            tail_clients: wal_tail_clients.as_deref(),
-            tls: None,
-        },
+        wal: wal_env.inputs(),
         ..ReceiverInputs::default()
     })?;
     let querier_enabled = std::env::var("OURIOS_QUERIER_ENABLED").ok();

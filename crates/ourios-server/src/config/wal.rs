@@ -6,7 +6,7 @@
 //! `receiver.wal.*`. Every error names the offending key.
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
 use ourios_serving::tls::TlsSettings;
 
@@ -111,6 +111,56 @@ pub struct WalInputs<'a> {
     pub tail_clients: Option<&'a str>,
     /// `receiver.wal.replicated.tls` (config-file only).
     pub tls: Option<&'a TlsSection>,
+}
+
+/// The `OURIOS_RECEIVER_WAL_*` leaves read once, owned so that
+/// [`WalEnv::inputs`] can lend them to the shared builder.
+#[derive(Debug, Default)]
+pub struct WalEnv {
+    backend: Option<String>,
+    node_id: Option<String>,
+    listen_addr: Option<String>,
+    peers: Option<String>,
+    tail_peers: Option<String>,
+    groups: Option<String>,
+    replication_factor: Option<String>,
+    tail_replicas: Option<String>,
+    tail_clients: Option<String>,
+}
+
+impl WalEnv {
+    #[must_use]
+    pub fn from_env() -> Self {
+        let var = |key: &str| std::env::var(format!("OURIOS_RECEIVER_WAL_{key}")).ok();
+        Self {
+            backend: var("BACKEND"),
+            node_id: var("NODE_ID"),
+            listen_addr: var("LISTEN_ADDR"),
+            peers: var("PEERS"),
+            tail_peers: var("TAIL_PEERS"),
+            groups: var("GROUPS"),
+            replication_factor: var("REPLICATION_FACTOR"),
+            tail_replicas: var("TAIL_REPLICAS"),
+            tail_clients: var("TAIL_CLIENTS"),
+        }
+    }
+
+    /// The env path has no TLS (RFC 0030 §3.1), so `tls` is `None`.
+    #[must_use]
+    pub fn inputs(&self) -> WalInputs<'_> {
+        WalInputs {
+            backend: self.backend.as_deref(),
+            node_id: self.node_id.as_deref(),
+            listen_addr: self.listen_addr.as_deref(),
+            peers: self.peers.as_deref(),
+            tail_peers: self.tail_peers.as_deref(),
+            groups: self.groups.as_deref(),
+            replication_factor: self.replication_factor.as_deref(),
+            tail_replicas: self.tail_replicas.as_deref(),
+            tail_clients: self.tail_clients.as_deref(),
+            tls: None,
+        }
+    }
 }
 
 /// Resolve and validate `receiver.wal`. Unset and `local` select the
@@ -237,15 +287,16 @@ fn parse_peers(raw: &str, field: &str, env: &str) -> Result<Vec<Peer>, String> {
 fn parse_peer(entry: &str) -> Option<Peer> {
     let (id, addr) = entry.split_once('=')?;
     let (host, port) = addr.rsplit_once(':')?;
-    let (id, host) = (id.trim(), host.trim());
-    match port.trim().parse::<u16>() {
-        Ok(port) if port != 0 && !id.is_empty() && !host.is_empty() => Some(Peer {
-            id: id.to_owned(),
-            host: host.to_owned(),
-            port,
-        }),
-        _ => None,
-    }
+    let port = port.trim().parse::<NonZeroU16>().ok()?;
+    Some(Peer {
+        id: non_empty(id)?.to_owned(),
+        host: non_empty(host)?.to_owned(),
+        port: port.get(),
+    })
+}
+
+fn non_empty(raw: &str) -> Option<&str> {
+    Some(raw.trim()).filter(|trimmed| !trimmed.is_empty())
 }
 
 fn node_role(node_id: &str, peers: &[Peer], tail_peers: &[Peer]) -> Result<NodeRole, String> {
@@ -621,13 +672,7 @@ mod tests {
     fn rfc0065_1_invalid_replicated_configs_fail_naming_the_field() {
         for (case, edits, field) in INVALID {
             let key = format!("receiver.wal.replicated.{field} ");
-            for (front_end, result) in [
-                ("file", from_file(Some("replicated"), edits, Some(MTLS))),
-                ("env", from_env(Some("replicated"), edits)),
-            ] {
-                let error = result.expect_err(case);
-                assert!(error.starts_with(&key), "{case} ({front_end}): {error}");
-            }
+            assert_both_front_ends_fail(case, "replicated", edits, &key);
         }
 
         let tls_cases = [
@@ -651,16 +696,17 @@ mod tests {
         assert!(error.starts_with("receiver.wal.replicated.tls "), "{error}");
 
         for backend in ["kafka", "Replicated", "raft"] {
-            for result in [
-                from_file(Some(backend), &[], Some(MTLS)),
-                from_env(Some(backend), &[]),
-            ] {
-                let error = result.expect_err(backend);
-                assert!(
-                    error.starts_with("receiver.wal.backend "),
-                    "{backend}: {error}"
-                );
-            }
+            assert_both_front_ends_fail(backend, backend, &[], "receiver.wal.backend ");
+        }
+    }
+
+    fn assert_both_front_ends_fail(case: &str, backend: &str, edits: &[Edit], key: &str) {
+        for (front_end, result) in [
+            ("file", from_file(Some(backend), edits, Some(MTLS))),
+            ("env", from_env(Some(backend), edits)),
+        ] {
+            let error = result.expect_err(case);
+            assert!(error.starts_with(key), "{case} ({front_end}): {error}");
         }
     }
 

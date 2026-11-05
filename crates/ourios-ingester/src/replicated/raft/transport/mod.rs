@@ -21,8 +21,11 @@
 //! rather than a partial success, so the stream keeps going. The follower
 //! answers each message in order once its log has flushed it.
 //!
-//! Plaintext only: mutual TLS (RFC 0030) arrives through [`Peers`]'s
-//! endpoint and the server's incoming stream.
+//! Peers authenticate each other with mutual TLS (B21): the server takes
+//! RFC 0030's reloading acceptor, refusing a caller whose certificate the
+//! peer CA did not sign, and [`Peers::mutual_tls`] presents the node's
+//! certificate from the same settings and verifies each peer's for the
+//! host its address names.
 
 mod client;
 mod server;

@@ -1421,14 +1421,29 @@ never count toward an ack (learners, under §4.3's shape).
 ### 6.8 The peer protocol
 
 - A gRPC service, `ourios.wal.v1.Replication`, on `listen_addr`, with
-  `openraft`'s peer calls (§4.3): `Append` (leader to follower, entries
-  and heartbeats), `Vote` and `PreVote` (candidate to voter), and
+  `openraft`'s peer calls (§4.3): `StreamAppend` and `Append` (leader
+  to follower, entries and heartbeats), `Vote` and `PreVote` (candidate
+  to voter), and
   `InstallSnapshot` (leader to a follower behind the checkpoint); then
   `Forward` (any node to a leader), and `Tail` and `TailScan` (querier
   to tail replica: the read point and published keys, then the rows
   under that read point, §6.7). Catch-up needs no call of its own: the
-  leader sends a lagging follower its missing entries by `Append`, or
-  the checkpoint by `InstallSnapshot` when they are already purged.
+  leader sends a lagging follower its missing entries by
+  `StreamAppend`, or the checkpoint by `InstallSnapshot` when they are
+  already purged.
+- Replication runs over `StreamAppend`, one bidirectional stream per
+  `openraft` replication session, so the leader sends appends without
+  waiting for the answers to earlier ones (§4.6). Every message on the
+  stream is an append request with its own header, and every header
+  must equal the first: a stream addresses one replica of one group. An
+  append larger than one message travels as several, each a valid
+  append the follower checks on its own. The follower answers each
+  message in order: a match, once its log has flushed the message,
+  with the log id it now matches through (absent for a heartbeat on an
+  empty log); or, without a flush, the `prev_log_id` it does not hold
+  or a higher vote. The stream ends after a conflict or a higher vote,
+  and when the group stops or the server shuts down. `Append`, the unary form,
+  carries one append and answers it.
 - Each request names its group, and one connection per peer carries
   every group's calls; a server answers an unknown group with
   `NOT_FOUND`.

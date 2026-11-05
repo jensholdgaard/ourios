@@ -14,11 +14,13 @@ use openraft::Raft;
 use openraft::errors::Fatal;
 use openraft::raft::{AppendEntriesRequest, StreamAppendResult};
 use openraft::storage::{RaftStateMachine, Snapshot};
+use ourios_serving::tls_serve::{ReloadingAcceptor, tls_incoming};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{oneshot, watch};
 use tonic::body::Body;
 use tonic::codegen::{Body as HttpBody, BoxFuture, StdError, http};
 use tonic::server::{NamedService, StreamingService, UnaryService};
-use tonic::transport::server::TcpIncoming;
+use tonic::transport::server::{Connected, TcpIncoming};
 use tonic::{Code, Request, Response, Status, Streaming};
 use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
@@ -246,8 +248,9 @@ where
         Ok(WireSnapshotResponse::from(&response))
     }
 
-    /// Serve until `shutdown` resolves. The incoming stream is where the
-    /// RFC 0030 TLS acceptor will sit.
+    /// Serve over mutual TLS until `shutdown` resolves (RFC 0065 §6.8):
+    /// `acceptor` comes from the peer listener's settings, whose client CA
+    /// every caller's certificate must chain to, and reloads with them.
     ///
     /// # Errors
     ///
@@ -255,8 +258,29 @@ where
     pub async fn serve(
         self,
         incoming: TcpIncoming,
+        acceptor: ReloadingAcceptor,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error> {
+        self.run(tls_incoming(incoming, acceptor), shutdown).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn serve_plaintext(
+        self,
+        incoming: TcpIncoming,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), tonic::transport::Error> {
+        self.run(incoming, shutdown).await
+    }
+
+    async fn run<IO>(
+        self,
+        incoming: impl Stream<Item = std::io::Result<IO>>,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), tonic::transport::Error>
+    where
+        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+    {
         let closing = Arc::clone(&self.closing);
         let shutdown = async move {
             shutdown.await;

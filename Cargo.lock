@@ -3832,6 +3832,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "http",
+ "hyper-util",
  "object_store",
  "openraft",
  "opentelemetry",

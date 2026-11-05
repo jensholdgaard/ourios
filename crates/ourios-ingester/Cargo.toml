@@ -96,8 +96,9 @@ ourios-parquet = { path = "../ourios-parquet" }
 # Async runtime for the background compaction loop: `time` for the
 # interval timer, `rt` for `spawn_blocking` (compaction is blocking
 # filesystem/Parquet work), `macros` for `#[tokio::main]`/tests, `sync`
-# for the audit sink's `Notify` eager-flush signal (issue #302).
-tokio = { version = "1", default-features = false, features = ["rt", "time", "macros", "sync"] }
+# for the audit sink's `Notify` eager-flush signal (issue #302), `net`
+# for the peer transport's TLS connector.
+tokio = { version = "1", default-features = false, features = ["rt", "time", "macros", "sync", "net"] }
 # Telemetry: the lightweight OTel metrics API only (RFC 0001 §6.8 — the
 # heavy SDK/OTLP live in ourios-telemetry; library crates resolve
 # instruments through the global meter). `trace` is the API half only —
@@ -148,8 +149,12 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # the generated `#[async_trait]` + `Request`/`Response`/`Status`.
 # `gzip` lets `grpc::logs_service` accept compressed requests, as a stock
 # Collector sends them. `transport` for the RFC 0065 peer transport's
-# server and per-peer client channels.
-tonic = { version = "0.14", default-features = false, features = ["codegen", "gzip", "transport"] }
+# server and per-peer client channels; `tls-connect-info` lets its server
+# serve the peer listener's TLS streams (RFC 0065 §6.8).
+tonic = { version = "0.14", default-features = false, features = ["codegen", "gzip", "transport", "tls-connect-info"] }
+# The peer transport's mutual-TLS connector hands tonic its TLS stream
+# through hyper's IO traits. Already in the tree via tonic.
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 # The RFC 0065 peer transport's codec: its messages are hand-declared
 # `prost::Message` structs (no `.proto`, no build script), which tonic
 # 0.14 encodes through this crate. Already in the tree via

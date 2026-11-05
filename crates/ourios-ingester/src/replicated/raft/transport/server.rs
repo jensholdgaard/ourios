@@ -4,27 +4,32 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 
+use futures_util::{Stream, StreamExt as _};
 use openraft::Raft;
 use openraft::errors::Fatal;
+use openraft::raft::{AppendEntriesRequest, StreamAppendResult};
 use openraft::storage::{RaftStateMachine, Snapshot};
+use tokio::sync::{oneshot, watch};
 use tonic::body::Body;
 use tonic::codegen::{Body as HttpBody, BoxFuture, StdError, http};
-use tonic::server::{NamedService, UnaryService};
+use tonic::server::{NamedService, StreamingService, UnaryService};
 use tonic::transport::server::TcpIncoming;
-use tonic::{Code, Request, Response, Status};
+use tonic::{Code, Request, Response, Status, Streaming};
 use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
 
 use super::super::types::RaftTypes;
-use super::trace::{Call, Traced, Tracing};
+use super::trace::{Call, Carried, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, Malformed, SnapshotRequest,
-    WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
+    StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
 };
-use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, VERSION, VOTE};
+use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, STREAM_APPEND, VERSION, VOTE};
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
 
@@ -35,6 +40,10 @@ where
 {
     groups: Arc<RwLock<Groups<SM>>>,
     tracing: Tracing,
+    /// Set once `serve`'s shutdown resolves. Graceful shutdown waits for
+    /// every running call, so a `StreamAppend` waiting on its peer must
+    /// end on it rather than on the peer.
+    closing: Arc<watch::Sender<bool>>,
 }
 
 impl<SM> Clone for ReplicationServer<SM>
@@ -45,6 +54,7 @@ where
         Self {
             groups: Arc::clone(&self.groups),
             tracing: self.tracing.clone(),
+            closing: Arc::clone(&self.closing),
         }
     }
 }
@@ -57,6 +67,7 @@ where
         Self {
             groups: Arc::default(),
             tracing: Tracing::default(),
+            closing: Arc::new(watch::Sender::new(false)),
         }
     }
 }
@@ -91,6 +102,7 @@ where
         Self {
             groups: Arc::default(),
             tracing,
+            closing: Arc::new(watch::Sender::new(false)),
         }
     }
 
@@ -127,6 +139,81 @@ where
         let rpc = request.into_raft()?;
         let response = raft.append_entries(rpc).await.map_err(|e| stopped(&e))?;
         Ok(AppendResponse::from(&response))
+    }
+
+    /// Open a `StreamAppend` stream: its first message routes it, and the
+    /// group's `Raft` answers each message in order.
+    async fn stream_append(
+        &self,
+        mut incoming: Streaming<AppendRequest>,
+    ) -> Result<AnswerStream, Status> {
+        let mut call = StreamCall::server(self.tracing.clone(), STREAM_APPEND);
+        let mut closing = self.closing.subscribe();
+        let first = tokio::select! {
+            first = incoming.message() => first,
+            _ = closing.wait_for(|closing| *closing) => {
+                return Err(refuse(&mut call, Status::unavailable("the server is shutting down")));
+            }
+        };
+        let first = match first {
+            Ok(Some(first)) => first,
+            Ok(None) => {
+                call.end(Code::Ok);
+                return Ok(Box::pin(futures_util::stream::empty()));
+            }
+            Err(status) => return Err(refuse(&mut call, status)),
+        };
+        let raft = self
+            .route(first.header.clone())
+            .map_err(|status| refuse(&mut call, status))?;
+        let opening = Opening {
+            first,
+            rest: incoming,
+        };
+        Ok(Box::pin(self.answers(&raft, opening, call)))
+    }
+
+    /// `raft`'s answers to the stream `opening` begins.
+    fn answers<'r>(
+        &self,
+        raft: &'r Raft<RaftTypes, SM>,
+        Opening { first, rest }: Opening,
+        call: StreamCall<'static>,
+    ) -> impl Stream<Item = Result<StreamAppendResponse, Status>> + Send + 'static + use<'r, SM>
+    {
+        let mut closing = self.closing.subscribe();
+        let reader = Arc::new(Reader {
+            refused: Mutex::default(),
+            admitted: AtomicU64::default(),
+            carried: call.carried(),
+        });
+        let (release, released) = oneshot::channel();
+        let inbound = Inbound {
+            header: first.header.clone(),
+            messages: futures_util::stream::once(std::future::ready(Ok(first))).chain(rest),
+            reader: Arc::clone(&reader),
+            released,
+        };
+        let requests = futures_util::stream::unfold(inbound, Inbound::next);
+        let watched = raft.wait(None);
+        let stopped = async move {
+            tokio::select! {
+                _ = watched.metrics(|m| m.running_state.is_err(), "the group stops") => {}
+                _ = closing.wait_for(|closing| *closing) => {}
+            }
+        };
+        let answers = Answers {
+            results: Box::pin(raft.stream_append(requests)),
+            stopped: Box::pin(stopped),
+            reader,
+            answered: 0,
+            call,
+            _release: release,
+        };
+        futures_util::stream::unfold(
+            Some(answers),
+            |answers| async move { answers?.next().await },
+        )
     }
 
     async fn vote(
@@ -170,6 +257,11 @@ where
         incoming: TcpIncoming,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error> {
+        let closing = Arc::clone(&self.closing);
+        let shutdown = async move {
+            shutdown.await;
+            closing.send_replace(true);
+        };
         tonic::transport::Server::builder()
             .serve_with_incoming_shutdown(self, incoming, shutdown)
             .await
@@ -232,6 +324,189 @@ where
     })
 }
 
+type AnswerStream = Pin<Box<dyn Stream<Item = Result<StreamAppendResponse, Status>> + Send>>;
+
+fn refuse(call: &mut StreamCall<'_>, status: Status) -> Status {
+    call.end(status.code());
+    status
+}
+
+/// What a stream's reader leaves its writer: why it stopped reading
+/// early, and how many appends it handed the `Raft`.
+struct Reader {
+    refused: Mutex<Option<Status>>,
+    admitted: AtomicU64,
+    carried: Carried,
+}
+
+impl Reader {
+    fn refuse(&self, status: Status) {
+        *self.refused.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
+    }
+
+    fn refused(&self) -> Option<Status> {
+        self.refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// A stream's messages as `openraft` appends, ending at the first one
+/// that is refused, which it leaves in the [`Reader`], or once the
+/// answers end.
+struct Inbound<M> {
+    messages: M,
+    header: Option<Header>,
+    reader: Arc<Reader>,
+    /// Resolves when the answers drop. `openraft` holds the requests
+    /// until its next read, and the stream stays open while they live.
+    released: oneshot::Receiver<()>,
+}
+
+impl<M> Inbound<M>
+where
+    M: Stream<Item = Result<AppendRequest, Status>> + Unpin,
+{
+    async fn next(mut self) -> Option<(AppendEntriesRequest<RaftTypes>, Self)> {
+        let message = tokio::select! {
+            message = self.messages.next() => message?,
+            _ = &mut self.released => return None,
+        };
+        match self.admit(message) {
+            Ok(rpc) => Some((rpc, self)),
+            Err(status) => {
+                self.reader.refuse(status);
+                None
+            }
+        }
+    }
+
+    /// Validated as a unary append is, under the header that routed the
+    /// stream.
+    fn admit(
+        &self,
+        message: Result<AppendRequest, Status>,
+    ) -> Result<AppendEntriesRequest<RaftTypes>, Status> {
+        let request = message?;
+        if request.header != self.header {
+            return Err(Status::invalid_argument(
+                "every message of a stream carries the header of its first",
+            ));
+        }
+        self.reader.carried.note(&request);
+        let rpc = request.into_raft()?;
+        self.reader.admitted.fetch_add(1, Ordering::Relaxed);
+        Ok(rpc)
+    }
+}
+
+/// The `Raft`'s answers to a stream, in order, ending after the first
+/// that ends replication, after the reader's refusal, or when the `Raft`
+/// stops.
+/// A `StreamAppend` stream: the message that routed it, and the rest.
+struct Opening {
+    first: AppendRequest,
+    rest: Streaming<AppendRequest>,
+}
+
+struct Answers<O> {
+    results: O,
+    /// Resolves once the `Raft` or the server stops: a stream the leader
+    /// keeps open but idle would otherwise never end, and a server's
+    /// graceful shutdown waits on every open stream.
+    stopped: Pin<Box<dyn Future<Output = ()> + Send>>,
+    reader: Arc<Reader>,
+    answered: u64,
+    call: StreamCall<'static>,
+    _release: oneshot::Sender<()>,
+}
+
+impl<O> Answers<O>
+where
+    O: Stream<Item = Result<StreamAppendResult<RaftTypes>, Fatal<RaftTypes>>> + Unpin,
+{
+    async fn next(mut self) -> Option<(Result<StreamAppendResponse, Status>, Option<Self>)> {
+        let next = tokio::select! {
+            biased;
+            next = self.results.next() => next,
+            () = &mut self.stopped => {
+                let status = Status::unavailable("the group or the server stopped");
+                return Some((Err(refuse(&mut self.call, status)), None));
+            }
+        };
+        match next {
+            Some(Ok(result)) => {
+                self.answered += 1;
+                let response = Ok(StreamAppendResponse::from(&result));
+                if result.is_ok() {
+                    Some((response, Some(self)))
+                } else {
+                    self.call.end(Code::Ok);
+                    Some((response, None))
+                }
+            }
+            Some(Err(fatal)) => Some((Err(refuse(&mut self.call, stopped(&fatal))), None)),
+            None => self.close().map(|status| (Err(status), None)),
+        }
+    }
+
+    /// The status the stream ends on once the `Raft` stops answering:
+    /// the reader's refusal, or `UNAVAILABLE` for appends it admitted that
+    /// went unanswered, which is a `Raft` that stopped.
+    fn close(mut self) -> Option<Status> {
+        let unanswered = self.reader.admitted.load(Ordering::Relaxed) > self.answered;
+        let status = self.reader.refused().or_else(|| {
+            unanswered.then(|| Status::unavailable("the group stopped before answering"))
+        });
+        self.call
+            .end(status.as_ref().map_or(Code::Ok, Status::code));
+        status
+    }
+}
+
+/// The `StreamAppend` method.
+struct AppendStreams<SM>
+where
+    SM: RaftStateMachine<RaftTypes>,
+{
+    server: ReplicationServer<SM>,
+}
+
+impl<SM> StreamingService<AppendRequest> for AppendStreams<SM>
+where
+    SM: RaftStateMachine<RaftTypes, SnapshotData = ()>,
+{
+    type Response = StreamAppendResponse;
+    type ResponseStream = AnswerStream;
+    type Future = BoxFuture<Response<AnswerStream>, Status>;
+
+    fn call(&mut self, request: Request<Streaming<AppendRequest>>) -> Self::Future {
+        let server = self.server.clone();
+        Box::pin(async move {
+            let answers = server.stream_append(request.into_inner()).await?;
+            Ok(Response::new(answers))
+        })
+    }
+}
+
+fn streaming<SM, B>(
+    server: ReplicationServer<SM>,
+    request: http::Request<B>,
+) -> BoxFuture<http::Response<Body>, Infallible>
+where
+    SM: RaftStateMachine<RaftTypes, SnapshotData = ()>,
+    B: HttpBody + Send + 'static,
+    B::Error: Into<StdError> + Send + 'static,
+{
+    Box::pin(async move {
+        let codec = ProstCodec::<StreamAppendResponse, AppendRequest>::default();
+        let mut grpc = tonic::server::Grpc::new(codec)
+            .apply_max_message_size_config(Some(MAX_MESSAGE_BYTES), Some(MAX_MESSAGE_BYTES));
+        Ok(grpc.streaming(AppendStreams { server }, request).await)
+    })
+}
+
 fn unimplemented() -> BoxFuture<http::Response<Body>, Infallible> {
     Box::pin(async { Ok(Status::unimplemented("no such method").into_http()) })
 }
@@ -270,6 +545,7 @@ where
                 let server = server.clone();
                 async move { server.install_snapshot(r).await }
             }),
+            STREAM_APPEND => streaming(server, request),
             _ => unimplemented(),
         }
     }

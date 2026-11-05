@@ -9,6 +9,12 @@
 # (each entry should carry a `# reason:` note); empty means none accepted.
 yanked = "deny"
 ignore = [
+    # reason: `astral-tokio-tar` is unmaintained (RUSTSEC-2026-0440, no
+    # vulnerability, no safe upgrade). It reaches us only as a
+    # dev-dependency through testcontainers, which uses it to copy files
+    # into the integration tests' containers; even testcontainers 0.28 needs
+    # it, so nothing ships with it. Remove when testcontainers moves off it.
+    "RUSTSEC-2026-0440",
     # reason: quick-xml < 0.41 DoS advisories (quadratic duplicate-attribute
     # check; unbounded namespace-declaration allocation). Transitive via
     # object_store — no upgrade path exists yet: datafusion 55 still pins
@@ -109,6 +115,13 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# RFC 0065 §4.5: the openraft safety fixes the replicated WAL requires
+# (9567ffea, 0240eca5) are on its `main` branch only, not in a crates.io
+# release. The dependency pins an exact `rev`, never a branch.
 # DataFusion 56 readiness only: the workspace `[patch.crates-io]` builds
-# DataFusion from an upstream revision. Remove together with that patch.
-allow-git = ["https://github.com/apache/datafusion"]
+# DataFusion from an upstream revision. Remove that entry together with
+# the patch.
+allow-git = [
+    "https://github.com/databendlabs/openraft",
+    "https://github.com/apache/datafusion",
+]

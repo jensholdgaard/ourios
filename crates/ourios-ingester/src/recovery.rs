@@ -813,6 +813,16 @@ impl FrameSink for DriverSink<'_> {
                 ));
             }
             FrameKind::TenantOtlpBatch => self.consume_batch(offset, payload)?,
+            // A replicated group's Raft log (RFC 0065 §4.3) lives in its own
+            // WAL; one in the local backend's root is a misplaced directory.
+            FrameKind::ReplicatedEntry => {
+                return Err(reject(
+                    kind,
+                    offset,
+                    &"replicated group frame (kind 0x04) in the local WAL root — a group's \
+                      log lives under wal_root/groups/<group>/ and is not replayed here",
+                ));
+            }
             // The miner's regeneration is the only source of replayed
             // events (RFC 0052 §3.7): feeding a stored event as well
             // would forward it twice. Nothing writes the kind yet (its

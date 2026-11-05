@@ -5,6 +5,7 @@
 //! entry travels as its frame kind `0x04` payload, the bytes the group
 //! log writes, and a membership in that codec's membership encoding.
 
+use std::borrow::Borrow;
 use std::fmt;
 use std::io;
 
@@ -254,16 +255,12 @@ impl AppendRequest {
     /// # Errors
     ///
     /// [`Malformed`] when an entry has no frame encoding.
+    #[cfg(test)]
     pub fn split(
         to: Recipient,
         rpc: &AppendEntriesRequest<RaftTypes>,
     ) -> Result<Vec<Self>, Malformed> {
-        let mut pieces = Pieces::new(to, rpc);
-        let mut split = vec![pieces.piece()?];
-        while !pieces.done() {
-            split.push(pieces.piece()?);
-        }
-        Ok(split)
+        Pieces::new(to, rpc).collect()
     }
 
     /// # Errors
@@ -285,34 +282,42 @@ impl AppendRequest {
     }
 }
 
-/// An append cut into messages under [`MAX_MESSAGE_BYTES`].
-struct Pieces<'a> {
+/// An append cut into messages under [`MAX_MESSAGE_BYTES`], encoded one
+/// piece at a time so that only the piece in hand is held encoded. `R`
+/// is the append, owned or borrowed.
+pub struct Pieces<R> {
     to: Recipient,
-    rpc: &'a AppendEntriesRequest<RaftTypes>,
+    rpc: R,
     /// The last log id of the pieces so far.
     prev: Option<LogId>,
     /// The first entry no piece carries yet.
     next: usize,
+    /// Whether a piece has been taken: an append without entries is one.
+    started: bool,
 }
 
-impl<'a> Pieces<'a> {
-    fn new(to: Recipient, rpc: &'a AppendEntriesRequest<RaftTypes>) -> Self {
+impl<R> Pieces<R>
+where
+    R: Borrow<AppendEntriesRequest<RaftTypes>>,
+{
+    pub fn new(to: Recipient, rpc: R) -> Self {
         Self {
             to,
+            prev: rpc.borrow().prev_log_id,
             rpc,
-            prev: rpc.prev_log_id,
             next: 0,
+            started: false,
         }
     }
 
     fn done(&self) -> bool {
-        self.next == self.rpc.entries.len()
+        self.started && self.next == self.rpc.borrow().entries.len()
     }
 
-    /// The next piece: the entries after `prev` that fit, and at least
-    /// one while any remain.
+    /// The next piece: the entries after the last piece that fit, and at
+    /// least one while any remain.
     fn piece(&mut self) -> Result<AppendRequest, Malformed> {
-        let rpc = self.rpc;
+        let rpc = self.rpc.borrow();
         let mut request = AppendRequest {
             header: Some(Header::to(self.to)),
             vote: Some(WireVote::from(&rpc.vote)),
@@ -320,18 +325,36 @@ impl<'a> Pieces<'a> {
             entries: Vec::new(),
             leader_commit: wire_id(rpc.leader_commit.as_ref()),
         };
+        let (mut prev, mut next) = (self.prev, self.next);
         let mut len = request.encoded_len();
-        for entry in &rpc.entries[self.next..] {
+        for entry in &rpc.entries[next..] {
             let bytes = codec::encode_entry(entry)?;
             len += prost::encoding::bytes::encoded_len(4, &bytes);
             if len > MAX_MESSAGE_BYTES && !request.entries.is_empty() {
                 break;
             }
             request.entries.push(bytes);
-            self.prev = Some(entry.log_id);
-            self.next += 1;
+            prev = Some(entry.log_id);
+            next += 1;
         }
+        (self.prev, self.next, self.started) = (prev, next, true);
         Ok(request)
+    }
+}
+
+impl<R> Iterator for Pieces<R>
+where
+    R: Borrow<AppendEntriesRequest<RaftTypes>>,
+{
+    type Item = Result<AppendRequest, Malformed>;
+
+    /// `None` once every entry is carried; an `Err` leaves the pieces
+    /// where they were.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done() {
+            return None;
+        }
+        Some(self.piece())
     }
 }
 
@@ -933,6 +956,20 @@ mod tests {
             carried.extend(back.entries);
         }
         assert_eq!(carried, rpc.entries);
+    }
+
+    /// The stream's chunker owns its append and encodes a piece only
+    /// when asked for one, cutting where the borrowed split does.
+    #[test]
+    fn an_owned_append_is_cut_one_piece_at_a_time() {
+        let seven_mib = 7 * 1024 * 1024;
+        let rpc = append_of((0..5).map(|i| large_entry(i, seven_mib)).collect());
+        let split = AppendRequest::split(to(), &rpc).expect("encode");
+        let mut pieces = Pieces::new(to(), rpc);
+        for expected in split {
+            assert_eq!(pieces.next().expect("a piece").expect("encode"), expected);
+        }
+        assert!(pieces.next().is_none());
     }
 
     #[test]

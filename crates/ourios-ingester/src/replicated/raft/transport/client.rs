@@ -29,8 +29,8 @@ use tracing::Instrument as _;
 use super::super::types::{NodeId, RaftTypes, Vote};
 use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing};
 use super::wire::{
-    AppendRequest, AppendResponse, MAX_MESSAGE_BYTES, Malformed, Recipient, Reply, SnapshotRequest,
-    StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
+    AppendRequest, AppendResponse, MAX_MESSAGE_BYTES, Malformed, Pieces, Recipient, Reply,
+    SnapshotRequest, StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
 };
 use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, STREAM_APPEND, VOTE};
 
@@ -242,15 +242,24 @@ impl PeerClient {
     /// Open `StreamAppend` with `input` as its messages. The soft TTL
     /// bounds the opening and then each wait for an answer; the stream
     /// itself lives as long as `openraft` keeps it.
+    ///
+    /// The opening waits for `input`'s first append before its deadline
+    /// starts: `openraft` holds that append back for as long as it backs
+    /// off from the peer, longer than the soft TTL, and the server opens
+    /// its answers only on a first message.
     async fn open_stream<S>(
         &self,
-        input: S,
+        mut input: S,
         option: RPCOption,
     ) -> Result<BoxStream<'_, Answer>, RpcError>
     where
         S: Stream<Item = AppendEntriesRequest<RaftTypes>> + OptionalSend + Unpin + 'static,
     {
         let channel = self.channel.clone()?;
+        let Some(first) = input.next().await else {
+            return Ok(Box::pin(futures_util::stream::empty()));
+        };
+        let input = futures_util::stream::iter([first]).chain(input);
         let ttl = option.soft_ttl();
         let peer = Peer::parse(&self.addr);
         let mut call = StreamCall::client(self.tracing.clone(), STREAM_APPEND, peer);
@@ -332,7 +341,9 @@ impl Sent {
 struct Outbound<S> {
     input: S,
     to: Recipient,
-    pieces: VecDeque<AppendRequest>,
+    /// The append being sent, encoded a piece at a time as the stream
+    /// takes them.
+    pieces: Option<Pieces<AppendEntriesRequest<RaftTypes>>>,
     sent: Arc<Sent>,
     /// Resolves when the replies drop: the stream stays open while its
     /// requests live, and `openraft` may hold its input open and idle.
@@ -344,23 +355,25 @@ where
     S: Stream<Item = AppendEntriesRequest<RaftTypes>> + Unpin,
 {
     async fn next(mut self) -> Option<(AppendRequest, Self)> {
-        while self.pieces.is_empty() {
+        loop {
+            match self.pieces.as_mut().and_then(Iterator::next) {
+                Some(Ok(piece)) => {
+                    self.sent.carried.note(&piece);
+                    self.sent.unanswered().push_back(Instant::now());
+                    return Some((piece, self));
+                }
+                Some(Err(e)) => {
+                    self.sent.refuse(e);
+                    return None;
+                }
+                None => {}
+            }
             let rpc = tokio::select! {
                 rpc = self.input.next() => rpc?,
                 _ = &mut self.released => return None,
             };
-            match AppendRequest::split(self.to, &rpc) {
-                Ok(pieces) => self.pieces = pieces.into(),
-                Err(e) => {
-                    self.sent.refuse(e);
-                    return None;
-                }
-            }
+            self.pieces = Some(Pieces::new(self.to, rpc));
         }
-        let piece = self.pieces.pop_front()?;
-        self.sent.carried.note(&piece);
-        self.sent.unanswered().push_back(Instant::now());
-        Some((piece, self))
     }
 }
 
@@ -376,7 +389,7 @@ where
     let outbound = Outbound {
         input,
         to,
-        pieces: VecDeque::new(),
+        pieces: None,
         sent,
         released,
     };

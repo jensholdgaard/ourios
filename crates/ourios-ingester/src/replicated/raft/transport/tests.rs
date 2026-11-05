@@ -2,8 +2,10 @@
 //! message sizes, and the peer-RPC spans.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
@@ -20,6 +22,7 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::codegen::http::uri::PathAndQuery;
+use tonic::codegen::{Body as HttpBody, BoxFuture, StdError, http};
 use tonic::transport::server::TcpIncoming;
 use tonic::{Code, Request, Status};
 use tonic_prost::ProstCodec;
@@ -34,7 +37,7 @@ use super::wire::{
     StreamAppendResponse, WireLogId, WireSnapshotResponse, WireVote,
 };
 use super::{
-    APPEND, INSTALL_SNAPSHOT, PeerClient, Peers, ReplicationServer, STREAM_APPEND, VERSION,
+    APPEND, INSTALL_SNAPSHOT, PeerClient, Peers, ReplicationServer, SERVICE, STREAM_APPEND, VERSION,
 };
 
 const GROUP: u32 = 7;
@@ -61,13 +64,19 @@ fn serve(
     (stop, serving)
 }
 
+/// A replica's identity and the directory its log and votes live in.
+struct Replica {
+    id: NodeId,
+    dir: TempDir,
+}
+
 struct Node {
     id: NodeId,
     raft: Raft<RaftTypes, MemSm>,
     sm: MemSm,
     stop: Option<oneshot::Sender<()>>,
     serving: JoinHandle<()>,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 impl Node {
@@ -77,9 +86,22 @@ impl Node {
         peers: &Peers,
         server: ReplicationServer<MemSm>,
     ) -> Self {
-        let id = NodeId::from(n);
         let dir = tempfile::tempdir().expect("tempdir");
         vote_log::create(dir.path()).expect("vote log");
+        let replica = Replica {
+            id: NodeId::from(n),
+            dir,
+        };
+        Self::open(replica, incoming, peers, server).await
+    }
+
+    /// `replica`, from the state in its directory, served on `incoming`.
+    async fn open(
+        Replica { id, dir }: Replica,
+        incoming: TcpIncoming,
+        peers: &Peers,
+        server: ReplicationServer<MemSm>,
+    ) -> Self {
         let votes = VoteLog::open(dir.path()).expect("vote log");
         let wal = wal_config(&group_dir(dir.path(), GROUP));
         let log = GroupLog::open(wal, GROUP, votes).expect("group log");
@@ -96,7 +118,7 @@ impl Node {
             sm,
             stop: Some(stop),
             serving,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -1057,4 +1079,157 @@ async fn a_stream_is_traced_once_and_only_when_it_carries_entries() {
         assert_eq!(rpc_of(&span), expected_rpc("StreamAppend", "OK"));
         assert!(!failure_of(&span).0, "{span:?}");
     }
+}
+
+/// A follower that went away comes back to a leader backing off from
+/// it: `openraft` then holds a session's first append for the backoff,
+/// longer than the soft TTL, and the stream must still open and catch the
+/// follower up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_that_rejoins_catches_up_over_the_stream() {
+    let peers = Peers::plaintext();
+    let mut listeners = Vec::new();
+    let mut members = BTreeMap::new();
+    for n in 1..=3 {
+        let (incoming, addr) = bind();
+        members.insert(NodeId::from(n), addr);
+        listeners.push((n, incoming));
+    }
+    let mut nodes = Vec::new();
+    for (n, incoming) in listeners {
+        nodes.push(Node::start(n, incoming, &peers, ReplicationServer::default()).await);
+    }
+    let addrs: BTreeMap<_, _> = members.iter().map(|(id, a)| (*id, a.to_string())).collect();
+    nodes[0].raft.initialize(addrs).await.expect("initialize");
+    let first = leader(&nodes.iter().collect::<Vec<_>>(), None).await;
+    let at = nodes.iter().position(|n| n.id == first).expect("leader");
+    let gone = (at + 1) % nodes.len();
+    write(&nodes[at].raft, 0).await;
+
+    let mut follower = nodes.remove(gone);
+    follower.kill().await;
+    let at = nodes.iter().position(|n| n.id == first).expect("leader");
+    let mut last = 0;
+    for n in 1..20 {
+        last = write(&nodes[at].raft, n).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let incoming = TcpIncoming::bind(members[&follower.id]).expect("rebind");
+    let replica = Replica {
+        id: follower.id,
+        dir: follower.dir,
+    };
+    let back = Node::open(replica, incoming, &peers, ReplicationServer::default()).await;
+    back.applied_through(last).await;
+    nodes.push(back);
+    for node in &mut nodes {
+        node.kill().await;
+    }
+}
+
+/// A peer that opens every `StreamAppend` stream and reads its messages
+/// but answers none of them.
+#[derive(Clone)]
+struct Withholding;
+
+impl tonic::server::StreamingService<AppendRequest> for Withholding {
+    type Response = StreamAppendResponse;
+    type ResponseStream =
+        futures_util::stream::BoxStream<'static, Result<StreamAppendResponse, Status>>;
+    type Future = BoxFuture<tonic::Response<Self::ResponseStream>, Status>;
+
+    fn call(&mut self, request: Request<tonic::Streaming<AppendRequest>>) -> Self::Future {
+        let read = futures_util::stream::unfold(request.into_inner(), |mut incoming| async move {
+            while let Ok(Some(_)) = incoming.message().await {}
+            std::future::pending::<Option<(Result<StreamAppendResponse, Status>, _)>>().await
+        });
+        Box::pin(async move { Ok(tonic::Response::new(read.boxed())) })
+    }
+}
+
+impl<B> tonic::codegen::Service<http::Request<B>> for Withholding
+where
+    B: HttpBody + Send + 'static,
+    B::Error: Into<StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        Box::pin(async move {
+            let codec = ProstCodec::<StreamAppendResponse, AppendRequest>::default();
+            Ok(tonic::server::Grpc::new(codec)
+                .streaming(Withholding, request)
+                .await)
+        })
+    }
+}
+
+impl tonic::server::NamedService for Withholding {
+    const NAME: &'static str = SERVICE;
+}
+
+/// An open stream whose peer holds back an answer times out the wait for
+/// it, rather than waiting as long as an idle stream may.
+#[tokio::test]
+async fn a_stream_whose_peer_withholds_an_answer_times_out() {
+    let (incoming, addr) = bind();
+    let serving = tokio::spawn(
+        tonic::transport::Server::builder().serve_with_incoming(Withholding, incoming),
+    );
+    let mut client = client_to(&Peers::plaintext(), NodeId::from(1), addr).await;
+    let option = RPCOption::new(Duration::from_millis(200));
+    let input =
+        futures_util::stream::iter(consecutive(&[1])).chain(futures_util::stream::pending());
+    let mut answers = client.stream_append(input, option).await.expect("open");
+    let answer = tokio::time::timeout(Duration::from_secs(5), answers.next())
+        .await
+        .expect("the wait for the answer ends");
+    assert!(
+        matches!(answer, Some(Err(RPCError::Timeout(_)))),
+        "{answer:?}"
+    );
+    drop(answers);
+    serving.abort();
+}
+
+/// An answered stream left idle past the soft TTL is not timed out, and
+/// carries the next append when `openraft` yields one.
+#[tokio::test]
+async fn a_stream_idle_past_the_soft_ttl_carries_the_next_append() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    let option = RPCOption::new(Duration::from_millis(200));
+    let soft_ttl = option.soft_ttl();
+    let (send, input) = futures::channel::mpsc::unbounded();
+    let mut appends = consecutive(&[1, 1]).into_iter();
+    send.unbounded_send(appends.next().expect("first"))
+        .expect("send");
+    let mut answers = client.stream_append(input, option).await.expect("open");
+    let first = answers.next().await.expect("an answer");
+    assert!(
+        matches!(first, Ok(Ok(Some(id))) if id.index == 0),
+        "{first:?}"
+    );
+
+    let idle = tokio::time::timeout(soft_ttl * 4, answers.next()).await;
+    assert!(idle.is_err(), "an idle stream is not a timeout: {idle:?}");
+
+    send.unbounded_send(appends.next().expect("second"))
+        .expect("send");
+    let second = answers.next().await.expect("an answer");
+    assert!(
+        matches!(second, Ok(Ok(Some(id))) if id.index == 1),
+        "{second:?}"
+    );
+    drop(answers);
+    node.kill().await;
 }

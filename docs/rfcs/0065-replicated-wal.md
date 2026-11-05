@@ -1428,8 +1428,9 @@ never count toward an ack (learners, under §4.3's shape).
   `Forward` (any node to a leader), and `Tail` and `TailScan` (querier
   to tail replica: the read point and published keys, then the rows
   under that read point, §6.7). Catch-up needs no call of its own: the
-  leader sends a lagging follower its missing entries by `Append`, or
-  the checkpoint by `InstallSnapshot` when they are already purged.
+  leader sends a lagging follower its missing entries by
+  `StreamAppend`, or the checkpoint by `InstallSnapshot` when they are
+  already purged.
 - Replication runs over `StreamAppend`, one bidirectional stream per
   `openraft` replication session, so the leader sends appends without
   waiting for the answers to earlier ones (§4.6). Every message on the

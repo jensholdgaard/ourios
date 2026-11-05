@@ -40,6 +40,7 @@ use super::{
     APPEND, INSTALL_SNAPSHOT, PeerClient, Peers, ReplicationServer, SERVICE, STREAM_APPEND, VERSION,
 };
 
+mod pipelining;
 mod shutdown;
 
 const GROUP: u32 = 7;

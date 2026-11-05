@@ -40,6 +40,8 @@ use super::{
     APPEND, INSTALL_SNAPSHOT, PeerClient, Peers, ReplicationServer, SERVICE, STREAM_APPEND, VERSION,
 };
 
+mod shutdown;
+
 const GROUP: u32 = 7;
 const WAIT: Option<Duration> = Some(Duration::from_secs(10));
 

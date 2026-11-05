@@ -366,7 +366,9 @@ where
                     self.sent.refuse(e);
                     return None;
                 }
-                None => {}
+                // Every piece is sent: free the append's entries before
+                // waiting, possibly long, for the next one.
+                None => self.pieces = None,
             }
             let rpc = tokio::select! {
                 rpc = self.input.next() => rpc?,

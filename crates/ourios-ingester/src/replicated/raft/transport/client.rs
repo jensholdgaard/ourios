@@ -255,10 +255,12 @@ impl PeerClient {
     where
         S: Stream<Item = AppendEntriesRequest<RaftTypes>> + OptionalSend + Unpin + 'static,
     {
-        let channel = self.channel.clone()?;
         let Some(first) = input.next().await else {
             return Ok(Box::pin(futures_util::stream::empty()));
         };
+        // After the first append: `openraft` backs off while producing it,
+        // so a peer that cannot be reached is retried at that pace.
+        let channel = self.channel.clone()?;
         let input = futures_util::stream::iter([first]).chain(input);
         let ttl = option.soft_ttl();
         let peer = Peer::parse(&self.addr);
@@ -604,6 +606,34 @@ mod tests {
         assert!(
             matches!(result, Err(RPCError::Unreachable(_))),
             "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_to_an_unparsable_address_waits_for_the_first_append() {
+        let mut network = Peers::plaintext().network(NodeId::from(1), 0);
+        let mut client = network
+            .new_client(NodeId::from(2), &"not an address\n".to_owned())
+            .await;
+        let option = || RPCOption::new(Duration::from_secs(1));
+        let held = client.stream_append(futures_util::stream::pending(), option());
+        let waited = tokio::time::timeout(Duration::from_millis(100), held).await;
+        assert!(waited.is_err(), "refused before the first append");
+        drop(waited);
+
+        let rpc = AppendEntriesRequest {
+            vote: Vote::new_committed(1, NodeId::from(1)),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        };
+        let opened = client
+            .stream_append(futures_util::stream::iter([rpc]), option())
+            .await;
+        assert!(
+            matches!(opened.as_ref().err(), Some(RPCError::Unreachable(_))),
+            "{:?}",
+            opened.err()
         );
     }
 }

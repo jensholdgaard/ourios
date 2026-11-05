@@ -2594,6 +2594,7 @@ dependencies = [
  "crc32c",
  "flate2",
  "futures-core",
+ "futures-util",
  "http",
  "object_store",
  "openraft",

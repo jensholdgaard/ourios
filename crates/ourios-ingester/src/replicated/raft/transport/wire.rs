@@ -5,12 +5,14 @@
 //! entry travels as its frame kind `0x04` payload, the bytes the group
 //! log writes, and a membership in that codec's membership encoding.
 
+use std::borrow::Borrow;
 use std::fmt;
 use std::io;
 
 use openraft::impls::leader_id_std::LeaderId;
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, StreamAppendError,
+    StreamAppendResult, VoteRequest, VoteResponse,
 };
 use openraft::type_config::alias::{SnapshotMetaOf, StoredMembershipOf};
 use prost::Message as _;
@@ -240,25 +242,25 @@ impl AppendRequest {
         to: Recipient,
         rpc: &AppendEntriesRequest<RaftTypes>,
     ) -> Result<(Self, Option<LogId>), Malformed> {
-        let mut request = Self {
-            header: Some(Header::to(to)),
-            vote: Some(WireVote::from(&rpc.vote)),
-            prev_log_id: wire_id(rpc.prev_log_id.as_ref()),
-            entries: Vec::new(),
-            leader_commit: wire_id(rpc.leader_commit.as_ref()),
-        };
-        let mut len = request.encoded_len();
-        let mut last = None;
-        for entry in &rpc.entries {
-            let bytes = codec::encode_entry(entry)?;
-            len += prost::encoding::bytes::encoded_len(4, &bytes);
-            if len > MAX_MESSAGE_BYTES && last.is_some() {
-                return Ok((request, last));
-            }
-            request.entries.push(bytes);
-            last = Some(entry.log_id);
-        }
-        Ok((request, None))
+        let mut pieces = Pieces::new(to, rpc);
+        let request = pieces.piece()?;
+        let cut = if pieces.done() { None } else { pieces.prev };
+        Ok((request, cut))
+    }
+
+    /// The requests that carry all of `rpc`'s entries in order, each
+    /// holding the longest run that fits [`MAX_MESSAGE_BYTES`] and
+    /// following the one before it, so each is an append of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`Malformed`] when an entry has no frame encoding.
+    #[cfg(test)]
+    pub fn split(
+        to: Recipient,
+        rpc: &AppendEntriesRequest<RaftTypes>,
+    ) -> Result<Vec<Self>, Malformed> {
+        Pieces::new(to, rpc).collect()
     }
 
     /// # Errors
@@ -277,6 +279,82 @@ impl AppendRequest {
         };
         check_segment(&rpc)?;
         Ok(rpc)
+    }
+}
+
+/// An append cut into messages under [`MAX_MESSAGE_BYTES`], encoded one
+/// piece at a time so that only the piece in hand is held encoded. `R`
+/// is the append, owned or borrowed.
+pub struct Pieces<R> {
+    to: Recipient,
+    rpc: R,
+    /// The last log id of the pieces so far.
+    prev: Option<LogId>,
+    /// The first entry no piece carries yet.
+    next: usize,
+    /// Whether a piece has been taken: an append without entries is one.
+    started: bool,
+}
+
+impl<R> Pieces<R>
+where
+    R: Borrow<AppendEntriesRequest<RaftTypes>>,
+{
+    pub fn new(to: Recipient, rpc: R) -> Self {
+        Self {
+            to,
+            prev: rpc.borrow().prev_log_id,
+            rpc,
+            next: 0,
+            started: false,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.started && self.next == self.rpc.borrow().entries.len()
+    }
+
+    /// The next piece: the entries after the last piece that fit, and at
+    /// least one while any remain.
+    fn piece(&mut self) -> Result<AppendRequest, Malformed> {
+        let rpc = self.rpc.borrow();
+        let mut request = AppendRequest {
+            header: Some(Header::to(self.to)),
+            vote: Some(WireVote::from(&rpc.vote)),
+            prev_log_id: wire_id(self.prev.as_ref()),
+            entries: Vec::new(),
+            leader_commit: wire_id(rpc.leader_commit.as_ref()),
+        };
+        let (mut prev, mut next) = (self.prev, self.next);
+        let mut len = request.encoded_len();
+        for entry in &rpc.entries[next..] {
+            let bytes = codec::encode_entry(entry)?;
+            len += prost::encoding::bytes::encoded_len(4, &bytes);
+            if len > MAX_MESSAGE_BYTES && !request.entries.is_empty() {
+                break;
+            }
+            request.entries.push(bytes);
+            prev = Some(entry.log_id);
+            next += 1;
+        }
+        (self.prev, self.next, self.started) = (prev, next, true);
+        Ok(request)
+    }
+}
+
+impl<R> Iterator for Pieces<R>
+where
+    R: Borrow<AppendEntriesRequest<RaftTypes>>,
+{
+    type Item = Result<AppendRequest, Malformed>;
+
+    /// `None` once every entry is carried; an `Err` leaves the pieces
+    /// where they were.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done() {
+            return None;
+        }
+        Some(self.piece())
     }
 }
 
@@ -365,6 +443,55 @@ impl Reply for AppendResponse {
             }
             AppendOutcome::Conflict(()) => AppendEntriesResponse::Conflict,
             AppendOutcome::HigherVote(vote) => AppendEntriesResponse::HigherVote(vote.try_into()?),
+        })
+    }
+}
+
+/// A `StreamAppend` answer to one request of the stream, in the order
+/// the requests were sent.
+#[derive(Clone, PartialEq, Eq, prost::Oneof)]
+pub enum StreamOutcome {
+    /// The follower's log matches through this log id.
+    #[prost(message, tag = "1")]
+    Matched(Matched),
+    /// The follower's log does not hold this `prev_log_id`.
+    #[prost(message, tag = "2")]
+    Conflict(WireLogId),
+    #[prost(message, tag = "3")]
+    HigherVote(WireVote),
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StreamAppendResponse {
+    #[prost(oneof = "StreamOutcome", tags = "1, 2, 3")]
+    pub outcome: Option<StreamOutcome>,
+}
+
+impl From<&StreamAppendResult<RaftTypes>> for StreamAppendResponse {
+    fn from(result: &StreamAppendResult<RaftTypes>) -> Self {
+        let outcome = match result {
+            Ok(id) => StreamOutcome::Matched(Matched {
+                log_id: wire_id(id.as_ref()),
+            }),
+            Err(StreamAppendError::Conflict(id)) => StreamOutcome::Conflict(WireLogId::from(id)),
+            Err(StreamAppendError::HigherVote(vote)) => {
+                StreamOutcome::HigherVote(WireVote::from(vote))
+            }
+        };
+        Self {
+            outcome: Some(outcome),
+        }
+    }
+}
+
+impl Reply for StreamAppendResponse {
+    type Raft = StreamAppendResult<RaftTypes>;
+
+    fn into_raft(self) -> Result<StreamAppendResult<RaftTypes>, Malformed> {
+        Ok(match required(self.outcome, "outcome")? {
+            StreamOutcome::Matched(m) => Ok(raft_id(m.log_id)),
+            StreamOutcome::Conflict(id) => Err(StreamAppendError::Conflict(id.into())),
+            StreamOutcome::HigherVote(vote) => Err(StreamAppendError::HigherVote(vote.try_into()?)),
         })
     }
 }
@@ -645,6 +772,14 @@ mod tests {
         ]
     }
 
+    fn stream_result() -> impl Strategy<Value = StreamAppendResult<RaftTypes>> {
+        prop_oneof![
+            proptest::option::of(log_id()).prop_map(Ok),
+            log_id().prop_map(|id| Err(StreamAppendError::Conflict(id))),
+            vote().prop_map(|v| Err(StreamAppendError::HigherVote(v))),
+        ]
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: ourios_testgen::proptest_cases(256),
@@ -673,6 +808,26 @@ mod tests {
         fn an_append_response_round_trips(response in append_response()) {
             let wire = through_wire(&AppendResponse::from(&response));
             prop_assert_eq!(wire.into_raft().expect("decode"), response);
+        }
+
+        #[test]
+        fn a_stream_append_response_round_trips(result in stream_result()) {
+            let wire = through_wire(&StreamAppendResponse::from(&result));
+            prop_assert_eq!(wire.into_raft().expect("decode"), result);
+        }
+
+        #[test]
+        fn a_split_append_carries_every_entry_in_follow_on_pieces(
+            to in recipient(),
+            (vote, prev_log_id, entries) in segment(),
+            leader_commit in proptest::option::of(log_id()),
+        ) {
+            let rpc = AppendEntriesRequest::<RaftTypes> { vote, prev_log_id, entries, leader_commit };
+            let pieces = AppendRequest::split(to, &rpc).expect("encode");
+            prop_assert_eq!(pieces.len(), 1);
+            let back = through_wire(&pieces[0]).into_raft().expect("decode");
+            prop_assert_eq!(back.prev_log_id, rpc.prev_log_id);
+            prop_assert_eq!(back.entries, rpc.entries);
         }
 
         #[test]
@@ -770,6 +925,63 @@ mod tests {
         let (request, cut) = AppendRequest::bounded(to(), &rpc).expect("encode");
         assert_eq!((request.entries.len(), cut), (1, None));
         assert!(request.encoded_len() <= MAX_MESSAGE_BYTES);
+    }
+
+    /// Each piece follows the one before it, so the follower checks each
+    /// on its own, and together they carry every entry once.
+    #[test]
+    fn an_append_over_the_byte_budget_splits_into_follow_on_pieces() {
+        let seven_mib = 7 * 1024 * 1024;
+        let rpc = AppendEntriesRequest {
+            leader_commit: Some(log(1, 4)),
+            ..append_of((0..5).map(|i| large_entry(i, seven_mib)).collect())
+        };
+        let pieces = AppendRequest::split(to(), &rpc).expect("encode");
+        assert_eq!(
+            pieces.iter().map(|p| p.entries.len()).collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        let mut prev = None;
+        let mut carried = Vec::new();
+        for piece in pieces {
+            assert!(piece.encoded_len() <= MAX_MESSAGE_BYTES);
+            assert_eq!(piece.header, Some(Header::to(to())));
+            let back = through_wire(&piece).into_raft().expect("decode");
+            assert_eq!(back.prev_log_id, prev);
+            assert_eq!(
+                (back.vote, back.leader_commit),
+                (rpc.vote, rpc.leader_commit)
+            );
+            prev = back.entries.last().map(|e| e.log_id);
+            carried.extend(back.entries);
+        }
+        assert_eq!(carried, rpc.entries);
+    }
+
+    /// The stream's chunker owns its append and encodes a piece only
+    /// when asked for one, cutting where the borrowed split does.
+    #[test]
+    fn an_owned_append_is_cut_one_piece_at_a_time() {
+        let seven_mib = 7 * 1024 * 1024;
+        let rpc = append_of((0..5).map(|i| large_entry(i, seven_mib)).collect());
+        let split = AppendRequest::split(to(), &rpc).expect("encode");
+        let mut pieces = Pieces::new(to(), rpc);
+        for expected in split {
+            assert_eq!(pieces.next().expect("a piece").expect("encode"), expected);
+        }
+        assert!(pieces.next().is_none());
+    }
+
+    #[test]
+    fn an_empty_append_is_one_empty_piece() {
+        let rpc = AppendEntriesRequest {
+            prev_log_id: Some(log(1, 3)),
+            ..append_of(Vec::new())
+        };
+        let pieces = AppendRequest::split(to(), &rpc).expect("encode");
+        assert_eq!(pieces.len(), 1);
+        assert!(pieces[0].entries.is_empty());
+        assert_eq!(pieces[0].prev_log_id, Some(WireLogId { term: 1, index: 3 }));
     }
 
     fn blank(term: u64, index: u64) -> Entry {
@@ -884,6 +1096,19 @@ mod tests {
             committed: false,
         };
         assert!(Vote::try_from(short).is_err());
+    }
+
+    #[test]
+    fn a_stream_answer_without_its_outcome_or_with_a_bad_vote_is_refused() {
+        assert!(StreamAppendResponse::default().into_raft().is_err());
+        let short = StreamAppendResponse {
+            outcome: Some(StreamOutcome::HigherVote(WireVote {
+                term: 1,
+                voted_for: vec![1, 2, 3],
+                committed: true,
+            })),
+        };
+        assert!(short.into_raft().is_err());
     }
 
     #[test]

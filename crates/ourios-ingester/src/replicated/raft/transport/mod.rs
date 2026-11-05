@@ -13,6 +13,14 @@
 //! frame plus its envelope, and an append carries as many entries as fit,
 //! reporting a partial success for the rest.
 //!
+//! Replication runs over `StreamAppend`, one bidirectional stream per
+//! `openraft` replication session or heartbeat. Every message on it is an
+//! append request with its own header, and every header must equal the
+//! first, which routes the stream: a stream addresses one replica. An
+//! append over the size limit travels as several follow-on messages
+//! rather than a partial success, so the stream keeps going. The follower
+//! answers each message in order once its log has flushed it.
+//!
 //! Plaintext only: mutual TLS (RFC 0030) arrives through [`Peers`]'s
 //! endpoint and the server's incoming stream.
 
@@ -30,6 +38,7 @@ pub const VERSION: u32 = 1;
 pub const SERVICE: &str = "ourios.wal.v1.Replication";
 
 const APPEND: &str = "/ourios.wal.v1.Replication/Append";
+const STREAM_APPEND: &str = "/ourios.wal.v1.Replication/StreamAppend";
 const VOTE: &str = "/ourios.wal.v1.Replication/Vote";
 const PRE_VOTE: &str = "/ourios.wal.v1.Replication/PreVote";
 const INSTALL_SNAPSHOT: &str = "/ourios.wal.v1.Replication/InstallSnapshot";

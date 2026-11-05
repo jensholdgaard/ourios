@@ -6,7 +6,14 @@
 //! most of a node's trace volume. It gets a span only when it fails, built
 //! once the failure is known: `tracing` cannot backdate a span, so that
 //! one goes through the `OpenTelemetry` API with the call's real start.
+//!
+//! A `StreamAppend` stream gets one span on each side, built the same way
+//! when it ends, and only when it carried entries or failed: what a
+//! stream carries is not known when it opens, and a heartbeat is a stream
+//! of one entry-less append.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use opentelemetry::KeyValue;
@@ -209,6 +216,12 @@ impl<'a> Call<'a> {
     }
 
     pub(super) fn finish(self, code: Code) {
+        self.end(code, false);
+    }
+
+    /// End the call; an untraced one that `carried` entries is recorded
+    /// whatever its code.
+    fn end(self, code: Code, carried: bool) {
         let name = code_name(code);
         let failed = self.side.fails(code);
         match &self.span {
@@ -218,18 +231,20 @@ impl<'a> Call<'a> {
                     ourios_core::telemetry::record_span_error(span, name);
                 }
             }
-            None if failed => self.failed_span(name),
+            None if failed || carried => self.built_span(name, failed),
             None => {}
         }
     }
 
-    fn failed_span(&self, name: &'static str) {
+    fn built_span(&self, name: &'static str, failed: bool) {
         let mut attributes = vec![
             KeyValue::new("rpc.system.name", "grpc"),
             KeyValue::new("rpc.method", self.method),
             KeyValue::new("rpc.response.status_code", name),
-            KeyValue::new(ourios_core::telemetry::ERROR_TYPE, name),
         ];
+        if failed {
+            attributes.push(KeyValue::new(ourios_core::telemetry::ERROR_TYPE, name));
+        }
         if let Some(peer) = self.peer {
             attributes.push(KeyValue::new("server.address", peer.host.to_owned()));
             if let Some(port) = peer.port {
@@ -241,7 +256,69 @@ impl<'a> Call<'a> {
             .with_start_time(self.started)
             .with_attributes(attributes);
         let mut span = self.tracing.start(builder);
-        span.set_status(Status::error(""));
+        if failed {
+            span.set_status(Status::error(""));
+        }
         span.end();
+    }
+}
+
+/// Whether a stream carried any entries: noted by the task that moves
+/// its requests, read when its span is recorded.
+#[derive(Clone, Default)]
+pub(super) struct Carried(Arc<AtomicBool>);
+
+impl Carried {
+    pub(super) fn note(&self, request: &impl Traced) {
+        if request.traced() {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// One `StreamAppend` stream's call, recorded when it drops with the
+/// code it ended on: `CANCELLED` unless [`Self::end`] says otherwise, as
+/// a stream dropped midway was cancelled by its holder.
+pub(super) struct StreamCall<'a> {
+    call: Option<Call<'a>>,
+    code: Code,
+    carried: Carried,
+}
+
+impl<'a> StreamCall<'a> {
+    pub(super) fn client(tracing: Tracing, path: &'static str, peer: Peer<'a>) -> Self {
+        Self::of(Call::client(tracing, path, peer, false))
+    }
+
+    pub(super) fn server(tracing: Tracing, path: &'static str) -> Self {
+        Self::of(Call::server(tracing, path, false))
+    }
+
+    fn of(call: Call<'a>) -> Self {
+        Self {
+            call: Some(call),
+            code: Code::Cancelled,
+            carried: Carried::default(),
+        }
+    }
+
+    pub(super) fn carried(&self) -> Carried {
+        self.carried.clone()
+    }
+
+    pub(super) fn end(&mut self, code: Code) {
+        self.code = code;
+    }
+}
+
+impl Drop for StreamCall<'_> {
+    fn drop(&mut self) {
+        if let Some(call) = self.call.take() {
+            call.end(self.code, self.carried.get());
+        }
     }
 }

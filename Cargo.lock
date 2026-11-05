@@ -3830,6 +3830,7 @@ dependencies = [
  "flate2",
  "futures",
  "futures-core",
+ "futures-util",
  "http",
  "object_store",
  "openraft",

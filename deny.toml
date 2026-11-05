@@ -9,6 +9,12 @@
 # (each entry should carry a `# reason:` note); empty means none accepted.
 yanked = "deny"
 ignore = [
+    # reason: `astral-tokio-tar` is unmaintained (RUSTSEC-2026-0440, no
+    # vulnerability, no safe upgrade). It reaches us only as a
+    # dev-dependency through testcontainers, which uses it to copy files
+    # into the integration tests' containers; even testcontainers 0.28 needs
+    # it, so nothing ships with it. Remove when testcontainers moves off it.
+    "RUSTSEC-2026-0440",
     # reason: quick-xml < 0.41 DoS advisories (quadratic duplicate-attribute
     # check; unbounded namespace-declaration allocation). Transitive via
     # object_store — no upgrade path exists yet: datafusion 55 still pins

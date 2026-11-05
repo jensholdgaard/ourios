@@ -40,6 +40,7 @@ use super::{
     APPEND, INSTALL_SNAPSHOT, PeerClient, Peers, ReplicationServer, SERVICE, STREAM_APPEND, VERSION,
 };
 
+mod mtls;
 mod pipelining;
 mod shutdown;
 
@@ -62,7 +63,10 @@ fn serve(
         let shutdown = async {
             let _ = stopped.await;
         };
-        server.serve(incoming, shutdown).await.expect("serve");
+        server
+            .serve_plaintext(incoming, shutdown)
+            .await
+            .expect("serve");
     });
     (stop, serving)
 }
@@ -100,10 +104,20 @@ impl Node {
 
     /// `replica`, from the state in its directory, served on `incoming`.
     async fn open(
-        Replica { id, dir }: Replica,
+        replica: Replica,
         incoming: TcpIncoming,
         peers: &Peers,
         server: ReplicationServer<MemSm>,
+    ) -> Self {
+        Self::open_on(replica, peers, server, |server| serve(server, incoming)).await
+    }
+
+    /// `replica`, from the state in its directory, served by `serve`.
+    async fn open_on(
+        Replica { id, dir }: Replica,
+        peers: &Peers,
+        server: ReplicationServer<MemSm>,
+        serve: impl FnOnce(ReplicationServer<MemSm>) -> (oneshot::Sender<()>, JoinHandle<()>),
     ) -> Self {
         let votes = VoteLog::open(dir.path()).expect("vote log");
         let wal = wal_config(&group_dir(dir.path(), GROUP));
@@ -114,7 +128,7 @@ impl Node {
             .await
             .expect("raft");
         server.insert(GROUP, raft.clone());
-        let (stop, serving) = serve(server, incoming);
+        let (stop, serving) = serve(server);
         Self {
             id,
             raft,

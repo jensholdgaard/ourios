@@ -1438,10 +1438,11 @@ never count toward an ack (learners, under §4.3's shape).
   must equal the first: a stream addresses one replica of one group. An
   append larger than one message travels as several, each a valid
   append the follower checks on its own. The follower answers each
-  message in order, once its log has flushed it, with the log id it
-  now matches through, the `prev_log_id` it does not hold, or a higher
-  vote; the stream ends after a conflict or a higher vote, and when the
-  group stops or the server shuts down. `Append`, the unary form,
+  message in order: a match, once its log has flushed the message,
+  with the log id it now matches through (absent for a heartbeat on an
+  empty log); or, without a flush, the `prev_log_id` it does not hold
+  or a higher vote. The stream ends after a conflict or a higher vote,
+  and when the group stops or the server shuts down. `Append`, the unary form,
   carries one append and answers it.
 - Each request names its group, and one connection per peer carries
   every group's calls; a server answers an unknown group with

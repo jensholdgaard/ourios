@@ -45,6 +45,11 @@ use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, STREAM_APPEND, VOTE};
 
 type RpcError = RPCError<RaftTypes>;
 
+/// How long a channel waits to connect, TLS handshake included: an RPC's
+/// own timeout does not end the channel's connection attempt, so a peer
+/// that accepts TCP and never answers the handshake would stall it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// How a pool's channels reach their peers.
 #[derive(Clone)]
 enum Security {
@@ -118,7 +123,8 @@ impl Peers {
         }
         // `http` even over TLS: the connector encrypts, and tonic refuses an
         // `https` endpoint whose TLS it does not configure itself.
-        let endpoint = Endpoint::from_shared(format!("http://{addr}"))?;
+        let endpoint =
+            Endpoint::from_shared(format!("http://{addr}"))?.connect_timeout(CONNECT_TIMEOUT);
         let channel = match &self.security {
             #[cfg(test)]
             Security::Plaintext => endpoint.connect_lazy(),

@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use openraft::async_runtime::WatchReceiver as _;
 use openraft::errors::RPCError;
@@ -14,6 +15,7 @@ use ourios_serving::tls::{ALPN_GRPC, TlsMinVersion, TlsSettings};
 use ourios_serving::tls_serve::{LISTENER_GRPC, reloading_acceptor};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use tempfile::TempDir;
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
@@ -21,7 +23,7 @@ use tonic::transport::server::TcpIncoming;
 use super::super::super::types::{NodeId, Vote};
 use super::super::super::vote_log;
 use super::super::{Peers, ReplicationServer};
-use super::{MemSm, Node, Replica, bind, client_to, leader, option, write};
+use super::{MemSm, Node, Replica, bind, client_to, leader, option, vote_request, write};
 
 /// A certificate authority minted for one test.
 struct Ca {
@@ -221,4 +223,33 @@ fn a_pool_needs_a_peer_ca() {
     };
     let refused = Peers::mutual_tls(&settings).err().expect("no peer CA");
     assert!(refused.contains("client_ca_file"), "{refused}");
+}
+
+#[tokio::test]
+async fn a_peer_that_never_answers_the_handshake_is_unreachable() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let holding = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let ca = Ca::new();
+    let certs = TempDir::new().expect("tempdir");
+    let peers = Peers::mutual_tls(&ca.node(certs.path(), "caller")).expect("peers");
+
+    let mut client = client_to(&peers, NodeId::from(1), addr).await;
+    let started = tokio::time::Instant::now();
+    let result = client.vote(vote_request(), option()).await;
+    assert!(
+        matches!(result, Err(RPCError::Unreachable(_) | RPCError::Network(_))),
+        "{result:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    holding.abort();
 }

@@ -1028,8 +1028,8 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
 - **With `openraft` (§4.3).** Routing and the trait apply as written;
   the frame, append-and-commit and slow-follower bullets are the
   fallback's. Instead:
-  - An export's turns are acknowledged once `client_write` returns,
-    which `openraft` resolves after a majority of the group's voters
+  - An export's turns are acknowledged once `client_write` returns
+    `Ok`, which `openraft` resolves after a majority of the group's voters
     have fsynced the entry, not necessarily the leader, and the leader
     has applied it (apply only queues the frame, §4.3). With three
     voters that is at least two fsynced copies. `seq` in the position
@@ -1037,6 +1037,9 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   - A `client_write` that has not returned within the commit timeout
     fails the waiting turns with the retryable rejection (RFC 0053),
     `error.type` `not_enough_replicas`, and nothing is acknowledged.
+    So does one that returns an error, except one saying this node
+    does not lead the group: nothing was appended, and the export is
+    forwarded (§6.8).
     The entry may still commit later, the uncertain outcome B3
     accepts. The timeout is an internal
     constant starting at 2 s, not a setting; the rate of these
@@ -1464,21 +1467,22 @@ never count toward an ack (learners, under §4.3's shape).
   the same rejection the client would have got, or `UNAVAILABLE` with
   its leader hint when it does not lead the group. A node never
   forwards a forwarded export again.
-- The sender tries another node only after an answer that proves
-  nothing was appended: the receiving node does not lead the group,
-  does not host it, or refused the connection before the call was
-  sent. It tries at most `replication_factor` nodes, the hint first
-  and then the group's voters in placement order. A rejection the
-  leader gives before appending, such as a credential or tenant
-  binding it refuses, also proves nothing was appended; the sender
-  passes it to the client unchanged and tries no other node. Any
-  other outcome (the commit timeout, a lost or failed answer once
-  the call was sent, a leader that lost leadership after appending)
-  is uncertain:
-  the entry may still commit, so the sender answers the client with
-  the retryable rejection and does not resubmit, which would append
-  the export again under a second index that §6.6 cannot remove
-  (§9 Q4).
+- The sender tries another node only after an outcome that proves
+  nothing was appended: the receiving node does not lead the group or
+  does not host it, or the connection was refused or not made within
+  the peer connect timeout (1 s, covering the TLS handshake), so the
+  call was never sent. It tries at most `replication_factor` nodes,
+  the hint first and then the group's voters in placement order. A
+  rejection the leader gives before appending, such as a credential
+  or tenant binding it refuses, also proves nothing was appended; the
+  sender passes it to the client unchanged and tries no other node.
+- Once sent, a call is bounded by the commit timeout plus the connect
+  timeout. Any other outcome (that deadline, the commit timeout, a
+  lost or failed answer, a leader that lost leadership after
+  appending) is uncertain: the entry may still commit, so the sender
+  answers the client with the retryable rejection and does not
+  resubmit, which would append the export again under a second index
+  that §6.6 cannot remove (§9 Q4).
 - RFC 0061 bounds the client's request. The forwarded frame is
   bounded by RFC 0008's frame size cap, as the WAL frame it becomes
   is, and a `Forward` message by the peer message limit, one

@@ -660,6 +660,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   RFC's implementation, both exports are acked and mined in log
 >   position order, an export acked before the other was sent mined
 >   first, and each tenant's query returns only its own rows
+> - **And** a forwarded export whose leader is not the node the sender
+>   tried is retried at the hinted leader and acked once, while one
+>   whose forwarded call times out or loses its answer gets the
+>   retryable rejection and is not sent again
 
 > **Scenario RFC0065.9 — a corrupt replica does not recover from itself (B4)**
 > - **Given** a follower whose group log fails an integrity check
@@ -1021,6 +1025,29 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   `Local(WalOffset)` on the local backend, `Group { group, seq }` here.
   `sync` returns once every appended entry is committed. The local
   backend's behaviour does not change.
+- **With `openraft` (§4.3).** Routing and the trait apply as written;
+  the frame, append-and-commit and slow-follower bullets are the
+  fallback's. Instead:
+  - An export's turns are acknowledged once `client_write` returns
+    `Ok`, which `openraft` resolves after a majority of the group's voters
+    have fsynced the entry, not necessarily the leader, and the leader
+    has applied it (apply only queues the frame, §4.3). With three
+    voters that is at least two fsynced copies. `seq` in the position
+    is the entry's Raft index.
+  - A `client_write` that has not returned within the commit timeout
+    fails the waiting turns with the retryable rejection (RFC 0053),
+    `error.type` `not_enough_replicas`, and nothing is acknowledged.
+    So does one that returns an error, except one saying this node
+    does not lead the group: nothing was appended, and the export is
+    forwarded (§6.8).
+    The entry may still commit later, the uncertain outcome B3
+    accepts. The timeout is an internal
+    constant starting at 2 s, not a setting; the rate of these
+    rejections is the signal that would move it.
+  - `wal_batch_window_ms` is only an upper bound. The group log flushes
+    as soon as work is queued, so a lightly loaded group fsyncs more
+    often and acknowledges sooner; every ack still waits for a
+    majority's fsync.
 
 ### 6.4 Fencing and log repair
 
@@ -1431,6 +1458,36 @@ never count toward an ack (learners, under §4.3's shape).
   leader sends a lagging follower its missing entries by
   `StreamAppend`, or the checkpoint by `InstallSnapshot` when they are
   already purged.
+- `Forward` carries one export to the node the sender believes leads
+  its group: the group, the `TenantOtlpBatch` payload and the
+  credential the client presented, if any. It names no target replica.
+  The leader authenticates that credential and checks the tenant
+  binding again (RFC 0026) before it appends, exactly as if the client
+  had sent the export to it, and answers with the committed position,
+  the same rejection the client would have got, or `UNAVAILABLE` with
+  its leader hint when it does not lead the group. A node never
+  forwards a forwarded export again.
+- The sender tries another node only after an outcome that proves
+  nothing was appended: the receiving node does not lead the group or
+  does not host it, or the connection was refused or not made within
+  the peer connect timeout (1 s, covering the TLS handshake), so the
+  call was never sent. It tries at most `replication_factor` nodes,
+  the hint first and then the group's voters in placement order. A
+  rejection the leader gives before appending, such as a credential
+  or tenant binding it refuses, also proves nothing was appended; the
+  sender passes it to the client unchanged and tries no other node.
+- Once sent, a call is bounded by the commit timeout plus the connect
+  timeout. Any other outcome (that deadline, the commit timeout, a
+  lost or failed answer, a leader that lost leadership after
+  appending) is uncertain: the entry may still commit, so the sender
+  answers the client with the retryable rejection and does not
+  resubmit, which would append the export again under a second index
+  that §6.6 cannot remove (§9 Q4).
+- RFC 0061 bounds the client's request. The forwarded frame is
+  bounded by RFC 0008's frame size cap, as the WAL frame it becomes
+  is, and a `Forward` message by the peer message limit, one
+  maximum-size frame plus its envelope, so an export the leader would
+  accept directly is never refused for the tenant prefix.
 - Replication runs over `StreamAppend`, one bidirectional stream per
   `openraft` replication session, so the leader sends appends without
   waiting for the answers to earlier ones (§4.6). Every message on the
@@ -1464,9 +1521,10 @@ never count toward an ack (learners, under §4.3's shape).
 ### 6.9 Telemetry
 
 - Ourios-owned names go through the shared `ourios-semconv` registry,
-  checked against the OTel conventions first: per group, the in-sync
-  set size, the epoch, follower lag in entries, and leadership changes;
-  compare-and-swap conflicts on the group record; forwarded exports;
+  checked against the OTel conventions first: per group, follower lag
+  in entries, leadership changes, and the term (the fallback's epoch);
+  with the fallback, also the in-sync set size and compare-and-swap
+  conflicts on the group record; forwarded exports;
   tail calls, their latency and `tail_unavailable` responses; and H8's
   two detection signals, the dedup hit count and
   `bytes_stored / bytes_received` per tenant.

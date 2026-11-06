@@ -1468,9 +1468,13 @@ never count toward an ack (learners, under §4.3's shape).
   nothing was appended: the receiving node does not lead the group,
   does not host it, or refused the connection before the call was
   sent. It tries at most `replication_factor` nodes, the hint first
-  and then the group's voters in placement order. Any other outcome
-  (the commit timeout, a lost or failed answer once the call was
-  sent, a leader that lost leadership after appending) is uncertain:
+  and then the group's voters in placement order. A rejection the
+  leader gives before appending, such as a credential or tenant
+  binding it refuses, also proves nothing was appended; the sender
+  passes it to the client unchanged and tries no other node. Any
+  other outcome (the commit timeout, a lost or failed answer once
+  the call was sent, a leader that lost leadership after appending)
+  is uncertain:
   the entry may still commit, so the sender answers the client with
   the retryable rejection and does not resubmit, which would append
   the export again under a second index that §6.6 cannot remove

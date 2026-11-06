@@ -31,6 +31,10 @@ struct State {
 struct Record {
     dir: PathBuf,
     gate: Arc<SyncGate>,
+    /// Held by a build or an install from before it reads or replaces the
+    /// snapshot until its record and memory both hold the new one;
+    /// `openraft` builds on its own task, so the two can overlap.
+    publishing: tokio::sync::Mutex<()>,
 }
 
 /// Clones share one state.
@@ -62,6 +66,7 @@ impl GroupSm {
             record: Arc::new(Record {
                 dir: dir.to_path_buf(),
                 gate,
+                publishing: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -70,15 +75,18 @@ impl GroupSm {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Make `meta` the recorded snapshot, durably, off the runtime's
-    /// workers.
+    /// Record `meta` durably, off the runtime's workers, then make it the
+    /// current snapshot. The caller holds `publishing`.
     async fn record(&self, meta: SnapshotMeta) -> io::Result<()> {
         let record = Arc::clone(&self.record);
+        let written = meta.clone();
         tokio::task::spawn_blocking(move || {
-            snapshot_record::write(&record.dir, &meta, &record.gate)
+            snapshot_record::write(&record.dir, &written, &record.gate)
         })
         .await
-        .unwrap_or_else(|e| Err(io::Error::other(e)))
+        .unwrap_or_else(|e| Err(io::Error::other(e)))?;
+        self.state().snapshot = Some(meta);
+        Ok(())
     }
 
     /// The last entry applied.
@@ -97,6 +105,10 @@ impl RaftSnapshotBuilder<RaftTypes> for GroupSm {
     type SnapshotData = ();
 
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<RaftTypes, ()>, io::Error> {
+        let record = Arc::clone(&self.record);
+        let _publishing = record.publishing.lock().await;
+        // Read once publishing is ours: an install that overlapped this
+        // build is then in the state, so it never records an older one.
         let meta = {
             let state = self.state();
             SnapshotMeta {
@@ -105,7 +117,6 @@ impl RaftSnapshotBuilder<RaftTypes> for GroupSm {
             }
         };
         self.record(meta.clone()).await?;
-        self.state().snapshot = Some(meta.clone());
         Ok(SnapshotOf::<RaftTypes, ()> { meta, snapshot: () })
     }
 }
@@ -148,11 +159,12 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
     }
 
     async fn install_snapshot(&mut self, meta: &SnapshotMeta, (): ()) -> Result<(), io::Error> {
+        let record = Arc::clone(&self.record);
+        let _publishing = record.publishing.lock().await;
         self.record(meta.clone()).await?;
         let mut state = self.state();
         state.applied = meta.last_log_id;
         state.membership = meta.last_membership.clone();
-        state.snapshot = Some(meta.clone());
         Ok(())
     }
 
@@ -161,5 +173,56 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
     ) -> Result<Option<SnapshotOf<RaftTypes, ()>>, io::Error> {
         let snapshot = self.state().snapshot.clone();
         Ok(snapshot.map(|meta| SnapshotOf::<RaftTypes, ()> { meta, snapshot: () }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use openraft::vote::leader_id_std::CommittedLeaderId;
+
+    use super::*;
+
+    fn at(index: u64) -> SnapshotMeta {
+        SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: CommittedLeaderId::new(2),
+                index,
+            }),
+            last_membership: StoredMembership::default(),
+        }
+    }
+
+    /// A build that starts while an install is held at its fsync waits for
+    /// it, then builds from the installed state rather than recording the
+    /// older one it would have read first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_build_overlapping_an_install_records_nothing_older() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gate = Arc::new(SyncGate::default());
+        let sm = GroupSm::open(dir.path(), Arc::clone(&gate)).expect("open");
+        sm.clone()
+            .install_snapshot(&at(5), ())
+            .await
+            .expect("install 5");
+
+        gate.close();
+        let mut installing = sm.clone();
+        let install = tokio::spawn(async move { installing.install_snapshot(&at(9), ()).await });
+        let held = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || held.wait_for_writer())
+            .await
+            .expect("join");
+        let mut building = sm.clone();
+        let build = tokio::spawn(async move { building.build_snapshot().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.open();
+
+        install.await.expect("join").expect("install 9");
+        let snapshot = build.await.expect("join").expect("build");
+        assert_eq!(snapshot.meta.last_log_id, at(9).last_log_id);
+        let reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
+        assert_eq!(reopened.applied(), at(9).last_log_id);
     }
 }

@@ -265,7 +265,7 @@ where
     }
 
     #[cfg(test)]
-    pub(super) async fn serve_plaintext(
+    pub(in crate::replicated::raft) async fn serve_plaintext(
         self,
         incoming: TcpIncoming,
         shutdown: impl Future<Output = ()>,

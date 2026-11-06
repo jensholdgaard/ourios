@@ -69,18 +69,6 @@ fn rfc0065_6_losing_and_regaining_a_follower() {
     );
 }
 
-/// Scenario RFC0065.7 — a diverged follower is repaired (B6).
-/// Given a follower holding uncommitted entries of an earlier writer, when
-/// a new writer takes over, then the follower converges to it.
-#[test]
-#[ignore = "RFC0065.7 stub — implemented with the write path on the in-process cluster"]
-fn rfc0065_7_a_diverged_follower_is_repaired() {
-    todo!(
-        "RFC0065.7 — the follower's log converges to the new writer's and no \
-         committed entry is removed"
-    );
-}
-
 /// Scenario RFC0065.8 — routing and tenancy (B9, B11, B12).
 /// Given two tenants in one group exporting to a node that does not hold
 /// their group, then both are acked and mined in log-position order.

@@ -13,6 +13,8 @@ use std::num::NonZeroU32;
 use ourios_parquet::{Store, StoreError};
 use serde::{Deserialize, Serialize};
 
+use super::placement::place;
+
 /// The layout object's key under the store root.
 pub const LAYOUT_KEY: &str = "wal/replicated/cluster.json";
 
@@ -47,6 +49,24 @@ impl VotingLayout {
             groups,
             replication_factor,
         }
+    }
+
+    /// `group`'s voters, in placement order (§6.1).
+    #[must_use]
+    pub fn voters(&self, group: u32) -> Vec<&str> {
+        place(
+            group,
+            self.peers.iter().map(String::as_str),
+            self.replication_factor,
+        )
+    }
+
+    /// The groups `node_id` votes in, ascending.
+    #[must_use]
+    pub fn groups_of(&self, node_id: &str) -> Vec<u32> {
+        (0..self.groups.get())
+            .filter(|&group| self.voters(group).contains(&node_id))
+            .collect()
     }
 
     /// The bytes [`LAYOUT_KEY`] holds.
@@ -318,6 +338,25 @@ mod tests {
             VotingLayout::decode(&bytes).expect("decode"),
             layout(&["a", "b", "c"], 16, 3)
         );
+    }
+
+    #[test]
+    fn a_node_votes_in_the_groups_that_place_it() {
+        let peers = [
+            "receiver-0",
+            "receiver-1",
+            "receiver-2",
+            "receiver-3",
+            "receiver-4",
+        ];
+        let layout = layout(&peers, 4, 3);
+        assert_eq!(layout.voters(0), ["receiver-4", "receiver-1", "receiver-0"]);
+        assert_eq!(layout.voters(3), ["receiver-2", "receiver-4", "receiver-1"]);
+        assert_eq!(layout.groups_of("receiver-4"), [0, 2, 3]);
+        assert_eq!(layout.groups_of("receiver-3"), [1]);
+        assert!(layout.groups_of("tail-0").is_empty());
+        let votes: usize = peers.iter().map(|p| layout.groups_of(p).len()).sum();
+        assert_eq!(votes, 4 * 3, "every group has replication_factor voters");
     }
 
     #[test]

@@ -7,11 +7,15 @@
 //! the previous one ran.
 
 mod codec;
+pub mod host;
 pub mod log_store;
+pub mod state_machine;
 pub mod transport;
 pub mod types;
 pub mod vote_log;
 
+#[cfg(test)]
+mod cluster;
 #[cfg(test)]
 mod tests;
 

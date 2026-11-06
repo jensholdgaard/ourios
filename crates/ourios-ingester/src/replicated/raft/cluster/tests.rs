@@ -42,11 +42,21 @@ async fn strand(
             .map(drop)
             .map_err(|e| e.to_string())
     });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let log = cluster.node(i).log(GROUP).await;
         if let Some(last) = log.last().filter(|e| e.log_id.index > after) {
             return (last.clone(), write);
         }
+        assert!(
+            !write.is_finished(),
+            "the write ended before appending: {:?}",
+            write.await
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {i} appended nothing past {after}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

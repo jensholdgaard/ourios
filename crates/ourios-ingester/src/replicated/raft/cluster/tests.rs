@@ -1,13 +1,16 @@
-//! Groups on the in-process cluster: log repair after a failover, and a
-//! crash under §8's model.
+//! Groups on the in-process cluster: log repair after a failover, a
+//! crash under §8's model, two groups on one host, and a host whose
+//! group fails to open.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use openraft::EntryPayload;
 use tokio::task::JoinHandle;
 
+use super::super::host::HostError;
 use super::super::types::Entry;
-use super::{Cluster, batch, write};
+use super::{Cluster, GroupHost, HostSpec, Peers, Replica, batch, group_dir, wal_config, write};
 
 const GROUP: u32 = 0;
 
@@ -126,4 +129,80 @@ async fn a_crashed_follower_restarts_from_its_fsynced_log_and_catches_up() {
         cluster.node(leader).log(GROUP).await
     );
     cluster.shutdown().await;
+}
+
+fn normal(log: &[Entry]) -> usize {
+    log.iter()
+        .filter(|e| matches!(e.payload, EntryPayload::Normal(_)))
+        .count()
+}
+
+/// Write `writes` entries to `group` through its leader.
+async fn write_to(cluster: &Cluster, group: u32, writes: u64) {
+    let leader = cluster.leader(group, None).await;
+    for n in 0..writes {
+        write(cluster.node(leader).raft(group), n).await;
+    }
+}
+
+/// Every node's log of `group` is its leader's, which holds `writes`
+/// entries of its own.
+async fn assert_holds_only(cluster: &Cluster, group: u32, writes: u64) {
+    let leader = cluster.leader(group, None).await;
+    let expected = cluster.node(leader).log(group).await;
+    let last = expected.last().expect("entries").log_id.index;
+    assert_eq!(normal(&expected) as u64, writes, "group {group}");
+    for i in 0..3 {
+        cluster.node(i).applied_through(group, last).await;
+        let mut log = cluster.node(i).log(group).await;
+        log.retain(|e| e.log_id.index <= last);
+        assert_eq!(log, expected, "node {i}, group {group}");
+    }
+}
+
+/// Two groups on the same three nodes keep separate logs: each node's log
+/// of a group is its leader's, holding only that group's writes, after a
+/// node restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_groups_on_the_same_nodes_keep_separate_logs() {
+    const WRITES: [(u32, u64); 2] = [(0, 3), (1, 1)];
+    let mut cluster = Cluster::start(3, &[0, 1]).await;
+    for (group, writes) in WRITES {
+        write_to(&cluster, group, writes).await;
+    }
+    cluster.kill(2).await;
+    cluster.restart(2).await;
+    for (group, writes) in WRITES {
+        assert_holds_only(&cluster, group, writes).await;
+    }
+    cluster.shutdown().await;
+}
+
+/// A group that cannot be opened fails the host and stops the groups
+/// opened before it, so the root opens again once the fault is gone.
+#[tokio::test]
+async fn a_group_that_fails_to_open_stops_the_ones_before_it() {
+    let replica = Replica::new(1, &[0, 1]);
+    let blocked = group_dir(replica.dir.path(), 1);
+    std::fs::create_dir_all(blocked.parent().expect("the groups directory")).expect("mkdir");
+    std::fs::write(&blocked, b"").expect("a file where group 1's directory goes");
+    let spec = || HostSpec {
+        id: replica.id,
+        wal: wal_config(replica.dir.path()),
+        groups: replica.groups.clone(),
+        peers: Peers::plaintext(),
+    };
+    match GroupHost::open(spec()).await {
+        Err(HostError::Log { group: 1, .. }) => {}
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("opened with group 1 blocked"),
+    }
+
+    std::fs::remove_file(&blocked).expect("unblock");
+    let host = tokio::time::timeout(Duration::from_secs(10), GroupHost::open(spec()))
+        .await
+        .expect("group 0's log and the vote log were released")
+        .expect("open");
+    assert_eq!(host.groups().collect::<Vec<_>>(), [0, 1]);
+    host.shutdown().await.expect("shutdown");
 }

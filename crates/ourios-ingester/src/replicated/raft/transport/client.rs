@@ -327,7 +327,8 @@ impl PeerClient {
         let result = tokio::time::timeout(ttl, call)
             .instrument(trace.span())
             .await
-            .unwrap_or_else(|_| Err(Status::deadline_exceeded("peer RPC timed out")));
+            .unwrap_or_else(|_| Err(Status::deadline_exceeded("peer RPC timed out")))
+            .and_then(|response| self.link().check().map(|()| response));
         trace.finish(result.as_ref().map_or_else(Status::code, |_| Code::Ok));
         result
             .map(tonic::Response::into_inner)

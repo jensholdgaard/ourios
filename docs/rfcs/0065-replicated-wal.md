@@ -660,6 +660,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   RFC's implementation, both exports are acked and mined in log
 >   position order, an export acked before the other was sent mined
 >   first, and each tenant's query returns only its own rows
+> - **And** a forwarded export whose leader is not the node the sender
+>   tried is retried at the hinted leader and acked once, while one
+>   whose forwarded call times out or loses its answer gets the
+>   retryable rejection and is not sent again
 
 > **Scenario RFC0065.9 — a corrupt replica does not recover from itself (B4)**
 > - **Given** a follower whose group log fails an integrity check
@@ -1025,10 +1029,11 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   the frame, append-and-commit and slow-follower bullets are the
   fallback's. Instead:
   - An export's turns are acknowledged once `client_write` returns,
-    which `openraft` resolves after a majority of the group's voters,
-    the leader among them, have fsynced the entry and the leader has
-    applied it (apply only queues the frame, §4.3). `seq` in the
-    position is the entry's Raft index.
+    which `openraft` resolves after a majority of the group's voters
+    have fsynced the entry, not necessarily the leader, and the leader
+    has applied it (apply only queues the frame, §4.3). With three
+    voters that is at least two fsynced copies. `seq` in the position
+    is the entry's Raft index.
   - A `client_write` that has not returned within the commit timeout
     fails the waiting turns with the retryable rejection (RFC 0053),
     `error.type` `not_enough_replicas`, and nothing is acknowledged.
@@ -1458,10 +1463,23 @@ never count toward an ack (learners, under §4.3's shape).
   had sent the export to it, and answers with the committed position,
   the same rejection the client would have got, or `UNAVAILABLE` with
   its leader hint when it does not lead the group. A node never
-  forwards a forwarded export again. The sender tries at most
-  `replication_factor` nodes, the hint first and then the group's
-  voters in placement order, and answers the client with the last
-  answer. The payload is bounded as an export is (RFC 0061).
+  forwards a forwarded export again.
+- The sender tries another node only after an answer that proves
+  nothing was appended: the receiving node does not lead the group,
+  does not host it, or refused the connection before the call was
+  sent. It tries at most `replication_factor` nodes, the hint first
+  and then the group's voters in placement order. Any other outcome
+  (the commit timeout, a lost or failed answer once the call was
+  sent, a leader that lost leadership after appending) is uncertain:
+  the entry may still commit, so the sender answers the client with
+  the retryable rejection and does not resubmit, which would append
+  the export again under a second index that §6.6 cannot remove
+  (§9 Q4).
+- RFC 0061 bounds the client's request. The forwarded frame is
+  bounded by RFC 0008's frame size cap, as the WAL frame it becomes
+  is, and a `Forward` message by the peer message limit, one
+  maximum-size frame plus its envelope, so an export the leader would
+  accept directly is never refused for the tenant prefix.
 - Replication runs over `StreamAppend`, one bidirectional stream per
   `openraft` replication session, so the leader sends appends without
   waiting for the answers to earlier ones (§4.6). Every message on the

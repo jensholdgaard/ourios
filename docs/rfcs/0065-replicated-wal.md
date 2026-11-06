@@ -939,11 +939,12 @@ the mass-failover time and vote-log batching as tuning signals.
   reclamation never touches it; it is rewritten (tmp, fsync, rename,
   directory fsync) holding only each group's latest vote once it
   passes a size threshold. Recovery takes the last record per group.
-- **An installed snapshot is recorded before its purge.** The group's
-  state machine writes the snapshot's last log id and membership to
+- **A snapshot is recorded before its purge.** The group's state
+  machine writes the snapshot's last log id and membership to
   `wal_root/groups/<group>/snapshot` (tmp, fsync, rename, directory
-  fsync) and returns from the install only once that is durable, so
-  the purge `openraft` makes after an install never runs ahead of it.
+  fsync) and returns from `install_snapshot` or `build_snapshot` only
+  once that is durable, so the purge `openraft` makes after either
+  never runs ahead of it.
   The record carries a format version and a CRC32C. The group's state
   machine opens from it, applied through the snapshot; a record that
   fails either check fails the group's open, and a group without one

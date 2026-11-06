@@ -3,7 +3,7 @@
 //!
 //! It lives in memory, except for its snapshot: `openraft` purges the log
 //! up to a snapshot it installs or builds, so the snapshot is recorded
-//! ([`snapshot_record`](super::snapshot_record)) before the call returns,
+//! in `wal_root/groups/<group>/snapshot` before the call returns,
 //! and a restart opens applied through it and replays the log after it.
 
 use std::io;

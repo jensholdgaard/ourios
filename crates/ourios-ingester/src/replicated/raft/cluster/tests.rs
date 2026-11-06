@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::EntryPayload;
+use openraft::async_runtime::WatchReceiver as _;
 use tokio::task::JoinHandle;
 
 use super::super::host::HostError;
@@ -205,4 +206,90 @@ async fn a_group_that_fails_to_open_stops_the_ones_before_it() {
         .expect("open");
     assert_eq!(host.groups().collect::<Vec<_>>(), [0, 1]);
     host.shutdown().await.expect("shutdown");
+}
+
+/// The highest index `leader` has seen node `i` match in `group`.
+fn matched(cluster: &Cluster, leader: usize, group: u32, i: usize) -> Option<u64> {
+    let metrics = cluster
+        .node(leader)
+        .raft(group)
+        .metrics()
+        .borrow_watched()
+        .clone();
+    let replication = metrics.replication.expect("the leader's replication");
+    replication
+        .get(&cluster.id(i))
+        .copied()
+        .flatten()
+        .map(|id| id.index)
+}
+
+/// With node `held`'s fsyncs stopped, commit four writes to `group` and check
+/// its leader never saw `held` match past `synced`.
+async fn commit_past(cluster: &Cluster, group: u32, held: usize, synced: u64) -> u64 {
+    let leader = cluster.leader(group, None).await;
+    let mut last = 0;
+    for n in 1..5 {
+        last = write(cluster.node(leader).raft(group), n).await;
+    }
+    assert_eq!(
+        matched(cluster, leader, group, held),
+        Some(synced),
+        "group {group}"
+    );
+    last
+}
+
+/// A crash takes every group on a node at once. Each group's log keeps
+/// exactly what it had fsynced, which no peer saw it match past, and
+/// each catches up once the node is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_keeps_each_group_on_the_node_through_its_own_last_fsync() {
+    const GROUPS: [u32; 2] = [0, 1];
+    let mut cluster = Cluster::start(3, &GROUPS).await;
+    let mut leaders = Vec::new();
+    for group in GROUPS {
+        leaders.push(cluster.leader(group, None).await);
+    }
+    let held = (0..3)
+        .find(|i| !leaders.contains(i))
+        .expect("a node leading neither group");
+    let mut synced = Vec::new();
+    for (group, &leader) in GROUPS.iter().zip(&leaders) {
+        let index = write(cluster.node(leader).raft(*group), 0).await;
+        cluster.node(held).applied_through(*group, index).await;
+        synced.push(index);
+    }
+
+    let gate = Arc::clone(&cluster.node(held).gate);
+    gate.close();
+    let mut last = Vec::new();
+    for (&group, &index) in GROUPS.iter().zip(&synced) {
+        last.push(commit_past(&cluster, group, held, index).await);
+    }
+    assert!(
+        cluster.crash(held).await > 0,
+        "appends were written, unsynced"
+    );
+
+    let others: Vec<_> = (0..3).filter(|&i| i != held).collect();
+    for &other in &others {
+        cluster.cut(held, other);
+    }
+    cluster.restart(held).await;
+    for (&group, &index) in GROUPS.iter().zip(&synced) {
+        let log = cluster.node(held).log(group).await;
+        assert_eq!(
+            log.last().map(|e| e.log_id.index),
+            Some(index),
+            "group {group}"
+        );
+    }
+    for &other in &others {
+        cluster.heal(held, other);
+    }
+    for (&group, &index) in GROUPS.iter().zip(&last) {
+        cluster.node(held).applied_through(group, index).await;
+    }
+    cluster.shutdown().await;
 }

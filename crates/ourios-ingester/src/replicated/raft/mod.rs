@@ -9,6 +9,7 @@
 mod codec;
 pub mod host;
 pub mod log_store;
+mod snapshot_record;
 pub mod state_machine;
 pub mod transport;
 pub mod types;

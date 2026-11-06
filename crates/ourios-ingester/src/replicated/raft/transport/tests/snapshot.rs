@@ -7,7 +7,7 @@ use openraft::network::v2::RaftNetworkV2 as _;
 use openraft::raft::VoteRequest;
 use tonic::Code;
 
-use super::super::super::cluster::name;
+use super::super::super::cluster::{Node, name};
 use super::super::super::types::{Membership, NodeId, RaftTypes, Vote};
 use super::super::wire::{AppendRequest, SnapshotRequest, WireSnapshotResponse, WireVote};
 use super::super::{INSTALL_SNAPSHOT, Peers, ReplicationServer, VERSION};
@@ -130,5 +130,58 @@ async fn requests_no_leader_sends_are_refused_and_the_group_keeps_serving() {
     let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
     let granted = client.vote(higher, option()).await.expect("still serving");
     assert!(granted.vote_granted);
+    node.kill().await;
+}
+
+/// A node restarts applied through a snapshot it installed, with its
+/// membership, though `openraft` purged the log up to it.
+#[tokio::test]
+async fn an_installed_snapshot_survives_a_restart() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    let vote = Vote::new_committed(2, NodeId::from(2));
+    let snapshot = snapshot_of(log(2, 5));
+    let meta = snapshot.meta.clone();
+    let never = std::future::pending::<openraft::errors::ReplicationClosed>();
+    let response = client.full_snapshot(vote, snapshot, never, option()).await;
+    response.expect("installed");
+    node.applied_through(GROUP, 5).await;
+    node.kill().await;
+
+    let replica = node.into_replica();
+    let mut node = Node::open(replica, bind().0, &peers, ReplicationServer::default()).await;
+    let restored = {
+        let sm = node.host.state_machine(GROUP).expect("hosted");
+        (sm.applied(), sm.membership())
+    };
+    assert_eq!(restored, (meta.last_log_id, meta.last_membership));
+    node.kill().await;
+}
+
+/// An install whose record never became durable fails, so `openraft`
+/// purges nothing and the node restarts without the snapshot.
+#[tokio::test]
+async fn an_install_whose_record_is_not_durable_fails_and_purges_nothing() {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut client = client_to(&peers, node.id, addr).await;
+    node.gate.crash();
+    let vote = Vote::new_committed(2, NodeId::from(2));
+    let never = std::future::pending::<openraft::errors::ReplicationClosed>();
+    let response = client
+        .full_snapshot(vote, snapshot_of(log(2, 5)), never, option())
+        .await;
+    assert!(response.is_err(), "{response:?}");
+    node.kill().await;
+
+    let replica = node.into_replica();
+    let mut node = Node::open(replica, bind().0, &peers, ReplicationServer::default()).await;
+    assert_eq!(
+        node.host.state_machine(GROUP).expect("hosted").applied(),
+        None
+    );
     node.kill().await;
 }

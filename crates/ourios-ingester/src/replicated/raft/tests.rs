@@ -79,7 +79,8 @@ impl StoreBuilder<RaftTypes, GroupLog, GroupSm, TempDir> for Builder {
         let votes = VoteLog::open(dir.path()).map_err(store_err)?;
         let config = wal_config(&group_dir(dir.path(), GROUP));
         let log = GroupLog::open(config, GROUP, votes).map_err(store_err)?;
-        Ok((dir, log, GroupSm::default()))
+        let sm = GroupSm::open(&group_dir(dir.path(), GROUP), Arc::default()).map_err(store_err)?;
+        Ok((dir, log, sm))
     }
 }
 

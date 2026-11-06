@@ -44,6 +44,10 @@ pub enum HostError {
         group: u32,
         source: io::Error,
     },
+    Snapshot {
+        group: u32,
+        source: io::Error,
+    },
     Raft {
         group: u32,
         source: Fatal<RaftTypes>,
@@ -56,6 +60,9 @@ impl std::fmt::Display for HostError {
             Self::Config(e) => write!(f, "the group Raft settings: {e}"),
             Self::Votes(e) => write!(f, "open the vote log: {e}"),
             Self::Log { group, source } => write!(f, "open group {group}'s log: {source}"),
+            Self::Snapshot { group, source } => {
+                write!(f, "read group {group}'s snapshot record: {source}")
+            }
             Self::Raft { group, source } => write!(f, "start group {group}: {source}"),
         }
     }
@@ -65,7 +72,9 @@ impl std::error::Error for HostError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Config(e) => Some(e),
-            Self::Votes(e) | Self::Log { source: e, .. } => Some(e),
+            Self::Votes(e) | Self::Log { source: e, .. } | Self::Snapshot { source: e, .. } => {
+                Some(e)
+            }
             Self::Raft { source, .. } => Some(source),
         }
     }
@@ -88,8 +97,9 @@ struct Launch<'a> {
 
 impl Launch<'_> {
     async fn group(&self, group: u32) -> Result<Hosted, HostError> {
+        let dir = group_dir(&self.spec.wal.root, group);
         let wal = WalConfig {
-            root: group_dir(&self.spec.wal.root, group),
+            root: dir.clone(),
             ..self.spec.wal.clone()
         };
         let (votes, gate) = (self.votes.clone(), Arc::clone(&self.gate));
@@ -99,7 +109,10 @@ impl Launch<'_> {
             .map_err(|source| HostError::Log { group, source })?;
         #[cfg(test)]
         let probe = probe::Probe::of(&mut log).await;
-        let sm = GroupSm::default();
+        let gate = Arc::clone(&self.gate);
+        let sm = blocking(move || GroupSm::open(&dir, gate))
+            .await
+            .map_err(|source| HostError::Snapshot { group, source })?;
         let (id, network) = (self.spec.id, self.spec.peers.network(self.spec.id, group));
         let raft = Raft::new(id, Arc::clone(&self.config), network, log, sm.clone())
             .await

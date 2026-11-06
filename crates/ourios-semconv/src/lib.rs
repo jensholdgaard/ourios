@@ -799,6 +799,16 @@ pub const OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_DESCRIPTION: &str = "Reclaima
 /// `ourios.wal.housekeeping.unlink.remaining` unit (UCUM).
 pub const OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_UNIT: &str = "{segment}";
 
+/// `ourios.wal.recovery.truncated.size` (counter, unit `By`).
+pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE: &str = "ourios.wal.recovery.truncated.size";
+
+/// `ourios.wal.recovery.truncated.size` description (the registry `brief`).
+pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE_DESCRIPTION: &str =
+    "Bytes crash recovery truncated from the tail of the newest WAL segment (RFC 0068 §3.3).";
+
+/// `ourios.wal.recovery.truncated.size` unit (UCUM).
+pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE_UNIT: &str = "By";
+
 /// `ourios.wal.retain_floor.lag.segment.count` (updowncounter, unit `{segment}`).
 pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT: &str =
     "ourios.wal.retain_floor.lag.segment.count";
@@ -1080,6 +1090,12 @@ pub const OURIOS_TLS_LISTENER: &str = "ourios.tls.listener";
 /// `ourios.tls.reload_error` attribute key.
 pub const OURIOS_TLS_RELOAD_ERROR: &str = "ourios.tls.reload_error";
 
+/// `ourios.wal.recovery.tail.offset` attribute key.
+pub const OURIOS_WAL_RECOVERY_TAIL_OFFSET: &str = "ourios.wal.recovery.tail.offset";
+
+/// `ourios.wal.recovery.tail.shape` attribute key.
+pub const OURIOS_WAL_RECOVERY_TAIL_SHAPE: &str = "ourios.wal.recovery.tail.shape";
+
 /// `ourios.wal.retain_floor.state` attribute key.
 pub const OURIOS_WAL_RETAIN_FLOOR_STATE: &str = "ourios.wal.retain_floor.state";
 
@@ -1225,3 +1241,6 @@ pub const EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR: &str = "ourios.server.tls.reload
 /// `ourios.template_map.binding.conflicted` log event name.
 pub const EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED: &str =
     "ourios.template_map.binding.conflicted";
+
+/// `ourios.wal.recovery.tail.truncated` log event name.
+pub const EVENT_OURIOS_WAL_RECOVERY_TAIL_TRUNCATED: &str = "ourios.wal.recovery.tail.truncated";

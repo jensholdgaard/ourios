@@ -9,26 +9,34 @@
 //! | 0x01 Blank          | term: u64_le | index: u64_le                      |
 //! | 0x02 Normal         | term | index | TenantOtlpBatch payload (RFC 0046) |
 //! | 0x03 Membership     | term | index | membership bytes                   |
+//! | 0x04 Control        | term | index | kind: u8 | kind's body             |
 //! | 0x10 TruncateAfter  | term | index   (replay drops entries above index) |
 //! | 0x11 TruncateAll    | (empty)        (replay drops every entry)         |
 //! | 0x12 Purge          | term | index   (replay drops entries at or below) |
 //! | 0x13 Committed      | term | index                                      |
 //! ```
 //!
-//! Tags `0x01..=0x03` are log entries; `0x10..=0x13` are the markers
+//! Tags `0x01..=0x04` are log entries; `0x10..=0x13` are the markers
 //! that replay honours in WAL order, so conflict truncation and purge
 //! need no tail-truncate primitive. A `Normal` entry carries the tenant
 //! exactly as a `TenantOtlpBatch` frame does, so RFC 0052's ledger keys
 //! on it. The membership bytes are the consensus layer's own encoding;
-//! this codec only bounds them. Any other tag, a fixed-size body of the
-//! wrong length, or a `Normal` body whose tenant prefix is malformed is
-//! a [`ReplicatedRecordError`].
+//! this codec only bounds them. A `Control` entry is one the leader
+//! appends beside the batches (RFC 0065 §6.5); kind `0x01`, the flusher
+//! assignment, carries the flusher's replica UUID, 16 bytes big-endian,
+//! and every other kind is reserved. Any other tag, an unknown control
+//! kind, a fixed-size body of the wrong length, or a `Normal` body whose
+//! tenant prefix is malformed is a [`ReplicatedRecordError`], so a replay
+//! refuses the log rather than skip an entry it cannot apply.
 
 use crate::{FrameKind, TenantBatch, TenantBatchError};
 
 const TAG_BLANK: u8 = 0x01;
 const TAG_NORMAL: u8 = 0x02;
 const TAG_MEMBERSHIP: u8 = 0x03;
+const TAG_CONTROL: u8 = 0x04;
+const KIND_FLUSHER_ASSIGNMENT: u8 = 0x01;
+const REPLICA_LEN: usize = 16;
 const TAG_TRUNCATE_AFTER: u8 = 0x10;
 const TAG_TRUNCATE_ALL: u8 = 0x11;
 const TAG_PURGE: u8 = 0x12;
@@ -72,6 +80,42 @@ pub enum EntryBody<'a> {
     Normal(&'a [u8]),
     /// A membership change, in the consensus layer's encoding.
     Membership(&'a [u8]),
+    /// An entry the leader appends beside the batches (RFC 0065 §6.5).
+    Control(Control),
+}
+
+/// A control entry's kind and body (RFC 0065 §6.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// The group's flusher: its replica UUID, 16 bytes big-endian.
+    FlusherAssignment([u8; REPLICA_LEN]),
+}
+
+impl Control {
+    /// The highest control kind this codec reads; every lower one is read
+    /// too (RFC 0065 §6.8).
+    pub const HIGHEST_KIND: u8 = KIND_FLUSHER_ASSIGNMENT;
+
+    fn write(self, out: &mut Vec<u8>) {
+        match self {
+            Self::FlusherAssignment(replica) => {
+                out.push(KIND_FLUSHER_ASSIGNMENT);
+                out.extend_from_slice(&replica);
+            }
+        }
+    }
+
+    fn read(body: &[u8]) -> Result<Self, ReplicatedRecordError> {
+        let Some((&kind, rest)) = body.split_first() else {
+            return Err(wrong_length(TAG_CONTROL, 1, 0));
+        };
+        match kind {
+            KIND_FLUSHER_ASSIGNMENT => <[u8; REPLICA_LEN]>::try_from(rest)
+                .map(Self::FlusherAssignment)
+                .map_err(|_| wrong_length(TAG_CONTROL, 1 + REPLICA_LEN, body.len())),
+            found => Err(ReplicatedRecordError::UnknownControlKind { found }),
+        }
+    }
 }
 
 /// One record of a replicated group's WAL.
@@ -112,6 +156,12 @@ impl<'a> ReplicatedRecord<'a> {
                         (TAG_NORMAL, bytes)
                     }
                     EntryBody::Membership(bytes) => (TAG_MEMBERSHIP, bytes),
+                    EntryBody::Control(control) => {
+                        out.push(TAG_CONTROL);
+                        log_id.write(&mut out);
+                        control.write(&mut out);
+                        return Ok(out);
+                    }
                 };
                 out.push(tag);
                 log_id.write(&mut out);
@@ -131,6 +181,10 @@ impl<'a> ReplicatedRecord<'a> {
                 body: EntryBody::Normal(bytes) | EntryBody::Membership(bytes),
                 ..
             } => bytes.len(),
+            Self::Entry {
+                body: EntryBody::Control(_),
+                ..
+            } => 1 + REPLICA_LEN,
             _ => 0,
         }
     }
@@ -145,7 +199,7 @@ impl<'a> ReplicatedRecord<'a> {
             return Err(ReplicatedRecordError::Empty);
         };
         match tag {
-            TAG_BLANK | TAG_NORMAL | TAG_MEMBERSHIP => decode_entry(tag, body),
+            TAG_BLANK | TAG_NORMAL | TAG_MEMBERSHIP | TAG_CONTROL => decode_entry(tag, body),
             TAG_TRUNCATE_ALL if body.is_empty() => Ok(Self::TruncateAfter(None)),
             TAG_TRUNCATE_ALL => Err(wrong_length(tag, 0, body.len())),
             TAG_TRUNCATE_AFTER => exact_log_id(tag, body).map(|id| Self::TruncateAfter(Some(id))),
@@ -187,6 +241,7 @@ fn decode_entry(tag: u8, body: &[u8]) -> Result<ReplicatedRecord<'_>, Replicated
             TenantBatch::decode(rest).map_err(ReplicatedRecordError::TenantBatch)?;
             EntryBody::Normal(rest)
         }
+        TAG_CONTROL => EntryBody::Control(Control::read(rest)?),
         _ => EntryBody::Membership(rest),
     };
     Ok(ReplicatedRecord::Entry { log_id, body })
@@ -223,6 +278,8 @@ pub enum ReplicatedRecordError {
     },
     /// A `Normal` body whose tenant prefix is malformed.
     TenantBatch(TenantBatchError),
+    /// A control entry of a kind this build does not read.
+    UnknownControlKind { found: u8 },
 }
 
 impl std::fmt::Display for ReplicatedRecordError {
@@ -241,6 +298,9 @@ impl std::fmt::Display for ReplicatedRecordError {
                 "ReplicatedEntry tag 0x{tag:02x} body is {found} byte(s); expected {expected}"
             ),
             Self::TenantBatch(e) => write!(f, "ReplicatedEntry Normal body: {e}"),
+            Self::UnknownControlKind { found } => {
+                write!(f, "unknown ReplicatedEntry control kind 0x{found:02x}")
+            }
         }
     }
 }
@@ -313,6 +373,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded: tag 0x04 is the control entry (RFC 0065 §6.5); see \
+                malformed_payloads_and_unknown_control_kinds_are_refused"]
     fn malformed_payloads_are_refused() {
         let decode = |bytes: &[u8]| ReplicatedRecord::decode(bytes).map(|_| ());
         assert_eq!(decode(&[]), Err(ReplicatedRecordError::Empty));
@@ -331,6 +393,56 @@ mod tests {
                 TenantBatchError::EmptyTenant
             ))
         );
+    }
+
+    #[test]
+    fn malformed_payloads_and_unknown_control_kinds_are_refused() {
+        let decode = |bytes: &[u8]| ReplicatedRecord::decode(bytes).map(|_| ());
+        assert_eq!(decode(&[]), Err(ReplicatedRecordError::Empty));
+        assert_eq!(
+            decode(&[0x05]),
+            Err(ReplicatedRecordError::UnknownTag { found: 0x05 })
+        );
+        assert_eq!(decode(&[0x11, 0]), Err(wrong_length(0x11, 0, 1)));
+        assert_eq!(decode(&[0x12, 0, 0]), Err(wrong_length(0x12, 16, 2)));
+        assert_eq!(decode(&golden(0x13, &[0])), Err(wrong_length(0x13, 16, 17)));
+        assert_eq!(decode(&[0x01; 9]), Err(wrong_length(0x01, 16, 8)));
+        assert_eq!(decode(&golden(0x01, &[0])), Err(wrong_length(0x01, 16, 17)));
+        assert_eq!(
+            decode(&golden(0x02, &[0, 0])),
+            Err(ReplicatedRecordError::TenantBatch(
+                TenantBatchError::EmptyTenant
+            ))
+        );
+        assert_eq!(decode(&[0x04]), Err(wrong_length(0x04, 16, 0)));
+        assert_eq!(decode(&golden(0x04, &[])), Err(wrong_length(0x04, 1, 0)));
+        assert_eq!(
+            decode(&golden(0x04, &[0x02])),
+            Err(ReplicatedRecordError::UnknownControlKind { found: 0x02 })
+        );
+        assert_eq!(
+            decode(&golden(0x04, &[0x01; 16])),
+            Err(wrong_length(0x04, 17, 16))
+        );
+        assert_eq!(
+            decode(&golden(0x04, &[0x01; 18])),
+            Err(wrong_length(0x04, 17, 18))
+        );
+    }
+
+    /// A flusher assignment is tag `0x04`, the log id, kind `0x01` and the
+    /// replica UUID (RFC 0065 §6.5).
+    #[test]
+    fn a_flusher_assignment_encodes_to_the_documented_bytes() {
+        let replica: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).expect("small"));
+        let assignment = ReplicatedRecord::Entry {
+            log_id: ID,
+            body: EntryBody::Control(Control::FlusherAssignment(replica)),
+        };
+        let mut tail = vec![0x01];
+        tail.extend_from_slice(&replica);
+        round_trip(assignment, &golden(0x04, &tail));
+        assert_eq!(Control::HIGHEST_KIND, 0x01);
     }
 
     #[test]
@@ -367,7 +479,7 @@ mod tests {
 
     fn any_record() -> impl Strategy<Value = (u8, u64, u64, Vec<u8>)> {
         (
-            0u8..7,
+            0u8..8,
             any::<u64>(),
             any::<u64>(),
             proptest::collection::vec(any::<u8>(), 0..64),
@@ -386,6 +498,11 @@ mod tests {
                 3 => ReplicatedRecord::TruncateAfter(Some(log_id)),
                 4 => ReplicatedRecord::TruncateAfter(None),
                 5 => ReplicatedRecord::Purge(log_id),
+                6 => {
+                    let replica = core::array::from_fn(|i| bytes.get(i).copied().unwrap_or(0));
+                    let control = Control::FlusherAssignment(replica);
+                    ReplicatedRecord::Entry { log_id, body: EntryBody::Control(control) }
+                }
                 _ => ReplicatedRecord::Committed(log_id),
             };
             let encoded = record.encode().expect("encode");

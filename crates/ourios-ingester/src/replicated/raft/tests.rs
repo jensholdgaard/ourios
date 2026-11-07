@@ -545,3 +545,44 @@ fn a_failed_ancestor_fsync_fails_the_open() {
         "groups/ was fsynced; wal_root's fsync failed"
     );
 }
+
+/// RFC0065.29, the log arm: a control entry this replica does not apply
+/// yet stops the group log's open rather than being skipped, and the
+/// entries before it are what a later release would replay.
+#[tokio::test]
+async fn a_control_entry_this_replica_cannot_apply_stops_the_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let (mut log, _) = open(dir.path());
+        append(&mut log, entries(1, 0..=2))
+            .await
+            .await
+            .expect("fsynced");
+        log.shutdown();
+    }
+    let config = wal_config(&group_dir(dir.path(), GROUP));
+    let mut wal = ourios_wal::Wal::open(config).expect("the group WAL");
+    let control = ourios_wal::ReplicatedRecord::Entry {
+        log_id: ourios_wal::RaftLogId { term: 1, index: 3 },
+        body: ourios_wal::EntryBody::Control(ourios_wal::Control::FlusherAssignment([7; 16])),
+    };
+    let frame = control.encode().expect("encode");
+    wal.append(ourios_wal::FrameKind::ReplicatedEntry, &frame)
+        .expect("append");
+    wal.sync().expect("sync");
+    drop(wal);
+
+    let refused = std::thread::spawn({
+        let root = dir.path().to_path_buf();
+        move || {
+            vote_log::create(&root).expect("create");
+            let votes = VoteLog::open(&root).expect("vote log");
+            let config = wal_config(&group_dir(&root, GROUP));
+            GroupLog::open(config, GROUP, votes).map(|_| ())
+        }
+    })
+    .join()
+    .expect("join");
+    let error = refused.expect_err("the control entry stops the open");
+    assert!(error.to_string().contains("control entry"), "{error}");
+}

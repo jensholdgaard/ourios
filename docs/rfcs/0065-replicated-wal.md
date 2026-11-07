@@ -811,6 +811,12 @@ the mass-failover time and vote-log batching as tuning signals.
 >   group fails closed: no election, no membership change and no ack
 >   until an original quorum returns, with the retryable rejection for
 >   its tenants; permanent loss of that quorum is B8's offline recovery
+> - **And** on a fresh cluster, the group forms once from the voters'
+>   `Identify` answers, recorded in `formed.json`: when the first-ranked
+>   voter records it and then restarts on an empty volume before it
+>   initializes, the other two initialize with the recorded membership,
+>   elect a leader, and the restarted voter joins under its new identity
+>   by the replacement above, never by initializing a second membership
 
 > **Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13)**
 > - **Given** a group whose other two voters are lost for good, with
@@ -901,14 +907,20 @@ the mass-failover time and vote-log batching as tuning signals.
   `tail_replicas` can change at any time. Each group's tail replicas are
   the `tail_replicas` members of `tail_peers` with the highest
   `xxh3_64(group, node_id)`; when that set changes, the group's leader
-  adds the new members as `openraft` learners (they catch up from the
-  checkpoint snapshot) and removes the old ones, a learner-only
+  adds the new members as `openraft` learners, under the replica UUID
+  each answers its `Identify` call with (§6.8; they catch up from the
+  checkpoint snapshot), and removes the old ones, a learner-only
   membership change that never touches the voters, the write quorum or
   voter placement. Adding tail capacity is adding tail nodes. The
   current flusher (§6.5) is removed last: when it leaves the set, the
   leader first commits a flusher-assignment entry naming a remaining
   tail replica that has mined through the commit point, and only then
-  removes it, so a group is never without a flusher.
+  removes it, so a group is never without a flusher. A tail node that
+  restarts on an empty or unreadable `wal_root` answers `Identify` under
+  a new UUID with an unchanged `node_id`: the leader adds the new UUID as
+  a learner and removes the learner under the old one, which no node
+  answers for any more, by the same rule, so a membership never holds
+  two learners with one `node_id` for longer than the handoff.
 - **A tenant belongs to one group**:
   `group = xxh3_64(tenant_bytes) mod groups`, where `xxh3_64` is
   XXH3's 64-bit variant with seed 0 and `tenant_bytes` are the tenant
@@ -931,9 +943,11 @@ the mass-failover time and vote-log batching as tuning signals.
   `node_id`, so membership pairs every UUID with the `node_id` it runs
   under, and it is replicated and persisted like any log entry. A node
   whose `wal_root` is empty or unreadable joins as a new replica: it
-  asks the leader to join under its new UUID and `node_id`; the leader
-  adds it as a learner, waits until its applied index reaches the
-  commit point, and then commits **one** membership change that
+  answers the leader's `Identify` call with its new UUID under its
+  `node_id` (§6.8); the leader, seeing a voter's `node_id` under a UUID
+  the membership does not hold, adds it as a learner, waits until its
+  applied index reaches the commit point, and then commits **one**
+  membership change that
   replaces the voter with the same `node_id` and a different UUID by the
   new UUID (joint consensus, so the voter count never drops). Each step
   is decided from the committed membership alone, so a new leader after
@@ -941,6 +955,25 @@ the mass-failover time and vote-log batching as tuning signals.
   an absent voter and the group runs on the rest of its quorum. A
   membership never holds two voters with the same `node_id`, and a node
   never rejoins under an identity whose vote it has lost (§4.5).
+- **A group's first membership** comes from its voters' own answers and
+  is recorded in the bucket, so a group forms once. Only the group's
+  first-ranked voter records it, and only while no record exists: it
+  calls `Identify` on each of the group's other voters at its configured
+  address (§6.8) and, once every one has answered, writes
+  `<bucket>/wal/replicated/groups/<group>/formed.json`, the membership
+  as each voter's UUID paired with its `node_id`, with
+  `put_if_absent`. Every voter whose log for the group is empty reads
+  that object, at start and then until it exists, and initializes the
+  group with exactly the membership it holds, if its own UUID is in it.
+  They all initialize with one membership, so any original majority
+  elects a leader even if the recording voter fails before it
+  initializes, and a leader replaces a lost voter as above. A voter that
+  finds the object naming another UUID for its `node_id`, one restarted
+  on a wiped `wal_root`, never initializes: it answers `Identify` under
+  its new UUID and joins through that committed replacement, so an
+  empty log never forms a second membership beside one that may hold
+  acknowledged batches. Until the object exists the group has no
+  leader.
 - **Each replica keeps one RFC 0008 WAL per group** under
   `wal_root/groups/<group>/`, with RFC 0008's segments, fsync policy
   and CRCs unchanged, and its RFC 0052 reclaim sidecar sized for the
@@ -1540,12 +1573,41 @@ never count toward an ack (learners, under §4.3's shape).
   to follower, entries and heartbeats), `Vote` and `PreVote` (candidate
   to voter), and
   `InstallSnapshot` (leader to a follower behind the checkpoint); then
-  `Forward` (any node to a leader), and `Tail` and `TailScan` (querier
-  to tail replica: the read point and published keys, then the rows
-  under that read point, §6.7). Catch-up needs no call of its own: the
+  `Forward` (any node to a leader), `Identify` (a leader, or a group's first-ranked voter
+  forming its first membership, to a configured peer: the `node_id`
+  and replica UUID it runs under, §6.1),
+  and `Tail` and `TailScan` (querier to tail replica: the read point and
+  published keys, then the rows under that read point, §6.7). Catch-up needs no call of its own: the
   leader sends a lagging follower its missing entries by
   `StreamAppend`, or the checkpoint by `InstallSnapshot` when they are
   already purged.
+- `Identify` names no group and changes nothing: the node answers with
+  its `node_id`, the UUID in its `replica.id`, and the highest control
+  entry kind it reads (§6.5). Kinds are numbered in the order they are
+  introduced and a release reads every kind up to its highest, so one
+  number states what a node can apply. A kind above the group's highest
+  kind is appended only once every member has answered with a kind at
+  or above it, a member that has not answered counting as below. A kind
+  at or below it needs no answers: every member then reads it, since a
+  learner is added only if its kind covers every kind in the leader's
+  log, committed or not, and a new kind and a membership change are
+  never in flight together (§6.5). So a lost
+  member holds back a new kind but never the reassignment of its own
+  flusher, and no admitted replica is asked to apply an entry it cannot
+  read. A member rolled back afterwards, under its UUID, is not
+  admitted again, so the check is also its own: a replica refuses an
+  append that carries a control kind above the highest it reads before
+  it writes or acknowledges it, as well as such an entry already in its
+  log or checkpoint (§6.5), and stops serving and voting in that group
+  as if it were down, until a release that reads the kind restarts it.
+  A leader calls each
+  peer of a group's tail placement, and each voter of the group, at
+  the address its own configuration gives, and acts on the answer
+  through a committed membership change only: it adds a node it does
+  not hold as a learner under the UUID it reported, and starts §6.1's
+  replacement for a voter's `node_id` that answers under a new UUID. An
+  unreachable peer is identified on a later pass, and an answer whose
+  `node_id` is not the one the leader called is ignored.
 - `Forward` carries one export to the node the sender believes leads
   its group: the group, the `TenantOtlpBatch` payload and the
   credential the client presented, if any. It names no target replica.
@@ -1589,9 +1651,10 @@ never count toward an ack (learners, under §4.3's shape).
   or a higher vote. The stream ends after a conflict or a higher vote,
   and when the group stops or the server shuts down. `Append`, the unary form,
   carries one append and answers it.
-- Each request names its group, and one connection per peer carries
-  every group's calls; a server answers an unknown group with
-  `NOT_FOUND`.
+- Each request but `Identify` names its group, and one connection per
+  peer carries every group's calls; a server answers an unknown group
+  with `NOT_FOUND`. `Identify` carries only the protocol version, so a
+  node answers it before it hosts any group.
 - **Mutual TLS is required** (RFC 0030's `TlsSection`). A tail replica
   accepts `Tail` and `TailScan` only from a client certificate whose identity (its
   URI or DNS subject alternative name) is listed in `tail_clients`, the

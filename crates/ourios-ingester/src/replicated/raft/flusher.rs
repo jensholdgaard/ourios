@@ -141,30 +141,41 @@ impl Steward {
     /// Append the assignment [`plan`] gives, held back while the log has
     /// never held its kind and not every member reads it.
     async fn assign(&mut self, group: Group<'_>, tail: Tail<'_>) -> Result<Option<NodeId>, String> {
-        let raft = group.raft;
-        let metrics = raft.metrics().borrow_watched().clone();
-        let Some(led_for) = self.led_for(&metrics) else {
+        let Some((next, highest_kind)) = self.choose(group, tail) else {
             return Ok(None);
         };
+        let control = Control::FlusherAssignment(*next.uuid().as_bytes());
+        if control.kind() > highest_kind {
+            let metrics = group.raft.metrics().borrow_watched().clone();
+            if !every_member_reads(group.raft, &metrics, tail, control.kind()).await {
+                return Ok(None);
+            }
+            // The round can outlast the patience, so `next` may no longer
+            // be healthy, or no longer the one to choose.
+            if self.choose(group, tail).map(|(chosen, _)| chosen) != Some(next) {
+                return Ok(None);
+            }
+        }
+        group
+            .raft
+            .client_write(GroupEntry::Control(control))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Some(next))
+    }
+
+    /// The replica [`plan`] assigns from what the leader sees now, with the
+    /// highest kind its log holds.
+    fn choose(&mut self, group: Group<'_>, tail: Tail<'_>) -> Option<(NodeId, u8)> {
+        let metrics = group.raft.metrics().borrow_watched().clone();
+        let led_for = self.led_for(&metrics)?;
         let controls = group.log.controls();
         let view = View {
             flusher: controls.flusher,
             learners: committed_learners(&metrics, tail.placed),
             led_for,
         };
-        let Some(next) = plan(&view, self.patience) else {
-            return Ok(None);
-        };
-        let control = Control::FlusherAssignment(*next.uuid().as_bytes());
-        if control.kind() > controls.highest_kind
-            && !every_member_reads(raft, &metrics, tail, control.kind()).await
-        {
-            return Ok(None);
-        }
-        raft.client_write(GroupEntry::Control(control))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(Some(next))
+        plan(&view, self.patience).map(|next| (next, controls.highest_kind))
     }
 
     /// How long this node has led the group, if it leads it.

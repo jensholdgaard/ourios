@@ -4,12 +4,12 @@
 //! A log id is `(term, index)`: the standard single-leader-per-term
 //! election, so frame kind `0x04` carries no node id. The node id is the
 //! replica's `UUIDv7` identity and the node data its `node_id`, so the
-//! group's membership pairs the two. Only raw `TenantOtlpBatch` payloads
-//! replicate (§6.7).
+//! group's membership pairs the two. The application data is a raw
+//! `TenantOtlpBatch` payload (§6.7) or a control entry (§6.5).
 
 use std::fmt;
 
-use ourios_wal::{TenantBatch, TenantBatchError};
+use ourios_wal::{Control, TenantBatch, TenantBatchError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -45,8 +45,7 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// One `TenantOtlpBatch` payload (RFC 0046 §3.3), tenant prefix included:
-/// the only application data a group's log holds.
+/// One `TenantOtlpBatch` payload (RFC 0046 §3.3), tenant prefix included.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<u8>", into = "Vec<u8>")]
 pub struct TenantBatchBytes(Vec<u8>);
@@ -86,10 +85,43 @@ impl fmt::Display for TenantBatchBytes {
     }
 }
 
+/// What a group's log entry applies: a tenant's batch, or a control entry
+/// the leader appends beside the batches (RFC 0065 §6.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupEntry {
+    Batch(TenantBatchBytes),
+    Control(#[serde(with = "ControlDef")] Control),
+}
+
+/// `openraft`'s `serde` feature wants the entry serialisable; the log and
+/// the peer transport carry it in `ourios-wal`'s codec instead.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Control")]
+enum ControlDef {
+    FlusherAssignment([u8; 16]),
+}
+
+impl From<TenantBatchBytes> for GroupEntry {
+    fn from(batch: TenantBatchBytes) -> Self {
+        Self::Batch(batch)
+    }
+}
+
+impl fmt::Display for GroupEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Batch(batch) => batch.fmt(f),
+            Self::Control(Control::FlusherAssignment(replica)) => {
+                write!(f, "FlusherAssignment({})", Uuid::from_bytes(*replica))
+            }
+        }
+    }
+}
+
 openraft::declare_raft_types!(
     /// One replicated group's Raft types.
     pub RaftTypes:
-        D = TenantBatchBytes,
+        D = GroupEntry,
         R = (),
         NodeId = NodeId,
         Node = String,
@@ -115,6 +147,18 @@ mod tests {
             Err(TenantBatchError::EmptyTenant)
         );
         assert!(serde_json::from_str::<TenantBatchBytes>("[0,0]").is_err());
+    }
+
+    #[test]
+    fn a_flusher_assignment_displays_its_replica() {
+        let uuid = Uuid::from_u128(0x0190_b3c8_1a2b_7c3d_9e4f_5060_7080_a0b0);
+        let entry = GroupEntry::Control(Control::FlusherAssignment(*uuid.as_bytes()));
+        assert_eq!(
+            entry.to_string(),
+            "FlusherAssignment(0190b3c8-1a2b-7c3d-9e4f-50607080a0b0)"
+        );
+        let json = serde_json::to_string(&entry).expect("serialise");
+        assert_eq!(serde_json::from_str::<GroupEntry>(&json).ok(), Some(entry));
     }
 
     #[test]

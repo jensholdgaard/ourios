@@ -16,7 +16,7 @@ use crate::receiver::ReceiveError;
 use crate::replicated::ingest::ReplicatedIngest;
 use crate::replicated::raft::cluster::{Cluster, wal_config, write};
 use crate::replicated::raft::log_store::{GroupLog, group_dir};
-use crate::replicated::raft::types::Entry;
+use crate::replicated::raft::types::{Entry, GroupEntry};
 use crate::replicated::raft::vote_log::VoteLog;
 use crate::replicated::write::GroupPosition;
 
@@ -31,7 +31,7 @@ fn marker(n: u32) -> String {
 
 fn carries(entry: &Entry, marker: &str) -> bool {
     match &entry.payload {
-        EntryPayload::Normal(batch) => batch
+        EntryPayload::Normal(GroupEntry::Batch(batch)) => batch
             .as_bytes()
             .windows(marker.len())
             .any(|w| w == marker.as_bytes()),

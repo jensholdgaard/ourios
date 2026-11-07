@@ -257,7 +257,9 @@ fn entry(index: u64, bytes: usize) -> Entry {
     let batch = TenantBatch::encode("acme", &vec![7; bytes]).expect("batch");
     Entry {
         log_id: WireLogId { term: 1, index }.into(),
-        payload: openraft::EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid")),
+        payload: openraft::EntryPayload::Normal(
+            TenantBatchBytes::new(batch).expect("valid").into(),
+        ),
     }
 }
 

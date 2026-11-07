@@ -230,7 +230,7 @@ impl GroupWriter {
             .groups
             .get(&group)
             .ok_or(WriteError::NotHosted { group })?;
-        match tokio::time::timeout(self.timeout, raft.client_write(batch)).await {
+        match tokio::time::timeout(self.timeout, raft.client_write(batch.into())).await {
             Ok(Ok(response)) => Ok(GroupPosition {
                 group,
                 seq: response.log_id.index,

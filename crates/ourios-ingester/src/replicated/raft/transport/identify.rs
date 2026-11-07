@@ -16,9 +16,9 @@ use super::trace::{Call, Peer, Traced, Tracing};
 use super::wire::MAX_MESSAGE_BYTES;
 use super::{IDENTIFY, VERSION};
 
-/// The highest control-entry kind this release reads (§6.5); `0` while it
-/// reads none.
-pub const HIGHEST_CONTROL_KIND: u8 = 0;
+/// The highest control-entry kind this release reads (§6.5): the group
+/// log's codec's.
+pub const HIGHEST_CONTROL_KIND: u8 = ourios_wal::Control::HIGHEST_KIND;
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct IdentifyRequest {

@@ -24,7 +24,7 @@ use super::log_store::group_dir;
 use super::state_machine::GroupSm;
 use super::telemetry::Meters;
 use super::transport::{Identity, Peers, ReplicationServer};
-use super::types::{Entry, NodeId, RaftTypes, TenantBatchBytes};
+use super::types::{Entry, GroupEntry, NodeId, RaftTypes, TenantBatchBytes};
 use super::vote_log;
 
 mod tests;
@@ -259,16 +259,22 @@ pub(crate) fn batch(n: u64) -> TenantBatchBytes {
     TenantBatchBytes::new(payload).expect("valid")
 }
 
-/// A new leader refuses writes until its blank entry commits.
+/// Commit `batch(n)`, returning its index.
 pub(crate) async fn write(raft: &GroupRaft, n: u64) -> u64 {
+    propose(raft, batch(n).into()).await
+}
+
+/// Commit `entry`, returning its index. A new leader refuses writes until
+/// its blank entry commits.
+pub(crate) async fn propose(raft: &GroupRaft, entry: GroupEntry) -> u64 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match raft.client_write(batch(n)).await {
+        match raft.client_write(entry.clone()).await {
             Ok(response) => return response.log_id.index,
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            Err(e) => panic!("write {n}: {e}"),
+            Err(e) => panic!("propose {entry}: {e}"),
         }
     }
 }

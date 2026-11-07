@@ -2,10 +2,8 @@
 //! message sizes, and the peer-RPC spans.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
@@ -13,227 +11,101 @@ use openraft::async_runtime::WatchReceiver as _;
 use openraft::errors::RPCError;
 use openraft::network::{RPCOption, RaftNetworkFactory, v2::RaftNetworkV2};
 use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, StreamAppendError, VoteRequest};
-use openraft::{Raft, RaftMetrics};
 use opentelemetry::global::BoxedTracer;
 use opentelemetry::trace::{SpanKind, Status as SpanStatus};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData};
 use ourios_wal::TenantBatch;
-use tempfile::TempDir;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tonic::codegen::http::uri::PathAndQuery;
-use tonic::codegen::{Body as HttpBody, BoxFuture, StdError, http};
 use tonic::transport::server::TcpIncoming;
 use tonic::{Code, Request, Status};
 use tonic_prost::ProstCodec;
 
-use super::super::log_store::{GroupLog, group_dir};
-use super::super::tests::{MemSm, wal_config};
+use super::super::cluster::{Node, Replica, bind, leader, name, serve, write};
+use super::super::state_machine::GroupSm;
 use super::super::types::{Entry, NodeId, RaftTypes, TenantBatchBytes, Vote};
-use super::super::vote_log::{self, VoteLog};
 use super::trace::Tracing;
 use super::wire::{
-    AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, SnapshotRequest,
-    StreamAppendResponse, WireLogId, WireSnapshotResponse, WireVote,
+    AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, StreamAppendResponse, WireLogId,
+    WireVote,
 };
-use super::{
-    APPEND, INSTALL_SNAPSHOT, PeerClient, Peers, ReplicationServer, SERVICE, STREAM_APPEND, VERSION,
-};
+use super::{APPEND, PeerClient, Peers, ReplicationServer, STREAM_APPEND, VERSION};
 
 mod mtls;
 mod pipelining;
 mod shutdown;
+mod snapshot;
+mod withholding;
 
 const GROUP: u32 = 7;
-const WAIT: Option<Duration> = Some(Duration::from_secs(10));
 
-fn bind() -> (TcpIncoming, SocketAddr) {
-    let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
-    let addr = incoming.local_addr().expect("local addr");
-    (incoming, addr)
-}
-
-/// Serve `server` on `incoming` until the returned sender fires or drops.
-fn serve(
-    server: ReplicationServer<MemSm>,
+/// A single node hosting [`GROUP`], from a fresh directory.
+async fn start(
+    n: u64,
     incoming: TcpIncoming,
-) -> (oneshot::Sender<()>, JoinHandle<()>) {
-    let (stop, stopped) = oneshot::channel::<()>();
-    let serving = tokio::spawn(async move {
-        let shutdown = async {
-            let _ = stopped.await;
-        };
-        server
-            .serve_plaintext(incoming, shutdown)
-            .await
-            .expect("serve");
-    });
-    (stop, serving)
+    peers: &Peers,
+    server: ReplicationServer<GroupSm>,
+) -> Node {
+    Node::open(Replica::new(n, &[GROUP]), incoming, peers, server).await
 }
 
-/// A replica's identity and the directory its log and votes live in.
-struct Replica {
-    id: NodeId,
-    dir: TempDir,
-}
-
-struct Node {
-    id: NodeId,
-    raft: Raft<RaftTypes, MemSm>,
-    sm: MemSm,
-    stop: Option<oneshot::Sender<()>>,
-    serving: JoinHandle<()>,
-    dir: TempDir,
-}
-
-impl Node {
-    async fn start(
-        n: u64,
-        incoming: TcpIncoming,
-        peers: &Peers,
-        server: ReplicationServer<MemSm>,
-    ) -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        vote_log::create(dir.path()).expect("vote log");
-        let replica = Replica {
-            id: NodeId::from(n),
-            dir,
-        };
-        Self::open(replica, incoming, peers, server).await
+/// `size` listeners, the membership naming each node by its `node_id`,
+/// and each `node_id`'s address.
+fn listeners(size: u64) -> (Vec<(u64, TcpIncoming)>, Members, Addresses) {
+    let mut listeners = Vec::new();
+    let mut members = BTreeMap::new();
+    let mut addresses = Vec::new();
+    for n in 1..=size {
+        let (incoming, addr) = bind();
+        let id = NodeId::from(n);
+        members.insert(id, name(id));
+        addresses.push((name(id), addr.to_string()));
+        listeners.push((n, incoming));
     }
-
-    /// `replica`, from the state in its directory, served on `incoming`.
-    async fn open(
-        replica: Replica,
-        incoming: TcpIncoming,
-        peers: &Peers,
-        server: ReplicationServer<MemSm>,
-    ) -> Self {
-        Self::open_on(replica, peers, server, |server| serve(server, incoming)).await
-    }
-
-    /// `replica`, from the state in its directory, served by `serve`.
-    async fn open_on(
-        Replica { id, dir }: Replica,
-        peers: &Peers,
-        server: ReplicationServer<MemSm>,
-        serve: impl FnOnce(ReplicationServer<MemSm>) -> (oneshot::Sender<()>, JoinHandle<()>),
-    ) -> Self {
-        let votes = VoteLog::open(dir.path()).expect("vote log");
-        let wal = wal_config(&group_dir(dir.path(), GROUP));
-        let log = GroupLog::open(wal, GROUP, votes).expect("group log");
-        let sm = MemSm::default();
-        let config = Arc::new(super::super::group_config().expect("config"));
-        let raft = Raft::new(id, config, peers.network(id, GROUP), log, sm.clone())
-            .await
-            .expect("raft");
-        server.insert(GROUP, raft.clone());
-        let (stop, serving) = serve(server);
-        Self {
-            id,
-            raft,
-            sm,
-            stop: Some(stop),
-            serving,
-            dir,
-        }
-    }
-
-    async fn kill(&mut self) {
-        self.raft.shutdown().await.expect("shutdown");
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        tokio::time::timeout(Duration::from_secs(10), &mut self.serving)
-            .await
-            .expect("server stops")
-            .expect("server task");
-    }
-
-    async fn applied_through(&self, index: u64) {
-        self.raft
-            .wait(WAIT)
-            .applied_index_at_least(Some(index), "applied")
-            .await
-            .expect("applied");
-        let applied = self.sm.state().applied.map(|id| id.index);
-        assert!(applied >= Some(index), "{} applied {applied:?}", self.id);
-    }
+    (listeners, members, addresses)
 }
 
-async fn leader(nodes: &[&Node], not: Option<NodeId>) -> NodeId {
-    let metrics = nodes[0]
-        .raft
-        .wait(WAIT)
-        .metrics(
-            |m: &RaftMetrics<RaftTypes>| m.current_leader.is_some() && m.current_leader != not,
-            "a leader",
-        )
-        .await
-        .expect("leader elected");
-    metrics.current_leader.expect("leader")
-}
-
-fn batch(n: u64) -> TenantBatchBytes {
-    let payload = TenantBatch::encode("acme", format!("record {n}").as_bytes()).expect("batch");
-    TenantBatchBytes::new(payload).expect("valid")
-}
-
-/// A new leader refuses writes until its blank entry commits.
-async fn write(raft: &Raft<RaftTypes, MemSm>, n: u64) -> u64 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match raft.client_write(batch(n)).await {
-            Ok(response) => return response.log_id.index,
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(e) => panic!("write {n}: {e}"),
-        }
-    }
-}
+type Members = BTreeMap<NodeId, String>;
+type Addresses = Vec<(String, String)>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_nodes_replicate_over_grpc_and_fail_over() {
-    let peers = Peers::plaintext();
-    let mut listeners = Vec::new();
-    let mut members = BTreeMap::new();
-    for n in 1..=3 {
-        let (incoming, addr) = bind();
-        members.insert(NodeId::from(n), addr.to_string());
-        listeners.push((n, incoming));
-    }
+    let (listeners, members, addresses) = listeners(3);
+    let peers = Peers::plaintext().with_addresses(addresses);
     let mut nodes = Vec::new();
     for (n, incoming) in listeners {
-        nodes.push(Node::start(n, incoming, &peers, ReplicationServer::default()).await);
+        nodes.push(start(n, incoming, &peers, ReplicationServer::default()).await);
     }
-    nodes[0].raft.initialize(members).await.expect("initialize");
+    nodes[0]
+        .raft(GROUP)
+        .initialize(members)
+        .await
+        .expect("initialize");
 
-    let first = leader(&nodes.iter().collect::<Vec<_>>(), None).await;
+    let first = leader(GROUP, &nodes.iter().collect::<Vec<_>>(), None).await;
     let at = nodes
         .iter()
         .position(|n| n.id == first)
         .expect("leader node");
     let mut last = 0;
     for n in 0..5 {
-        last = write(&nodes[at].raft, n).await;
+        last = write(nodes[at].raft(GROUP), n).await;
     }
     for node in &nodes {
-        node.applied_through(last).await;
+        node.applied_through(GROUP, last).await;
     }
 
     let mut old = nodes.remove(at);
     old.kill().await;
     let survivors: Vec<&Node> = nodes.iter().collect();
-    let second = leader(&survivors, Some(first)).await;
+    let second = leader(GROUP, &survivors, Some(first)).await;
     let new = survivors
         .iter()
         .find(|n| n.id == second)
         .expect("new leader is a survivor");
-    let written = write(&new.raft, 99).await;
+    let written = write(new.raft(GROUP), 99).await;
     assert!(written > last);
     for node in &survivors {
-        node.applied_through(written).await;
+        node.applied_through(GROUP, written).await;
     }
     for node in &mut nodes {
         node.kill().await;
@@ -300,9 +172,13 @@ fn option() -> RPCOption {
     RPCOption::new(Duration::from_secs(5))
 }
 
+/// A client to `target`, reached at `addr`.
 async fn client_to(peers: &Peers, target: NodeId, addr: SocketAddr) -> PeerClient {
+    let peers = peers
+        .clone()
+        .with_addresses([(name(target), addr.to_string())]);
     let mut network = peers.network(NodeId::from(2), GROUP);
-    network.new_client(target, &addr.to_string()).await
+    network.new_client(target, &name(target)).await
 }
 
 #[tokio::test]
@@ -329,8 +205,8 @@ async fn a_group_the_peer_does_not_host_is_unreachable() {
 async fn a_request_for_another_replica_at_the_address_is_refused_uncredited() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
-    let vote_before = node.raft.metrics().borrow_watched().vote;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
+    let vote_before = node.raft(GROUP).metrics().borrow_watched().vote;
     let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
 
     let mut stranger = client_to(&peers, NodeId::from(9), addr).await;
@@ -339,7 +215,10 @@ async fn a_request_for_another_replica_at_the_address_is_refused_uncredited() {
         matches!(refused, Err(RPCError::Unreachable(_))),
         "{refused:?}"
     );
-    assert_eq!(node.raft.metrics().borrow_watched().vote, vote_before);
+    assert_eq!(
+        node.raft(GROUP).metrics().borrow_watched().vote,
+        vote_before
+    );
 
     let mut addressed = client_to(&peers, node.id, addr).await;
     let granted = addressed.vote(higher, option()).await.expect("vote");
@@ -395,7 +274,7 @@ const MIB: usize = 1024 * 1024;
 async fn an_entry_over_four_mib_replicates() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let response = client
         .append_entries(append(vec![entry(0, 5 * MIB)]), option())
@@ -408,7 +287,7 @@ async fn an_entry_over_four_mib_replicates() {
 async fn a_batch_over_the_byte_budget_is_a_partial_success() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let rpc = append((0..3).map(|i| entry(i, 7 * MIB)).collect());
     let second = rpc.entries[1].log_id;
@@ -526,7 +405,7 @@ async fn a_successful_empty_append_records_no_span() {
     let (incoming, addr) = bind();
     let peers = Peers::traced_by(tracing.clone());
     let server = ReplicationServer::traced_by(tracing);
-    let mut node = Node::start(1, incoming, &peers, server).await;
+    let mut node = start(1, incoming, &peers, server).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let response = client.append_entries(append(Vec::new()), option()).await;
     assert!(response.is_ok(), "{response:?}");
@@ -591,8 +470,8 @@ async fn a_failing_empty_append_records_a_server_error_span_too() {
     let (exporter, tracing, _default) = capture();
     let (incoming, addr) = bind();
     let peers = Peers::traced_by(tracing.clone());
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::traced_by(tracing)).await;
-    node.raft.shutdown().await.expect("shutdown");
+    let mut node = start(1, incoming, &peers, ReplicationServer::traced_by(tracing)).await;
+    node.raft(GROUP).shutdown().await.expect("shutdown");
     let mut client = client_to(&peers, node.id, addr).await;
     let empty = client.append_entries(append(Vec::new()), option()).await;
     assert!(matches!(empty, Err(RPCError::Unreachable(_))), "{empty:?}");
@@ -621,124 +500,6 @@ fn silent_peer() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local addr");
     (listener, addr)
-}
-
-fn snapshot_of(
-    last: openraft::type_config::alias::LogIdOf<RaftTypes>,
-) -> openraft::type_config::alias::SnapshotOf<RaftTypes, ()> {
-    let voters = std::collections::BTreeSet::from([NodeId::from(1), NodeId::from(2)]);
-    let nodes = BTreeMap::from([
-        (NodeId::from(1), "127.0.0.1:1".to_owned()),
-        (NodeId::from(2), "127.0.0.1:2".to_owned()),
-    ]);
-    let membership = super::super::types::Membership::new(vec![voters], nodes).expect("membership");
-    openraft::type_config::alias::SnapshotOf::<RaftTypes, ()> {
-        meta: openraft::type_config::alias::SnapshotMetaOf::<RaftTypes> {
-            last_log_id: Some(last),
-            last_membership: openraft::StoredMembership::new(Some(last), membership),
-        },
-        snapshot: (),
-    }
-}
-
-#[tokio::test]
-async fn a_full_snapshot_installs_over_grpc() {
-    let (incoming, addr) = bind();
-    let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
-    let mut client = client_to(&peers, node.id, addr).await;
-    let vote = Vote::new_committed(2, NodeId::from(2));
-    let snapshot = snapshot_of(log(2, 5));
-    let meta = snapshot.meta.clone();
-    let never = std::future::pending::<openraft::errors::ReplicationClosed>();
-    let response = client.full_snapshot(vote, snapshot, never, option()).await;
-    assert_eq!(response.expect("installed").vote, vote);
-    node.applied_through(5).await;
-    let installed = {
-        let state = node.sm.state();
-        (state.applied, state.membership.clone())
-    };
-    assert_eq!(installed, (meta.last_log_id, meta.last_membership));
-    node.kill().await;
-}
-
-#[tokio::test]
-async fn a_pending_snapshot_install_ends_when_replication_closes() {
-    let (_listener, addr) = silent_peer();
-    let mut client = client_to(&Peers::plaintext(), NodeId::from(1), addr).await;
-    let closed = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        openraft::errors::ReplicationClosed::new("replication stopped")
-    };
-    let vote = Vote::new_committed(2, NodeId::from(2));
-    let response = client
-        .full_snapshot(vote, snapshot_of(log(2, 5)), closed, option())
-        .await;
-    assert!(
-        matches!(response, Err(openraft::errors::StreamingError::Closed(_))),
-        "{response:?}"
-    );
-}
-
-/// Requests a leader never sends, which `openraft` would assert on or
-/// the group log fail on, are refused before dispatch and leave the group
-/// serving.
-#[tokio::test]
-async fn requests_no_leader_sends_are_refused_and_the_group_keeps_serving() {
-    let (incoming, addr) = bind();
-    let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
-    let vote = Vote::new_committed(1, NodeId::from(2));
-    let to = super::wire::Recipient {
-        group: GROUP,
-        node: node.id,
-    };
-    let after_vote = snapshot_of(log(9, 5)).meta;
-    let mut membership_ahead = snapshot_of(log(1, 5)).meta;
-    membership_ahead.last_membership = openraft::StoredMembership::new(
-        Some(log(1, 6)),
-        membership_ahead.last_membership.membership().clone(),
-    );
-    for (vote, meta) in [
-        (vote, after_vote),
-        (vote, membership_ahead),
-        (Vote::new(1, NodeId::from(2)), snapshot_of(log(1, 5)).meta),
-    ] {
-        let snapshot = SnapshotRequest::new(to, &vote, &meta).expect("encode");
-        let refused = raw::<_, WireSnapshotResponse>(addr, INSTALL_SNAPSHOT, snapshot).await;
-        let code = refused.map(drop).map_err(|s| s.code());
-        assert_eq!(code, Err(Code::InvalidArgument), "{vote} {meta:?}");
-    }
-
-    let uncommitted = AppendRequest {
-        header: Some(header(VERSION)),
-        vote: Some(WireVote::from(&Vote::new(1, NodeId::from(2)))),
-        ..AppendRequest::default()
-    };
-    assert_eq!(
-        raw_append(addr, uncommitted).await.code(),
-        Code::InvalidArgument
-    );
-
-    let oversized = AppendRequest {
-        header: Some(header(VERSION)),
-        vote: Some(WireVote::from(&vote)),
-        entries: vec![vec![0; ourios_wal::MAX_FRAME_BYTES + 1]],
-        ..AppendRequest::default()
-    };
-    assert_eq!(
-        raw_append(addr, oversized).await.code(),
-        Code::InvalidArgument
-    );
-
-    let mut client = client_to(&peers, node.id, addr).await;
-    let gap = append(vec![entry(3, 16)]);
-    assert!(client.append_entries(gap, option()).await.is_err());
-
-    let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
-    let granted = client.vote(higher, option()).await.expect("still serving");
-    assert!(granted.vote_granted);
-    node.kill().await;
 }
 
 /// The replies to `requests` sent as one `StreamAppend` stream past
@@ -828,28 +589,26 @@ fn matched(answers: &[StreamAnswer]) -> Vec<Option<u64>> {
 #[tokio::test]
 async fn three_nodes_replicate_through_stream_append() {
     let (exporter, tracing, _default) = capture();
-    let peers = Peers::traced_by(tracing.clone());
-    let mut listeners = Vec::new();
-    let mut members = BTreeMap::new();
-    for n in 1..=3 {
-        let (incoming, addr) = bind();
-        members.insert(NodeId::from(n), addr.to_string());
-        listeners.push((n, incoming));
-    }
+    let (listeners, members, addresses) = listeners(3);
+    let peers = Peers::traced_by(tracing.clone()).with_addresses(addresses);
     let mut nodes = Vec::new();
     for (n, incoming) in listeners {
         let server = ReplicationServer::traced_by(tracing.clone());
-        nodes.push(Node::start(n, incoming, &peers, server).await);
+        nodes.push(start(n, incoming, &peers, server).await);
     }
-    nodes[0].raft.initialize(members).await.expect("initialize");
-    let first = leader(&nodes.iter().collect::<Vec<_>>(), None).await;
+    nodes[0]
+        .raft(GROUP)
+        .initialize(members)
+        .await
+        .expect("initialize");
+    let first = leader(GROUP, &nodes.iter().collect::<Vec<_>>(), None).await;
     let at = nodes.iter().position(|n| n.id == first).expect("leader");
     let mut last = 0;
     for n in 0..5 {
-        last = write(&nodes[at].raft, n).await;
+        last = write(nodes[at].raft(GROUP), n).await;
     }
     for node in &nodes {
-        node.applied_through(last).await;
+        node.applied_through(GROUP, last).await;
     }
     for node in &mut nodes {
         node.kill().await;
@@ -877,7 +636,7 @@ async fn three_nodes_replicate_through_stream_append() {
 async fn a_stream_answers_each_append_in_order() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let answers = streamed(&mut client, consecutive(&[3, 2, 1, 0]), option())
         .await
@@ -897,7 +656,7 @@ async fn a_stream_answers_each_append_in_order() {
 async fn a_streamed_append_over_the_byte_budget_is_split_and_fully_matched() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let rpc = append((0..3).map(|i| entry(i, 7 * MIB)).collect());
     let answers = streamed(&mut client, vec![rpc], option())
@@ -911,7 +670,7 @@ async fn a_streamed_append_over_the_byte_budget_is_split_and_fully_matched() {
 async fn a_conflict_ends_the_stream() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let ahead = AppendEntriesRequest {
         prev_log_id: Some(log(1, 5)),
@@ -936,7 +695,7 @@ async fn a_conflict_ends_the_stream() {
 async fn a_higher_vote_ends_the_stream() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let higher = VoteRequest::new(Vote::new(5, NodeId::from(3)), None);
     let granted = client.vote(higher, option()).await.expect("vote");
@@ -962,7 +721,7 @@ async fn a_higher_vote_ends_the_stream() {
 async fn a_stream_is_refused_as_unary_append_is() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let valid = wire_append(node.id, &consecutive(&[1])[0]);
     let headed = |header: Header| AppendRequest {
         header: Some(header),
@@ -1026,8 +785,8 @@ async fn a_stream_to_a_group_the_peer_does_not_host_is_unreachable() {
 async fn a_stream_to_a_stopped_group_is_unreachable() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
-    node.raft.shutdown().await.expect("shutdown");
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
+    node.raft(GROUP).shutdown().await.expect("shutdown");
     let mut client = client_to(&peers, node.id, addr).await;
     let answers = streamed(&mut client, consecutive(&[1]), option())
         .await
@@ -1045,7 +804,7 @@ async fn a_stream_to_a_stopped_group_is_unreachable() {
 async fn an_idle_stream_ends_when_the_group_stops() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let input =
         futures_util::stream::iter(consecutive(&[1])).chain(futures_util::stream::pending());
@@ -1055,7 +814,7 @@ async fn an_idle_stream_ends_when_the_group_stops() {
     let idle = tokio::time::timeout(Duration::from_millis(200), answers.next()).await;
     assert!(idle.is_err(), "an idle stream is not a timeout: {idle:?}");
 
-    node.raft.shutdown().await.expect("shutdown");
+    node.raft(GROUP).shutdown().await.expect("shutdown");
     let ended = answers.next().await.expect("an end");
     assert!(matches!(ended, Err(RPCError::Unreachable(_))), "{ended:?}");
     drop(answers);
@@ -1080,7 +839,7 @@ async fn a_stream_is_traced_once_and_only_when_it_carries_entries() {
     let (incoming, addr) = bind();
     let peers = Peers::traced_by(tracing.clone());
     let server = ReplicationServer::traced_by(tracing);
-    let mut node = Node::start(1, incoming, &peers, server).await;
+    let mut node = start(1, incoming, &peers, server).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let heartbeat = streamed(&mut client, consecutive(&[0]), option()).await;
     assert_eq!(matched(&heartbeat.expect("heartbeat")), [None]);
@@ -1104,116 +863,41 @@ async fn a_stream_is_traced_once_and_only_when_it_carries_entries() {
 /// follower up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_that_rejoins_catches_up_over_the_stream() {
-    let peers = Peers::plaintext();
-    let mut listeners = Vec::new();
-    let mut members = BTreeMap::new();
-    for n in 1..=3 {
-        let (incoming, addr) = bind();
-        members.insert(NodeId::from(n), addr);
-        listeners.push((n, incoming));
-    }
+    let (listeners, members, addresses) = listeners(3);
+    let peers = Peers::plaintext().with_addresses(addresses);
+    let mut addrs = BTreeMap::new();
     let mut nodes = Vec::new();
     for (n, incoming) in listeners {
-        nodes.push(Node::start(n, incoming, &peers, ReplicationServer::default()).await);
+        addrs.insert(NodeId::from(n), incoming.local_addr().expect("local addr"));
+        nodes.push(start(n, incoming, &peers, ReplicationServer::default()).await);
     }
-    let addrs: BTreeMap<_, _> = members.iter().map(|(id, a)| (*id, a.to_string())).collect();
-    nodes[0].raft.initialize(addrs).await.expect("initialize");
-    let first = leader(&nodes.iter().collect::<Vec<_>>(), None).await;
+    nodes[0]
+        .raft(GROUP)
+        .initialize(members)
+        .await
+        .expect("initialize");
+    let first = leader(GROUP, &nodes.iter().collect::<Vec<_>>(), None).await;
     let at = nodes.iter().position(|n| n.id == first).expect("leader");
     let gone = (at + 1) % nodes.len();
-    write(&nodes[at].raft, 0).await;
+    write(nodes[at].raft(GROUP), 0).await;
 
     let mut follower = nodes.remove(gone);
     follower.kill().await;
     let at = nodes.iter().position(|n| n.id == first).expect("leader");
     let mut last = 0;
     for n in 1..20 {
-        last = write(&nodes[at].raft, n).await;
+        last = write(nodes[at].raft(GROUP), n).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let incoming = TcpIncoming::bind(members[&follower.id]).expect("rebind");
-    let replica = Replica {
-        id: follower.id,
-        dir: follower.dir,
-    };
+    let incoming = TcpIncoming::bind(addrs[&follower.id]).expect("rebind");
+    let replica = follower.into_replica();
     let back = Node::open(replica, incoming, &peers, ReplicationServer::default()).await;
-    back.applied_through(last).await;
+    back.applied_through(GROUP, last).await;
     nodes.push(back);
     for node in &mut nodes {
         node.kill().await;
     }
-}
-
-/// A peer that opens every `StreamAppend` stream and reads its messages
-/// but answers none of them.
-#[derive(Clone)]
-struct Withholding;
-
-impl tonic::server::StreamingService<AppendRequest> for Withholding {
-    type Response = StreamAppendResponse;
-    type ResponseStream =
-        futures_util::stream::BoxStream<'static, Result<StreamAppendResponse, Status>>;
-    type Future = BoxFuture<tonic::Response<Self::ResponseStream>, Status>;
-
-    fn call(&mut self, request: Request<tonic::Streaming<AppendRequest>>) -> Self::Future {
-        let read = futures_util::stream::unfold(request.into_inner(), |mut incoming| async move {
-            while let Ok(Some(_)) = incoming.message().await {}
-            std::future::pending::<Option<(Result<StreamAppendResponse, Status>, _)>>().await
-        });
-        Box::pin(async move { Ok(tonic::Response::new(read.boxed())) })
-    }
-}
-
-impl<B> tonic::codegen::Service<http::Request<B>> for Withholding
-where
-    B: HttpBody + Send + 'static,
-    B::Error: Into<StdError> + Send + 'static,
-{
-    type Response = http::Response<tonic::body::Body>;
-    type Error = Infallible;
-    type Future = BoxFuture<Self::Response, Self::Error>;
-
-    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Infallible>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: http::Request<B>) -> Self::Future {
-        Box::pin(async move {
-            let codec = ProstCodec::<StreamAppendResponse, AppendRequest>::default();
-            Ok(tonic::server::Grpc::new(codec)
-                .streaming(Withholding, request)
-                .await)
-        })
-    }
-}
-
-impl tonic::server::NamedService for Withholding {
-    const NAME: &'static str = SERVICE;
-}
-
-/// An open stream whose peer holds back an answer times out the wait for
-/// it, rather than waiting as long as an idle stream may.
-#[tokio::test]
-async fn a_stream_whose_peer_withholds_an_answer_times_out() {
-    let (incoming, addr) = bind();
-    let serving = tokio::spawn(
-        tonic::transport::Server::builder().serve_with_incoming(Withholding, incoming),
-    );
-    let mut client = client_to(&Peers::plaintext(), NodeId::from(1), addr).await;
-    let option = RPCOption::new(Duration::from_millis(200));
-    let input =
-        futures_util::stream::iter(consecutive(&[1])).chain(futures_util::stream::pending());
-    let mut answers = client.stream_append(input, option).await.expect("open");
-    let answer = tokio::time::timeout(Duration::from_secs(5), answers.next())
-        .await
-        .expect("the wait for the answer ends");
-    assert!(
-        matches!(answer, Some(Err(RPCError::Timeout(_)))),
-        "{answer:?}"
-    );
-    drop(answers);
-    serving.abort();
 }
 
 /// An answered stream left idle past the soft TTL is not timed out, and
@@ -1222,7 +906,7 @@ async fn a_stream_whose_peer_withholds_an_answer_times_out() {
 async fn a_stream_idle_past_the_soft_ttl_carries_the_next_append() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let mut client = client_to(&peers, node.id, addr).await;
     let option = RPCOption::new(Duration::from_millis(200));
     let soft_ttl = option.soft_ttl();

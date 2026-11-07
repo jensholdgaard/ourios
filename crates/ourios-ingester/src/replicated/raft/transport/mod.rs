@@ -28,6 +28,7 @@
 //! host its address names.
 
 mod client;
+mod links;
 mod server;
 mod trace;
 pub mod wire;

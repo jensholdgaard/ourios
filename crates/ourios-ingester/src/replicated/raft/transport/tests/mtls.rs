@@ -2,7 +2,6 @@
 //! caller or a server without a certificate the peer CA signed is
 //! refused.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,13 +16,15 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsage
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
+use super::super::super::cluster::Serving;
+use super::super::super::state_machine::GroupSm;
 use super::super::super::types::{NodeId, Vote};
-use super::super::super::vote_log;
 use super::super::{Peers, ReplicationServer};
-use super::{MemSm, Node, Replica, bind, client_to, leader, option, vote_request, write};
+use super::{
+    GROUP, Node, Replica, bind, client_to, leader, listeners, option, vote_request, write,
+};
 
 /// A certificate authority minted for one test.
 struct Ca {
@@ -71,10 +72,10 @@ impl Ca {
 }
 
 fn serve_tls(
-    server: ReplicationServer<MemSm>,
+    server: ReplicationServer<GroupSm>,
     incoming: TcpIncoming,
     settings: &TlsSettings,
-) -> (oneshot::Sender<()>, JoinHandle<()>) {
+) -> Serving {
     let acceptor = reloading_acceptor(settings, ALPN_GRPC, LISTENER_GRPC).expect("acceptor");
     let (stop, stopped) = oneshot::channel::<()>();
     let serving = tokio::spawn(async move {
@@ -89,14 +90,8 @@ fn serve_tls(
     (stop, serving)
 }
 
-async fn start_tls(n: u64, incoming: TcpIncoming, settings: &TlsSettings) -> Node {
-    let dir = tempfile::tempdir().expect("tempdir");
-    vote_log::create(dir.path()).expect("vote log");
-    let replica = Replica {
-        id: NodeId::from(n),
-        dir,
-    };
-    let peers = Peers::mutual_tls(settings).expect("peers");
+async fn start_tls(n: u64, incoming: TcpIncoming, settings: &TlsSettings, peers: Peers) -> Node {
+    let replica = Replica::new(n, &[GROUP]);
     let server = ReplicationServer::default();
     Node::open_on(replica, &peers, server, |server| {
         serve_tls(server, incoming, settings)
@@ -108,21 +103,32 @@ async fn start_tls(n: u64, incoming: TcpIncoming, settings: &TlsSettings) -> Nod
 async fn two_nodes_replicate_over_mutual_tls() {
     let ca = Ca::new();
     let certs = TempDir::new().expect("tempdir");
-    let mut members = BTreeMap::new();
+    let (listeners, members, addresses) = listeners(2);
     let mut nodes = Vec::new();
-    for n in 1..=2 {
-        let (incoming, addr) = bind();
-        members.insert(NodeId::from(n), addr.to_string());
+    for (n, incoming) in listeners {
         let settings = ca.node(certs.path(), &format!("node-{n}"));
-        nodes.push(start_tls(n, incoming, &settings).await);
+        let peers = Peers::mutual_tls(&settings).expect("peers");
+        nodes.push(
+            start_tls(
+                n,
+                incoming,
+                &settings,
+                peers.with_addresses(addresses.clone()),
+            )
+            .await,
+        );
     }
-    nodes[0].raft.initialize(members).await.expect("initialize");
+    nodes[0]
+        .raft(GROUP)
+        .initialize(members)
+        .await
+        .expect("initialize");
 
-    let first = leader(&nodes.iter().collect::<Vec<_>>(), None).await;
+    let first = leader(GROUP, &nodes.iter().collect::<Vec<_>>(), None).await;
     let at = nodes.iter().position(|n| n.id == first).expect("leader");
-    let index = write(&nodes[at].raft, 1).await;
+    let index = write(nodes[at].raft(GROUP), 1).await;
     for node in &nodes {
-        node.applied_through(index).await;
+        node.applied_through(GROUP, index).await;
     }
     for node in &mut nodes {
         node.kill().await;
@@ -147,8 +153,9 @@ fn anonymous(ca: &Ca) -> rustls::ClientConfig {
 /// keeps its vote, and a caller with `trusted` is then granted one.
 async fn refused_then_granted(server: &TlsSettings, refused: &Peers, trusted: &Peers) {
     let (incoming, addr) = bind();
-    let mut node = start_tls(1, incoming, server).await;
-    let vote_before = node.raft.metrics().borrow_watched().vote;
+    let peers = Peers::mutual_tls(server).expect("peers");
+    let mut node = start_tls(1, incoming, server, peers).await;
+    let vote_before = node.raft(GROUP).metrics().borrow_watched().vote;
     let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
 
     let mut stranger = client_to(refused, node.id, addr).await;
@@ -159,7 +166,10 @@ async fn refused_then_granted(server: &TlsSettings, refused: &Peers, trusted: &P
         matches!(result, Err(RPCError::Unreachable(_) | RPCError::Network(_))),
         "{result:?}"
     );
-    assert_eq!(node.raft.metrics().borrow_watched().vote, vote_before);
+    assert_eq!(
+        node.raft(GROUP).metrics().borrow_watched().vote,
+        vote_before
+    );
 
     let mut peer = client_to(trusted, node.id, addr).await;
     let granted = peer.vote(higher, option()).await.expect("vote");

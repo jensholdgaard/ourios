@@ -348,7 +348,7 @@ impl GroupLog {
         Self::open_with(wal, group, votes, Arc::default())
     }
 
-    fn open_with(
+    pub(super) fn open_with(
         wal: WalConfig,
         group: u32,
         votes: VoteLog,
@@ -633,7 +633,7 @@ impl Writer {
 }
 
 #[cfg(test)]
-mod test_hooks {
+pub(super) mod test_hooks {
     use std::thread::JoinHandle;
 
     use super::*;

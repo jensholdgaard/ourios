@@ -861,6 +861,16 @@ the mass-failover time and vote-log batching as tuning signals.
 >   pre-request row a flusher publishes after the confirming pass is
 >   RFC 0009 D3's residual, pinned by RFC0009.22, not this scenario)
 
+> **Scenario RFC0065.29 — a log entry a replica cannot read stops it (B11)**
+> - **Given** a group WAL holding a flusher assignment, then a control
+>   entry of a kind the replica does not know, or a flusher assignment
+>   whose body is shorter or longer than 16 bytes
+> - **When** the replica opens the group's log
+> - **Then** it reads the first assignment's UUID, and it refuses to
+>   open the log at the unreadable entry rather than skip it; and a
+>   leader whose members have not all reported reading a kind does not
+>   append one
+
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
@@ -1176,13 +1186,13 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   version the tenant's audit trail holds, and its next widen of that
   template takes the version above it, so no `(template_id,
   template_version)` key ever names two token sequences.
-- **Control entries.** The flusher assignment, and the checkpoint,
-  id-block and miner-configuration entries below, are log entries the
-  leader appends beside the tenant batches, so every replica applies
-  them at the same position. In the group WAL each is a `ReplicatedEntry`
-  record with its own tag, `0x04`, followed by the entry's `term` and
-  `index` as every entry is, a one-byte `kind`, and that kind's body;
-  integers are little-endian, as everywhere in RFC 0008.
+- **Control entries.** The flusher assignment, the checkpoint, id-block
+  and miner-configuration entries below, and §6.7's published and
+  erasure entries are log entries the leader appends beside the tenant
+  batches, so every replica applies them at the same position. In the
+  group WAL each is a `ReplicatedEntry` record with its own tag, `0x04`,
+  followed by `term: u64_le | index: u64_le` as every entry is, a
+  one-byte `kind`, and that kind's body.
 
   | `kind` | Entry | Body |
   |---|---|---|
@@ -1190,12 +1200,18 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   | `0x02` | Checkpoint | reserved |
   | `0x03` | Id-block reservation | reserved |
   | `0x04` | Miner configuration | reserved |
+  | `0x05` | Published (§6.7) | reserved |
+  | `0x06` | Erasure (§6.7) | reserved |
 
   A reserved kind's body is fixed by the amendment that implements it.
   A replica that reads a kind it does not know, or a body of the wrong
   length, refuses to open the group's log rather than skip the entry:
-  mining and flushing depend on applying every control entry in order,
-  so a rolling upgrade finishes before any leader appends a new kind.
+  mining and flushing depend on applying every control entry in order.
+  So a leader appends a kind only once every member of the group,
+  voters and learners, has answered its `Identify` call (§6.8) with a
+  highest readable kind at or above it; a rolling upgrade therefore
+  holds new kinds back until it has reached every member, with no
+  setting to change.
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
   when the flusher reports its remaining ids. A miner that exhausts them
@@ -1706,6 +1722,9 @@ from rows.
   toolchain for a single-maintainer project would cost more than it
   finds. With the §6 fallback, a model of the whole protocol, checked
   in CI to a bounded depth, since nothing upstream covers it.
+- RFC0065.29: codec and open tests in `ourios-wal` and the group log
+  beside the existing record codec tests, and the leader's kind gate on
+  the in-process cluster.
 - RFC0065.16: the existing suites, unchanged.
 - RFC0065.17: `deploy/helm/render-tests.sh`.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process

@@ -17,7 +17,7 @@ use openraft::async_runtime::WatchReceiver as _;
 
 use super::host::GroupRaft;
 use super::transport::{Identity, Peers};
-use super::types::NodeId;
+use super::types::{Membership, NodeId};
 use crate::replicated::placement::place;
 
 /// The tail pool: its members' `node_id`s and the learners per group.
@@ -116,7 +116,10 @@ fn removals(
 
 /// One pass for `group` on this node: if it leads the group, identify the
 /// placed tail peers and commit the changes [`plan`] gives, adding before
-/// removing. A node that does not lead the group changes nothing.
+/// removing. It plans from the committed membership only, and changes
+/// nothing while a membership change is in flight, while the membership
+/// is joint, or on a node that does not lead the group; a later pass
+/// picks up from there.
 ///
 /// # Errors
 ///
@@ -153,13 +156,28 @@ pub async fn reconcile(
     Ok(changes)
 }
 
-/// The group's membership, if this node leads it.
+/// The group's committed membership, if this node leads it and no change
+/// to it is in flight: one still uncommitted would be planned against as
+/// if it had been.
 fn led_members(raft: &GroupRaft) -> Option<Members> {
     let metrics = raft.metrics().borrow_watched().clone();
     if metrics.current_leader != Some(metrics.id) {
         return None;
     }
-    let membership = metrics.membership_config.membership();
+    let committed = &metrics.committed_membership_config;
+    if committed.log_id() != metrics.membership_config.log_id() {
+        return None;
+    }
+    stable(committed.membership())
+}
+
+/// The members of `membership`, unless it is joint: a learner edit there
+/// would collapse the voters to one configuration and move the write
+/// quorum, so the pass waits for the joint change to finish.
+fn stable(membership: &Membership) -> Option<Members> {
+    if membership.get_joint_config().len() != 1 {
+        return None;
+    }
     let voters: BTreeSet<_> = membership.voter_ids().collect();
     let learners = membership
         .non_write_voter_ids()

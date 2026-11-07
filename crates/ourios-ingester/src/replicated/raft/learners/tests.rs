@@ -9,7 +9,7 @@ use openraft::async_runtime::WatchReceiver as _;
 use super::{Changes, Members, TailPool, plan, reconcile};
 use crate::replicated::raft::cluster::{Cluster, WAIT, name, write};
 use crate::replicated::raft::transport::Identity;
-use crate::replicated::raft::types::NodeId;
+use crate::replicated::raft::types::{Membership, NodeId};
 
 const PATIENCE: Duration = Duration::from_secs(2);
 
@@ -111,6 +111,36 @@ fn a_voter_or_a_peer_that_cannot_read_the_log_is_not_added() {
         1,
     );
     assert_eq!(planned, changes(&[(12, "t2")], &[]));
+}
+
+/// A joint membership is never edited: a learner change there would
+/// collapse the voters to one configuration, so neither an addition nor a
+/// removal is planned until the joint change finishes. A uniform one is.
+#[test]
+fn a_joint_membership_is_left_alone() {
+    let nodes = |ids: &[u64]| {
+        ids.iter()
+            .map(|&n| (id(n), format!("n{n}")))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let set = |ids: &[u64]| ids.iter().map(|&n| id(n)).collect::<BTreeSet<_>>();
+    let joint = Membership::new(
+        vec![set(&[1, 2, 3]), set(&[1, 2, 4])],
+        nodes(&[1, 2, 3, 4, 11]),
+    )
+    .expect("joint membership");
+    assert!(
+        super::stable(&joint).is_none(),
+        "a joint membership is not planned"
+    );
+    let uniform =
+        Membership::new(vec![set(&[1, 2, 3])], nodes(&[1, 2, 3, 11])).expect("uniform membership");
+    let members = super::stable(&uniform).expect("a uniform membership is planned");
+    assert_eq!(members.voters, set(&[1, 2, 3]));
+    assert_eq!(
+        members.learners,
+        BTreeMap::from([(id(11), "n11".to_owned())])
+    );
 }
 
 /// The leader of group 0, once it has committed an entry of its term.

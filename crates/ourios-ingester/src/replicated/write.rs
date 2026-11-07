@@ -30,8 +30,8 @@ pub struct GroupPosition {
 
 type ClientWriteFailure = RaftError<RaftTypes, ClientWriteError<RaftTypes>>;
 
-/// Why an export was not committed. Every one is the retryable rejection
-/// and none is acknowledged.
+/// Why an export was not committed; none is acknowledged. `TooLarge` is
+/// the permanent size rejection, every other one the retryable rejection.
 #[derive(Debug)]
 pub enum WriteError {
     /// `client_write` did not return within [`COMMIT_TIMEOUT`]. The entry

@@ -52,8 +52,9 @@ impl ReplicatedIngest {
     /// # Errors
     ///
     /// [`ReceiveError::TenantDenied`] before any write;
-    /// [`ReceiveError::Replication`], counted on `ourios.ingest.batches`
-    /// under its `error.type`, when the group did not commit it.
+    /// [`ReceiveError::Replication`] when the group did not commit it,
+    /// counted on `ourios.ingest.batches` under its `error.type`; a size
+    /// rejection is counted by the transport, from its response.
     pub async fn ingest(&self, export: Export<'_>) -> Result<Ingested, ReceiveError> {
         let Export {
             request,

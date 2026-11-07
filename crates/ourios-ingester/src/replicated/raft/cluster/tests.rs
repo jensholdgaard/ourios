@@ -24,6 +24,26 @@ async fn commit(cluster: &Cluster, i: usize, ns: std::ops::Range<u64>) -> u64 {
     last
 }
 
+/// Node `i`'s log once it equals node `j`'s: an election after the last
+/// write can append a blank entry to one before the other.
+async fn converged(cluster: &Cluster, i: usize, j: usize) -> Vec<Entry> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (log, other) = (
+            cluster.node(i).log(GROUP).await,
+            cluster.node(j).log(GROUP).await,
+        );
+        if log == other {
+            return log;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {i}'s log never matched node {j}'s:\n{log:?}\n{other:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Cut node `i` off from `others`, have it append an entry it cannot
 /// commit, and return that entry and the write's task.
 async fn strand(
@@ -99,8 +119,7 @@ async fn rfc0065_7_a_diverged_follower_is_repaired() {
         cluster.heal(old, i);
     }
     cluster.node(old).applied_through(GROUP, last).await;
-    let repaired = cluster.node(old).log(GROUP).await;
-    assert_eq!(repaired, cluster.node(new).log(GROUP).await);
+    let repaired = converged(&cluster, old, new).await;
     assert!(
         !repaired.contains(&diverged),
         "the uncommitted entry is gone"
@@ -135,10 +154,7 @@ async fn a_crashed_follower_restarts_from_its_fsynced_log_and_catches_up() {
 
     cluster.restart(follower).await;
     cluster.node(follower).applied_through(GROUP, last).await;
-    assert_eq!(
-        cluster.node(follower).log(GROUP).await,
-        cluster.node(leader).log(GROUP).await
-    );
+    converged(&cluster, follower, leader).await;
     cluster.shutdown().await;
 }
 

@@ -79,6 +79,13 @@ pub(super) fn decode(payload: &[u8]) -> io::Result<Replayed> {
                     EntryPayload::Normal(TenantBatchBytes::new(bytes.to_vec()).map_err(invalid)?)
                 }
                 EntryBody::Membership(bytes) => EntryPayload::Membership(decode_membership(bytes)?),
+                // Not applied yet (RFC 0065 §6.5): refuse the log rather
+                // than skip an entry that mining will depend on.
+                EntryBody::Control(control) => {
+                    return Err(invalid(format!(
+                        "a control entry this replica does not apply yet: {control:?}"
+                    )));
+                }
             };
             let log_id = raft_id(log_id);
             Ok(Replayed::Entry(Entry { log_id, payload }))

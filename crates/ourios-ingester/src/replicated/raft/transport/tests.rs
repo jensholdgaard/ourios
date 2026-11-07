@@ -28,7 +28,10 @@ use super::wire::{
     AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, StreamAppendResponse, WireLogId,
     WireVote,
 };
-use super::{APPEND, PeerClient, Peers, ReplicationServer, STREAM_APPEND, VERSION};
+use super::{
+    APPEND, ForwardRequest, ForwardTarget, Forwarded, PeerClient, Peers, ReplicationServer,
+    STREAM_APPEND, VERSION,
+};
 
 mod mtls;
 mod pipelining;
@@ -933,4 +936,47 @@ async fn a_stream_idle_past_the_soft_ttl_carries_the_next_append() {
     );
     drop(answers);
     node.kill().await;
+}
+
+/// A node whose forwarded exports never commit.
+struct Hanging;
+
+impl ForwardTarget for Hanging {
+    fn commit(
+        &self,
+        _: Forwarded,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, super::Refusal>> + Send>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// A forward's client span records the call's own status, not the
+/// outcome the sender reads it as: a refused version is
+/// `FAILED_PRECONDITION`, not "not hosted", and a call that outlives its
+/// deadline is `DEADLINE_EXCEEDED`.
+#[tokio::test]
+async fn a_forward_span_records_the_calls_own_status() {
+    let (exporter, tracing, _guard) = capture();
+    let server = ReplicationServer::<GroupSm>::traced_by(tracing.clone());
+    server.serve_forwards(Arc::new(Hanging));
+    let (incoming, addr) = bind();
+    let (_stop, _serving) = serve(server, incoming);
+    let peers = Peers::traced_by(tracing).with_addresses([("n1".to_owned(), addr.to_string())]);
+    let request = |version| ForwardRequest {
+        version,
+        group: GROUP,
+        payload: TenantBatch::encode("acme", b"record").expect("batch"),
+        credential: None,
+    };
+    let commit = Duration::from_millis(100);
+    peers.forward("n1", request(VERSION + 1), commit).await;
+    peers.forward("n1", request(VERSION), commit).await;
+
+    let codes: Vec<_> = peer_spans(&exporter)
+        .iter()
+        .filter(|span| span.span_kind == SpanKind::Client)
+        .map(|span| attr(span, "rpc.response.status_code"))
+        .collect();
+    let expected = ["FAILED_PRECONDITION", "DEADLINE_EXCEEDED"].map(|c| Some(c.to_owned()));
+    assert_eq!(codes, expected);
 }

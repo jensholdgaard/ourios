@@ -21,7 +21,7 @@ use tonic::transport::server::TcpIncoming;
 use super::super::super::cluster::Serving;
 use super::super::super::state_machine::GroupSm;
 use super::super::super::types::{NodeId, Vote};
-use super::super::{Peers, ReplicationServer};
+use super::super::{ForwardRequest, Outcome, Peers, ReplicationServer};
 use super::{
     GROUP, Node, Replica, bind, client_to, leader, listeners, option, vote_request, write,
 };
@@ -262,4 +262,90 @@ async fn a_peer_that_never_answers_the_handshake_is_unreachable() {
         started.elapsed()
     );
     holding.abort();
+}
+
+/// A forward whose connection fails the caller's own handshake was never
+/// sent: a server certificate from another CA, or a peer that never
+/// answers the handshake within the connect timeout.
+#[tokio::test]
+async fn a_forward_that_fails_the_handshake_was_never_sent() {
+    let (ca, other) = (Ca::new(), Ca::new());
+    let certs = TempDir::new().expect("tempdir");
+    let caller = ca.node(certs.path(), "caller");
+    let server = TlsSettings {
+        client_ca_file: caller.client_ca_file.clone(),
+        ..other.node(certs.path(), "server")
+    };
+    let (incoming, addr) = bind();
+    let peers = Peers::mutual_tls(&server).expect("peers");
+    let mut node = start_tls(1, incoming, &server, peers).await;
+    let request = || ForwardRequest {
+        version: super::super::VERSION,
+        group: GROUP,
+        payload: ourios_wal::TenantBatch::encode("acme", b"record").expect("batch"),
+        credential: None,
+    };
+    let commit = Duration::from_millis(200);
+    let caller = Peers::mutual_tls(&caller).expect("peers");
+    let rogue = caller
+        .clone()
+        .with_addresses([("n1".to_owned(), addr.to_string())]);
+    let refused = rogue.forward("n1", request(), commit).await;
+    assert!(matches!(refused, Outcome::Unreached(_)), "{refused:?}");
+    node.kill().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let silent = listener.local_addr().expect("addr");
+    let holding = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let waiting = caller.with_addresses([("n2".to_owned(), silent.to_string())]);
+    let started = tokio::time::Instant::now();
+    let unanswered = waiting.forward("n2", request(), commit).await;
+    assert!(
+        matches!(unanswered, Outcome::Unreached(_)),
+        "{unanswered:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    holding.abort();
+}
+
+/// A forward whose caller certificate the server refuses is uncertain, not
+/// never sent: the refusal comes as an alert after the caller's side of
+/// the handshake has finished, by when the request may have been written.
+/// Reading it as never sent would let the sender resubmit an export that
+/// might have committed.
+#[tokio::test]
+async fn a_forward_whose_caller_certificate_is_refused_is_uncertain() {
+    let (ca, other) = (Ca::new(), Ca::new());
+    let certs = TempDir::new().expect("tempdir");
+    let server = ca.node(certs.path(), "server");
+    let (incoming, addr) = bind();
+    let peers = Peers::mutual_tls(&server).expect("peers");
+    let mut node = start_tls(1, incoming, &server, peers).await;
+    let rogue = TlsSettings {
+        client_ca_file: server.client_ca_file.clone(),
+        ..other.node(certs.path(), "rogue")
+    };
+    let rogue = Peers::mutual_tls(&rogue)
+        .expect("peers")
+        .with_addresses([("n1".to_owned(), addr.to_string())]);
+    let request = ForwardRequest {
+        version: super::super::VERSION,
+        group: GROUP,
+        payload: ourios_wal::TenantBatch::encode("acme", b"record").expect("batch"),
+        credential: None,
+    };
+    let outcome = rogue
+        .forward("n1", request, Duration::from_millis(200))
+        .await;
+    assert!(matches!(outcome, Outcome::Uncertain(_)), "{outcome:?}");
+    node.kill().await;
 }

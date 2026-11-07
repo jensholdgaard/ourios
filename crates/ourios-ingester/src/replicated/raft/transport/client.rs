@@ -4,13 +4,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt as _};
-use hyper_util::rt::TokioIo;
 use openraft::OptionalSend;
 use openraft::base::{BoxFuture, BoxStream};
 use openraft::errors::{
@@ -23,12 +20,8 @@ use openraft::raft::{
 };
 use openraft::type_config::alias::SnapshotOf;
 use ourios_serving::tls::TlsSettings;
-use rustls::pki_types::ServerName;
-use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
-use tokio_rustls::client::TlsStream;
-use tonic::codegen::http::Uri;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status, Streaming};
@@ -36,6 +29,10 @@ use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
 
 use super::super::types::{NodeId, RaftTypes, Vote};
+#[cfg(test)]
+use super::connect::PlainConnector;
+use super::connect::TlsConnector;
+use super::forward;
 use super::links::{Link, Links};
 use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing};
 use super::wire::{
@@ -49,7 +46,7 @@ type RpcError = RPCError<RaftTypes>;
 /// How long a channel waits to connect, TLS handshake included: an RPC's
 /// own timeout does not end the channel's connection attempt, so a peer
 /// that accepts TCP and never answers the handshake would stall it.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How a pool's channels reach their peers.
 #[derive(Clone)]
@@ -133,6 +130,27 @@ impl Peers {
         }
     }
 
+    /// Forward `request` to the node named `node_id` (RFC 0065 §6.8), whose
+    /// answer must come within `commit_timeout` plus the connect timeout
+    /// once the call is sent.
+    pub async fn forward(
+        &self,
+        node_id: &str,
+        request: forward::ForwardRequest,
+        commit_timeout: Duration,
+    ) -> forward::Outcome {
+        let (addr, channel) = self.resolve(node_id);
+        let channel = match channel {
+            Ok(channel) => channel,
+            Err(e) => return forward::Outcome::Unreached(e.to_string()),
+        };
+        let deadlines = forward::Deadlines {
+            connect: CONNECT_TIMEOUT,
+            commit: commit_timeout,
+        };
+        forward::traced_call(channel, (&addr, self.tracing.clone()), request, deadlines).await
+    }
+
     /// The address `node_id` is reached at, and its channel: a peer
     /// with no configured address cannot be reached.
     fn resolve(&self, node_id: &str) -> (String, Result<Channel, Unreachable<RaftTypes>>) {
@@ -158,57 +176,13 @@ impl Peers {
             Endpoint::from_shared(format!("http://{addr}"))?.connect_timeout(CONNECT_TIMEOUT);
         let channel = match &self.security {
             #[cfg(test)]
-            Security::Plaintext => endpoint.connect_lazy(),
+            Security::Plaintext => endpoint.connect_with_connector_lazy(PlainConnector),
             Security::MutualTls(connector) => {
                 endpoint.connect_with_connector_lazy(connector.clone())
             }
         };
         channels.insert(addr.to_owned(), channel.clone());
         Ok(channel)
-    }
-}
-
-/// Connects a channel to its peer over TLS, verifying the peer's
-/// certificate for the host the channel's address names.
-#[derive(Clone)]
-struct TlsConnector(tokio_rustls::TlsConnector);
-
-type Connecting = Pin<Box<dyn Future<Output = io::Result<TokioIo<TlsStream<TcpStream>>>> + Send>>;
-
-impl tower::Service<Uri> for TlsConnector {
-    type Response = TokioIo<TlsStream<TcpStream>>;
-    type Error = io::Error;
-    type Future = Connecting;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: Uri) -> Connecting {
-        let connector = self.0.clone();
-        Box::pin(async move {
-            let (host, port) = host_and_port(&uri)?;
-            let name = ServerName::try_from(host.clone())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let tcp = TcpStream::connect((host.as_str(), port)).await?;
-            tcp.set_nodelay(true)?;
-            Ok(TokioIo::new(connector.connect(name, tcp).await?))
-        })
-    }
-}
-
-/// The host, without an IPv6 literal's brackets, and the port of a
-/// peer's `host:port` address.
-fn host_and_port(uri: &Uri) -> io::Result<(String, u16)> {
-    let host = uri
-        .host()
-        .map(|host| host.trim_start_matches('[').trim_end_matches(']'));
-    match (host, uri.port_u16()) {
-        (Some(host), Some(port)) => Ok((host.to_owned(), port)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("the peer address {uri} is not host:port"),
-        )),
     }
 }
 

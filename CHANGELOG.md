@@ -2,6 +2,98 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.17.0] - 2026-11-07
+
+### Breaking (summary)
+
+- **OTLP request-size limit (RFC 0061, #1154).** An oversize OTLP/gRPC
+  Export, over the request limit or over the WAL frame, now fails with
+  `RESOURCE_EXHAUSTED`. Before, it failed with `INVALID_ARGUMENT`, or
+  with tonic's retryable `OUT_OF_RANGE` for frames over 4 MiB. The
+  gRPC and HTTP limits rise to 16 773 120 bytes (16 MiB less 4 KiB),
+  from tonic's 4 MiB default on gRPC. `receiver.max_request_bytes`
+  lowers either.
+- **Attribute paths into map values (query grammar v2.0, RFC 0062,
+  #1155).** `attr.user.id == "u7"` now also matches a record whose
+  `user` attribute is the map `{id: "u7"}`. A saved query can lose rows
+  in three cases:
+  - a comparison that matched only through a pair nested in another
+    attribute's map (already removed by #1137);
+  - a negated comparison, such as `not (attr.user.id == "u7")`, on a
+    record that holds the value only inside a map;
+  - a query with `limit` whose new map matches displace rows it
+    returned before.
+
+### Upgrade notes
+
+- **OTLP clients:** an oversize Export now gets `RESOURCE_EXHAUSTED`.
+  The Collector's OTLP exporter retries that only when the response
+  carries `RetryInfo`, so an oversize batch is now dropped where an
+  `OUT_OF_RANGE` one was retried. Keep batches under the limit, for
+  example with the batch processor's `send_batch_max_size`. Set
+  `receiver.max_request_bytes` to keep a lower ceiling.
+- **Saved queries and dashboards:** re-check those that compare a
+  dotted attribute path, especially negated ones and ones with `limit`.
+- **Replicated WAL (RFC 0065):** the storage, peer transport, mTLS and
+  group host are in this release but not usable yet. A receiver with
+  `receiver.wal.backend: replicated` validates its layout, then refuses
+  to start. Keep `local`.
+
+### Added
+
+- Rfc 0065 group host and cluster harness (#1177) (ef8a8ab)
+- Rfc 0065 peer mtls for the raft transport (#1174) (78f848e)
+- Rfc 0065 pipelined stream_append for the peer transport (#1169) (e3536e6)
+- Rfc 0065 raft peer transport over grpc (#1167) (59ef3ec)
+- Rfc 0065 raft log storage over the rfc 0008 wal (#1162) (15372fa)
+- Rfc 0065 recorded voting layout and replica identity (#1161) (c47658b)
+- Rfc 0065 wal config section and placement hashes (#1159) (fbf7706)
+- **BREAKING** Resolve a dotted attribute key into map values (#1155) (d80918c)
+- **BREAKING** Configurable otlp request-size limit (rfc 0061) (#1154) (94a70f0)
+- Configurable receiver flush age (rfc 0063) (#1145) (3152c06)
+
+### CI
+
+- Free runner disk before the clusterfuzzlite builds (#1156) (eb832d5)
+
+### Chore
+
+- Pin ourios-semconv v0.3.25 for the wal tail truncation names (#1179) (ab524db)
+- Accept the astral-tokio-tar unmaintained advisory (#1173) (4e237fc)
+- Update arrow + parquet to v59.3.2 (#1148) (e286442)
+- Update taiki-e/install-action digest to 1919c4a (#1147) (fb88fb6)
+
+### Documentation
+
+- Record an installed snapshot before its purge (#1180) (a192a4e)
+- State the openraft write path and forward (#1176) (aeafd09)
+- Describe stream_append in the peer protocol (#1172) (35e9910)
+- Draft wal recovery from a zero-filled tail (amends rfc 0008) (#1166) (b14fbdf)
+- List openraft's peer calls in the peer protocol (#1168) (3fa561f)
+- Name the openraft main api the storage uses (#1164) (d807617)
+- Move the peer port off the querier's 4319, state the list format (#1160) (e134eb3)
+- Fix the byte encoding of the rendezvous placement score (#1158) (e373c16)
+- Meta, broker-replicated acks under wal-before-ack (drafted) (#1150) (38fec93)
+- Enact rfc 0064 in agents.md and hazards (#1149) (0209ea6)
+- Draft the otlp request-size limit (amends rfc 0018 §3.2) (#1135) (d39fa9e)
+- Attribute paths into map values (#1138) (f993785)
+- Replicated wal with a queryable tail (#1146) (cbd2084)
+- Use a quick-start query the querier accepts (#1140) (1820c56)
+- Rfc 0063 configurable receiver flush age (specified) (#1143) (45d3088)
+
+### Fixed
+
+- Name the aggregate in its promotion hint (#1178) (fdc3199)
+- Attribute == and != match the top-level key only (#1137) (8cd141b)
+- Render the global extraEnv on its own line (#1139) (6f5797c)
+
+### Tests
+
+- Red, the §5 stubs land, status specified→red (#1153) (3c5a602)
+- Red, the §5 stubs land, status drafted→red (#1152) (4309b89)
+- Red, the §5 stubs land, status drafted→red (#1151) (0505601)
+- Red, the §5 stubs land, status specified→red (#1144) (706ecc3)
+
 ## [0.16.2] - 2026-10-30
 
 ### Security

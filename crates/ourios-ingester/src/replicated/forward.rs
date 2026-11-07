@@ -4,9 +4,12 @@
 //! forwarded on: a node that does not lead the group says so, with the
 //! leader it knows of.
 //!
-//! The node that decides an outcome counts it on `ourios.ingest.batches`,
-//! as a direct export's would be, so a forwarded export's rejection is
-//! counted here and not again by its sender.
+//! Counting on `ourios.ingest.batches`: a rejection before appending is
+//! decided here, so it is counted here and passed back for the sender to
+//! return uncounted. A commit that failed after the entry may have been
+//! appended is not counted here. Its sender cannot tell that answer from a
+//! lost one, so the sender counts every forward that ends without a
+//! committed position, as `group_unavailable` (§6.3).
 
 use std::sync::Arc;
 
@@ -110,12 +113,7 @@ impl Inner {
                 ERROR_TYPE_REQUEST_TOO_LARGE,
                 e.to_string(),
             )),
-            Err(e) => {
-                self.admission
-                    .metrics()
-                    .record_rejected_batch(e.error_type());
-                Err(Refusal::Failed(e.to_string()))
-            }
+            Err(e) => Err(Refusal::Failed(e.to_string())),
         }
     }
 

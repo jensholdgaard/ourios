@@ -3,6 +3,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ourios_serving::AuthResolver;
 
@@ -169,5 +170,62 @@ async fn a_forward_to_the_leader_commits_and_one_to_a_follower_names_it() {
         .await;
     let hint = Some(name(cluster.id(leader)));
     assert_eq!(at_follower, Outcome::NotLeader { leader: hint });
+    cluster.shutdown().await;
+}
+
+/// A commit that may have happened stays uncertain. With both followers'
+/// fsyncs held, the leader stays leader but its commit times out after
+/// appending, which it answers as failed, and the sender reads that over
+/// the wire as uncertain, never as a refusal it could retry and append
+/// twice. A commit to a stopped group fails the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_that_may_have_happened_stays_uncertain() {
+    let mut cluster = Cluster::start(3, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let impatient = || {
+        let writer = GroupWriter::new(layout(&cluster, 1), &cluster.node(leader).host)
+            .with_timeout(Duration::from_millis(300));
+        LeaderTarget::new(writer, resolver(&["acme"]))
+    };
+    let (direct, served, stopped) = (impatient(), impatient(), impatient());
+    cluster
+        .node(leader)
+        .host
+        .server()
+        .serve_forwards(Arc::new(served));
+    let followers: Vec<_> = (0..3).filter(|&i| i != leader).collect();
+    for &follower in &followers {
+        cluster.node(follower).gate.close();
+    }
+
+    let failed = direct.commit(export("acme", Some("Bearer tok-edge"))).await;
+    assert!(matches!(failed, Err(Refusal::Failed(_))), "{failed:?}");
+    let request = ForwardRequest {
+        version: VERSION,
+        group: 0,
+        payload: payload("acme", 8),
+        credential: Some("Bearer tok-edge".to_owned()),
+    };
+    let leader_name = name(cluster.id(leader));
+    let over_the_wire = cluster
+        .peers()
+        .forward(&leader_name, request, Duration::from_millis(300))
+        .await;
+    assert!(
+        matches!(over_the_wire, Outcome::Uncertain(_)),
+        "{over_the_wire:?}"
+    );
+
+    for &follower in &followers {
+        cluster.node(follower).gate.open();
+    }
+    cluster.kill(leader).await;
+    let after_stop = stopped
+        .commit(export("acme", Some("Bearer tok-edge")))
+        .await;
+    assert!(
+        matches!(after_stop, Err(Refusal::Failed(_))),
+        "{after_stop:?}"
+    );
     cluster.shutdown().await;
 }

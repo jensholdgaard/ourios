@@ -86,12 +86,14 @@ impl Router {
     }
 
     /// The next node to try: a named leader not tried yet, else the first
-    /// voter in placement order not tried yet; never this node.
+    /// voter in placement order not tried yet; never this node. A named
+    /// leader that is not one of the group's voters is passed over, so a
+    /// stale or foreign hint cannot use up a try a voter needs.
     fn next(&self, named: Option<String>, voters: &[&str], tried: &[String]) -> Option<String> {
         let fresh =
             |candidate: &str| candidate != self.node && !tried.iter().any(|t| t == candidate);
         named
-            .filter(|leader| fresh(leader))
+            .filter(|leader| voters.contains(&leader.as_str()) && fresh(leader))
             .or_else(|| voters.iter().find(|v| fresh(v)).map(|v| (*v).to_owned()))
     }
 }

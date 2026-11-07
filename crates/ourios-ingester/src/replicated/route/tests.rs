@@ -206,3 +206,25 @@ async fn an_uncertain_forward_is_not_sent_again() {
     }
     cluster.shutdown().await;
 }
+
+/// A hint naming a node outside the group's voters is passed over, so it
+/// cannot take a try a voter needs: the first try goes to the first voter
+/// in placement order, and every voter is still tried.
+#[test]
+fn a_hint_outside_the_groups_voters_is_passed_over() {
+    let layout = VotingLayout::new(["a", "b", "c"], NonZeroU32::new(1).expect("one"), 3);
+    let voters = layout.voters(0);
+    let router = Router::new(
+        crate::replicated::raft::transport::Peers::plaintext(),
+        layout.clone(),
+        "outside".to_owned(),
+        COMMIT_TIMEOUT,
+    );
+    let first = router.next(Some("ghost".to_owned()), &voters, &[]);
+    assert_eq!(first.as_deref(), Some(voters[0]));
+    let mut tried = Vec::new();
+    while let Some(next) = router.next(Some("ghost".to_owned()), &voters, &tried) {
+        tried.push(next);
+    }
+    assert_eq!(tried, voters, "each voter once, in placement order");
+}

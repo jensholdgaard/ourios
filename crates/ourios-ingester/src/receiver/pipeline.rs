@@ -36,7 +36,7 @@ use crate::receiver::commit::{CommitCoordinator, CommitOutcome};
 
 pub(super) use super::error::IngestFailure;
 pub use super::error::ReceiveError;
-pub(crate) use super::error::SpanError;
+pub(crate) use super::error::{SpanError, span_error};
 pub use super::journal::Journal;
 
 /// The §6.9 rotation-cadence callback: receives the miner as it
@@ -308,12 +308,7 @@ impl IngestPipeline {
     /// - [`ReceiveError::WalAppend`] / [`ReceiveError::WalSync`] if
     ///   persistence fails; the batch is **not** acked.
     pub async fn ingest_bound(&self, export: Export<'_>) -> Result<usize, ReceiveError> {
-        self.ingest_reported(export, |error| {
-            IngestFailure::classify(error)
-                .span_error_type()
-                .map(str::to_owned)
-        })
-        .await
+        self.ingest_reported(export, span_error).await
     }
 
     /// [`Self::ingest_bound`], with the transport saying how a failure
@@ -711,7 +706,7 @@ impl IngestPipeline {
 /// Log records across every `ResourceLogs` and `ScopeLogs` of an export,
 /// counted before the request is consumed so the `ingest logs` span carries
 /// it from its start (RFC 0038 §3.5).
-fn log_record_count(request: &ExportLogsServiceRequest) -> i64 {
+pub(crate) fn log_record_count(request: &ExportLogsServiceRequest) -> i64 {
     span_count(
         request
             .resource_logs

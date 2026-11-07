@@ -870,7 +870,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   open the log at the unreadable entry rather than skip it; a leader
 >   whose members have not all reported reading a kind the log has never
 >   held does not append it, and one whose log already holds a kind
->   appends it with a member lost
+>   appends it with a member lost; a leader holding an uncommitted entry
+>   of a new kind admits no learner until it commits, and a learner it
+>   then admits reads that kind, and one with a membership change in
+>   flight appends no new kind until that change commits
 
 ## 6. Proposed design
 
@@ -1224,7 +1227,14 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   member, with no setting to change. The log's highest kind is the
   highest of the latest checkpoint's recorded value and every kind
   committed after that checkpoint, and the checkpoint body records it,
-  so purging the log below a checkpoint loses none of it.
+  so purging the log below a checkpoint loses none of it. A leader
+  gates on its own log, committed or not: the kinds of its uncommitted
+  entries count too, so a learner it admits reads an entry of a new kind
+  still in flight, and an entry a later leader truncates only ever made
+  the gate stricter. The two changes never overlap: a leader appends a
+  new kind only while no membership change is in flight, asking every
+  member of its latest membership, and changes the membership only
+  once its newest entry of a new kind has committed.
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
   when the flusher reports its remaining ids. A miner that exhausts them

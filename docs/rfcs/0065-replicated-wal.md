@@ -892,7 +892,12 @@ the mass-failover time and vote-log batching as tuning signals.
   current flusher (§6.5) is removed last: when it leaves the set, the
   leader first commits a flusher-assignment entry naming a remaining
   tail replica that has mined through the commit point, and only then
-  removes it, so a group is never without a flusher.
+  removes it, so a group is never without a flusher. A tail node that
+  restarts on an empty or unreadable `wal_root` answers `Identify` under
+  a new UUID with an unchanged `node_id`: the leader adds the new UUID as
+  a learner and removes the learner under the old one, which no node
+  answers for any more, by the same rule, so a membership never holds
+  two learners with one `node_id` for longer than the handoff.
 - **A tenant belongs to one group**:
   `group = xxh3_64(tenant_bytes) mod groups`, where `xxh3_64` is
   XXH3's 64-bit variant with seed 0 and `tenant_bytes` are the tenant
@@ -1536,9 +1541,10 @@ never count toward an ack (learners, under §4.3's shape).
   or a higher vote. The stream ends after a conflict or a higher vote,
   and when the group stops or the server shuts down. `Append`, the unary form,
   carries one append and answers it.
-- Each request names its group, and one connection per peer carries
-  every group's calls; a server answers an unknown group with
-  `NOT_FOUND`.
+- Each request but `Identify` names its group, and one connection per
+  peer carries every group's calls; a server answers an unknown group
+  with `NOT_FOUND`. `Identify` carries only the protocol version, so a
+  node answers it before it hosts any group.
 - **Mutual TLS is required** (RFC 0030's `TlsSection`). A tail replica
   accepts `Tail` and `TailScan` only from a client certificate whose identity (its
   URI or DNS subject alternative name) is listed in `tail_clients`, the

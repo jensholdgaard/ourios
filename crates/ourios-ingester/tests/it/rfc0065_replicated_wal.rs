@@ -466,3 +466,18 @@ fn rfc0065_29_a_kind_not_every_member_reads_is_not_appended() {
          Identify answer; one it holds is appended with a member lost"
     );
 }
+
+/// Scenario RFC0065.30 — the leader names one flusher and keeps it (B11).
+/// Given three tail learners and no assignment, the leader assigns the
+/// first healthy one in placement order, replaces it only once it has been
+/// unhealthy for the patience or has left the placement, and a new leader
+/// keeps it.
+#[test]
+#[ignore = "RFC0065.30 stub — implemented with the leader's flusher assignment"]
+fn rfc0065_30_the_leader_names_one_flusher_and_keeps_it() {
+    todo!(
+        "RFC0065.30 — first healthy in placement order; replaced after the \
+         patience or on leaving the placement, never taken back on recovery; \
+         none appended with none healthy; kept across a failover"
+    );
+}

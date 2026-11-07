@@ -1051,11 +1051,18 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   - A `client_write` that has not returned within the commit timeout
     fails the waiting turns with the retryable rejection (RFC 0053),
     `error.type` `not_enough_replicas`, and nothing is acknowledged.
-    So does one that returns an error, except one saying this node
-    does not lead the group: nothing was appended, and the export is
-    forwarded (§6.8).
-    The entry may still commit later, the uncertain outcome B3
-    accepts. The timeout is an internal
+    Only the timeout counts as `not_enough_replicas`.
+  - An error saying this node does not lead the group means nothing
+    was appended, and the export is forwarded (§6.8), as it is from a
+    node that does not host the group. Every other `client_write`
+    error, such as a stopped group or an entry a leader change
+    discarded after appending, fails the waiting turns with the same
+    retryable rejection, `error.type` `group_unavailable` (§6.9), and
+    nothing is acknowledged. So does a forward that ends without a
+    committed position, except for a rejection the leader gives, which
+    reaches the client unchanged.
+  - After a timeout or an uncertain forward the entry may still commit
+    later, the uncertain outcome B3 accepts. The timeout is an internal
     constant starting at 2 s, not a setting; the rate of these
     rejections is the signal that would move it.
   - `wal_batch_window_ms` is only an upper bound. The group log flushes

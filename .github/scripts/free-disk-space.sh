@@ -16,10 +16,11 @@ df -h /
 # Current images give / far more than the original ~14 GiB, and deleting
 # the SDKs then costs a minute or more of the job for nothing; clean only
 # when the runner is short of room.
-min_free_gib=50
-free_gib="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
-if [ "$free_gib" -ge "$min_free_gib" ]; then
-  echo "${free_gib} GiB free (at least ${min_free_gib}); nothing to remove."
+min_free_bytes=$((50 * 1024 * 1024 * 1024))
+# Bytes, not -BG: df rounds a GiB count up, so 49.5 GiB would read as 50.
+free_bytes="$(df --output=avail -B1 / | tail -1 | tr -dc '0-9')"
+if [ "$free_bytes" -ge "$min_free_bytes" ]; then
+  echo "$((free_bytes / 1024 / 1024 / 1024)) GiB free (at least 50); nothing to remove."
   exit 0
 fi
 

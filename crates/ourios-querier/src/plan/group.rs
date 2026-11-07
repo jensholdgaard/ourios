@@ -58,6 +58,12 @@ pub(super) fn group_by_promoted(
     key: &str,
     schema: &DFSchema,
 ) -> Result<Expr, QueryError> {
+    promoted(column, key, schema, "grouping by")
+}
+
+/// The promoted column for `column`'s `key`, or the promotion hint naming
+/// what the query does with it.
+fn promoted(column: &str, key: &str, schema: &DFSchema, using: &str) -> Result<Expr, QueryError> {
     let name = promoted_column_name(column, key);
     if has_column(schema, &name) {
         Ok(Expr::Column(Column::new_unqualified(name)))
@@ -72,7 +78,7 @@ pub(super) fn group_by_promoted(
         };
         Err(QueryError::InvalidQuery {
             detail: format!(
-                "grouping by '{name}' requires the attribute to be promoted to a column present \
+                "{using} '{name}' requires the attribute to be promoted to a column present \
                  in the queried range; add '{key}' to storage.promoted_attributes.{sublist}"
             ),
         })
@@ -113,8 +119,8 @@ pub(super) fn field_group_expr(field: &Field, schema: &DFSchema) -> Result<Expr,
 
 /// Compile a `sum`/`min`/`max`/`avg(path)` scalar aggregate to its `DataFusion`
 /// `Expr` (RFC0002.17). The path is a promoted attribute column, resolved like
-/// a group key ([`group_by_promoted`] — same presence check and promotion-hint
-/// error), then `try_cast` to `Float64` so a `Utf8` promoted column aggregates
+/// a group key (the same presence check and promotion hint, naming the
+/// aggregate), then `try_cast` to `Float64` so a `Utf8` promoted column aggregates
 /// numerically. `try_cast` (not `cast`) is deliberate: an unparseable value
 /// yields NULL rather than erroring the query, and the aggregate skips NULLs,
 /// so a dirty value neither fails the query nor contributes (RFC0002.18).
@@ -125,11 +131,11 @@ pub(crate) fn scalar_agg_expr(
 ) -> Result<Expr, QueryError> {
     let (column, name) = match path {
         Field::Attr(key) => (
-            group_by_promoted(columns::ATTRIBUTES, key, schema)?,
+            promoted(columns::ATTRIBUTES, key, schema, "aggregating")?,
             promoted_column_name(columns::ATTRIBUTES, key),
         ),
         Field::Resource(key) => (
-            group_by_promoted(columns::RESOURCE_ATTRIBUTES, key, schema)?,
+            promoted(columns::RESOURCE_ATTRIBUTES, key, schema, "aggregating")?,
             promoted_column_name(columns::RESOURCE_ATTRIBUTES, key),
         ),
         _ => return Err(agg_path_error()),

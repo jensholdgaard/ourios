@@ -873,7 +873,9 @@ the mass-failover time and vote-log batching as tuning signals.
 >   appends it with a member lost; a leader holding an uncommitted entry
 >   of a new kind admits no learner until it commits, and a learner it
 >   then admits reads that kind, and one with a membership change in
->   flight appends no new kind until that change commits
+>   flight appends no new kind until that change commits; a replica
+>   whose checkpoint records a kind above the highest it reads refuses
+>   to open the log at the checkpoint
 
 ## 6. Proposed design
 
@@ -1227,7 +1229,12 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   member, with no setting to change. The log's highest kind is the
   highest of the latest checkpoint's recorded value and every kind
   committed after that checkpoint, and the checkpoint body records it,
-  so purging the log below a checkpoint loses none of it. A leader
+  so purging the log below a checkpoint loses none of it. A replica
+  whose release reads below that recorded kind, one rolled back past a
+  kind the group has used, refuses to open the group's log at the
+  checkpoint rather than catch up into entries it cannot read; it
+  serves and votes in no group whose log it has not opened, and rejoins
+  only on a release that reads the group's highest kind. A leader
   gates on its own log, committed or not: the kinds of its uncommitted
   entries count too, so a learner it admits reads an entry of a new kind
   still in flight, and an entry a later leader truncates only ever made

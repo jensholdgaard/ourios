@@ -932,6 +932,16 @@ the mass-failover time and vote-log batching as tuning signals.
   an absent voter and the group runs on the rest of its quorum. A
   membership never holds two voters with the same `node_id`, and a node
   never rejoins under an identity whose vote it has lost (§4.5).
+- **A group's first membership** comes from its voters' own answers. Only
+  the group's first-ranked voter, and only while its log for the group
+  is empty, initializes it: it calls `Identify` on each of the group's
+  other voters at its configured address (§6.8), and once every one has
+  answered it initializes the group with each voter's UUID paired with
+  its `node_id`. Until then it retries and the group has no leader; the
+  other voters wait to be contacted. A first-ranked voter that restarts
+  on a wiped `wal_root` and initializes again cannot take the group:
+  the other voters hold a later term and a longer log, so it never gets
+  a majority, and the group's leader replaces it as above.
 - **Each replica keeps one RFC 0008 WAL per group** under
   `wal_root/groups/<group>/`, with RFC 0008's segments, fsync policy
   and CRCs unchanged, and its RFC 0052 reclaim sidecar sized for the
@@ -1481,8 +1491,9 @@ never count toward an ack (learners, under §4.3's shape).
   to follower, entries and heartbeats), `Vote` and `PreVote` (candidate
   to voter), and
   `InstallSnapshot` (leader to a follower behind the checkpoint); then
-  `Forward` (any node to a leader), `Identify` (a leader to a
-  configured peer: the `node_id` and replica UUID it runs under, §6.1),
+  `Forward` (any node to a leader), `Identify` (a leader, or a group's first-ranked voter
+  forming its first membership, to a configured peer: the `node_id`
+  and replica UUID it runs under, §6.1),
   and `Tail` and `TailScan` (querier to tail replica: the read point and
   published keys, then the rows under that read point, §6.7). Catch-up needs no call of its own: the
   leader sends a lagging follower its missing entries by

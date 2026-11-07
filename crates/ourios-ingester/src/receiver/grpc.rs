@@ -40,7 +40,7 @@ use tonic::{Code, Request, Response, Status};
 
 use opentelemetry::context::FutureExt as _;
 
-use crate::receiver::pipeline::{IngestFailure, ReceiveError, SharedPipeline};
+use crate::receiver::pipeline::{Export, IngestFailure, ReceiveError, SharedPipeline};
 use crate::receiver::selector;
 use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
 use ourios_serving::propagation::extract_context_from_metadata;
@@ -304,7 +304,15 @@ impl LogsService for LogsReceiver {
         match tokio::spawn(
             async move {
                 pipeline
-                    .ingest_reported(export, tenant, binding.as_deref(), false, span_error)
+                    .ingest_reported(
+                        Export {
+                            request: export,
+                            tenant,
+                            binding: binding.as_deref(),
+                            lenient_json: false,
+                        },
+                        span_error,
+                    )
                     .await
             }
             .with_context(parent),

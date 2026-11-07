@@ -46,13 +46,15 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse;
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
 use prost::Message;
 
 use opentelemetry::context::FutureExt as _;
 
 use crate::receiver::decode::{decode_json, decode_protobuf};
-use crate::receiver::pipeline::{IngestFailure, ReceiveError, SharedPipeline};
+use crate::receiver::pipeline::{Export, IngestFailure, ReceiveError, SharedPipeline};
 use crate::receiver::selector;
 use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
 use ourios_serving::propagation::extract_context;
@@ -301,49 +303,16 @@ async fn logs_response(
             "unsupported Content-Type: expected application/x-protobuf or application/json",
         );
     };
-    let raw = match content_encoding(&headers) {
-        Some(Encoding::Identity) => body.to_vec(),
-        Some(Encoding::Gzip) => match gunzip(&body, state.max_decompressed_bytes) {
-            Ok(bytes) => bytes,
-            // Corrupt gzip is a malformed request (400); a body that
-            // decompresses past the limit is too large (413) — a
-            // decompression bomb, since DefaultBodyLimit only bounds the
-            // compressed bytes.
-            Err(GunzipError::Corrupt) => {
-                return error_response(StatusCode::BAD_REQUEST, "corrupt gzip body");
-            }
-            Err(GunzipError::TooLarge) => {
-                return error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "gzip body decompresses past the configured limit",
-                );
-            }
-        },
-        None => {
-            return error_response(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "unsupported Content-Encoding: expected identity or gzip",
-            );
-        }
+    let raw = match decompressed(&headers, &body, state.max_decompressed_bytes) {
+        Ok(raw) => raw,
+        Err((status, reason)) => return error_response(status, reason),
     };
-    let decoded = match format {
-        WireFormat::Protobuf => decode_protobuf(&raw).map(|request| (request, false)),
-        WireFormat::Json => decode_json(&raw),
-    };
-    let Ok((request, lenient_json)) = decoded else {
+    let Some((request, lenient_json)) = decode(format, &raw) else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "body is not a decodable ExportLogsServiceRequest",
         );
     };
-    if lenient_json {
-        // Rare by construction (spec-valid payloads upstream with-serde
-        // rejects — ourios#549); debug so a client emitting them at
-        // volume can't turn the log stream into the bottleneck. The
-        // countable signal is `ourios.ingest.json.lenient` on the
-        // batches counter.
-        tracing::debug!("OTLP/JSON payload parsed via the lenient unset-AnyValue retry");
-    }
 
     // WAL-before-ack ingest. The fsync is batched by the group-commit
     // coordinator (RFC0008.8), which offloads its blocking `sync`, so the
@@ -357,9 +326,13 @@ async fn logs_response(
     let pipeline = state.pipeline.clone();
     match tokio::spawn(
         async move {
-            pipeline
-                .ingest_reported(request, tenant, binding.as_deref(), lenient_json, as_5xx)
-                .await
+            let export = Export {
+                request,
+                tenant,
+                binding: binding.as_deref(),
+                lenient_json,
+            };
+            pipeline.ingest_reported(export, as_5xx).await
         }
         .with_context(parent),
     )
@@ -375,6 +348,53 @@ async fn logs_response(
         // and a new one needs a registered semconv name.
         Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "ingest task failed"),
     }
+}
+
+/// The request body as the `Content-Encoding` says to read it, or the
+/// status and reason to refuse it with.
+fn decompressed(
+    headers: &HeaderMap,
+    body: &Bytes,
+    max_decompressed_bytes: usize,
+) -> Result<Vec<u8>, (StatusCode, &'static str)> {
+    match content_encoding(headers) {
+        Some(Encoding::Identity) => Ok(body.to_vec()),
+        Some(Encoding::Gzip) => match gunzip(body, max_decompressed_bytes) {
+            Ok(bytes) => Ok(bytes),
+            // Corrupt gzip is a malformed request (400); a body that
+            // decompresses past the limit is too large (413) — a
+            // decompression bomb, since DefaultBodyLimit only bounds the
+            // compressed bytes.
+            Err(GunzipError::Corrupt) => Err((StatusCode::BAD_REQUEST, "corrupt gzip body")),
+            Err(GunzipError::TooLarge) => Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "gzip body decompresses past the configured limit",
+            )),
+        },
+        None => Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported Content-Encoding: expected identity or gzip",
+        )),
+    }
+}
+
+/// `raw` as an export in `format`, and whether OTLP/JSON only parsed
+/// via the lenient retry; `None` when it is not a decodable export.
+fn decode(format: WireFormat, raw: &[u8]) -> Option<(ExportLogsServiceRequest, bool)> {
+    let decoded = match format {
+        WireFormat::Protobuf => decode_protobuf(raw).map(|request| (request, false)),
+        WireFormat::Json => decode_json(raw),
+    };
+    let (request, lenient_json) = decoded.ok()?;
+    if lenient_json {
+        // Rare by construction (spec-valid payloads upstream with-serde
+        // rejects — ourios#549); debug so a client emitting them at
+        // volume can't turn the log stream into the bottleneck. The
+        // countable signal is `ourios.ingest.json.lenient` on the
+        // batches counter.
+        tracing::debug!("OTLP/JSON payload parsed via the lenient unset-AnyValue retry");
+    }
+    Some((request, lenient_json))
 }
 
 /// Map a settled ingest failure to its HTTP status (RFC 0018 §3.2).

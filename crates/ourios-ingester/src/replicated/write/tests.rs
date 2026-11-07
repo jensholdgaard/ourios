@@ -70,11 +70,9 @@ fn followers(leader: usize) -> Vec<usize> {
 
 async fn held(gate: &Arc<SyncGate>) {
     let gate = Arc::clone(gate);
-    let waiting = tokio::task::spawn_blocking(move || gate.wait_for_writer());
-    tokio::time::timeout(Duration::from_secs(10), waiting)
+    tokio::task::spawn_blocking(move || gate.wait_for_writer())
         .await
-        .expect("a writer reaches the gate")
-        .expect("join");
+        .expect("a writer reaches the gate");
 }
 
 fn committed(ingested: Ingested) -> super::GroupPosition {
@@ -280,5 +278,58 @@ async fn an_entry_over_the_wal_frame_is_refused_and_the_group_keeps_committing()
         .await
         .expect("a later export commits");
     assert_eq!(position.group, 0);
+    cluster.shutdown().await;
+}
+
+/// A binding whose one token may write `tenants`.
+fn binding(tenants: &[&str]) -> ourios_serving::AuthBinding {
+    let store = ourios_core::auth::build_token_store(Some(&[ourios_core::auth::TokenSpec {
+        name: Some("edge".to_owned()),
+        token: Some("tok-edge".to_owned()),
+        tenants: tenants.iter().map(|t| (*t).to_owned()).collect(),
+    }]))
+    .expect("valid spec")
+    .expect("enabled store");
+    ourios_serving::authenticate_bearer(Some(&store), Some("Bearer tok-edge"))
+        .expect("known token")
+        .expect("bound")
+}
+
+/// RFC 0026 §3.2 on the replicated path: an export whose tenant its
+/// binding does not allow is denied before anything is proposed, and one
+/// the binding allows commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_binding_is_checked_before_the_export_is_proposed() {
+    let cluster = Cluster::start(3, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let ingest = ReplicatedIngest::new(writer(&cluster, leader));
+    let before = cluster.node(leader).log(0).await.len();
+
+    let other = binding(&["globex"]);
+    let denied = Export {
+        binding: Some(&other),
+        ..export("denied")
+    };
+    match ingest.ingest(denied).await {
+        Err(ReceiveError::TenantDenied { tenant, .. }) => assert_eq!(tenant.as_str(), "acme"),
+        other => panic!("expected the binding denial, got {other:?}"),
+    }
+    assert_eq!(
+        cluster.node(leader).log(0).await.len(),
+        before,
+        "a denied export is never proposed"
+    );
+
+    let own = binding(&["acme"]);
+    let allowed = Export {
+        binding: Some(&own),
+        ..export("allowed")
+    };
+    committed(
+        ingest
+            .ingest(allowed)
+            .await
+            .expect("an allowed export commits"),
+    );
     cluster.shutdown().await;
 }

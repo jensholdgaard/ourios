@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use openraft::async_runtime::WatchReceiver as _;
 use openraft::errors::{ClientWriteError, RaftError};
 
 use super::layout::VotingLayout;
@@ -50,6 +51,10 @@ pub enum WriteError {
         group: u32,
         source: Box<ClientWriteFailure>,
     },
+    /// The export was forwarded and no leader committed it (§6.8): every
+    /// node tried proved it did not take it, or an answer left the outcome
+    /// uncertain.
+    Unforwarded { group: u32, reason: String },
 }
 
 impl WriteError {
@@ -72,9 +77,10 @@ impl WriteError {
         match self {
             Self::NotEnoughReplicas { .. } => ERROR_TYPE_NOT_ENOUGH_REPLICAS,
             Self::TooLarge { .. } => ERROR_TYPE_REQUEST_TOO_LARGE,
-            Self::NotLeader { .. } | Self::NotHosted { .. } | Self::Raft { .. } => {
-                ERROR_TYPE_GROUP_UNAVAILABLE
-            }
+            Self::NotLeader { .. }
+            | Self::NotHosted { .. }
+            | Self::Raft { .. }
+            | Self::Unforwarded { .. } => ERROR_TYPE_GROUP_UNAVAILABLE,
         }
     }
 }
@@ -100,6 +106,12 @@ impl std::fmt::Display for WriteError {
                 "the export's {len} bytes exceed the {limit} a WAL frame's entry can hold"
             ),
             Self::Raft { group, source } => write!(f, "group {group}: {source}"),
+            Self::Unforwarded { group, reason } => {
+                write!(
+                    f,
+                    "no leader of group {group} committed the export: {reason}"
+                )
+            }
         }
     }
 }
@@ -111,9 +123,20 @@ impl std::error::Error for WriteError {
             Self::NotEnoughReplicas { .. }
             | Self::NotLeader { .. }
             | Self::NotHosted { .. }
-            | Self::TooLarge { .. } => None,
+            | Self::TooLarge { .. }
+            | Self::Unforwarded { .. } => None,
         }
     }
+}
+
+/// Who leads a tenant's group, as this node's Raft last knew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Leading {
+    /// This node does.
+    Here,
+    /// Another node does, or none this node knows of, or this node does
+    /// not host the group: `leader` is the `node_id` it knows of, if any.
+    Elsewhere { group: u32, leader: Option<String> },
 }
 
 /// Commits exports to the groups this node votes in.
@@ -142,6 +165,32 @@ impl GroupWriter {
     #[must_use]
     pub fn group_of(&self, tenant: &str) -> u32 {
         self.layout.group_of(tenant)
+    }
+
+    /// Whether this node leads `tenant`'s group, as its Raft last knew.
+    #[must_use]
+    pub fn leading(&self, tenant: &str) -> Leading {
+        let group = self.layout.group_of(tenant);
+        let Some(raft) = self.groups.get(&group) else {
+            return Leading::Elsewhere {
+                group,
+                leader: None,
+            };
+        };
+        let metrics = raft.metrics().borrow_watched().clone();
+        match metrics.current_leader {
+            Some(id) if id == metrics.id => Leading::Here,
+            leader => Leading::Elsewhere {
+                group,
+                leader: leader.and_then(|id| {
+                    metrics
+                        .membership_config
+                        .membership()
+                        .get_node(&id)
+                        .cloned()
+                }),
+            },
+        }
     }
 
     #[cfg(test)]

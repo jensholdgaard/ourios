@@ -352,6 +352,7 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
     let msg = error.to_string();
     match IngestFailure::classify(error) {
         IngestFailure::Denied => Status::permission_denied(msg),
+        IngestFailure::Unauthenticated => Status::unauthenticated(msg),
         // OTLP names RESOURCE_EXHAUSTED for an over-size request; with no
         // RetryInfo it is non-retryable (RFC 0061 §3.2).
         IngestFailure::TooLarge => Status::resource_exhausted(msg),

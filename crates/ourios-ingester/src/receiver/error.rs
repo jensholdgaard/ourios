@@ -31,6 +31,9 @@ pub enum ReceiveError {
     /// The replicated backend's group did not commit the export (RFC 0065
     /// §6.3) — the batch must not be acked.
     Replication(crate::replicated::write::WriteError),
+    /// The group's leader refused the forwarded export before appending
+    /// it; returned to the client as the leader gave it (RFC 0065 §6.8).
+    Forwarded(crate::replicated::raft::transport::Rejected),
 }
 
 /// How a transport classifies a failed batch for the `ingest logs` server
@@ -64,6 +67,10 @@ pub(super) enum IngestFailure {
     /// `RetryInfo`, as for an Export over the listener's limit (RFC 0061
     /// §3.2).
     TooLarge,
+    /// The credential is missing or invalid, as a forwarded export's
+    /// leader found it: the direct path refuses it before ingest. HTTP 401
+    /// / gRPC `UNAUTHENTICATED`.
+    Unauthenticated,
     /// Durability is temporarily unavailable; retryable. HTTP 503 /
     /// gRPC `UNAVAILABLE`.
     Unavailable,
@@ -111,6 +118,18 @@ impl IngestFailure {
             | ReceiveError::WalSync(_)
             | ReceiveError::Replication(_) => Self::Unavailable,
             ReceiveError::TenantFrame(_) => Self::Internal,
+            ReceiveError::Forwarded(rejected) => Self::of_rejection(rejected.rejection),
+        }
+    }
+
+    /// A leader's rejection's class, as the client would have got it there.
+    fn of_rejection(rejection: crate::replicated::raft::transport::Rejection) -> Self {
+        use crate::replicated::raft::transport::Rejection;
+        match rejection {
+            Rejection::Unauthenticated => Self::Unauthenticated,
+            Rejection::Unavailable => Self::Unavailable,
+            Rejection::PermissionDenied => Self::Denied,
+            Rejection::TooLarge => Self::TooLarge,
         }
     }
 
@@ -119,6 +138,7 @@ impl IngestFailure {
     pub(super) fn error_type(self) -> &'static str {
         match self {
             Self::Denied => "permission_denied",
+            Self::Unauthenticated => "unauthenticated",
             Self::TooLarge => "too_large",
             Self::Unavailable => "unavailable",
             Self::ServerTerminal => "server_terminal",
@@ -135,7 +155,7 @@ impl IngestFailure {
     #[must_use]
     pub(super) fn span_error_type(self) -> Option<&'static str> {
         match self {
-            Self::Denied | Self::TooLarge => None,
+            Self::Denied | Self::Unauthenticated | Self::TooLarge => None,
             Self::Unavailable | Self::ServerTerminal | Self::Internal => Some(self.error_type()),
         }
     }
@@ -158,6 +178,7 @@ impl std::fmt::Display for ReceiveError {
             Self::WalAppend(e) => write!(f, "{e}"),
             Self::WalSync(e) => write!(f, "{e}"),
             Self::Replication(e) => write!(f, "{e}"),
+            Self::Forwarded(rejected) => f.write_str(&rejected.message),
         }
     }
 }
@@ -165,7 +186,7 @@ impl std::fmt::Display for ReceiveError {
 impl std::error::Error for ReceiveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::TenantDenied { .. } => None,
+            Self::TenantDenied { .. } | Self::Forwarded(_) => None,
             Self::TenantFrame(e) => Some(e),
             Self::WalAppend(e) => Some(e),
             Self::WalSync(e) => Some(e),
@@ -200,6 +221,35 @@ pub(crate) fn check_binding(tenant: &TenantId, binding: &AuthBinding) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leader's rejection of a forwarded export classifies as it would
+    /// have there: an unauthenticated one as the client's fault, so the
+    /// server span stays unset, and its text is the leader's message.
+    #[test]
+    fn a_forwarded_rejection_keeps_its_class_and_message() {
+        use crate::replicated::raft::transport::{Rejected, Rejection};
+        let forwarded = |rejection| {
+            ReceiveError::Forwarded(Rejected {
+                rejection,
+                error_type: String::new(),
+                message: "the leader's words".to_owned(),
+                details: Vec::new(),
+            })
+        };
+        for (rejection, class) in [
+            (Rejection::Unauthenticated, IngestFailure::Unauthenticated),
+            (Rejection::Unavailable, IngestFailure::Unavailable),
+            (Rejection::PermissionDenied, IngestFailure::Denied),
+            (Rejection::TooLarge, IngestFailure::TooLarge),
+        ] {
+            let error = forwarded(rejection);
+            assert_eq!(IngestFailure::classify(&error), class, "{rejection:?}");
+            assert_eq!(error.to_string(), "the leader's words");
+        }
+        let unauthenticated = IngestFailure::Unauthenticated;
+        assert_eq!(unauthenticated.error_type(), "unauthenticated");
+        assert_eq!(unauthenticated.span_error_type(), None);
+    }
 
     /// The classifier exists to force "one retryable-vs-not decision"
     /// (see its doc comment). It used to fold a permanently quiesced

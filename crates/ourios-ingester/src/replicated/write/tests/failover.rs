@@ -262,8 +262,11 @@ async fn rfc0065_6_losing_and_regaining_a_follower() {
     cluster.restart(lost).await;
     // With the other follower's fsyncs held, only the returning one can
     // complete an ack, and its log must first hold everything before it.
+    // It may still be reconnecting and catching up, so this ack may take
+    // longer than the commit timeout: the order is under test, not speed.
     cluster.node(kept).gate.close();
-    let rejoined = acked(&ingest, 10).await;
+    let patient = writer(&cluster, leader).with_timeout(Duration::from_secs(20));
+    let rejoined = acked(&ReplicatedIngest::new(patient), 10).await;
     all.push(rejoined);
     let log = cluster.node(lost).log(0).await;
     for ack in &all {

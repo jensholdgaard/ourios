@@ -11,6 +11,7 @@ pub mod host;
 pub mod log_store;
 mod snapshot_record;
 pub mod state_machine;
+mod telemetry;
 pub mod transport;
 pub mod types;
 pub mod vote_log;

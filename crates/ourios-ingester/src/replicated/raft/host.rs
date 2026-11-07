@@ -16,6 +16,7 @@ use super::gate::SyncGate;
 use super::group_config;
 use super::log_store::{GroupLog, group_dir};
 use super::state_machine::GroupSm;
+use super::telemetry::ReplicationTelemetry;
 use super::transport::{Peers, ReplicationServer};
 use super::types::{NodeId, RaftTypes};
 use super::vote_log::VoteLog;
@@ -130,6 +131,8 @@ impl Launch<'_> {
 pub struct GroupHost {
     groups: BTreeMap<u32, Hosted>,
     server: ReplicationServer<GroupSm>,
+    /// RFC 0065 §6.9's signals for the groups, once every one has opened.
+    telemetry: Option<ReplicationTelemetry>,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -171,6 +174,7 @@ impl GroupHost {
         let mut host = Self {
             groups: BTreeMap::new(),
             server,
+            telemetry: None,
         };
         for &group in &spec.groups {
             match launch.group(group).await {
@@ -185,6 +189,9 @@ impl GroupHost {
                 }
             }
         }
+        let rafts = host.groups.iter().map(|(&g, hosted)| (g, &hosted.raft));
+        let meter = ourios_core::telemetry::meter("ourios.wal");
+        host.telemetry = Some(ReplicationTelemetry::watch(&meter, rafts));
         Ok(host)
     }
 

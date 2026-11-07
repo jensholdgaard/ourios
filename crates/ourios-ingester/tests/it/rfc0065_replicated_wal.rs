@@ -363,7 +363,8 @@ fn rfc0065_29_an_unreadable_control_entry_stops_the_open() {
 
 /// Scenario RFC0065.29 — the leader's kind gate. A leader whose members have
 /// not all reported, through `Identify`, reading a kind the log has never
-/// held does not append it; one the log holds it appends with a member lost.
+/// held does not append it; one whose log already holds the kind appends it
+/// with a member lost.
 #[test]
 #[ignore = "RFC0065.29 stub — implemented with Identify and the flusher-assignment entry"]
 fn rfc0065_29_a_kind_not_every_member_reads_is_not_appended() {

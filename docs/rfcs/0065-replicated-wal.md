@@ -1490,7 +1490,13 @@ never count toward an ack (learners, under §4.3's shape).
   already purged.
 - `Identify` names no group and changes nothing: the node answers with
   its `node_id`, the UUID in its `replica.id`, and the highest control
-  entry kind it reads (§6.5), which gates a leader's new kinds. A leader calls each
+  entry kind it reads (§6.5). Kinds are numbered in the order they are
+  introduced and a release reads every kind up to its highest, so one
+  number states what a node can apply. A leader appends a new kind only
+  once every member has answered with a kind at or above it, a member
+  that has not answered counting as below, and adds a learner only if
+  its kind covers every kind the group's log already holds, so no
+  replica is asked to apply an entry it cannot read. A leader calls each
   peer of a group's tail placement, and each voter of the group, at
   the address its own configuration gives, and acts on the answer
   through a committed membership change only: it adds a node it does

@@ -350,8 +350,9 @@ impl LogsService for LogsReceiver {
 /// and is exhaustive there). The message rides along on every arm.
 fn ingest_error_status(error: &ReceiveError) -> Status {
     let msg = error.to_string();
-    match IngestFailure::classify(error) {
+    let status = match IngestFailure::classify(error) {
         IngestFailure::Denied => Status::permission_denied(msg),
+        IngestFailure::Unauthenticated => Status::unauthenticated(msg),
         // OTLP names RESOURCE_EXHAUSTED for an over-size request; with no
         // RetryInfo it is non-retryable (RFC 0061 §3.2).
         IngestFailure::TooLarge => Status::resource_exhausted(msg),
@@ -361,6 +362,15 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
         // the code, carries the distinction.
         IngestFailure::Unavailable | IngestFailure::ServerTerminal => Status::unavailable(msg),
         IngestFailure::Internal => Status::internal(msg),
+    };
+    // A leader's rejection goes back as it gave it, details included
+    // (RFC 0065 §6.8).
+    match error {
+        ReceiveError::Forwarded(rejected) if !rejected.details.is_empty() => {
+            let details = rejected.details.clone().into();
+            Status::with_details(status.code(), status.message(), details)
+        }
+        _ => status,
     }
 }
 
@@ -392,6 +402,24 @@ mod tests {
     use super::{IngestFailure, ReceiveError, ingest_error_status, server_error_code};
     use ourios_wal::{AppendError, RotationFault, RotationSite, SyncError};
     use tonic::Code;
+
+    /// A forwarded rejection reaches the gRPC client as its leader gave it:
+    /// code, message and status details.
+    #[test]
+    fn a_forwarded_rejection_keeps_its_code_message_and_details() {
+        use crate::replicated::raft::transport::{Rejected, Rejection};
+        let details = vec![0x08, 0x07, 0x12, 0x02, b'n', b'o'];
+        let error = ReceiveError::Forwarded(Rejected {
+            rejection: Rejection::PermissionDenied,
+            error_type: "permission_denied".to_owned(),
+            message: "the leader's words".to_owned(),
+            details: details.clone(),
+        });
+        let status = ingest_error_status(&error);
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "the leader's words");
+        assert_eq!(status.details(), details.as_slice());
+    }
 
     fn fault(attempts: u32) -> RotationFault {
         RotationFault::new(

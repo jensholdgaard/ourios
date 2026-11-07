@@ -4,6 +4,7 @@
 //! voter until the tail exists.
 
 mod failover;
+mod forwarding;
 mod outage;
 mod spans;
 

@@ -27,12 +27,15 @@ use tracing::Instrument as _;
 
 use super::super::types::RaftTypes;
 use super::forward::{self, ForwardTarget};
+use super::identify::{self, Identity};
 use super::trace::{Call, Carried, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, Malformed, SnapshotRequest,
     StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
 };
-use super::{APPEND, FORWARD, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, STREAM_APPEND, VERSION, VOTE};
+use super::{
+    APPEND, FORWARD, IDENTIFY, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, STREAM_APPEND, VERSION, VOTE,
+};
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
 
@@ -45,6 +48,9 @@ where
     /// The node's ingest for `Forward`; until it is set, every forwarded
     /// export is refused as not hosted.
     forwards: Arc<RwLock<Option<Arc<dyn ForwardTarget>>>>,
+    /// Who this node is, for `Identify`; until it is set the call is
+    /// unavailable.
+    identity: Arc<RwLock<Option<Identity>>>,
     tracing: Tracing,
     /// Set once `serve`'s shutdown resolves. Graceful shutdown waits for
     /// every running call, so a `StreamAppend` waiting on its peer must
@@ -60,6 +66,7 @@ where
         Self {
             groups: Arc::clone(&self.groups),
             forwards: Arc::clone(&self.forwards),
+            identity: Arc::clone(&self.identity),
             tracing: self.tracing.clone(),
             closing: Arc::clone(&self.closing),
         }
@@ -74,6 +81,7 @@ where
         Self {
             groups: Arc::default(),
             forwards: Arc::default(),
+            identity: Arc::default(),
             tracing: Tracing::default(),
             closing: Arc::new(watch::Sender::new(false)),
         }
@@ -109,6 +117,19 @@ where
             .unwrap_or_else(PoisonError::into_inner) = Some(target);
     }
 
+    /// Answer `Identify` as `identity`, replacing any earlier one.
+    pub fn identify_as(&self, identity: Identity) {
+        *self
+            .identity
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(identity);
+    }
+
+    fn identity(&self) -> Option<Identity> {
+        let identity = self.identity.read().unwrap_or_else(PoisonError::into_inner);
+        identity.clone()
+    }
+
     fn forward_target(&self) -> Option<Arc<dyn ForwardTarget>> {
         let target = self.forwards.read().unwrap_or_else(PoisonError::into_inner);
         target.clone()
@@ -123,6 +144,7 @@ where
         Self {
             groups: Arc::default(),
             forwards: Arc::default(),
+            identity: Arc::default(),
             tracing,
             closing: Arc::new(watch::Sender::new(false)),
         }
@@ -592,6 +614,10 @@ where
             FORWARD => unary(FORWARD, tracing, request, move |r| {
                 let target = server.forward_target();
                 forward::serve(target, r)
+            }),
+            IDENTIFY => unary(IDENTIFY, tracing, request, move |r| {
+                let identity = server.identity();
+                async move { identify::serve(identity, &r) }
             }),
             STREAM_APPEND => streaming(server, request),
             _ => unimplemented(),

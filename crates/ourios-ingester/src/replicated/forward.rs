@@ -6,7 +6,9 @@
 //!
 //! Counting on `ourios.ingest.batches`: a rejection before appending is
 //! decided here, so it is counted here and passed back for the sender to
-//! return uncounted. A commit that failed after the entry may have been
+//! return uncounted. The size rejection is the exception: as on the
+//! direct path, the transport counts it from its response, on the node
+//! the client sent the export to. A commit that failed after the entry may have been
 //! appended is not counted here. Its sender cannot tell that answer from a
 //! lost one, so the sender counts every forward that ends without a
 //! committed position, as `group_unavailable` (§6.3).
@@ -108,7 +110,7 @@ impl Inner {
             Ok(position) => Ok(position.seq),
             Err(WriteError::NotLeader { leader, .. }) => Err(Refusal::NotLeader { leader }),
             Err(WriteError::NotHosted { .. }) => Err(Refusal::NotHosted),
-            Err(e @ WriteError::TooLarge { .. }) => Err(self.reject(
+            Err(e @ WriteError::TooLarge { .. }) => Err(rejected(
                 Rejection::TooLarge,
                 ERROR_TYPE_REQUEST_TOO_LARGE,
                 e.to_string(),

@@ -23,7 +23,7 @@ use super::host::{GroupHost, GroupRaft, HostSpec};
 use super::log_store::group_dir;
 use super::state_machine::GroupSm;
 use super::telemetry::Meters;
-use super::transport::{Peers, ReplicationServer};
+use super::transport::{Identity, Peers, ReplicationServer};
 use super::types::{Entry, NodeId, RaftTypes, TenantBatchBytes};
 use super::vote_log;
 
@@ -160,6 +160,7 @@ impl Node {
             groups: replica.groups.clone(),
             peers: peers.clone(),
         };
+        server.identify_as(Identity::new(name(replica.id), replica.id));
         let host = GroupHost::open_with(spec, server, Arc::clone(&gate), &replica.meters)
             .await
             .expect("host");
@@ -299,10 +300,31 @@ impl Cluster {
         groups: &[u32],
         meters: impl Fn(usize) -> Meters,
     ) -> Self {
-        let bound: Vec<_> = (1..=size).map(|n| (NodeId::from(n), bind())).collect();
+        Self::open((size, 0), groups, meters).await
+    }
+
+    /// `voters` nodes that vote in every group, and `tail` more, nodes
+    /// `voters..`, that host every group but are in no membership until a
+    /// leader adds them as learners.
+    pub(crate) async fn start_with_tail(voters: u64, tail: u64, groups: &[u32]) -> Self {
+        Self::open((voters, tail), groups, |_| Meters::global()).await
+    }
+
+    async fn open(
+        (voters, tail): (u64, u64),
+        groups: &[u32],
+        meters: impl Fn(usize) -> Meters,
+    ) -> Self {
+        let bound: Vec<_> = (1..=voters + tail)
+            .map(|n| (NodeId::from(n), bind()))
+            .collect();
         let addresses = bound.iter().map(|(id, (_, a))| (name(*id), a.to_string()));
         let peers = Peers::plaintext().with_addresses(addresses);
-        let members: BTreeMap<_, _> = bound.iter().map(|(id, _)| (*id, name(*id))).collect();
+        let members: BTreeMap<_, _> = bound
+            .iter()
+            .take(usize::try_from(voters).expect("a small cluster"))
+            .map(|(id, _)| (*id, name(*id)))
+            .collect();
         let mut cluster = Self {
             peers,
             addrs: bound.iter().map(|(_, (_, a))| *a).collect(),

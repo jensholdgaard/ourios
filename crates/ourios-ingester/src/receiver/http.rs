@@ -414,6 +414,7 @@ fn decode(format: WireFormat, raw: &[u8]) -> Option<(ExportLogsServiceRequest, b
 fn ingest_error_status(error: &ReceiveError) -> StatusCode {
     match IngestFailure::classify(error) {
         IngestFailure::Denied => StatusCode::FORBIDDEN,
+        IngestFailure::Unauthenticated => StatusCode::UNAUTHORIZED,
         IngestFailure::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         // Both durability classes are `503`: a non-retryable code would
         // tell the client to drop a batch that was never acked (RFC 0018

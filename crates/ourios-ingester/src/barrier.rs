@@ -742,7 +742,8 @@ fn rotation_error_type(error: &ReceiveError) -> &'static str {
         | ReceiveError::TenantDenied { .. }
         | ReceiveError::TenantFrame(_)
         | ReceiveError::WalSync(_)
-        | ReceiveError::Replication(_) => "_OTHER",
+        | ReceiveError::Replication(_)
+        | ReceiveError::Forwarded(_) => "_OTHER",
     }
 }
 

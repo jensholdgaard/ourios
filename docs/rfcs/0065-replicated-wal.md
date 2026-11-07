@@ -347,8 +347,9 @@ testing and without membership change.
 The shape, replacing §6.2–§6.4:
 - **Storage:** `RaftLogStorage` over RFC 0008 segments; frame kind
   `0x04` (`ReplicatedEntry`) carries the Raft log id `(term, index)`
-  where §6.3 has `(epoch, seq)`, as a tagged record: a blank, normal or
-  membership entry, or a truncation, purge or commit marker. The log id
+  where §6.3 has `(epoch, seq)`, as a tagged record: a blank, normal,
+  membership or control entry (§6.5), or a truncation, purge or commit
+  marker. The log id
   is `(term, index)` because the type config uses `openraft`'s
   standard leader id (`impls::leader_id_std::LeaderId`); its default
   would add the node id. Votes go in one group-committed vote log per
@@ -1175,6 +1176,26 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   version the tenant's audit trail holds, and its next widen of that
   template takes the version above it, so no `(template_id,
   template_version)` key ever names two token sequences.
+- **Control entries.** The flusher assignment, and the checkpoint,
+  id-block and miner-configuration entries below, are log entries the
+  leader appends beside the tenant batches, so every replica applies
+  them at the same position. In the group WAL each is a `ReplicatedEntry`
+  record with its own tag, `0x04`, followed by the entry's `term` and
+  `index` as every entry is, a one-byte `kind`, and that kind's body;
+  integers are little-endian, as everywhere in RFC 0008.
+
+  | `kind` | Entry | Body |
+  |---|---|---|
+  | `0x01` | Flusher assignment | the flusher's replica UUID, 16 bytes big-endian |
+  | `0x02` | Checkpoint | reserved |
+  | `0x03` | Id-block reservation | reserved |
+  | `0x04` | Miner configuration | reserved |
+
+  A reserved kind's body is fixed by the amendment that implements it.
+  A replica that reads a kind it does not know, or a body of the wrong
+  length, refuses to open the group's log rather than skip the entry:
+  mining and flushing depend on applying every control entry in order,
+  so a rolling upgrade finishes before any leader appends a new kind.
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
   when the flusher reports its remaining ids. A miner that exhausts them

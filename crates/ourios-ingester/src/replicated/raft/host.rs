@@ -9,12 +9,13 @@ use std::sync::Arc;
 
 use openraft::Raft;
 use openraft::errors::Fatal;
+use openraft::storage::RaftLogStorage as _;
 use openraft::type_config::alias::JoinErrorOf;
 use ourios_wal::WalConfig;
 
 use super::gate::SyncGate;
 use super::group_config;
-use super::log_store::{GroupLog, group_dir};
+use super::log_store::{GroupLog, GroupLogReader, group_dir};
 use super::state_machine::GroupSm;
 use super::telemetry::{Meters, ReplicationTelemetry};
 use super::transport::{Peers, ReplicationServer};
@@ -84,6 +85,7 @@ impl std::error::Error for HostError {
 struct Hosted {
     raft: GroupRaft,
     sm: GroupSm,
+    log: GroupLogReader,
     #[cfg(test)]
     probe: probe::Probe,
 }
@@ -108,8 +110,9 @@ impl Launch<'_> {
         let mut log = blocking(move || GroupLog::open_with(wal, group, votes, gate))
             .await
             .map_err(|source| HostError::Log { group, source })?;
+        let reader = log.get_log_reader().await;
         #[cfg(test)]
-        let probe = probe::Probe::of(&mut log).await;
+        let probe = probe::Probe::of(&log);
         log.count_takeovers(self.meters.takeovers(self.spec.id, group));
         let gate = Arc::clone(&self.gate);
         let sm = blocking(move || GroupSm::open(&dir, gate))
@@ -122,6 +125,7 @@ impl Launch<'_> {
         Ok(Hosted {
             raft,
             sm,
+            log: reader,
             #[cfg(test)]
             probe,
         })
@@ -208,6 +212,12 @@ impl GroupHost {
         self.groups.get(&group).map(|hosted| &hosted.sm)
     }
 
+    /// A read-only view of `group`'s log.
+    #[must_use]
+    pub fn log(&self, group: u32) -> Option<&GroupLogReader> {
+        self.groups.get(&group).map(|hosted| &hosted.log)
+    }
+
     /// The groups hosted, ascending.
     pub fn groups(&self) -> impl Iterator<Item = u32> + '_ {
         self.groups.keys().copied()
@@ -238,22 +248,16 @@ impl GroupHost {
 mod probe {
     use std::sync::Arc;
 
-    use openraft::storage::RaftLogStorage as _;
-
     use super::super::log_store::{GroupLog, GroupLogReader, test_hooks::Hooks};
     use super::{GroupHost, Hosted};
 
     pub(super) struct Probe {
-        pub(super) reader: GroupLogReader,
         pub(super) hooks: Arc<Hooks>,
     }
 
     impl Probe {
-        pub(super) async fn of(log: &mut GroupLog) -> Self {
-            Self {
-                reader: log.get_log_reader().await,
-                hooks: log.hooks(),
-            }
+        pub(super) fn of(log: &GroupLog) -> Self {
+            Self { hooks: log.hooks() }
         }
     }
 
@@ -263,7 +267,7 @@ mod probe {
         }
 
         pub(in crate::replicated::raft) fn log_reader(&self, group: u32) -> Option<GroupLogReader> {
-            self.probe(group).map(|probe| probe.reader.clone())
+            self.log(group).cloned()
         }
 
         pub(in crate::replicated::raft) fn log_hooks(&self, group: u32) -> Option<Arc<Hooks>> {

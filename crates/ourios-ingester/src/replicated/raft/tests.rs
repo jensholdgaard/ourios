@@ -657,3 +657,76 @@ async fn a_flusher_assignment_reopens_and_an_unknown_kind_stops_the_open() {
     );
     assert!(error.to_string().contains(&kind), "{error}");
 }
+
+fn assignment(at: LogId, replica: NodeId) -> Entry {
+    let uuid = replica.uuid();
+    Entry {
+        log_id: at,
+        payload: EntryPayload::Normal(GroupEntry::Control(ourios_wal::Control::FlusherAssignment(
+            *uuid.as_bytes(),
+        ))),
+    }
+}
+
+/// The log's control view follows the entries it holds, committed or
+/// not: an entry replaced or truncated takes its kind and assignment with
+/// it, a purged one keeps only its kind, and a reopen restores the view.
+#[tokio::test]
+async fn the_log_controls_follow_its_entries() {
+    use super::log_store::LogControls;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut log, _) = open(dir.path());
+    let reader = log.get_log_reader().await;
+    assert_eq!(reader.controls(), LogControls::default());
+
+    let mut batch = entries(1, 1..=2);
+    batch.extend([
+        assignment(log_id(1, 3), NodeId::from(7)),
+        entry(1, 4),
+        assignment(log_id(1, 5), NodeId::from(9)),
+    ]);
+    append(&mut log, batch).await.await.expect("fsynced");
+    let both = LogControls {
+        highest_kind: 1,
+        introduced: Some(3),
+        flusher: Some(NodeId::from(9)),
+    };
+    assert_eq!(reader.controls(), both);
+
+    append(&mut log, entries(2, 5..=6))
+        .await
+        .await
+        .expect("fsynced");
+    let first = LogControls {
+        flusher: Some(NodeId::from(7)),
+        ..both
+    };
+    assert_eq!(reader.controls(), first, "a replaced assignment is gone");
+
+    log.truncate_after(Some(log_id(1, 2)))
+        .await
+        .expect("truncate");
+    assert_eq!(reader.controls(), LogControls::default());
+
+    append(
+        &mut log,
+        vec![assignment(log_id(3, 3), NodeId::from(7)), entry(3, 4)],
+    )
+    .await
+    .await
+    .expect("fsynced");
+    log.purge(log_id(3, 3)).await.expect("purge");
+    let purged = LogControls {
+        highest_kind: 1,
+        introduced: None,
+        flusher: None,
+    };
+    assert_eq!(reader.controls(), purged, "a purged entry keeps its kind");
+    drop(reader);
+    log.shutdown();
+
+    let (mut log, _) = open(dir.path());
+    let reopened = log.get_log_reader().await.controls();
+    assert_eq!(reopened, purged);
+}

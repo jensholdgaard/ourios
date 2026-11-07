@@ -1204,18 +1204,27 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   | `0x05` | Published (§6.7) | reserved |
   | `0x06` | Erasure (§6.7) | reserved |
 
-  A reserved kind's body is fixed by the amendment that implements it.
+  A reserved kind's body is fixed by the amendment that implements it,
+  and kinds are implemented in order: a release reads a kind only if it
+  reads every kind below it. A release's highest readable kind,
+  `0x00` when it reads none, is therefore exactly the set of kinds it
+  reads.
   A replica that reads a kind it does not know, or a body of the wrong
   length, refuses to open the group's log rather than skip the entry:
   mining and flushing depend on applying every control entry in order.
-  So a leader appends a kind the group's log has never held only once
-  every member of the group, voters and learners, has answered its
-  `Identify` call (§6.8) with a highest readable kind at or above it; a
-  kind the committed log or the latest checkpoint already holds needs no
-  answers, so a lost member never blocks the flusher reassignment that
-  replaces it. A rolling upgrade therefore holds new kinds back until it
-  has reached every member, with no setting to change, and the
-  checkpoint body records the highest kind its log has held.
+  So the group's log has a highest kind, the highest it has ever held,
+  and a leader appends a kind above it only once every member of the
+  group, voters and learners, has answered its `Identify` call (§6.8)
+  with a highest readable kind at or above the new kind. A kind at or
+  below the log's highest kind needs no answers: every member already
+  reads it, since a member joins only reading the log's highest kind
+  (§6.8) and so, kinds being in order, every kind below. A lost member
+  therefore never blocks the flusher reassignment that replaces it. A
+  rolling upgrade holds new kinds back until it has reached every
+  member, with no setting to change. The log's highest kind is the
+  highest of the latest checkpoint's recorded value and every kind
+  committed after that checkpoint, and the checkpoint body records it,
+  so purging the log below a checkpoint loses none of it.
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
   when the flusher reports its remaining ids. A miner that exhausts them

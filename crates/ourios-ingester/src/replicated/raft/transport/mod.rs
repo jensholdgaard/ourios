@@ -30,6 +30,7 @@
 mod client;
 mod connect;
 mod forward;
+mod identify;
 mod links;
 mod server;
 mod trace;
@@ -40,6 +41,7 @@ pub use forward::{
     ForwardRequest, ForwardResponse, ForwardTarget, Forwarded, Outcome, Refusal, Rejected,
     Rejection,
 };
+pub use identify::{HIGHEST_CONTROL_KIND, IdentifyError, Identity};
 pub use server::ReplicationServer;
 
 /// The peer protocol version every request carries (B22).
@@ -53,6 +55,7 @@ const VOTE: &str = "/ourios.wal.v1.Replication/Vote";
 const PRE_VOTE: &str = "/ourios.wal.v1.Replication/PreVote";
 const INSTALL_SNAPSHOT: &str = "/ourios.wal.v1.Replication/InstallSnapshot";
 const FORWARD: &str = "/ourios.wal.v1.Replication/Forward";
+const IDENTIFY: &str = "/ourios.wal.v1.Replication/Identify";
 
 #[cfg(test)]
 mod tests;

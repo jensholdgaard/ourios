@@ -83,6 +83,7 @@ impl ReplicatedIngest {
         outcome
     }
 
+    /// [`Self::ingest`]'s work, inside its span.
     async fn ingest_batch(&self, export: Export<'_>) -> Result<Ingested, ReceiveError> {
         let Export {
             request,

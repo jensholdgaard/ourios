@@ -33,6 +33,7 @@ async fn traced(
     (outcome, exporter.get_finished_spans().expect("spans"))
 }
 
+/// The one span named `name`; panics on none or several.
 fn one<'a>(spans: &'a [SpanData], name: &str) -> &'a SpanData {
     let [span] = spans.iter().filter(|s| s.name == name).collect::<Vec<_>>()[..] else {
         panic!("one {name} span, got {spans:?}");
@@ -40,6 +41,7 @@ fn one<'a>(spans: &'a [SpanData], name: &str) -> &'a SpanData {
     span
 }
 
+/// The span's `error.type`, if it was recorded.
 fn error_type(span: &SpanData) -> Option<String> {
     span.attributes
         .iter()

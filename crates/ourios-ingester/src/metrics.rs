@@ -165,6 +165,13 @@ const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
 /// §3.5): over `receiver.max_request_bytes` on either listener, or over the
 /// WAL frame (`AppendError::TooLarge`).
 pub(crate) const ERROR_TYPE_REQUEST_TOO_LARGE: &str = "request_too_large";
+/// The `error.type` value for a replicated export not committed within
+/// the commit timeout (RFC 0065 §6.3, §6.9).
+pub(crate) const ERROR_TYPE_NOT_ENOUGH_REPLICAS: &str = "not_enough_replicas";
+/// The `error.type` value for a replicated export its group could not
+/// take: this node does not lead it or host it, or its Raft failed
+/// (RFC 0065 §6.3, §6.9).
+pub(crate) const ERROR_TYPE_GROUP_UNAVAILABLE: &str = "group_unavailable";
 /// The `error.type` value for a cadence sweep step that panicked (#791),
 /// and for an RFC 0052 §3.2 housekeeping tick that panicked.
 ///

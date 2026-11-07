@@ -26,12 +26,13 @@ use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
 
 use super::super::types::RaftTypes;
+use super::forward::{self, ForwardTarget};
 use super::trace::{Call, Carried, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, Malformed, SnapshotRequest,
     StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
 };
-use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, STREAM_APPEND, VERSION, VOTE};
+use super::{APPEND, FORWARD, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, STREAM_APPEND, VERSION, VOTE};
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
 
@@ -41,6 +42,9 @@ where
     SM: RaftStateMachine<RaftTypes>,
 {
     groups: Arc<RwLock<Groups<SM>>>,
+    /// The node's ingest for `Forward`; until it is set, every forwarded
+    /// export is refused as not hosted.
+    forwards: Arc<RwLock<Option<Arc<dyn ForwardTarget>>>>,
     tracing: Tracing,
     /// Set once `serve`'s shutdown resolves. Graceful shutdown waits for
     /// every running call, so a `StreamAppend` waiting on its peer must
@@ -55,6 +59,7 @@ where
     fn clone(&self) -> Self {
         Self {
             groups: Arc::clone(&self.groups),
+            forwards: Arc::clone(&self.forwards),
             tracing: self.tracing.clone(),
             closing: Arc::clone(&self.closing),
         }
@@ -68,6 +73,7 @@ where
     fn default() -> Self {
         Self {
             groups: Arc::default(),
+            forwards: Arc::default(),
             tracing: Tracing::default(),
             closing: Arc::new(watch::Sender::new(false)),
         }
@@ -95,6 +101,19 @@ where
         self.write().insert(group, raft);
     }
 
+    /// Commit forwarded exports with `target`, replacing any earlier one.
+    pub fn serve_forwards(&self, target: Arc<dyn ForwardTarget>) {
+        *self
+            .forwards
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(target);
+    }
+
+    fn forward_target(&self) -> Option<Arc<dyn ForwardTarget>> {
+        let target = self.forwards.read().unwrap_or_else(PoisonError::into_inner);
+        target.clone()
+    }
+
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Groups<SM>> {
         self.groups.write().unwrap_or_else(PoisonError::into_inner)
     }
@@ -103,6 +122,7 @@ where
     pub(super) fn traced_by(tracing: Tracing) -> Self {
         Self {
             groups: Arc::default(),
+            forwards: Arc::default(),
             tracing,
             closing: Arc::new(watch::Sender::new(false)),
         }
@@ -265,7 +285,7 @@ where
     }
 
     #[cfg(test)]
-    pub(super) async fn serve_plaintext(
+    pub(in crate::replicated::raft) async fn serve_plaintext(
         self,
         incoming: TcpIncoming,
         shutdown: impl Future<Output = ()>,
@@ -568,6 +588,10 @@ where
             INSTALL_SNAPSHOT => unary(INSTALL_SNAPSHOT, tracing, request, move |r| {
                 let server = server.clone();
                 async move { server.install_snapshot(r).await }
+            }),
+            FORWARD => unary(FORWARD, tracing, request, move |r| {
+                let target = server.forward_target();
+                forward::serve(target, r)
             }),
             STREAM_APPEND => streaming(server, request),
             _ => unimplemented(),

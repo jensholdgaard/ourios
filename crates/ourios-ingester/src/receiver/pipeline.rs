@@ -27,17 +27,17 @@ use ourios_core::record::MinedRecord;
 use ourios_core::sync::{lock_recover, read_recover, write_recover};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::{
-    FrameKind, HousekeepingProgress, PassId, ReclaimError, ReclaimOutcome, ReclaimPlan,
-    ReclaimState, RotationKind, RotationState, SnapshotHorizons, TenantBatch, Wal, WalOffset,
-};
-use prost::Message;
+use ourios_wal::WalOffset;
 use tracing::Instrument as _;
 
-use crate::metrics::{AcceptedBatch, IngestMetrics};
+pub use crate::receiver::admission::Export;
+use crate::receiver::admission::{Admission, Framed};
 use crate::receiver::commit::{CommitCoordinator, CommitOutcome};
-use crate::receiver::tenant::assign;
-use ourios_serving::AuthBinding;
+
+pub(super) use super::error::IngestFailure;
+pub use super::error::ReceiveError;
+pub(crate) use super::error::{SpanError, span_error};
+pub use super::journal::Journal;
 
 /// The §6.9 rotation-cadence callback: receives the miner as it
 /// stands and the rotation-point high-water mark. See
@@ -51,208 +51,6 @@ pub type RotationHook = Box<dyn FnMut(&MinerCluster, WalOffset) + Send>;
 /// concurrent requests batch their fsyncs (RFC0008.8) instead of
 /// serializing end to end. Used by both the HTTP and gRPC transports.
 pub type SharedPipeline = Arc<IngestPipeline>;
-
-/// The durability sink the pipeline appends to and fsyncs through.
-///
-/// Abstracted (rather than a concrete `Wal`) so the WAL-before-ack
-/// ordering can be exercised with a spy that records / counts the
-/// `append`/`sync` calls and can be made to fail (RFC0003.1/.12,
-/// RFC0008.8 per §8). The only production implementation is [`Wal`].
-///
-/// `Send` so it can live behind the coordinator's `Mutex<Box<dyn Journal>>`
-/// as shared state in the async HTTP/gRPC listeners.
-pub trait Journal: Send {
-    /// Append one `OtlpBatch` frame carrying `payload` (not yet durable),
-    /// yielding **this frame's own offset**.
-    ///
-    /// RFC 0052 §3.1: that offset, not the group sync's reported EOF, is
-    /// what the turn stores as `last_durable` and what the barrier reads
-    /// as its mark. A sync's EOF can cover a later turn's frame that has
-    /// not run yet, and a checkpoint at that EOF would stamp across a
-    /// frame nothing had mined.
-    ///
-    /// # Errors
-    ///
-    /// [`ReceiveError::WalAppend`] on a persistence failure.
-    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError>;
-
-    /// Fsync — appended frames are durable when this returns `Ok`,
-    /// yielding the durable high-water offset. The real WAL always has
-    /// one (RFC 0008 §6.3); the group-commit coordinator compares it
-    /// against waiters and the snapshot writer records it as the
-    /// snapshot's WAL high-water mark (RFC 0001 §6.9).
-    ///
-    /// # Errors
-    ///
-    /// [`ReceiveError::WalSync`] on an fsync failure.
-    fn sync(&mut self) -> Result<WalOffset, ReceiveError>;
-
-    /// The WAL's current unflushed-bytes counter (RFC 0008 §6.8), read
-    /// by the coordinator's segment-fill early cut ("until the segment
-    /// fills", §3.4). Cheap — an in-memory counter, no syscall.
-    fn unflushed_bytes(&self) -> u64;
-
-    /// RFC 0052 §3.7's reclamation surface, reached through the trait
-    /// object rather than a downcast so the barrier's tests can drive a
-    /// double that observes reclamation.
-    ///
-    /// The defaults answer [`ReclaimError::NoReclamationSurface`]: the
-    /// spy journals the ingest-path tests use persist nothing, and a
-    /// silent no-op default would let a missing checkpoint read as a
-    /// clean pass. Only [`Wal`] overrides them.
-    ///
-    /// # Errors
-    ///
-    /// [`ReclaimError::Checkpoint`] on a sidecar write failure — the
-    /// in-memory mark is left where it was either way (§3.1's
-    /// fail-closed rule).
-    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError> {
-        let _ = durable_to;
-        Err(ReclaimError::NoReclamationSurface)
-    }
-
-    /// The journal's persisted checkpoint mark, if any.
-    fn last_checkpoint(&self) -> Option<WalOffset> {
-        None
-    }
-
-    /// The ledger half of one capped housekeeping pass (§3.2), under the
-    /// journal's single-writer position. There is no file-half method:
-    /// the plan carries the `RECLAIM` sidecar it was planned against, so
-    /// [`ourios_wal::write_plan_record`] and [`ourios_wal::unlink_planned`]
-    /// run on the plan alone, and no implementation can put that I/O
-    /// back under the guard.
-    ///
-    /// # Errors
-    ///
-    /// As [`Wal::housekeeping_prepare`].
-    fn housekeeping_prepare(
-        &mut self,
-        horizons: &SnapshotHorizons,
-        max_unlinks: usize,
-    ) -> Result<ReclaimPlan, ReclaimError> {
-        let _ = (horizons, max_unlinks);
-        Err(ReclaimError::NoReclamationSurface)
-    }
-
-    /// Fold the file half's outcome back under the writer position.
-    ///
-    /// # Errors
-    ///
-    /// As [`Wal::housekeeping_commit`].
-    fn housekeeping_commit(
-        &mut self,
-        pass: PassId,
-        outcome: ReclaimOutcome,
-    ) -> Result<HousekeepingProgress, ReclaimError> {
-        let _ = (pass, outcome);
-        Err(ReclaimError::NoReclamationSurface)
-    }
-
-    /// §3.3's append-independent rotation — the barrier task's idle
-    /// rotation, and the discharge of a pending rotation-origin
-    /// directory fsync.
-    ///
-    /// The default fails closed like the rest of this surface: a journal
-    /// that answers [`Self::segment_age_exceeded`] or
-    /// [`Self::owes_rotation_fsync`] but inherits a silent `Ok` here would
-    /// have `rotate_if_aged` read an owed rotation or fsync as discharged.
-    ///
-    /// # Errors
-    ///
-    /// As [`Wal::rotate`]; the default answers
-    /// [`ourios_wal::AppendError::Io`] with an `Unsupported` source.
-    fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError> {
-        let _ = kind;
-        Err(ReceiveError::WalAppend(ourios_wal::AppendError::Io {
-            op: "rotate",
-            source: std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "this journal exposes no RFC 0052 rotation surface",
-            ),
-        }))
-    }
-
-    /// Whether the current segment has outlived `segment_age_secs` —
-    /// the barrier task's idle-rotation predicate (§3.1).
-    fn segment_age_exceeded(&self) -> bool {
-        false
-    }
-
-    /// Whether a rotation-origin directory fsync is still owed (§3.3).
-    fn owes_rotation_fsync(&self) -> bool {
-        false
-    }
-
-    /// §3.5's export surface.
-    fn reclaim_state(&self) -> ReclaimState {
-        ReclaimState::default()
-    }
-
-    /// §3.3's rotation state alone — cheap, because the coordinator
-    /// reads it on every guard release to emit the rotation edges.
-    fn rotation_state(&self) -> RotationState {
-        RotationState::Healthy
-    }
-}
-
-impl Journal for Wal {
-    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
-        Wal::append(self, FrameKind::TenantOtlpBatch, payload).map_err(ReceiveError::WalAppend)
-    }
-
-    fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
-        Wal::sync(self).map_err(ReceiveError::WalSync)
-    }
-
-    fn unflushed_bytes(&self) -> u64 {
-        self.metrics().unflushed_bytes
-    }
-
-    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError> {
-        Wal::checkpoint(self, durable_to).map_err(ReclaimError::Checkpoint)
-    }
-
-    fn last_checkpoint(&self) -> Option<WalOffset> {
-        Wal::last_checkpoint(self)
-    }
-
-    fn housekeeping_prepare(
-        &mut self,
-        horizons: &SnapshotHorizons,
-        max_unlinks: usize,
-    ) -> Result<ReclaimPlan, ReclaimError> {
-        Wal::housekeeping_prepare(self, horizons, max_unlinks)
-    }
-
-    fn housekeeping_commit(
-        &mut self,
-        pass: PassId,
-        outcome: ReclaimOutcome,
-    ) -> Result<HousekeepingProgress, ReclaimError> {
-        Wal::housekeeping_commit(self, pass, outcome)
-    }
-
-    fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError> {
-        Wal::rotate(self, kind).map_err(ReceiveError::WalAppend)
-    }
-
-    fn segment_age_exceeded(&self) -> bool {
-        Wal::segment_age_exceeded(self)
-    }
-
-    fn owes_rotation_fsync(&self) -> bool {
-        Wal::owes_rotation_fsync(self)
-    }
-
-    fn reclaim_state(&self) -> ReclaimState {
-        Wal::reclaim_state(self)
-    }
-
-    fn rotation_state(&self) -> RotationState {
-        Wal::rotation_state(self).clone()
-    }
-}
 
 /// The ingester's WAL-before-ack ingest path. Owns the group-commit
 /// [`CommitCoordinator`] (which owns the durability [`Journal`]), the
@@ -331,11 +129,9 @@ pub struct IngestPipeline {
     /// the rotation-detection read-then-write must see a consistent value.
     last_durable: Mutex<Option<DurableMark>>,
     rotation_hook: Mutex<Option<RotationHook>>,
-    /// Ingest throughput + WAL-before-ack latency instruments (RFC 0014
-    /// §6.3), recorded on durably-acked batches — plus the RFC 0026 §3.4
-    /// rejection counts (`error.type` on the batches counter), recorded
-    /// on the pre-WAL denial paths.
-    metrics: IngestMetrics,
+    /// The binding check, the frame and the batch metrics, shared with
+    /// the replicated path.
+    admission: Admission,
     /// RFC 0035 §3.1: the concurrent encode pool. When present (every
     /// production wiring — the server role, the soak, the Parquet-sink
     /// integration tests), the gated section runs
@@ -345,19 +141,6 @@ pub struct IngestPipeline {
     /// to hand a pool (spy/no-op-sink test pipelines) — keeps the fully
     /// synchronous `miner.ingest` path.
     encode_pool: Option<crate::encode_pool::EncodePool>,
-    /// RFC 0026 §3.4: the sink for `ingest_denied` audit events. Behind a
-    /// mutex — denials are the cold path.
-    ///
-    /// **Best-effort durability, deliberately.** The server wires the
-    /// buffering audit sink, so a crash before its next cadence flush can
-    /// drop denial events — and unlike template events they have no WAL
-    /// replay to recover from (the denied batch never reached the WAL,
-    /// which is the §3.2 point). The durable alerting signal is the
-    /// `error.type = permission_denied` counter; the event is forensic
-    /// detail. Making denials synchronously durable would put an fsync on
-    /// the rejection path — a write-amplification lever for any
-    /// authenticated-but-misconfigured (or hostile) sender.
-    denial_audit: Mutex<Option<Box<dyn ourios_core::audit::AuditSink + Send>>>,
 }
 
 impl IngestPipeline {
@@ -373,8 +156,7 @@ impl IngestPipeline {
             last_durable: Mutex::new(None),
             rotation_hook: Mutex::new(None),
             encode_pool: None,
-            metrics: IngestMetrics::new(),
-            denial_audit: Mutex::new(None),
+            admission: Admission::new(),
         }
     }
 
@@ -445,7 +227,7 @@ impl IngestPipeline {
         self,
         sink: Box<dyn ourios_core::audit::AuditSink + Send>,
     ) -> Self {
-        *lock_recover(&self.denial_audit) = Some(sink);
+        self.admission.set_denial_audit_sink(sink);
         self
     }
 
@@ -496,49 +278,18 @@ impl IngestPipeline {
         request: ExportLogsServiceRequest,
         tenant: TenantId,
     ) -> Result<usize, ReceiveError> {
-        self.ingest_bound(request, tenant, None, false).await
+        self.ingest_bound(Export {
+            request,
+            tenant,
+            binding: None,
+            lenient_json: false,
+        })
+        .await
     }
 
-    /// The RFC 0026 §3.2 per-batch tenant-binding enforcement, with the
-    /// §3.4 denial surface: the rejection counts on
-    /// `ourios.ingest.batches` (`error.type = permission_denied`) and
-    /// emits the `IngestDenied` audit event. `None` binding is open
-    /// mode — every tenant passes.
-    fn enforce_binding(
-        &self,
-        tenant: &TenantId,
-        binding: Option<&AuthBinding>,
-    ) -> Result<(), ReceiveError> {
-        let Some(binding) = binding else {
-            return Ok(());
-        };
-        if let Err(e) = check_binding(tenant, binding) {
-            if let ReceiveError::TenantDenied {
-                token_name,
-                tenant: denied_tenant,
-            } = &e
-            {
-                self.metrics
-                    .record_rejected_batch(crate::metrics::ERROR_TYPE_PERMISSION_DENIED);
-                let mut sink = lock_recover(&self.denial_audit);
-                if let Some(sink) = sink.as_mut() {
-                    sink.emit(ourios_core::audit::AuditEvent {
-                        tenant_id: denied_tenant.clone(),
-                        timestamp: std::time::SystemTime::now(),
-                        payload: ourios_core::audit::AuditPayload::IngestDenied {
-                            token_name: token_name.clone(),
-                        },
-                    });
-                }
-            }
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    /// Ingest one decoded export under the out-of-band `tenant` (RFC 0046
+    /// Ingest one decoded export under its out-of-band `tenant` (RFC 0046
     /// §3.1) per the §6.5 sequence: enforce the RFC 0026 §3.2 tenant
-    /// binding (when `binding` is present), materialise every record under
+    /// binding (when the export carries one), materialise every record under
     /// `tenant`, append the export as a single `TenantOtlpBatch` frame,
     /// **fsync** (batched via the group-commit coordinator), then hand the
     /// records to the miner, then ack. Returns the number of records
@@ -556,19 +307,8 @@ impl IngestPipeline {
     ///   with no partial success (RFC 0026 §3.2).
     /// - [`ReceiveError::WalAppend`] / [`ReceiveError::WalSync`] if
     ///   persistence fails; the batch is **not** acked.
-    pub async fn ingest_bound(
-        &self,
-        request: ExportLogsServiceRequest,
-        tenant: TenantId,
-        binding: Option<&AuthBinding>,
-        lenient_json: bool,
-    ) -> Result<usize, ReceiveError> {
-        self.ingest_reported(request, tenant, binding, lenient_json, |error| {
-            IngestFailure::classify(error)
-                .span_error_type()
-                .map(str::to_owned)
-        })
-        .await
+    pub async fn ingest_bound(&self, export: Export<'_>) -> Result<usize, ReceiveError> {
+        self.ingest_reported(export, span_error).await
     }
 
     /// [`Self::ingest_bound`], with the transport saying how a failure
@@ -591,8 +331,8 @@ impl IngestPipeline {
         name = "ingest logs",
         fields(
             otel.kind = "server",
-            ourios.tenant = tenant.as_str(),
-            ourios.ingest.batch.record_count = log_record_count(&request),
+            ourios.tenant = export.tenant.as_str(),
+            ourios.ingest.batch.record_count = log_record_count(&export.request),
             ourios.ingest.batch.size = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
             error.type = tracing::field::Empty,
@@ -600,15 +340,10 @@ impl IngestPipeline {
     )]
     pub(crate) async fn ingest_reported(
         &self,
-        request: ExportLogsServiceRequest,
-        tenant: TenantId,
-        binding: Option<&AuthBinding>,
-        lenient_json: bool,
+        export: Export<'_>,
         span_error: SpanError,
     ) -> Result<usize, ReceiveError> {
-        let outcome = self
-            .ingest_batch(request, tenant, binding, lenient_json)
-            .await;
+        let outcome = self.ingest_batch(export).await;
         if let Err(error) = &outcome
             && let Some(error_type) = span_error(error)
         {
@@ -642,30 +377,20 @@ impl IngestPipeline {
     }
 
     /// [`Self::ingest_bound`]'s work, inside its span.
-    async fn ingest_batch(
-        &self,
-        request: ExportLogsServiceRequest,
-        tenant: TenantId,
-        binding: Option<&AuthBinding>,
-        lenient_json: bool,
-    ) -> Result<usize, ReceiveError> {
+    async fn ingest_batch(&self, export: Export<'_>) -> Result<usize, ReceiveError> {
+        let Export {
+            request,
+            tenant,
+            binding,
+            lenient_json,
+        } = export;
         // RFC 0026 §3.2: authz precedes every other ingest step — a denied
         // batch does no encode, materialisation, or WAL work.
-        self.enforce_binding(&tenant, binding)?;
-        // Encode before materialisation consumes the request: the WAL frame
-        // is the tenant prefix + the protobuf `ExportLogsServiceRequest`
-        // (RFC 0046 §3.3 / §6.5 step 3). Byte-equality to the wire isn't
-        // required — recoverability is. The selector was validated by the
-        // transport, so the codec's own bound cannot fail here.
-        let payload = TenantBatch::encode(tenant.as_str(), &request.encode_to_vec())
-            .map_err(ReceiveError::TenantFrame)?;
-        tracing::Span::current().record(
-            ourios_semconv::OURIOS_INGEST_BATCH_SIZE,
-            span_count(payload.len()),
-        );
-
-        // Steps 1–2: every record under the selected tenant (RFC 0046 §3.2).
-        let records = assign(request, &tenant);
+        self.admission.enforce_binding(&tenant, binding)?;
+        // Steps 1–3: every record under the selected tenant (RFC 0046 §3.2),
+        // and the frame.
+        let framed = Framed::of(request, &tenant)?;
+        let records = &framed.records;
 
         // Empty fast path (RFC0003.12): no records → success, no WAL
         // frame, miner untouched.
@@ -682,7 +407,7 @@ impl IngestPipeline {
         // I/O-bound, latency-bearing step (a durationful op is a span, not an
         // event). Nests under the batch span; `.instrument` (not an entered
         // guard) carries it across the await cleanly.
-        let outcome = self.commit_traced(&payload).await;
+        let outcome = self.commit_traced(&framed.payload).await;
         // The WAL-before-ack latency: time until the batch is durable
         // (includes the group-commit window + fsync). Recorded below only
         // on a successful, acked commit.
@@ -733,7 +458,7 @@ impl IngestPipeline {
                 // Taken **before** the miner lock, and never requested
                 // while holding it.
                 let _bound = self.share_bound();
-                let mined = self.fold_turn(&tenant, &records, now);
+                let mined = self.fold_turn(&tenant, records, now);
                 if let Some(pool) = &self.encode_pool {
                     // Still under the ingest gate (`_gate` drops at
                     // return): every frame ≤ this seq submits its encodes
@@ -749,21 +474,11 @@ impl IngestPipeline {
                 // replay re-covers those frames (no §3.5.3 divergence).
                 *self.lock_last_durable() = Some(DurableMark::Acknowledged(now));
                 // Throughput + WAL-before-ack latency for this acked batch.
-                // RFC 0018 §3.5: tag out-of-range-severity records on the
-                // ingest counter via `error.type` (post-materialise on the
-                // preserved `u8`; the rare non-`u8` extremes narrowed to 0
-                // aren't separately attributed — accepted limitation).
-                let severity_out_of_range = records
-                    .iter()
-                    .filter(|r| super::materialize::severity_is_out_of_range(r.severity_number))
-                    .count();
-                self.metrics.record_batch(&AcceptedBatch {
-                    tenant: &tenant,
-                    record_count: records.len(),
-                    severity_out_of_range,
+                self.admission.metrics().record_batch(&framed.accepted(
+                    &tenant,
                     lenient_json,
-                    elapsed: append_elapsed,
-                });
+                    append_elapsed,
+                ));
                 Ok(records.len())
             }
             // Sync failed: the frame is not durable and not acked; it
@@ -991,7 +706,7 @@ impl IngestPipeline {
 /// Log records across every `ResourceLogs` and `ScopeLogs` of an export,
 /// counted before the request is consumed so the `ingest logs` span carries
 /// it from its start (RFC 0038 §3.5).
-fn log_record_count(request: &ExportLogsServiceRequest) -> i64 {
+pub(crate) fn log_record_count(request: &ExportLogsServiceRequest) -> i64 {
     span_count(
         request
             .resource_logs
@@ -1004,183 +719,8 @@ fn log_record_count(request: &ExportLogsServiceRequest) -> i64 {
 
 /// A count as a span attribute value: `i64`, since tracing-opentelemetry
 /// renders a `u64` field as a string.
-fn span_count(count: usize) -> i64 {
+pub(super) fn span_count(count: usize) -> i64 {
     i64::try_from(count).unwrap_or(i64::MAX)
-}
-
-/// Failure ingesting an export. Tenant-resolution failures reject the
-/// whole batch (RFC0003.4); WAL failures mean the batch is not acked
-/// (`[§3.4]`).
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ReceiveError {
-    /// The selected tenant falls outside the authenticated token's
-    /// allowed set — the whole batch is denied before any WAL work
-    /// (RFC 0026 §3.2, `PERMISSION_DENIED` / 403).
-    TenantDenied {
-        /// The rejecting token's audit/metric label (never the value) —
-        /// what the §3.4 rejection audit event will carry.
-        token_name: String,
-        /// The offending selected tenant.
-        tenant: ourios_core::tenant::TenantId,
-    },
-    /// The tenant could not be framed into the WAL payload (RFC 0046
-    /// §3.3) — unreachable for a transport-validated selector; surfaced
-    /// rather than unwrapped.
-    TenantFrame(ourios_wal::TenantBatchError),
-    /// Appending the `OtlpBatch` frame to the WAL failed.
-    WalAppend(ourios_wal::AppendError),
-    /// Fsyncing the WAL failed — the batch must not be acked.
-    WalSync(ourios_wal::SyncError),
-}
-
-/// How a transport classifies a failed batch for the `ingest logs` server
-/// span: the `error.type` it fails with, or `None` for a status that is not
-/// a server error under that transport's convention.
-pub(crate) type SpanError = fn(&ReceiveError) -> Option<String>;
-
-/// The transport-agnostic classification of a [`ReceiveError`] —
-/// one exhaustive match instead of one per transport (epic #745
-/// wave 2; this replaced twin 4-arm mappers in `http.rs`/`grpc.rs`,
-/// which now adapt these four outcomes to their status vocabularies).
-/// A future `ReceiveError` variant breaks the build HERE, forcing one
-/// retryable-vs-not decision instead of two independently-drifting
-/// ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum IngestFailure {
-    /// An authenticated caller writing outside its tenant set — a
-    /// permanent authz rejection, whole batch, pre-WAL (RFC 0026
-    /// §3.2). HTTP 403 / gRPC `PERMISSION_DENIED`.
-    Denied,
-    /// The batch exceeds the WAL's frame bound; the client must
-    /// shrink it. HTTP 413 / gRPC `RESOURCE_EXHAUSTED` without
-    /// `RetryInfo`, as for an Export over the listener's limit (RFC 0061
-    /// §3.2).
-    TooLarge,
-    /// Durability is temporarily unavailable; retryable. HTTP 503 /
-    /// gRPC `UNAVAILABLE`.
-    Unavailable,
-    /// **Server-terminal, client-retryable** — RFC 0018 §3.2's third
-    /// class, which RFC 0052 §3.3 adds. The WAL's rotation retry budget
-    /// is exhausted: no delay fixes the node, it needs an operator, and
-    /// the only exit today is a restart (#791).
-    ///
-    /// Still HTTP 503 / gRPC `UNAVAILABLE`, deliberately and for the
-    /// reason §3.2 gives: the batch was never acked, and every
-    /// non-retryable OTLP status also instructs the client to *drop*
-    /// it, which would turn a terminal node into silent data loss.
-    /// OTLP's retryable axis is about the data, and this batch is
-    /// valid — it will be accepted once the node is cleared. What
-    /// changes is the message, which names the state instead of
-    /// implying a blip, and that no retry hint is carried: the server
-    /// schedules no retry of its own, so a conforming client backs off
-    /// exponentially.
-    ServerTerminal,
-    /// Unreachable for a transport-validated selector; our bug.
-    /// HTTP 500 / gRPC `INTERNAL`.
-    Internal,
-}
-
-impl IngestFailure {
-    /// Classify `error` into the transport-agnostic outcome.
-    #[must_use]
-    pub(super) fn classify(error: &ReceiveError) -> Self {
-        match error {
-            ReceiveError::TenantDenied { .. } => Self::Denied,
-            ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => Self::TooLarge,
-            // RFC 0052 §3.3's narrow reclassification: only the
-            // *terminal* rotation state leaves the transient class. A
-            // rotation still inside its retry budget genuinely is
-            // transient — a later append can succeed — and an ordinary
-            // append or fsync I/O failure never reaches this arm at all.
-            ReceiveError::WalAppend(ourios_wal::AppendError::RotationTerminal(_))
-            | ReceiveError::WalSync(ourios_wal::SyncError::RotationTerminal(_)) => {
-                Self::ServerTerminal
-            }
-            ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => Self::Unavailable,
-            ReceiveError::TenantFrame(_) => Self::Internal,
-        }
-    }
-
-    /// The low-cardinality `error.type` of the class.
-    #[must_use]
-    pub(super) fn error_type(self) -> &'static str {
-        match self {
-            Self::Denied => "permission_denied",
-            Self::TooLarge => "too_large",
-            Self::Unavailable => "unavailable",
-            Self::ServerTerminal => "server_terminal",
-            Self::Internal => "internal",
-        }
-    }
-
-    /// The `error.type` the batch span fails with, or `None` for a
-    /// rejection that is the client's fault: an `ingest logs` span is a
-    /// server span, which semconv leaves unset on a 4xx / client-error
-    /// status (HTTP 403 / 413, gRPC `PERMISSION_DENIED` /
-    /// `RESOURCE_EXHAUSTED`). The gRPC server convention counts UNAVAILABLE
-    /// and INTERNAL, the codes the other classes map to, as errors.
-    #[must_use]
-    pub(super) fn span_error_type(self) -> Option<&'static str> {
-        match self {
-            Self::Denied | Self::TooLarge => None,
-            Self::Unavailable | Self::ServerTerminal | Self::Internal => Some(self.error_type()),
-        }
-    }
-}
-
-impl std::fmt::Display for ReceiveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            // The wire message names the tenant, not the token: the caller
-            // knows its own credential, and the token's label belongs to
-            // the operator's audit surface (RFC 0026 §3.4), not the
-            // client's error text.
-            Self::TenantDenied { tenant, .. } => write!(
-                f,
-                "tenant `{}` is outside the authenticated token's allowed \
-                 tenant set (RFC 0026 §3.2)",
-                tenant.as_str(),
-            ),
-            Self::TenantFrame(e) => write!(f, "{e}"),
-            Self::WalAppend(e) => write!(f, "{e}"),
-            Self::WalSync(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for ReceiveError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::TenantDenied { .. } => None,
-            Self::TenantFrame(e) => Some(e),
-            Self::WalAppend(e) => Some(e),
-            Self::WalSync(e) => Some(e),
-        }
-    }
-}
-
-/// Enforce the §3.2 per-batch tenant binding: the out-of-band selected
-/// `tenant` (RFC 0046 §3.1) must fall inside the binding's write set.
-///
-/// Runs before the WAL append *and* before materialisation, so a denied
-/// batch does no ingest work at all. Lives with [`ReceiveError`] — the
-/// error it raises — since RFC 0051 moved the resolver to
-/// `ourios-serving`; the binding *decision* stays on the ingest side.
-///
-/// # Errors
-///
-/// [`ReceiveError::TenantDenied`] when `tenant` is outside the set — the
-/// whole batch is rejected (`PERMISSION_DENIED` / 403).
-pub(crate) fn check_binding(tenant: &TenantId, binding: &AuthBinding) -> Result<(), ReceiveError> {
-    if binding.may_write(tenant.as_str()) {
-        Ok(())
-    } else {
-        Err(ReceiveError::TenantDenied {
-            token_name: binding.token_name().to_string(),
-            tenant: tenant.clone(),
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1194,162 +734,6 @@ mod tests {
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use ourios_config::MinerConfig;
-
-    /// The classifier exists to force "one retryable-vs-not decision"
-    /// (see its doc comment). It used to fold a permanently quiesced
-    /// WAL into the transient bucket, so a node only a restart could
-    /// fix kept answering "retry later" forever (#791). RFC 0052 §3.3
-    /// made the refusal *bounded*, so the rule is now terminal-only:
-    /// the state that leaves the transient class is the exhausted
-    /// budget, and nothing else.
-    mod terminal_vs_transient {
-        use super::super::{IngestFailure, ReceiveError};
-        use ourios_wal::{AppendError, RotationFault, RotationSite, SyncError};
-
-        fn fault(attempts: u32) -> RotationFault {
-            RotationFault::new(
-                RotationSite::CloseSync,
-                &std::io::Error::other("io"),
-                attempts,
-                3,
-            )
-        }
-
-        /// The state #794 called wedged. It is reached by exhausting the
-        /// budget now, and every append after it carries this variant.
-        #[test]
-        fn a_terminal_rotation_state_classifies_server_terminal_not_transient() {
-            assert_eq!(
-                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::RotationTerminal(
-                    fault(3),
-                ))),
-                IngestFailure::ServerTerminal,
-            );
-        }
-
-        /// The append whose own rotation spent the last unit of the
-        /// budget is already terminal: every later append is refused.
-        /// #794 classified it transient, which advised a retry on the
-        /// one request that had just made retrying useless — and the
-        /// *sync* surface reaches the same state, so it must classify
-        /// the same way.
-        #[test]
-        fn the_append_and_the_sync_that_exhaust_the_budget_are_both_terminal() {
-            for error in [
-                ReceiveError::WalAppend(AppendError::RotationTerminal(fault(3))),
-                ReceiveError::WalSync(SyncError::RotationTerminal(fault(3))),
-            ] {
-                assert_eq!(
-                    IngestFailure::classify(&error),
-                    IngestFailure::ServerTerminal
-                );
-            }
-        }
-
-        /// The half #794 got wrong once §3.3 lands: a rotation failure
-        /// still inside its budget genuinely is transient, because a
-        /// later append can succeed. Classifying it terminal would tell
-        /// an operator to intervene on a blip.
-        #[test]
-        fn a_rotation_still_inside_its_budget_stays_transient() {
-            for error in [
-                ReceiveError::WalAppend(AppendError::RotationRetrying(fault(1))),
-                ReceiveError::WalSync(SyncError::RotationRetrying(fault(1))),
-            ] {
-                assert_eq!(IngestFailure::classify(&error), IngestFailure::Unavailable);
-            }
-        }
-
-        /// The batch span is a server span: the server's own failures
-        /// mark it `Error`, a client-fault rejection leaves it unset.
-        #[test]
-        fn only_server_faults_fail_the_batch_span() {
-            assert_eq!(IngestFailure::Denied.span_error_type(), None);
-            assert_eq!(IngestFailure::TooLarge.span_error_type(), None);
-            assert_eq!(
-                IngestFailure::Unavailable.span_error_type(),
-                Some("unavailable")
-            );
-            assert_eq!(
-                IngestFailure::ServerTerminal.span_error_type(),
-                Some("server_terminal")
-            );
-            assert_eq!(IngestFailure::Internal.span_error_type(), Some("internal"));
-        }
-
-        /// A real WAL whose idle timer spent the budget on an owed
-        /// directory fsync, then whose flush's data sync fails on the
-        /// same disk: the flush must still classify terminal, not as
-        /// the ordinary sync failure a client should retry.
-        #[test]
-        fn a_failing_data_sync_behind_a_terminal_owed_dir_fsync_is_terminal() {
-            use ourios_wal::{FrameKind, RotationFaults, RotationKind, Wal, WalConfig};
-
-            let tmp = tempfile::TempDir::new().expect("temp");
-            let mut wal = Wal::open(WalConfig {
-                root: tmp.path().to_path_buf(),
-                batch_window_ms: 20,
-                segment_size_bytes: ourios_wal::MIN_SEGMENT_SIZE_BYTES,
-                segment_age_secs: 600,
-                housekeeping_secs: 60,
-                max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
-                rotation_retry_attempts: 2,
-                macos_full_fsync: false,
-            })
-            .expect("open WAL");
-            wal.append(FrameKind::OtlpBatch, b"seed").expect("seed");
-            wal.arm_rotation_faults(RotationFaults::always(RotationSite::ParentFsync));
-            wal.rotate(RotationKind::Owed)
-                .expect_err("the rotation's parent fsync fails");
-            wal.append(FrameKind::OtlpBatch, b"appended, never flushed")
-                .expect("appends land in the installed segment");
-            wal.rotate(RotationKind::Discretionary)
-                .expect_err("the timer's discharge spends the budget");
-            wal.arm_rotation_faults(
-                RotationFaults::always(RotationSite::ParentFsync).and_failing_segment_sync(),
-            );
-
-            for _ in 0..3 {
-                let error = ReceiveError::WalSync(wal.sync().expect_err("nothing is acked"));
-                assert_eq!(
-                    IngestFailure::classify(&error),
-                    IngestFailure::ServerTerminal,
-                    "{error}",
-                );
-            }
-        }
-
-        #[test]
-        fn other_append_and_sync_failures_stay_transient() {
-            assert_eq!(
-                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::Io {
-                    op: "write",
-                    source: std::io::Error::other("io"),
-                })),
-                IngestFailure::Unavailable,
-            );
-            assert_eq!(
-                IngestFailure::classify(&ReceiveError::WalSync(SyncError::Io {
-                    op: "fdatasync",
-                    source: std::io::Error::other("io"),
-                })),
-                IngestFailure::Unavailable,
-            );
-        }
-
-        /// The split must not have moved the oversize case, which is the
-        /// one append failure a client can fix itself.
-        #[test]
-        fn an_oversize_batch_is_still_its_own_outcome() {
-            assert_eq!(
-                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::TooLarge {
-                    len: 32 * 1024 * 1024,
-                    limit: 16 * 1024 * 1024,
-                })),
-                IngestFailure::TooLarge,
-            );
-        }
-    }
 
     /// Persists nothing; `sync` reports the configured offset and counts
     /// its calls, so a test can assert WAL-before-ack ordering and
@@ -1434,36 +818,6 @@ mod tests {
                 }],
                 ..Default::default()
             }],
-        }
-    }
-
-    /// RFC 0026 §3.2 (relocated here by RFC 0051): `check_binding`
-    /// allows a tenant inside the binding's write set and rejects one
-    /// outside it, preserving the token's audit label and the selected
-    /// tenant in the error.
-    #[test]
-    fn check_binding_allows_inside_and_denies_outside_the_write_set() {
-        let store = ourios_core::auth::build_token_store(Some(&[ourios_core::auth::TokenSpec {
-            name: Some("edge".to_string()),
-            token: Some("tok-edge".to_string()),
-            tenants: vec!["acme".to_string()],
-        }]))
-        .expect("valid spec")
-        .expect("enabled store");
-        let binding = ourios_serving::authenticate_bearer(Some(&store), Some("Bearer tok-edge"))
-            .expect("known token")
-            .expect("bound");
-
-        let acme = ourios_core::tenant::TenantId::new("acme");
-        assert!(check_binding(&acme, &binding).is_ok());
-
-        let globex = ourios_core::tenant::TenantId::new("globex");
-        match check_binding(&globex, &binding) {
-            Err(ReceiveError::TenantDenied { token_name, tenant }) => {
-                assert_eq!(token_name, "edge", "audit label preserved");
-                assert_eq!(tenant, globex, "selected tenant preserved");
-            }
-            other => panic!("expected TenantDenied, got {other:?}"),
         }
     }
 

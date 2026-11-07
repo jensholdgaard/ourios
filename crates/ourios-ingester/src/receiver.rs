@@ -32,10 +32,13 @@
 //!   wrapping the same pipeline: controlled `Status` mapping + concurrent
 //!   WAL-before-ack (RFC0003.11 gRPC arms / .15).
 
+pub(crate) mod admission;
 pub mod commit;
 pub mod decode;
+mod error;
 pub mod grpc;
 pub mod http;
+mod journal;
 pub mod materialize;
 pub mod pipeline;
 pub mod selector;
@@ -44,7 +47,7 @@ pub mod tenant;
 pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};
-pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};
+pub use pipeline::{Export, IngestPipeline, Journal, ReceiveError, SharedPipeline};
 pub use selector::{SelectorError, TENANT_HEADER};
 pub use tenant::assign;
 

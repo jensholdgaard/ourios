@@ -1951,6 +1951,25 @@ async fn rfc0002_18_unparseable_value_excluded_from_scalar() {
     );
 }
 
+/// A scalar aggregate over a non-promoted attribute names the aggregate in
+/// its promotion hint, not a grouping the query never asked for.
+#[tokio::test]
+async fn an_unpromoted_aggregate_path_hint_names_the_aggregate() {
+    use crate::common::{TS0, kv, rec_with_attrs, write_all};
+
+    let recs = [rec_with_attrs(
+        "a",
+        TS0,
+        vec![kv("service.name", "agent")],
+        vec![kv("cost", "1.0")],
+    )];
+    let store = tempfile::TempDir::new().expect("temp");
+    write_all(store.path(), &recs);
+    let err = run_dsl_err(store.path(), "template_id == 1 | sum(attr.cost)").await;
+    assert!(err.contains("aggregating 'attr.cost'"), "{err}");
+    assert!(!err.contains("grouping by"), "{err}");
+}
+
 /// Scenario RFC0002.19 — a non-promoted / non-attribute aggregate path, or a
 /// second aggregation stage, is a specific compile-time error. See §5
 /// (amendment 2026-07-23).

@@ -4,13 +4,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt as _};
-use hyper_util::rt::TokioIo;
 use openraft::OptionalSend;
 use openraft::base::{BoxFuture, BoxStream};
 use openraft::errors::{
@@ -23,12 +20,8 @@ use openraft::raft::{
 };
 use openraft::type_config::alias::SnapshotOf;
 use ourios_serving::tls::TlsSettings;
-use rustls::pki_types::ServerName;
-use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
-use tokio_rustls::client::TlsStream;
-use tonic::codegen::http::Uri;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status, Streaming};
@@ -36,6 +29,11 @@ use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
 
 use super::super::types::{NodeId, RaftTypes, Vote};
+#[cfg(test)]
+use super::connect::PlainConnector;
+use super::connect::TlsConnector;
+use super::forward;
+use super::links::{Link, Links};
 use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, MAX_MESSAGE_BYTES, Malformed, Pieces, Recipient, Reply,
@@ -48,7 +46,7 @@ type RpcError = RPCError<RaftTypes>;
 /// How long a channel waits to connect, TLS handshake included: an RPC's
 /// own timeout does not end the channel's connection attempt, so a peer
 /// that accepts TCP and never answers the handshake would stall it.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How a pool's channels reach their peers.
 #[derive(Clone)]
@@ -59,9 +57,15 @@ enum Security {
 }
 
 /// One lazily connected channel per peer address. Clones share the pool.
+///
+/// A peer is named by its `node_id`, each member's node data in a
+/// group's membership (§6.1), and reached at the address the
+/// configuration pairs with that `node_id`.
 #[derive(Clone)]
 pub struct Peers {
+    addresses: Arc<HashMap<String, String>>,
     channels: Arc<Mutex<HashMap<String, Channel>>>,
+    pub(super) links: Links,
     tracing: Tracing,
     security: Security,
 }
@@ -85,10 +89,20 @@ impl Peers {
 
     fn secured(security: Security) -> Self {
         Self {
+            addresses: Arc::default(),
             channels: Arc::default(),
+            links: Links::new(),
             tracing: Tracing::default(),
             security,
         }
+    }
+
+    /// The pool with each `(node_id, host:port)` pair added, the
+    /// `peers` and `tail_peers` entries.
+    #[must_use]
+    pub fn with_addresses(mut self, addresses: impl IntoIterator<Item = (String, String)>) -> Self {
+        Arc::make_mut(&mut self.addresses).extend(addresses);
+        self
     }
 
     /// The pool for plaintext peers.
@@ -116,6 +130,41 @@ impl Peers {
         }
     }
 
+    /// Forward `request` to the node named `node_id` (RFC 0065 §6.8), whose
+    /// answer must come within `commit_timeout` plus the connect timeout
+    /// once the call is sent.
+    pub async fn forward(
+        &self,
+        node_id: &str,
+        request: forward::ForwardRequest,
+        commit_timeout: Duration,
+    ) -> forward::Outcome {
+        let (addr, channel) = self.resolve(node_id);
+        let channel = match channel {
+            Ok(channel) => channel,
+            Err(e) => return forward::Outcome::Unreached(e.to_string()),
+        };
+        let deadlines = forward::Deadlines {
+            connect: CONNECT_TIMEOUT,
+            commit: commit_timeout,
+        };
+        forward::traced_call(channel, (&addr, self.tracing.clone()), request, deadlines).await
+    }
+
+    /// The address `node_id` is reached at, and its channel: a peer
+    /// with no configured address cannot be reached.
+    fn resolve(&self, node_id: &str) -> (String, Result<Channel, Unreachable<RaftTypes>>) {
+        let Some(addr) = self.addresses.get(node_id) else {
+            let unknown = io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no address is configured for the peer {node_id:?}"),
+            );
+            return (node_id.to_owned(), Err(Unreachable::new(&unknown)));
+        };
+        let channel = self.channel(addr).map_err(|e| Unreachable::new(&e));
+        (addr.clone(), channel)
+    }
+
     fn channel(&self, addr: &str) -> Result<Channel, tonic::transport::Error> {
         let mut channels = self.channels.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(channel) = channels.get(addr) {
@@ -127,57 +176,13 @@ impl Peers {
             Endpoint::from_shared(format!("http://{addr}"))?.connect_timeout(CONNECT_TIMEOUT);
         let channel = match &self.security {
             #[cfg(test)]
-            Security::Plaintext => endpoint.connect_lazy(),
+            Security::Plaintext => endpoint.connect_with_connector_lazy(PlainConnector),
             Security::MutualTls(connector) => {
                 endpoint.connect_with_connector_lazy(connector.clone())
             }
         };
         channels.insert(addr.to_owned(), channel.clone());
         Ok(channel)
-    }
-}
-
-/// Connects a channel to its peer over TLS, verifying the peer's
-/// certificate for the host the channel's address names.
-#[derive(Clone)]
-struct TlsConnector(tokio_rustls::TlsConnector);
-
-type Connecting = Pin<Box<dyn Future<Output = io::Result<TokioIo<TlsStream<TcpStream>>>> + Send>>;
-
-impl tower::Service<Uri> for TlsConnector {
-    type Response = TokioIo<TlsStream<TcpStream>>;
-    type Error = io::Error;
-    type Future = Connecting;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: Uri) -> Connecting {
-        let connector = self.0.clone();
-        Box::pin(async move {
-            let (host, port) = host_and_port(&uri)?;
-            let name = ServerName::try_from(host.clone())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let tcp = TcpStream::connect((host.as_str(), port)).await?;
-            tcp.set_nodelay(true)?;
-            Ok(TokioIo::new(connector.connect(name, tcp).await?))
-        })
-    }
-}
-
-/// The host, without an IPv6 literal's brackets, and the port of a
-/// peer's `host:port` address.
-fn host_and_port(uri: &Uri) -> io::Result<(String, u16)> {
-    let host = uri
-        .host()
-        .map(|host| host.trim_start_matches('[').trim_end_matches(']'));
-    match (host, uri.port_u16()) {
-        (Some(host), Some(port)) => Ok((host.to_owned(), port)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("the peer address {uri} is not host:port"),
-        )),
     }
 }
 
@@ -194,15 +199,16 @@ impl RaftNetworkFactory<RaftTypes> for GroupNetwork {
     // The trait is async; the channel connects lazily, on first use.
     #[allow(clippy::unused_async_trait_impl)]
     async fn new_client(&mut self, target: NodeId, node: &String) -> PeerClient {
-        let channel = self.peers.channel(node).map_err(|e| Unreachable::new(&e));
+        let (addr, channel) = self.peers.resolve(node);
         PeerClient {
             id: self.id,
             to: Recipient {
                 group: self.group,
                 node: target,
             },
-            addr: node.clone(),
+            addr,
             channel,
+            links: self.peers.links.clone(),
             tracing: self.peers.tracing.clone(),
         }
     }
@@ -213,8 +219,10 @@ pub struct PeerClient {
     id: NodeId,
     to: Recipient,
     addr: String,
-    /// An address that does not parse is a peer that cannot be reached.
+    /// A peer with no configured address, or one that does not parse,
+    /// cannot be reached.
     channel: Result<Channel, Unreachable<RaftTypes>>,
+    links: Links,
     tracing: Tracing,
 }
 
@@ -273,8 +281,8 @@ impl PeerClient {
         Req: prost::Message + Traced + Send + 'static,
         Resp: prost::Message + Default + Send + 'static,
     {
-        let channel = self.channel.clone()?;
         let ttl = option.soft_ttl();
+        let channel = self.reach(rpc.action, ttl)?;
         let peer = Peer::parse(&self.addr);
         let trace = Call::client(self.tracing.clone(), rpc.path, peer, message.traced());
         let call = async move {
@@ -293,11 +301,28 @@ impl PeerClient {
         let result = tokio::time::timeout(ttl, call)
             .instrument(trace.span())
             .await
-            .unwrap_or_else(|_| Err(Status::deadline_exceeded("peer RPC timed out")));
+            .unwrap_or_else(|_| Err(Status::deadline_exceeded("peer RPC timed out")))
+            .and_then(|response| self.link().check().map(|()| response));
         trace.finish(result.as_ref().map_or_else(Status::code, |_| Code::Ok));
         result
             .map(tonic::Response::into_inner)
             .map_err(|status| self.rpc_error(&status, rpc.action, ttl))
+    }
+
+    fn link(&self) -> Link {
+        Link {
+            links: self.links.clone(),
+            from: self.id,
+            to: self.to.node,
+        }
+    }
+
+    fn reach(&self, action: RPCTypes, ttl: Duration) -> Result<Channel, RpcError> {
+        let channel = self.channel.clone()?;
+        self.link()
+            .check()
+            .map_err(|status| self.rpc_error(&status, action, ttl))?;
+        Ok(channel)
     }
 
     /// Transport failures, a version the peer refuses, a group or replica
@@ -357,15 +382,16 @@ impl PeerClient {
         };
         // After the first append: `openraft` backs off while producing it,
         // so a peer that cannot be reached is retried at that pace.
-        let channel = self.channel.clone()?;
-        let input = futures_util::stream::iter([first]).chain(input);
         let ttl = option.soft_ttl();
+        let channel = self.reach(RPCTypes::AppendEntries, ttl)?;
+        let input = futures_util::stream::iter([first]).chain(input);
         let peer = Peer::parse(&self.addr);
         let mut call = StreamCall::client(self.tracing.clone(), STREAM_APPEND, peer);
         let sent = Arc::new(Sent {
             unanswered: Mutex::default(),
             refused: Mutex::default(),
             carried: call.carried(),
+            link: self.link(),
         });
         let (release, released) = oneshot::channel();
         let requests = outbound(self.to, input, Arc::clone(&sent), released);
@@ -413,6 +439,8 @@ struct Sent {
     unanswered: Mutex<VecDeque<Instant>>,
     refused: Mutex<Option<Malformed>>,
     carried: Carried,
+    /// Checked before each message goes out and as each answer comes in.
+    link: Link,
 }
 
 impl Sent {
@@ -456,6 +484,7 @@ where
     async fn next(mut self) -> Option<(AppendRequest, Self)> {
         loop {
             match self.pieces.as_mut().and_then(Iterator::next) {
+                Some(Ok(_)) if self.sent.link.check().is_err() => return None,
                 Some(Ok(piece)) => {
                     self.sent.carried.note(&piece);
                     self.sent.unanswered().push_back(Instant::now());
@@ -533,9 +562,13 @@ impl Replies<'_> {
         }
     }
 
-    /// Why a stream the follower closed is unfinished, if it is: a
-    /// message this end could not encode, or messages left unanswered.
+    /// Why a stream the follower closed is unfinished, if it is: a cut
+    /// link, a message this end could not encode, or messages left
+    /// unanswered.
     fn unfinished(&mut self) -> Option<Status> {
+        if let Err(cut) = self.sent.link.check() {
+            return Some(cut);
+        }
         if let Some(e) = self.sent.refused() {
             return Some(Status::internal(e.to_string()));
         }
@@ -556,6 +589,7 @@ impl Replies<'_> {
             let wake = due.unwrap_or_else(|| Instant::now() + self.ttl);
             match tokio::time::timeout_at(wake, self.incoming.message()).await {
                 Ok(reply) => {
+                    self.sent.link.check()?;
                     if matches!(reply, Ok(Some(_))) {
                         self.sent.unanswered().pop_front();
                         self.progress = Instant::now();
@@ -656,6 +690,7 @@ mod tests {
             },
             addr: "127.0.0.1:1".to_owned(),
             channel: Err(Unreachable::new(&Status::unavailable("unused"))),
+            links: Links::default(),
             tracing: Tracing::default(),
         }
     }
@@ -690,16 +725,46 @@ mod tests {
         }
     }
 
+    /// A pool whose peer `receiver-2` has an address that does not parse.
+    fn unparsable() -> Peers {
+        let addresses = [("receiver-2".to_owned(), "not an address\n".to_owned())];
+        Peers::plaintext().with_addresses(addresses)
+    }
+
+    async fn vote_to(node: &str, peers: &Peers) -> Result<VoteResponse<RaftTypes>, RpcError> {
+        let mut network = peers.network(NodeId::from(1), 0);
+        let mut client = network.new_client(NodeId::from(2), &node.to_owned()).await;
+        let rpc = VoteRequest::new(Vote::new(1, NodeId::from(1)), None);
+        client
+            .vote(rpc, RPCOption::new(Duration::from_secs(1)))
+            .await
+    }
+
+    /// The node data is a `node_id` (§6.1), dialled at its configured
+    /// address, never as an address itself.
+    #[tokio::test]
+    async fn a_peer_is_dialled_at_its_configured_address_not_its_node_data() {
+        let addr = "127.0.0.1:4320".to_owned();
+        let peers = Peers::plaintext().with_addresses([("receiver-2".to_owned(), addr.clone())]);
+        let mut network = peers.network(NodeId::from(1), 0);
+        let named = network
+            .new_client(NodeId::from(2), &"receiver-2".to_owned())
+            .await;
+        assert!(named.channel.is_ok());
+        assert_eq!(named.addr, addr, "spans name the address dialled");
+        let by_address = network.new_client(NodeId::from(2), &addr).await;
+        assert!(by_address.channel.is_err(), "an address is not a node_id");
+
+        let result = vote_to("receiver-3", &peers).await;
+        assert!(
+            matches!(result, Err(RPCError::Unreachable(_))),
+            "{result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_unparsable_peer_address_is_unreachable() {
-        let mut network = Peers::plaintext().network(NodeId::from(1), 0);
-        let mut client = network
-            .new_client(NodeId::from(2), &"not an address\n".to_owned())
-            .await;
-        let rpc = VoteRequest::new(Vote::new(1, NodeId::from(1)), None);
-        let result = client
-            .vote(rpc, RPCOption::new(Duration::from_secs(1)))
-            .await;
+        let result = vote_to("receiver-2", &unparsable()).await;
         assert!(
             matches!(result, Err(RPCError::Unreachable(_))),
             "{result:?}"
@@ -708,9 +773,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_to_an_unparsable_address_waits_for_the_first_append() {
-        let mut network = Peers::plaintext().network(NodeId::from(1), 0);
+        let mut network = unparsable().network(NodeId::from(1), 0);
         let mut client = network
-            .new_client(NodeId::from(2), &"not an address\n".to_owned())
+            .new_client(NodeId::from(2), &"receiver-2".to_owned())
             .await;
         let option = || RPCOption::new(Duration::from_secs(1));
         let held = client.stream_append(futures_util::stream::pending(), option());

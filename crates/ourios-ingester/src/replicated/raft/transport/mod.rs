@@ -28,11 +28,18 @@
 //! host its address names.
 
 mod client;
+mod connect;
+mod forward;
+mod links;
 mod server;
 mod trace;
 pub mod wire;
 
 pub use client::{GroupNetwork, PeerClient, Peers};
+pub use forward::{
+    ForwardRequest, ForwardResponse, ForwardTarget, Forwarded, Outcome, Refusal, Rejected,
+    Rejection,
+};
 pub use server::ReplicationServer;
 
 /// The peer protocol version every request carries (B22).
@@ -45,6 +52,7 @@ const STREAM_APPEND: &str = "/ourios.wal.v1.Replication/StreamAppend";
 const VOTE: &str = "/ourios.wal.v1.Replication/Vote";
 const PRE_VOTE: &str = "/ourios.wal.v1.Replication/PreVote";
 const INSTALL_SNAPSHOT: &str = "/ourios.wal.v1.Replication/InstallSnapshot";
+const FORWARD: &str = "/ourios.wal.v1.Replication/Forward";
 
 #[cfg(test)]
 mod tests;

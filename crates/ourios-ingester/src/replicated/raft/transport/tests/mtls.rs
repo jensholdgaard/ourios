@@ -2,7 +2,6 @@
 //! caller or a server without a certificate the peer CA signed is
 //! refused.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,13 +16,15 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsage
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
+use super::super::super::cluster::Serving;
+use super::super::super::state_machine::GroupSm;
 use super::super::super::types::{NodeId, Vote};
-use super::super::super::vote_log;
-use super::super::{Peers, ReplicationServer};
-use super::{MemSm, Node, Replica, bind, client_to, leader, option, vote_request, write};
+use super::super::{ForwardRequest, Outcome, Peers, ReplicationServer};
+use super::{
+    GROUP, Node, Replica, bind, client_to, leader, listeners, option, vote_request, write,
+};
 
 /// A certificate authority minted for one test.
 struct Ca {
@@ -71,10 +72,10 @@ impl Ca {
 }
 
 fn serve_tls(
-    server: ReplicationServer<MemSm>,
+    server: ReplicationServer<GroupSm>,
     incoming: TcpIncoming,
     settings: &TlsSettings,
-) -> (oneshot::Sender<()>, JoinHandle<()>) {
+) -> Serving {
     let acceptor = reloading_acceptor(settings, ALPN_GRPC, LISTENER_GRPC).expect("acceptor");
     let (stop, stopped) = oneshot::channel::<()>();
     let serving = tokio::spawn(async move {
@@ -89,14 +90,8 @@ fn serve_tls(
     (stop, serving)
 }
 
-async fn start_tls(n: u64, incoming: TcpIncoming, settings: &TlsSettings) -> Node {
-    let dir = tempfile::tempdir().expect("tempdir");
-    vote_log::create(dir.path()).expect("vote log");
-    let replica = Replica {
-        id: NodeId::from(n),
-        dir,
-    };
-    let peers = Peers::mutual_tls(settings).expect("peers");
+async fn start_tls(n: u64, incoming: TcpIncoming, settings: &TlsSettings, peers: Peers) -> Node {
+    let replica = Replica::new(n, &[GROUP]);
     let server = ReplicationServer::default();
     Node::open_on(replica, &peers, server, |server| {
         serve_tls(server, incoming, settings)
@@ -108,21 +103,32 @@ async fn start_tls(n: u64, incoming: TcpIncoming, settings: &TlsSettings) -> Nod
 async fn two_nodes_replicate_over_mutual_tls() {
     let ca = Ca::new();
     let certs = TempDir::new().expect("tempdir");
-    let mut members = BTreeMap::new();
+    let (listeners, members, addresses) = listeners(2);
     let mut nodes = Vec::new();
-    for n in 1..=2 {
-        let (incoming, addr) = bind();
-        members.insert(NodeId::from(n), addr.to_string());
+    for (n, incoming) in listeners {
         let settings = ca.node(certs.path(), &format!("node-{n}"));
-        nodes.push(start_tls(n, incoming, &settings).await);
+        let peers = Peers::mutual_tls(&settings).expect("peers");
+        nodes.push(
+            start_tls(
+                n,
+                incoming,
+                &settings,
+                peers.with_addresses(addresses.clone()),
+            )
+            .await,
+        );
     }
-    nodes[0].raft.initialize(members).await.expect("initialize");
+    nodes[0]
+        .raft(GROUP)
+        .initialize(members)
+        .await
+        .expect("initialize");
 
-    let first = leader(&nodes.iter().collect::<Vec<_>>(), None).await;
+    let first = leader(GROUP, &nodes.iter().collect::<Vec<_>>(), None).await;
     let at = nodes.iter().position(|n| n.id == first).expect("leader");
-    let index = write(&nodes[at].raft, 1).await;
+    let index = write(nodes[at].raft(GROUP), 1).await;
     for node in &nodes {
-        node.applied_through(index).await;
+        node.applied_through(GROUP, index).await;
     }
     for node in &mut nodes {
         node.kill().await;
@@ -147,8 +153,9 @@ fn anonymous(ca: &Ca) -> rustls::ClientConfig {
 /// keeps its vote, and a caller with `trusted` is then granted one.
 async fn refused_then_granted(server: &TlsSettings, refused: &Peers, trusted: &Peers) {
     let (incoming, addr) = bind();
-    let mut node = start_tls(1, incoming, server).await;
-    let vote_before = node.raft.metrics().borrow_watched().vote;
+    let peers = Peers::mutual_tls(server).expect("peers");
+    let mut node = start_tls(1, incoming, server, peers).await;
+    let vote_before = node.raft(GROUP).metrics().borrow_watched().vote;
     let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
 
     let mut stranger = client_to(refused, node.id, addr).await;
@@ -159,7 +166,10 @@ async fn refused_then_granted(server: &TlsSettings, refused: &Peers, trusted: &P
         matches!(result, Err(RPCError::Unreachable(_) | RPCError::Network(_))),
         "{result:?}"
     );
-    assert_eq!(node.raft.metrics().borrow_watched().vote, vote_before);
+    assert_eq!(
+        node.raft(GROUP).metrics().borrow_watched().vote,
+        vote_before
+    );
 
     let mut peer = client_to(trusted, node.id, addr).await;
     let granted = peer.vote(higher, option()).await.expect("vote");
@@ -252,4 +262,90 @@ async fn a_peer_that_never_answers_the_handshake_is_unreachable() {
         started.elapsed()
     );
     holding.abort();
+}
+
+/// A forward whose connection fails the caller's own handshake was never
+/// sent: a server certificate from another CA, or a peer that never
+/// answers the handshake within the connect timeout.
+#[tokio::test]
+async fn a_forward_that_fails_the_handshake_was_never_sent() {
+    let (ca, other) = (Ca::new(), Ca::new());
+    let certs = TempDir::new().expect("tempdir");
+    let caller = ca.node(certs.path(), "caller");
+    let server = TlsSettings {
+        client_ca_file: caller.client_ca_file.clone(),
+        ..other.node(certs.path(), "server")
+    };
+    let (incoming, addr) = bind();
+    let peers = Peers::mutual_tls(&server).expect("peers");
+    let mut node = start_tls(1, incoming, &server, peers).await;
+    let request = || ForwardRequest {
+        version: super::super::VERSION,
+        group: GROUP,
+        payload: ourios_wal::TenantBatch::encode("acme", b"record").expect("batch"),
+        credential: None,
+    };
+    let commit = Duration::from_millis(200);
+    let caller = Peers::mutual_tls(&caller).expect("peers");
+    let rogue = caller
+        .clone()
+        .with_addresses([("n1".to_owned(), addr.to_string())]);
+    let refused = rogue.forward("n1", request(), commit).await;
+    assert!(matches!(refused, Outcome::Unreached(_)), "{refused:?}");
+    node.kill().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let silent = listener.local_addr().expect("addr");
+    let holding = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let waiting = caller.with_addresses([("n2".to_owned(), silent.to_string())]);
+    let started = tokio::time::Instant::now();
+    let unanswered = waiting.forward("n2", request(), commit).await;
+    assert!(
+        matches!(unanswered, Outcome::Unreached(_)),
+        "{unanswered:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    holding.abort();
+}
+
+/// A forward whose caller certificate the server refuses is uncertain, not
+/// never sent: the refusal comes as an alert after the caller's side of
+/// the handshake has finished, by when the request may have been written.
+/// Reading it as never sent would let the sender resubmit an export that
+/// might have committed.
+#[tokio::test]
+async fn a_forward_whose_caller_certificate_is_refused_is_uncertain() {
+    let (ca, other) = (Ca::new(), Ca::new());
+    let certs = TempDir::new().expect("tempdir");
+    let server = ca.node(certs.path(), "server");
+    let (incoming, addr) = bind();
+    let peers = Peers::mutual_tls(&server).expect("peers");
+    let mut node = start_tls(1, incoming, &server, peers).await;
+    let rogue = TlsSettings {
+        client_ca_file: server.client_ca_file.clone(),
+        ..other.node(certs.path(), "rogue")
+    };
+    let rogue = Peers::mutual_tls(&rogue)
+        .expect("peers")
+        .with_addresses([("n1".to_owned(), addr.to_string())]);
+    let request = ForwardRequest {
+        version: super::super::VERSION,
+        group: GROUP,
+        payload: ourios_wal::TenantBatch::encode("acme", b"record").expect("batch"),
+        credential: None,
+    };
+    let outcome = rogue
+        .forward("n1", request, Duration::from_millis(200))
+        .await;
+    assert!(matches!(outcome, Outcome::Uncertain(_)), "{outcome:?}");
+    node.kill().await;
 }

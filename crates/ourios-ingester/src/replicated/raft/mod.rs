@@ -7,11 +7,17 @@
 //! the previous one ran.
 
 mod codec;
+pub mod host;
 pub mod log_store;
+mod snapshot_record;
+pub mod state_machine;
+mod telemetry;
 pub mod transport;
 pub mod types;
 pub mod vote_log;
 
+#[cfg(test)]
+pub(crate) mod cluster;
 #[cfg(test)]
 mod tests;
 
@@ -159,8 +165,11 @@ pub(crate) enum Pass {
 #[cfg(test)]
 pub(crate) mod gate {
     use std::sync::{Condvar, Mutex, PoisonError};
+    use std::time::Duration;
 
     use super::Pass;
+
+    const WRITER_WAIT: Duration = Duration::from_secs(30);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum State {
@@ -258,15 +267,19 @@ pub(crate) mod gate {
             self.lock().passed
         }
 
-        /// Blocks until a writer is held at the gate.
+        /// Blocks until a writer is held at the gate, and panics after
+        /// [`WRITER_WAIT`]: a writer that never arrives must fail the test,
+        /// not hang it, since a runtime waits for its blocking tasks.
         pub(crate) fn wait_for_writer(&self) {
-            let mut inner = self.lock();
-            while inner.waiting == 0 {
-                inner = self
-                    .changed
-                    .wait(inner)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
+            let inner = self.lock();
+            let (inner, waited) = self
+                .changed
+                .wait_timeout_while(inner, WRITER_WAIT, |inner| inner.waiting == 0)
+                .unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                !waited.timed_out() || inner.waiting > 0,
+                "no writer reached the gate within {WRITER_WAIT:?}"
+            );
         }
 
         pub(crate) fn pass(&self) -> Pass {

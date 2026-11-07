@@ -31,6 +31,7 @@ use tokio::sync::oneshot;
 
 use super::codec::{self, Replayed};
 use super::gate::SyncGate;
+use super::telemetry::Takeovers;
 use super::types::{Entry, LogId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
 use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership, writer_gone};
@@ -312,6 +313,7 @@ pub struct GroupLog {
     index: Arc<Mutex<Index>>,
     votes: VoteLog,
     tx: Sender<Command>,
+    takeovers: Option<Takeovers>,
     #[cfg(test)]
     hooks: Arc<test_hooks::Hooks>,
 }
@@ -348,7 +350,7 @@ impl GroupLog {
         Self::open_with(wal, group, votes, Arc::default())
     }
 
-    fn open_with(
+    pub(super) fn open_with(
         wal: WalConfig,
         group: u32,
         votes: VoteLog,
@@ -391,9 +393,15 @@ impl GroupLog {
             index: Arc::new(Mutex::new(index)),
             votes,
             tx,
+            takeovers: None,
             #[cfg(test)]
             hooks: Arc::new(test_hooks::Hooks::new(hooks_gate, synced, thread)),
         })
+    }
+
+    /// Count the terms this node leads from the votes the log saves.
+    pub(super) fn count_takeovers(&mut self, takeovers: Takeovers) {
+        self.takeovers = Some(takeovers);
     }
 
     fn index(&self) -> std::sync::MutexGuard<'_, Index> {
@@ -496,7 +504,11 @@ impl RaftLogStorage<RaftTypes> for GroupLog {
     /// queued on the node's shared vote log.
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
         self.fence().await?;
-        self.votes.save(self.group, *vote).await
+        self.votes.save(self.group, *vote).await?;
+        if let Some(takeovers) = &self.takeovers {
+            takeovers.saved(vote);
+        }
+        Ok(())
     }
 
     /// Not fsynced on its own: `enable_leader_restore = false` (RFC 0065
@@ -633,7 +645,7 @@ impl Writer {
 }
 
 #[cfg(test)]
-mod test_hooks {
+pub(super) mod test_hooks {
     use std::thread::JoinHandle;
 
     use super::*;

@@ -799,6 +799,45 @@ pub const OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_DESCRIPTION: &str = "Reclaima
 /// `ourios.wal.housekeeping.unlink.remaining` unit (UCUM).
 pub const OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_UNIT: &str = "{segment}";
 
+/// `ourios.wal.recovery.truncated.size` (counter, unit `By`).
+pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE: &str = "ourios.wal.recovery.truncated.size";
+
+/// `ourios.wal.recovery.truncated.size` description (the registry `brief`).
+pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE_DESCRIPTION: &str =
+    "Bytes crash recovery truncated from the tail of the newest WAL segment (RFC 0068 §3.3).";
+
+/// `ourios.wal.recovery.truncated.size` unit (UCUM).
+pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE_UNIT: &str = "By";
+
+/// `ourios.wal.replication.lag` (gauge, unit `{entry}`).
+pub const OURIOS_WAL_REPLICATION_LAG: &str = "ourios.wal.replication.lag";
+
+/// `ourios.wal.replication.lag` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_LAG_DESCRIPTION: &str = "Log entries a replication group's leader has appended that it has not yet seen a follower match (RFC 0065 §6.9).";
+
+/// `ourios.wal.replication.lag` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_LAG_UNIT: &str = "{entry}";
+
+/// `ourios.wal.replication.takeovers` (counter, unit `{takeover}`).
+pub const OURIOS_WAL_REPLICATION_TAKEOVERS: &str = "ourios.wal.replication.takeovers";
+
+/// `ourios.wal.replication.takeovers` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_TAKEOVERS_DESCRIPTION: &str =
+    "Times this node became the leader of a replication group (RFC 0065 §6.9).";
+
+/// `ourios.wal.replication.takeovers` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_TAKEOVERS_UNIT: &str = "{takeover}";
+
+/// `ourios.wal.replication.term` (gauge, unit `{term}`).
+pub const OURIOS_WAL_REPLICATION_TERM: &str = "ourios.wal.replication.term";
+
+/// `ourios.wal.replication.term` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_TERM_DESCRIPTION: &str =
+    "The Raft term of a replication group as this node last saw it (RFC 0065 §6.9).";
+
+/// `ourios.wal.replication.term` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_TERM_UNIT: &str = "{term}";
+
 /// `ourios.wal.retain_floor.lag.segment.count` (updowncounter, unit `{segment}`).
 pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT: &str =
     "ourios.wal.retain_floor.lag.segment.count";
@@ -1080,6 +1119,18 @@ pub const OURIOS_TLS_LISTENER: &str = "ourios.tls.listener";
 /// `ourios.tls.reload_error` attribute key.
 pub const OURIOS_TLS_RELOAD_ERROR: &str = "ourios.tls.reload_error";
 
+/// `ourios.wal.group` attribute key.
+pub const OURIOS_WAL_GROUP: &str = "ourios.wal.group";
+
+/// `ourios.wal.recovery.tail.offset` attribute key.
+pub const OURIOS_WAL_RECOVERY_TAIL_OFFSET: &str = "ourios.wal.recovery.tail.offset";
+
+/// `ourios.wal.recovery.tail.shape` attribute key.
+pub const OURIOS_WAL_RECOVERY_TAIL_SHAPE: &str = "ourios.wal.recovery.tail.shape";
+
+/// `ourios.wal.replica` attribute key.
+pub const OURIOS_WAL_REPLICA: &str = "ourios.wal.replica";
+
 /// `ourios.wal.retain_floor.state` attribute key.
 pub const OURIOS_WAL_RETAIN_FLOOR_STATE: &str = "ourios.wal.retain_floor.state";
 
@@ -1225,3 +1276,6 @@ pub const EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR: &str = "ourios.server.tls.reload
 /// `ourios.template_map.binding.conflicted` log event name.
 pub const EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED: &str =
     "ourios.template_map.binding.conflicted";
+
+/// `ourios.wal.recovery.tail.truncated` log event name.
+pub const EVENT_OURIOS_WAL_RECOVERY_TAIL_TRUNCATED: &str = "ourios.wal.recovery.tail.truncated";

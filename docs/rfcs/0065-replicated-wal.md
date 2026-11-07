@@ -811,6 +811,12 @@ the mass-failover time and vote-log batching as tuning signals.
 >   group fails closed: no election, no membership change and no ack
 >   until an original quorum returns, with the retryable rejection for
 >   its tenants; permanent loss of that quorum is B8's offline recovery
+> - **And** on a fresh cluster, the group forms once from the voters'
+>   `Identify` answers, recorded in `formed.json`: when the first-ranked
+>   voter records it and then restarts on an empty volume before it
+>   initializes, the other two initialize with the recorded membership,
+>   elect a leader, and the restarted voter joins under its new identity
+>   by the replacement above, never by initializing a second membership
 
 > **Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13)**
 > - **Given** a group whose other two voters are lost for good, with
@@ -951,22 +957,23 @@ the mass-failover time and vote-log batching as tuning signals.
   never rejoins under an identity whose vote it has lost (§4.5).
 - **A group's first membership** comes from its voters' own answers and
   is recorded in the bucket, so a group forms once. Only the group's
-  first-ranked voter forms it, and only while its log for the group is
-  empty: it calls `Identify` on each of the group's other voters at its
-  configured address (§6.8) and, once every one has answered, writes
+  first-ranked voter records it, and only while no record exists: it
+  calls `Identify` on each of the group's other voters at its configured
+  address (§6.8) and, once every one has answered, writes
   `<bucket>/wal/replicated/groups/<group>/formed.json`, the membership
   as each voter's UUID paired with its `node_id`, with
-  `put_if_absent`. It initializes the group only with the membership
-  that object holds, and only if its own UUID is in it: the voter whose
-  write won initializes, and so does that voter restarting on the same
-  `wal_root` before its log took the first entry. A voter that finds
-  the object naming another UUID for its `node_id`, a first-ranked voter
-  restarting on a wiped `wal_root` above all, never initializes; it
-  answers `Identify` under its new UUID and joins through the committed
-  replacement above, so an empty log never forms a second membership
-  beside one that may hold acknowledged batches. Until the object exists
-  and the group is initialized, the group has no leader; the other
-  voters wait to be contacted.
+  `put_if_absent`. Every voter whose log for the group is empty reads
+  that object, at start and then until it exists, and initializes the
+  group with exactly the membership it holds, if its own UUID is in it.
+  They all initialize with one membership, so any original majority
+  elects a leader even if the recording voter fails before it
+  initializes, and a leader replaces a lost voter as above. A voter that
+  finds the object naming another UUID for its `node_id`, one restarted
+  on a wiped `wal_root`, never initializes: it answers `Identify` under
+  its new UUID and joins through that committed replacement, so an
+  empty log never forms a second membership beside one that may hold
+  acknowledged batches. Until the object exists the group has no
+  leader.
 - **Each replica keeps one RFC 0008 WAL per group** under
   `wal_root/groups/<group>/`, with RFC 0008's segments, fsync policy
   and CRCs unchanged, and its RFC 0052 reclaim sidecar sized for the

@@ -15,7 +15,7 @@ use crate::replicated::raft::cluster::{Cluster, name, write};
 use crate::replicated::raft::transport::{
     ForwardTarget, Forwarded, IdentifyError, Refusal, Rejection,
 };
-use crate::replicated::raft::types::{Entry, TenantBatchBytes};
+use crate::replicated::raft::types::{Entry, GroupEntry, TenantBatchBytes};
 use crate::replicated::write::{COMMIT_TIMEOUT, GroupWriter};
 
 const TOKEN: Option<&str> = Some("Bearer tok-edge");
@@ -94,7 +94,7 @@ fn export(marker: &str, credential: Option<&str>) -> Forwarded {
 /// How many of `log`'s entries carry `marker`.
 fn copies(log: &[Entry], marker: &str) -> usize {
     let carries = |e: &&Entry| match &e.payload {
-        openraft::EntryPayload::Normal(batch) => batch
+        openraft::EntryPayload::Normal(GroupEntry::Batch(batch)) => batch
             .as_bytes()
             .windows(marker.len())
             .any(|w| w == marker.as_bytes()),

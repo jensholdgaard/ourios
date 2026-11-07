@@ -658,12 +658,12 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use openraft::EntryPayload;
-    use ourios_wal::TenantBatch;
+    use ourios_wal::{Control, TenantBatch};
     use proptest::prelude::*;
     use prost::Message;
 
     use super::*;
-    use crate::replicated::raft::types::{Membership, TenantBatchBytes};
+    use crate::replicated::raft::types::{GroupEntry, Membership, TenantBatchBytes};
 
     fn through_wire<M: Message + Default>(message: &M) -> M {
         M::decode(message.encode_to_vec().as_slice()).expect("decode")
@@ -709,11 +709,15 @@ mod tests {
     fn entry() -> impl Strategy<Value = Entry> {
         let normal = proptest::collection::vec(any::<u8>(), 0..64).prop_map(|body| {
             let batch = TenantBatch::encode("acme", &body).expect("batch");
-            EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid"))
+            EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid").into())
+        });
+        let flusher = any::<[u8; 16]>().prop_map(|replica| {
+            EntryPayload::Normal(GroupEntry::Control(Control::FlusherAssignment(replica)))
         });
         let payload = prop_oneof![
             Just(EntryPayload::Blank),
             normal,
+            flusher,
             membership().prop_map(EntryPayload::Membership),
         ];
         (log_id(), payload).prop_map(|(log_id, payload)| Entry { log_id, payload })
@@ -888,7 +892,7 @@ mod tests {
         let batch = TenantBatch::encode("acme", &vec![7; bytes]).expect("batch");
         Entry {
             log_id: LogId::from(WireLogId { term: 1, index }),
-            payload: EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid")),
+            payload: EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid").into()),
         }
     }
 

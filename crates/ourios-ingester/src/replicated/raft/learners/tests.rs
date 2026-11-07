@@ -238,7 +238,7 @@ async fn a_learner_never_makes_a_quorum() {
     let raft = cluster.node(leader).raft(0).clone();
     let target = raft.metrics().borrow_watched().last_log_index.unwrap_or(0) + 1;
     let writing = tokio::spawn(async move {
-        raft.client_write(crate::replicated::raft::cluster::batch(9))
+        raft.client_write(crate::replicated::raft::cluster::batch(9).into())
             .await
     });
     let learner = cluster.id(3);

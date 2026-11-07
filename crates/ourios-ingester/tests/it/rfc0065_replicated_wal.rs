@@ -367,13 +367,91 @@ fn rfc0065_28_no_erased_row_returns_during_a_store_outage() {
 /// the log arm. Given a flusher assignment and then an unknown control kind,
 /// or an assignment whose body is not 16 bytes, when the replica opens the
 /// group's log, then it reads the first UUID and refuses the rest.
-#[test]
-#[ignore = "RFC0065.29 stub — implemented with the flusher-assignment entry"]
-fn rfc0065_29_an_unreadable_control_entry_stops_the_open() {
-    todo!(
-        "RFC0065.29 — the replica reads the first flusher assignment and refuses to \
-         open the log at an unknown kind or a body of the wrong length"
-    );
+/// One `0x04` entry record at `(1, index)`.
+fn record(index: u64, body: ourios_wal::EntryBody<'_>) -> Vec<u8> {
+    let log_id = ourios_wal::RaftLogId { term: 1, index };
+    ourios_wal::ReplicatedRecord::Entry { log_id, body }
+        .encode()
+        .expect("encode")
+}
+
+/// A flusher assignment at `index` naming `replica`, then `edit`ed.
+fn assignment(index: u64, replica: [u8; 16], edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let control = ourios_wal::Control::FlusherAssignment(replica);
+    let mut frame = record(index, ourios_wal::EntryBody::Control(control));
+    edit(&mut frame);
+    frame
+}
+
+/// Open group 0's log from a WAL holding a blank entry, then `frames`.
+fn open_holding(
+    frames: &[&[u8]],
+) -> (
+    std::io::Result<ourios_ingester::replicated::raft::log_store::GroupLog>,
+    tempfile::TempDir,
+) {
+    use ourios_ingester::replicated::raft::log_store::{GroupLog, group_dir};
+    use ourios_ingester::replicated::raft::vote_log::{self, VoteLog};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = ourios_wal::WalConfig {
+        root: group_dir(dir.path(), 0),
+        batch_window_ms: 2,
+        segment_size_bytes: ourios_wal::MIN_SEGMENT_SIZE_BYTES,
+        segment_age_secs: 600,
+        housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
+        rotation_retry_attempts: ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS,
+        macos_full_fsync: false,
+    };
+    let mut wal = ourios_wal::Wal::open(config.clone()).expect("the group WAL");
+    let blank = record(0, ourios_wal::EntryBody::Blank);
+    for frame in std::iter::once(&blank[..]).chain(frames.iter().copied()) {
+        wal.append(ourios_wal::FrameKind::ReplicatedEntry, frame)
+            .expect("append");
+    }
+    wal.sync().expect("sync");
+    drop(wal);
+    vote_log::create(dir.path()).expect("vote log");
+    let votes = VoteLog::open(dir.path()).expect("vote log");
+    (GroupLog::open(config, 0, votes), dir)
+}
+
+#[tokio::test]
+async fn rfc0065_29_an_unreadable_control_entry_stops_the_open() {
+    use openraft::EntryPayload;
+    use openraft::storage::RaftLogReader as _;
+    use ourios_ingester::replicated::raft::types::GroupEntry;
+    use ourios_wal::Control;
+
+    let flusher = *uuid::Uuid::from_u128(0x0190_b3c8_1a2b_7c3d_9e4f_5060_7080_a0b0).as_bytes();
+    let first = assignment(1, flusher, |_| {});
+    let (opened, _dir) = open_holding(&[&first]);
+    let mut log = opened.expect("a log holding a flusher assignment opens");
+    let entries = log.try_get_log_entries(..).await.expect("read");
+    let assigned = entries.iter().find_map(|e| match &e.payload {
+        EntryPayload::Normal(GroupEntry::Control(Control::FlusherAssignment(replica))) => {
+            Some(*replica)
+        }
+        _ => None,
+    });
+    assert_eq!(assigned, Some(flusher), "the first assignment's UUID");
+
+    let unknown_kind = assignment(2, [7; 16], |f| f[17] = Control::HIGHEST_KIND + 1);
+    let short_body = assignment(2, [7; 16], |f| f.truncate(f.len() - 1));
+    let long_body = assignment(2, [7; 16], |f| f.push(0));
+    let kind = format!("control kind 0x{:02x}", Control::HIGHEST_KIND + 1);
+    for (unreadable, why) in [
+        (&unknown_kind, kind.as_str()),
+        (&short_body, "body is 32 byte(s); expected 33"),
+        (&long_body, "body is 34 byte(s); expected 33"),
+    ] {
+        let (refused, _dir) = open_holding(&[&first, unreadable]);
+        let Err(error) = refused else {
+            panic!("{why}: the entry did not stop the open");
+        };
+        assert!(error.to_string().contains(why), "{error}");
+    }
 }
 
 /// Scenario RFC0065.29 — the leader's kind gate. A leader whose members have

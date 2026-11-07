@@ -10,10 +10,10 @@ use openraft::async_runtime::WatchReceiver as _;
 use tokio::task::JoinHandle;
 
 use super::super::host::HostError;
-use super::super::types::Entry;
+use super::super::types::{Entry, GroupEntry};
 use super::{
     Cluster, GroupHost, GroupRaft, HostSpec, NodeId, Peers, Replica, WAIT, batch, group_dir,
-    wal_config, write,
+    propose, wal_config, write,
 };
 
 const GROUP: u32 = 0;
@@ -60,7 +60,7 @@ async fn strand(
     }
     let raft = cluster.node(i).raft(GROUP).clone();
     let write = tokio::spawn(async move {
-        raft.client_write(batch(100))
+        raft.client_write(batch(100).into())
             .await
             .map(drop)
             .map_err(|e| e.to_string())
@@ -133,6 +133,49 @@ async fn rfc0065_7_a_diverged_follower_is_repaired() {
             .find(|e| e.log_id.index == entry.log_id.index);
         assert_eq!(kept, Some(entry), "committed index {}", entry.log_id.index);
     }
+    cluster.shutdown().await;
+}
+
+fn assign(flusher: NodeId) -> GroupEntry {
+    GroupEntry::Control(ourios_wal::Control::FlusherAssignment(
+        *flusher.uuid().as_bytes(),
+    ))
+}
+
+/// A committed flusher assignment names the flusher on every replica, a
+/// later one replaces it, and a restarted replica names it again from its
+/// log; the batches around them commit as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_replica_applies_the_last_flusher_assignment() {
+    let mut cluster = Cluster::start(3, &[GROUP]).await;
+    let leader = cluster.leader(GROUP, None).await;
+    let (first, second) = (cluster.id(1), cluster.id(2));
+    commit(&cluster, leader, 0..2).await;
+    propose(cluster.node(leader).raft(GROUP), assign(first)).await;
+    let flusher_of = |cluster: &Cluster, i: usize| {
+        let sm = cluster.node(i).host.state_machine(GROUP).expect("hosted");
+        sm.flusher()
+    };
+    let last = commit(&cluster, leader, 2..4).await;
+    for i in 0..3 {
+        cluster.node(i).applied_through(GROUP, last).await;
+        assert_eq!(flusher_of(&cluster, i), Some(first), "node {i}");
+    }
+
+    let follower = (leader + 1) % 3;
+    cluster.kill(follower).await;
+    cluster.restart(follower).await;
+    cluster.node(follower).applied_through(GROUP, last).await;
+    assert_eq!(flusher_of(&cluster, follower), Some(first), "replayed");
+
+    propose(cluster.node(leader).raft(GROUP), assign(second)).await;
+    let last = commit(&cluster, leader, 4..6).await;
+    for i in 0..3 {
+        cluster.node(i).applied_through(GROUP, last).await;
+        assert_eq!(flusher_of(&cluster, i), Some(second), "node {i}");
+    }
+    let log = converged(&cluster, follower, leader).await;
+    assert_eq!(normal(&log), 8, "six batches and two assignments");
     cluster.shutdown().await;
 }
 

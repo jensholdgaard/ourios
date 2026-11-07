@@ -38,6 +38,14 @@ pub enum ReceiveError {
 /// a server error under that transport's convention.
 pub(crate) type SpanError = fn(&ReceiveError) -> Option<String>;
 
+/// The transport-agnostic [`SpanError`]: the class's
+/// [`IngestFailure::span_error_type`].
+pub(crate) fn span_error(error: &ReceiveError) -> Option<String> {
+    IngestFailure::classify(error)
+        .span_error_type()
+        .map(str::to_owned)
+}
+
 /// The transport-agnostic classification of a [`ReceiveError`] —
 /// one exhaustive match instead of one per transport (epic #745
 /// wave 2; this replaced twin 4-arm mappers in `http.rs`/`grpc.rs`,

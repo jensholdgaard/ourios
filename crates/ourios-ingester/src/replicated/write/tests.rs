@@ -5,6 +5,7 @@
 
 mod failover;
 mod outage;
+mod spans;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;

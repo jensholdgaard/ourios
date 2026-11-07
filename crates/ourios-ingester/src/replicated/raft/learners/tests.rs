@@ -7,7 +7,7 @@ use std::time::Duration;
 use openraft::async_runtime::WatchReceiver as _;
 
 use super::{Changes, Members, TailPool, plan, reconcile};
-use crate::replicated::raft::cluster::{Cluster, name, write};
+use crate::replicated::raft::cluster::{Cluster, WAIT, name, write};
 use crate::replicated::raft::transport::Identity;
 use crate::replicated::raft::types::NodeId;
 
@@ -99,17 +99,18 @@ fn an_unanswered_peer_changes_nothing() {
     assert_eq!(planned, Changes::default());
 }
 
-/// A voter is never added as a learner, and a peer that reads fewer kinds
-/// than the log holds is held back (§6.8).
+/// A voter is never added as a learner, even one that reads every kind
+/// the log holds; a tail peer that reads fewer is held back (§6.8), and
+/// one that reads enough is added.
 #[test]
 fn a_voter_or_a_peer_that_cannot_read_the_log_is_not_added() {
     let planned = plan(
         &members(&[1, 2, 3], &[]),
-        &["v1", "t1"],
-        &answers(&[("v1", 1, 0), ("t1", 11, 0)]),
+        &["v1", "t1", "t2"],
+        &answers(&[("v1", 1, 1), ("t1", 11, 0), ("t2", 12, 1)]),
         1,
     );
-    assert_eq!(planned, Changes::default());
+    assert_eq!(planned, changes(&[(12, "t2")], &[]));
 }
 
 /// The leader of group 0, once it has committed an entry of its term.
@@ -184,8 +185,8 @@ async fn the_leader_adds_the_placed_tail_node_and_it_catches_up() {
 }
 
 /// A learner never counts toward the write quorum: with both voting
-/// followers' fsyncs held, a write is not committed although the learner
-/// keeps up.
+/// followers' fsyncs held, a write the learner has fsynced and matched is
+/// still not committed, and commits once a voting follower fsyncs it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_learner_never_makes_a_quorum() {
     let cluster = Cluster::start_with_tail(3, 1, &[0]).await;
@@ -204,18 +205,50 @@ async fn a_learner_never_makes_a_quorum() {
     for &f in &followers {
         cluster.node(f).gate.close();
     }
-    let held = tokio::time::timeout(
-        Duration::from_millis(500),
-        cluster
-            .node(leader)
-            .raft(0)
-            .client_write(crate::replicated::raft::cluster::batch(9)),
-    )
-    .await;
-    assert!(held.is_err(), "committed on the leader and a learner alone");
+    let raft = cluster.node(leader).raft(0).clone();
+    let target = raft.metrics().borrow_watched().last_log_index.unwrap_or(0) + 1;
+    let writing = tokio::spawn(async move {
+        raft.client_write(crate::replicated::raft::cluster::batch(9))
+            .await
+    });
+    let learner = cluster.id(3);
+    cluster
+        .node(leader)
+        .raft(0)
+        .wait(WAIT)
+        .metrics(
+            |m| {
+                let matched = m.replication.as_ref().and_then(|r| r.get(&learner));
+                matched
+                    .copied()
+                    .flatten()
+                    .is_some_and(|l| l.index >= target)
+            },
+            "the learner matches the write",
+        )
+        .await
+        .expect("the learner caught up");
+    let committed = cluster
+        .node(leader)
+        .raft(0)
+        .metrics()
+        .borrow_watched()
+        .cluster_committed;
+    assert!(
+        committed.is_none_or(|c| c.index < target),
+        "committed on the leader and a learner alone: {committed:?}"
+    );
+    assert!(
+        !writing.is_finished(),
+        "acknowledged without a voting follower"
+    );
     for &f in &followers {
         cluster.node(f).gate.open();
     }
+    writing
+        .await
+        .expect("join")
+        .expect("committed once a voter fsyncs");
     cluster.shutdown().await;
 }
 

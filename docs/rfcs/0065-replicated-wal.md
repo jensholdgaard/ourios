@@ -1053,7 +1053,10 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     `error.type` `not_enough_replicas`, and nothing is acknowledged.
     So does one that returns an error, except one saying this node
     does not lead the group: nothing was appended, and the export is
-    forwarded (§6.8).
+    forwarded (§6.8). Only the timeout counts as
+    `not_enough_replicas`. A node that does not lead or host the
+    group, a stopped group, and an entry a leader change discarded
+    after appending count as `group_unavailable` (§6.9).
     The entry may still commit later, the uncertain outcome B3
     accepts. The timeout is an internal
     constant starting at 2 s, not a setting; the rate of these

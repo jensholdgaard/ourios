@@ -11,7 +11,7 @@ use openraft::EntryPayload;
 use openraft::async_runtime::WatchReceiver as _;
 use openraft::storage::RaftLogReader as _;
 
-use super::{committed, export, followers, ready_leader, rejected_as, writer};
+use super::{committed, export, followers, held, ready_leader, rejected_as, writer};
 use crate::receiver::ReceiveError;
 use crate::replicated::ingest::ReplicatedIngest;
 use crate::replicated::raft::cluster::{Cluster, wal_config, write};
@@ -114,9 +114,16 @@ async fn rfc0065_3_a_leader_crashed_mid_stream_is_replaced_with_every_ack() {
             })
         })
         .collect();
-    while acks.lock().expect("acks").len() < 20 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let streaming = async {
+        while acks.lock().expect("acks").len() < 20 {
+            let stopped = senders.iter().any(tokio::task::JoinHandle::is_finished);
+            assert!(!stopped, "a sender stopped before the crash");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), streaming)
+        .await
+        .expect("20 acks before the crash");
     cluster.crash(old).await;
     for sender in senders {
         assert_retryable(&sender.await.expect("join"));
@@ -156,7 +163,7 @@ async fn rfc0065_4_a_replaced_writer_cannot_acknowledge() {
     // Long enough that the queued turns are still waiting once the cut
     // heals, rather than timing out while it stands.
     let stale = Arc::new(ReplicatedIngest::new(
-        writer(&cluster, old).with_timeout(Duration::from_secs(10)),
+        writer(&cluster, old).with_timeout(Duration::from_secs(20)),
     ));
     let queued: Vec<_> = (100..105)
         .map(|n| {
@@ -164,6 +171,18 @@ async fn rfc0065_4_a_replaced_writer_cannot_acknowledge() {
             tokio::spawn(async move { stale.ingest(export(&marker(n))).await })
         })
         .collect();
+    let appended = async {
+        loop {
+            let log = cluster.node(old).log(0).await;
+            if (100..105).all(|n| log.iter().any(|e| carries(e, &marker(n)))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), appended)
+        .await
+        .expect("the cut-off leader appends every queued export");
 
     let new = cluster.leader(0, Some(old)).await;
     write(cluster.node(new).raft(0), 0).await;
@@ -171,6 +190,10 @@ async fn rfc0065_4_a_replaced_writer_cannot_acknowledge() {
     for n in 3..6 {
         all.push(acked(&fresh, n).await);
     }
+    assert!(
+        !queued.iter().any(tokio::task::JoinHandle::is_finished),
+        "a queued export was answered before the cut healed"
+    );
     for f in followers(old) {
         cluster.heal(old, f);
     }
@@ -260,14 +283,26 @@ async fn rfc0065_6_losing_and_regaining_a_follower() {
     }
 
     cluster.restart(lost).await;
-    // With the other follower's fsyncs held, only the returning one can
-    // complete an ack, and its log must first hold everything before it.
-    // It may still be reconnecting and catching up, so this ack may take
-    // longer than the commit timeout: the order is under test, not speed.
+    // With both followers' fsyncs held the ack waits. Released for the
+    // returning follower alone, it completes once that follower has caught
+    // up and fsynced it; `kept` stays held through the crash check, so the
+    // second surviving copy can only be the returning follower's. It may
+    // still be reconnecting, so the ack may outlast the commit timeout: the
+    // order is under test, not speed.
     cluster.node(kept).gate.close();
+    cluster.node(lost).gate.close();
     let patient = writer(&cluster, leader).with_timeout(Duration::from_secs(20));
-    let rejoined = acked(&ReplicatedIngest::new(patient), 10).await;
-    all.push(rejoined);
+    let patient = Arc::new(ReplicatedIngest::new(patient));
+    let sending = Arc::clone(&patient);
+    let rejoining = tokio::spawn(async move { acked(&sending, 10).await });
+    held(&cluster.node(lost).gate).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !rejoining.is_finished(),
+        "acknowledged with both followers' fsyncs held"
+    );
+    cluster.node(lost).gate.open();
+    all.push(rejoining.await.expect("join"));
     let log = cluster.node(lost).log(0).await;
     for ack in &all {
         assert!(
@@ -276,6 +311,5 @@ async fn rfc0065_6_losing_and_regaining_a_follower() {
             ack.0
         );
     }
-    cluster.node(kept).gate.open();
     assert_two_fsynced_copies(&mut cluster, &all).await;
 }

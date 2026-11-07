@@ -37,7 +37,8 @@ pub mod wire;
 
 pub use client::{GroupNetwork, PeerClient, Peers};
 pub use forward::{
-    ForwardRequest, ForwardResponse, ForwardTarget, Forwarded, Outcome, Refusal, Rejection,
+    ForwardRequest, ForwardResponse, ForwardTarget, Forwarded, Outcome, Refusal, Rejected,
+    Rejection,
 };
 pub use server::ReplicationServer;
 

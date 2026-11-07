@@ -7,8 +7,8 @@ use std::time::Duration;
 use tonic::{Code, Status};
 
 use super::{
-    Committing, ForwardRequest, ForwardTarget, Forwarded, Outcome, Refusal, Rejection, classify,
-    refusal, serve,
+    Committing, ForwardRequest, ForwardTarget, Forwarded, Outcome, Refusal, Rejected, Rejection,
+    classify, refusal, serve,
 };
 use crate::replicated::raft::cluster::{bind, serve as serve_on};
 use crate::replicated::raft::state_machine::GroupSm;
@@ -43,6 +43,17 @@ impl ForwardTarget for Fake {
     }
 }
 
+/// A leader's rejection with its message and details, as its client
+/// would have got them.
+fn denied(rejection: Rejection) -> Rejected {
+    Rejected {
+        rejection,
+        error_type: "permission_denied".to_owned(),
+        message: "the token edge may not write the tenant acme".to_owned(),
+        details: vec![0x08, 0x07, 0x12, 0x02, b'n', b'o'],
+    }
+}
+
 #[test]
 fn each_refusal_reads_back_as_the_outcome_it_proves() {
     let read = |r: Refusal| classify(&refusal(r));
@@ -63,9 +74,11 @@ fn each_refusal_reads_back_as_the_outcome_it_proves() {
         Rejection::PermissionDenied,
         Rejection::TooLarge,
     ] {
-        let outcome = read(Refusal::Rejected(rejection, "permission_denied"));
-        let expected = Outcome::Rejected(rejection, "permission_denied".to_owned());
-        assert_eq!(outcome, expected);
+        let rejected = denied(rejection);
+        assert_eq!(
+            read(Refusal::Rejected(rejected.clone())),
+            Outcome::Rejected(rejected)
+        );
     }
     let failed = read(Refusal::Failed("the commit timed out".to_owned()));
     assert!(matches!(failed, Outcome::Uncertain(_)), "{failed:?}");
@@ -138,11 +151,8 @@ async fn a_forward_over_loopback_reads_each_answer() {
             },
         ),
         (
-            Fake::Answer(Err(Refusal::Rejected(
-                Rejection::PermissionDenied,
-                "permission_denied",
-            ))),
-            Outcome::Rejected(Rejection::PermissionDenied, "permission_denied".to_owned()),
+            Fake::Answer(Err(Refusal::Rejected(denied(Rejection::PermissionDenied)))),
+            Outcome::Rejected(denied(Rejection::PermissionDenied)),
         ),
     ] {
         let (peers, _serving) = node(fake);

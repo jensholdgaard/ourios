@@ -75,6 +75,17 @@ pub enum Rejection {
     TooLarge,
 }
 
+/// A leader's rejection as its client would have got it: the code's
+/// class, its `error.type`, and the status message and details, carried
+/// back unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejected {
+    pub rejection: Rejection,
+    pub error_type: String,
+    pub message: String,
+    pub details: Vec<u8>,
+}
+
 /// How a node answers an export it did not commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
@@ -83,7 +94,7 @@ pub enum Refusal {
     /// It does not host the group; nothing was appended.
     NotHosted,
     /// Its leader refused the export before appending it.
-    Rejected(Rejection, &'static str),
+    Rejected(Rejected),
     /// The export may have been appended: the commit timed out, or a leader
     /// change discarded the entry after appending it.
     Failed(String),
@@ -148,15 +159,17 @@ fn refusal(refusal: Refusal) -> Status {
             Status::not_found("the group is not hosted here"),
             "not_hosted",
         ),
-        Refusal::Rejected(rejection, error_type) => {
-            let status = Status::new(
-                rejection.code(),
-                format!("the leader refused: {error_type}"),
-            );
+        Refusal::Rejected(Rejected {
+            rejection,
+            error_type,
+            message,
+            details,
+        }) => {
+            let status = Status::with_details(rejection.code(), message, details.into());
             let mut status = refused(status, "rejected");
-            status
-                .metadata_mut()
-                .insert(ERROR_TYPE, MetadataValue::from_static(error_type));
+            if let Ok(error_type) = MetadataValue::try_from(error_type) {
+                status.metadata_mut().insert(ERROR_TYPE, error_type);
+            }
             status
         }
         Refusal::Failed(reason) => Status::unavailable(reason),
@@ -198,7 +211,7 @@ pub enum Outcome {
     /// within the connect timeout.
     Unreached(String),
     /// The leader refused the export before appending it.
-    Rejected(Rejection, String),
+    Rejected(Rejected),
     /// The export may have committed; it must not be sent again.
     Uncertain(String),
 }
@@ -218,16 +231,17 @@ pub(super) async fn traced_call(
     deadlines: Deadlines,
 ) -> Outcome {
     let trace = Call::client(tracing, FORWARD, Peer::parse(addr), true);
-    let outcome =
+    let (outcome, code) =
         tracing::Instrument::instrument(call(channel, request, deadlines), trace.span()).await;
-    trace.finish(outcome.code());
+    trace.finish(code);
     outcome
 }
 
 /// Forward `request` over `channel`, which connects within the connect
 /// deadline or not at all. Once sent, the call is bounded by the commit
-/// timeout plus the connect timeout (§6.8).
-async fn call(channel: Channel, request: ForwardRequest, deadlines: Deadlines) -> Outcome {
+/// timeout plus the connect timeout (§6.8). Returns the outcome and the
+/// call's own status code, which its span records.
+async fn call(channel: Channel, request: ForwardRequest, deadlines: Deadlines) -> (Outcome, Code) {
     let Deadlines {
         connect: connect_timeout,
         commit: commit_timeout,
@@ -239,32 +253,29 @@ async fn call(channel: Channel, request: ForwardRequest, deadlines: Deadlines) -
     // from the call itself, marked as never sent.
     match tokio::time::timeout(connect_timeout, grpc.ready()).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return Outcome::Unreached(e.to_string()),
-        Err(_) => return Outcome::Unreached("the channel was not ready in time".to_owned()),
+        Ok(Err(e)) => return (Outcome::Unreached(e.to_string()), Code::Unavailable),
+        Err(_) => {
+            let late = Outcome::Unreached("the channel was not ready in time".to_owned());
+            return (late, Code::DeadlineExceeded);
+        }
     }
     let deadline = commit_timeout + connect_timeout;
     let mut request = Request::new(request);
-    request.set_timeout(deadline);
+    // The peer stops work a little after the sender gives up, so the
+    // sender's own deadline is the one that ends the call.
+    request.set_timeout(deadline + connect_timeout);
     let codec = ProstCodec::<ForwardRequest, ForwardResponse>::default();
     let answer = grpc.unary(request, PathAndQuery::from_static(FORWARD), codec);
     match tokio::time::timeout(deadline, answer).await {
-        Ok(Ok(response)) => Outcome::Committed(response.into_inner().seq),
-        Ok(Err(status)) if super::connect::never_sent(&status) => {
-            Outcome::Unreached(status.message().to_owned())
-        }
-        Ok(Err(status)) => classify(&status),
-        Err(_) => Outcome::Uncertain("the forwarded call timed out".to_owned()),
-    }
-}
-
-impl Outcome {
-    /// The status code the call's span records.
-    fn code(&self) -> Code {
-        match self {
-            Self::Committed(_) => Code::Ok,
-            Self::NotHosted => Code::NotFound,
-            Self::NotLeader { .. } | Self::Unreached(_) | Self::Uncertain(_) => Code::Unavailable,
-            Self::Rejected(rejection, _) => rejection.code(),
+        Ok(Ok(response)) => (Outcome::Committed(response.into_inner().seq), Code::Ok),
+        Ok(Err(status)) if super::connect::never_sent(&status) => (
+            Outcome::Unreached(status.message().to_owned()),
+            status.code(),
+        ),
+        Ok(Err(status)) => (classify(&status), status.code()),
+        Err(_) => {
+            let timed_out = Outcome::Uncertain("the forwarded call timed out".to_owned());
+            (timed_out, Code::DeadlineExceeded)
         }
     }
 }
@@ -280,10 +291,12 @@ fn classify(status: &Status) -> Outcome {
         },
         (Some("not_hosted"), _) | (None, Code::Unimplemented) => Outcome::NotHosted,
         (Some("rejected"), code) => match Rejection::from_code(code) {
-            Some(rejection) => {
-                let error_type = text(ERROR_TYPE).unwrap_or_default().to_owned();
-                Outcome::Rejected(rejection, error_type)
-            }
+            Some(rejection) => Outcome::Rejected(Rejected {
+                rejection,
+                error_type: text(ERROR_TYPE).unwrap_or_default().to_owned(),
+                message: status.message().to_owned(),
+                details: status.details().to_vec(),
+            }),
             None => Outcome::Uncertain(status.message().to_owned()),
         },
         _ => Outcome::Uncertain(status.message().to_owned()),

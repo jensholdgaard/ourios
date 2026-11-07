@@ -1484,7 +1484,8 @@ never count toward an ack (learners, under §4.3's shape).
   `StreamAppend`, or the checkpoint by `InstallSnapshot` when they are
   already purged.
 - `Identify` names no group and changes nothing: the node answers with
-  its `node_id` and the UUID in its `replica.id`. A leader calls each
+  its `node_id`, the UUID in its `replica.id`, and the highest control
+  entry kind it reads (§6.5), which gates a leader's new kinds. A leader calls each
   peer of a group's tail placement, and each voter of the group, at
   the address its own configuration gives, and acts on the answer
   through a committed membership change only: it adds a node it does

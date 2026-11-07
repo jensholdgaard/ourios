@@ -23,12 +23,13 @@ use openraft::type_config::alias::SnapshotMetaOf;
 use super::codec::{decode_membership, encode_membership, raft_id, wal_id};
 use super::gate::SyncGate;
 use super::types::{LogId, RaftTypes};
-use super::{sync_through, writer_gone};
+use super::{OWNER_WAIT, sync_through, take_ownership, writer_gone};
 use ourios_wal::RaftLogId;
 
 pub(super) type SnapshotMeta = SnapshotMetaOf<RaftTypes>;
 
 const FILE: &str = "snapshot";
+const LOCK_FILE: &str = "snapshot.lock";
 const VERSION: u8 = 1;
 const ID_LEN: usize = 1 + 8 + 8;
 const CRC_LEN: usize = 4;
@@ -113,7 +114,16 @@ pub(super) fn read(dir: &Path) -> io::Result<Option<SnapshotMeta>> {
 
 /// Replace the record in `dir` with `meta`: tmp, fsync, rename, directory
 /// fsync, with both fsyncs behind `gate`. Blocking.
+///
+/// A record newer than `meta` is kept. `openraft` builds on a task that
+/// can outlive its host's shutdown, so a build from a host already
+/// replaced may arrive after the new host recorded a later snapshot;
+/// the lock keeps the two writers apart.
 pub(super) fn write(dir: &Path, meta: &SnapshotMeta, gate: &SyncGate) -> io::Result<()> {
+    let _owner = take_ownership(&dir.join(LOCK_FILE), OWNER_WAIT, "snapshot record")?;
+    if read(dir)?.is_some_and(|recorded| recorded.last_log_id > meta.last_log_id) {
+        return Ok(());
+    }
     let bytes = encode(meta)?;
     let tmp = dir.join(format!("{FILE}.tmp"));
     let mut file = File::create(&tmp)?;
@@ -174,6 +184,20 @@ mod tests {
         bytes[body..].copy_from_slice(&crc.to_le_bytes());
         let e = decode(&bytes).expect_err("refused");
         assert!(e.to_string().contains("unknown version 2"), "{e}");
+    }
+
+    #[test]
+    fn an_older_snapshot_never_replaces_a_newer_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gate = SyncGate::default();
+        let mut newer = meta();
+        newer.last_log_id = Some(LogId {
+            leader_id: CommittedLeaderId::new(4),
+            index: 20,
+        });
+        write(dir.path(), &newer, &gate).expect("write the newer");
+        write(dir.path(), &meta(), &gate).expect("an older write is not an error");
+        assert_eq!(read(dir.path()).expect("read"), Some(newer));
     }
 
     #[test]

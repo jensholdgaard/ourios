@@ -106,13 +106,17 @@ impl Control {
     }
 
     fn read(body: &[u8]) -> Result<Self, ReplicatedRecordError> {
+        // `WrongLength` counts every byte after the tag, the log id too.
         let Some((&kind, rest)) = body.split_first() else {
-            return Err(wrong_length(TAG_CONTROL, 1, 0));
+            return Err(wrong_length(TAG_CONTROL, LOG_ID_LEN + 1, LOG_ID_LEN));
         };
         match kind {
             KIND_FLUSHER_ASSIGNMENT => <[u8; REPLICA_LEN]>::try_from(rest)
                 .map(Self::FlusherAssignment)
-                .map_err(|_| wrong_length(TAG_CONTROL, 1 + REPLICA_LEN, body.len())),
+                .map_err(|_| {
+                    let expected = LOG_ID_LEN + 1 + REPLICA_LEN;
+                    wrong_length(TAG_CONTROL, expected, LOG_ID_LEN + body.len())
+                }),
             found => Err(ReplicatedRecordError::UnknownControlKind { found }),
         }
     }
@@ -415,18 +419,18 @@ mod tests {
             ))
         );
         assert_eq!(decode(&[0x04]), Err(wrong_length(0x04, 16, 0)));
-        assert_eq!(decode(&golden(0x04, &[])), Err(wrong_length(0x04, 1, 0)));
+        assert_eq!(decode(&golden(0x04, &[])), Err(wrong_length(0x04, 17, 16)));
         assert_eq!(
             decode(&golden(0x04, &[0x02])),
             Err(ReplicatedRecordError::UnknownControlKind { found: 0x02 })
         );
         assert_eq!(
             decode(&golden(0x04, &[0x01; 16])),
-            Err(wrong_length(0x04, 17, 16))
+            Err(wrong_length(0x04, 33, 32))
         );
         assert_eq!(
             decode(&golden(0x04, &[0x01; 18])),
-            Err(wrong_length(0x04, 17, 18))
+            Err(wrong_length(0x04, 33, 34))
         );
     }
 

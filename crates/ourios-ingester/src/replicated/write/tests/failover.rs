@@ -291,6 +291,17 @@ async fn rfc0065_6_losing_and_regaining_a_follower() {
     }
 
     cluster.restart(lost).await;
+    // A returning follower the leader has not reached yet stands for
+    // election, and with `kept`'s fsyncs held the leader loses its quorum
+    // lease and can be unseated; it has to follow the leader first.
+    let leader_id = cluster.id(leader);
+    cluster
+        .node(lost)
+        .raft(0)
+        .wait(Some(Duration::from_secs(10)))
+        .current_leader(leader_id, "the returning follower follows the leader")
+        .await
+        .expect("rejoined");
     // With both followers' fsyncs held the ack waits. Released for the
     // returning follower alone, it completes once that follower has caught
     // up and fsynced it; `kept` stays held through the crash check, so the

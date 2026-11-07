@@ -12,7 +12,9 @@ use openraft::errors::{ClientWriteError, RaftError};
 use super::layout::VotingLayout;
 use super::raft::host::{GroupHost, GroupRaft};
 use super::raft::types::{RaftTypes, TenantBatchBytes};
-use crate::metrics::{ERROR_TYPE_GROUP_UNAVAILABLE, ERROR_TYPE_NOT_ENOUGH_REPLICAS};
+use crate::metrics::{
+    ERROR_TYPE_GROUP_UNAVAILABLE, ERROR_TYPE_NOT_ENOUGH_REPLICAS, ERROR_TYPE_REQUEST_TOO_LARGE,
+};
 
 /// How long a commit waits for `client_write`. An internal constant, not
 /// a setting: the rate of `not_enough_replicas` rejections is the signal
@@ -40,6 +42,9 @@ pub enum WriteError {
     NotLeader { group: u32, leader: Option<String> },
     /// This node is not a voter of the group, so nothing was appended.
     NotHosted { group: u32 },
+    /// The export's entry would not fit one WAL frame, so it was never
+    /// proposed: the permanent size rejection, as on the local WAL.
+    TooLarge { len: usize, limit: usize },
     /// `client_write` failed otherwise; the outcome may be uncertain.
     Raft {
         group: u32,
@@ -66,6 +71,7 @@ impl WriteError {
     pub fn error_type(&self) -> &'static str {
         match self {
             Self::NotEnoughReplicas { .. } => ERROR_TYPE_NOT_ENOUGH_REPLICAS,
+            Self::TooLarge { .. } => ERROR_TYPE_REQUEST_TOO_LARGE,
             Self::NotLeader { .. } | Self::NotHosted { .. } | Self::Raft { .. } => {
                 ERROR_TYPE_GROUP_UNAVAILABLE
             }
@@ -89,6 +95,10 @@ impl std::fmt::Display for WriteError {
                 leader: None,
             } => write!(f, "group {group} has no known leader"),
             Self::NotHosted { group } => write!(f, "this node is not a voter of group {group}"),
+            Self::TooLarge { len, limit } => write!(
+                f,
+                "the export's {len} bytes exceed the {limit} a WAL frame's entry can hold"
+            ),
             Self::Raft { group, source } => write!(f, "group {group}: {source}"),
         }
     }
@@ -98,9 +108,10 @@ impl std::error::Error for WriteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Raft { source, .. } => Some(source.as_ref()),
-            Self::NotEnoughReplicas { .. } | Self::NotLeader { .. } | Self::NotHosted { .. } => {
-                None
-            }
+            Self::NotEnoughReplicas { .. }
+            | Self::NotLeader { .. }
+            | Self::NotHosted { .. }
+            | Self::TooLarge { .. } => None,
         }
     }
 }
@@ -143,6 +154,13 @@ impl GroupWriter {
         tenant: &str,
         batch: TenantBatchBytes,
     ) -> Result<GroupPosition, WriteError> {
+        let (len, limit) = (
+            batch.as_bytes().len(),
+            ourios_wal::ReplicatedRecord::MAX_ENTRY_PAYLOAD_BYTES,
+        );
+        if len > limit {
+            return Err(WriteError::TooLarge { len, limit });
+        }
         let group = self.layout.group_of(tenant);
         let raft = self
             .groups

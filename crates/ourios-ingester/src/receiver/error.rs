@@ -86,7 +86,10 @@ impl IngestFailure {
     pub(super) fn classify(error: &ReceiveError) -> Self {
         match error {
             ReceiveError::TenantDenied { .. } => Self::Denied,
-            ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => Self::TooLarge,
+            ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. })
+            | ReceiveError::Replication(crate::replicated::write::WriteError::TooLarge {
+                ..
+            }) => Self::TooLarge,
             // RFC 0052 §3.3's narrow reclassification: only the
             // *terminal* rotation state leaves the transient class. A
             // rotation still inside its retry budget genuinely is
@@ -363,6 +366,21 @@ mod tests {
                     IngestFailure::Unavailable,
                 );
             }
+        }
+
+        /// RFC 0061 §3.2: an export too large for one WAL frame's entry is
+        /// the permanent size rejection, as it is on the local WAL.
+        #[test]
+        fn a_replicated_entry_over_the_frame_is_too_large() {
+            use crate::replicated::write::WriteError;
+            let error = WriteError::TooLarge {
+                len: ourios_wal::ReplicatedRecord::MAX_ENTRY_PAYLOAD_BYTES + 1,
+                limit: ourios_wal::ReplicatedRecord::MAX_ENTRY_PAYLOAD_BYTES,
+            };
+            assert_eq!(
+                IngestFailure::classify(&ReceiveError::Replication(error)),
+                IngestFailure::TooLarge,
+            );
         }
     }
 

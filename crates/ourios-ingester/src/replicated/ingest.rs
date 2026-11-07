@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use super::raft::types::TenantBatchBytes;
-use super::write::{GroupPosition, GroupWriter};
+use super::write::{GroupPosition, GroupWriter, WriteError};
 use crate::receiver::admission::{Admission, Export, Framed};
 use crate::receiver::pipeline::ReceiveError;
 
@@ -78,6 +78,9 @@ impl ReplicatedIngest {
                     position,
                 })
             }
+            // The transport counts a size rejection from its response, as
+            // it does the local WAL's.
+            Err(e @ WriteError::TooLarge { .. }) => Err(ReceiveError::Replication(e)),
             Err(e) => {
                 self.admission
                     .metrics()

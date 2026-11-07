@@ -90,6 +90,10 @@ pub enum ReplicatedRecord<'a> {
 }
 
 impl<'a> ReplicatedRecord<'a> {
+    /// The largest payload a log entry can carry: its frame, prefix
+    /// included, must fit [`MAX_FRAME_BYTES`](crate::MAX_FRAME_BYTES).
+    pub const MAX_ENTRY_PAYLOAD_BYTES: usize = crate::MAX_FRAME_BYTES - ENTRY_PREFIX_LEN;
+
     /// The frame payload for this record.
     ///
     /// # Errors

@@ -22,6 +22,7 @@ use crate::replicated::ingest::{Ingested, ReplicatedIngest};
 use crate::replicated::layout::{LayoutCheck, VotingLayout, record_or_check};
 use crate::replicated::raft::cluster::{Cluster, batch, name, write};
 use crate::replicated::raft::gate::SyncGate;
+use crate::replicated::raft::types::TenantBatchBytes;
 
 fn layout(cluster: &Cluster, groups: u32) -> VotingLayout {
     let peers = (0..3).map(|i| name(cluster.id(i)));
@@ -244,5 +245,40 @@ async fn an_unhosted_or_stopped_group_is_unavailable() {
         }
         other => panic!("expected a Raft failure, got {other:?}"),
     }
+    cluster.shutdown().await;
+}
+
+/// A batch whose `TenantOtlpBatch` payload is exactly `len` bytes.
+fn batch_of(tenant: &str, len: usize) -> TenantBatchBytes {
+    let prefix = ourios_wal::TenantBatch::encode(tenant, b"")
+        .expect("prefix")
+        .len();
+    let payload = ourios_wal::TenantBatch::encode(tenant, &vec![0; len - prefix]).expect("batch");
+    TenantBatchBytes::new(payload).expect("valid")
+}
+
+/// RFC 0061 §3.2: an export whose entry would not fit one WAL frame is
+/// refused before it is proposed, so the group's log never sees it and
+/// the next export commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_over_the_wal_frame_is_refused_and_the_group_keeps_committing() {
+    let cluster = Cluster::start(3, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let writer = writer(&cluster, leader);
+    let limit = ourios_wal::ReplicatedRecord::MAX_ENTRY_PAYLOAD_BYTES;
+    match writer.commit("acme", batch_of("acme", limit + 1)).await {
+        Err(WriteError::TooLarge {
+            len,
+            limit: refused,
+        }) => {
+            assert_eq!((len, refused), (limit + 1, limit));
+        }
+        other => panic!("expected the size rejection, got {other:?}"),
+    }
+    let position = writer
+        .commit("acme", batch(1))
+        .await
+        .expect("a later export commits");
+    assert_eq!(position.group, 0);
     cluster.shutdown().await;
 }

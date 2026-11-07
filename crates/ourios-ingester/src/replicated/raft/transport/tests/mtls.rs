@@ -316,3 +316,36 @@ async fn a_forward_that_fails_the_handshake_was_never_sent() {
     );
     holding.abort();
 }
+
+/// A forward whose caller certificate the server refuses is uncertain, not
+/// never sent: the refusal comes as an alert after the caller's side of
+/// the handshake has finished, by when the request may have been written.
+/// Reading it as never sent would let the sender resubmit an export that
+/// might have committed.
+#[tokio::test]
+async fn a_forward_whose_caller_certificate_is_refused_is_uncertain() {
+    let (ca, other) = (Ca::new(), Ca::new());
+    let certs = TempDir::new().expect("tempdir");
+    let server = ca.node(certs.path(), "server");
+    let (incoming, addr) = bind();
+    let peers = Peers::mutual_tls(&server).expect("peers");
+    let mut node = start_tls(1, incoming, &server, peers).await;
+    let rogue = TlsSettings {
+        client_ca_file: server.client_ca_file.clone(),
+        ..other.node(certs.path(), "rogue")
+    };
+    let rogue = Peers::mutual_tls(&rogue)
+        .expect("peers")
+        .with_addresses([("n1".to_owned(), addr.to_string())]);
+    let request = ForwardRequest {
+        version: super::super::VERSION,
+        group: GROUP,
+        payload: ourios_wal::TenantBatch::encode("acme", b"record").expect("batch"),
+        credential: None,
+    };
+    let outcome = rogue
+        .forward("n1", request, Duration::from_millis(200))
+        .await;
+    assert!(matches!(outcome, Outcome::Uncertain(_)), "{outcome:?}");
+    node.kill().await;
+}

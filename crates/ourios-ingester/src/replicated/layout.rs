@@ -13,7 +13,7 @@ use std::num::NonZeroU32;
 use ourios_parquet::{Store, StoreError};
 use serde::{Deserialize, Serialize};
 
-use super::placement::place;
+use super::placement::{group_of, place};
 
 /// The layout object's key under the store root.
 pub const LAYOUT_KEY: &str = "wal/replicated/cluster.json";
@@ -59,6 +59,12 @@ impl VotingLayout {
             self.peers.iter().map(String::as_str),
             self.replication_factor,
         )
+    }
+
+    /// The group `tenant` belongs to (§6.1).
+    #[must_use]
+    pub fn group_of(&self, tenant: &str) -> u32 {
+        group_of(tenant.as_bytes(), self.groups)
     }
 
     /// The groups `node_id` votes in, ascending.
@@ -357,6 +363,17 @@ mod tests {
         assert!(layout.groups_of("tail-0").is_empty());
         let votes: usize = peers.iter().map(|p| layout.groups_of(p).len()).sum();
         assert_eq!(votes, 4 * 3, "every group has replication_factor voters");
+    }
+
+    #[test]
+    fn a_tenant_routes_by_the_layouts_group_count() {
+        let layout = layout(&["a", "b", "c"], 16, 3);
+        for tenant in ["acme", "globex", "initech"] {
+            assert_eq!(
+                layout.group_of(tenant),
+                group_of(tenant.as_bytes(), groups(16))
+            );
+        }
     }
 
     #[test]

@@ -7,30 +7,10 @@
 //!
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC is
 //! red; each names the slice that discharges it.
-
-/// Scenario RFC0065.2 — an ack waits for the write quorum (B1).
-/// Given three voters, when an export is sent while both followers' fsyncs
-/// are held, then no success is sent until a second voter has fsynced it.
-#[test]
-#[ignore = "RFC0065.2 stub — implemented with the write path on the in-process cluster"]
-fn rfc0065_2_an_ack_waits_for_a_second_voters_fsync() {
-    todo!(
-        "RFC0065.2 — with both followers' fsyncs held, no success acknowledgement \
-         is sent until a second voter has fsynced the export"
-    );
-}
-
-/// Scenario RFC0065.2 — an ack waits for the write quorum (B3).
-/// With both followers down the export gets the retryable rejection, never
-/// a success; if its entry commits once they return, its records appear.
-#[test]
-#[ignore = "RFC0065.2 stub — implemented with the write path on the in-process cluster"]
-fn rfc0065_2_without_a_quorum_the_export_is_rejected_retryably() {
-    todo!(
-        "RFC0065.2 — both followers down: retryable rejection, no success ever \
-         sent; if the entry commits after they return, its records become visible"
-    );
-}
+//!
+//! RFC0065.2, RFC0065.7 and RFC0065.15's write arm run on the crate-internal
+//! cluster harness, so they are unit tests: `replicated::write::tests` and
+//! `replicated::raft::cluster::tests`.
 
 /// Scenario RFC0065.4 — a replaced writer cannot acknowledge (B5).
 /// Given the acknowledging replica paused while another takes over, when it
@@ -180,16 +160,13 @@ fn rfc0065_14_an_unreachable_tail_is_named_in_the_response() {
     );
 }
 
-/// Scenario RFC0065.15 — a store outage does not stop acks (B10).
-/// Given a healthy three-node cluster, when the object store becomes
-/// unreachable, then exports keep being acknowledged.
+/// Scenario RFC0065.15 — a store outage does not stop acks (B10), the
+/// recovery arm. Given a healthy three-node cluster, when the object store
+/// becomes unreachable and returns, then failover and checkpoints resume.
 #[test]
-#[ignore = "RFC0065.15 stub — implemented with the write path on the in-process cluster"]
-fn rfc0065_15_a_store_outage_does_not_stop_acks() {
-    todo!(
-        "RFC0065.15 — exports keep being acknowledged while the store is \
-         unreachable, and failover and checkpoints resume once it returns"
-    );
+#[ignore = "RFC0065.15 stub — implemented with checkpoints on the in-process cluster"]
+fn rfc0065_15_failover_and_checkpoints_resume_after_a_store_outage() {
+    todo!("RFC0065.15 — failover and checkpoints resume once the store returns");
 }
 
 /// Scenario RFC0065.16 — the local backend is unchanged, the column arm.

@@ -16,7 +16,7 @@ pub mod types;
 pub mod vote_log;
 
 #[cfg(test)]
-mod cluster;
+pub(crate) mod cluster;
 #[cfg(test)]
 mod tests;
 

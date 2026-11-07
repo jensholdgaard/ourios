@@ -28,6 +28,9 @@ pub enum ReceiveError {
     WalAppend(ourios_wal::AppendError),
     /// Fsyncing the WAL failed — the batch must not be acked.
     WalSync(ourios_wal::SyncError),
+    /// The replicated backend's group did not commit the export (RFC 0065
+    /// §6.3) — the batch must not be acked.
+    Replication(crate::replicated::write::WriteError),
 }
 
 /// How a transport classifies a failed batch for the `ingest logs` server
@@ -93,7 +96,9 @@ impl IngestFailure {
             | ReceiveError::WalSync(ourios_wal::SyncError::RotationTerminal(_)) => {
                 Self::ServerTerminal
             }
-            ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => Self::Unavailable,
+            ReceiveError::WalAppend(_)
+            | ReceiveError::WalSync(_)
+            | ReceiveError::Replication(_) => Self::Unavailable,
             ReceiveError::TenantFrame(_) => Self::Internal,
         }
     }
@@ -141,6 +146,7 @@ impl std::fmt::Display for ReceiveError {
             Self::TenantFrame(e) => write!(f, "{e}"),
             Self::WalAppend(e) => write!(f, "{e}"),
             Self::WalSync(e) => write!(f, "{e}"),
+            Self::Replication(e) => write!(f, "{e}"),
         }
     }
 }
@@ -152,6 +158,7 @@ impl std::error::Error for ReceiveError {
             Self::TenantFrame(e) => Some(e),
             Self::WalAppend(e) => Some(e),
             Self::WalSync(e) => Some(e),
+            Self::Replication(e) => Some(e),
         }
     }
 }
@@ -336,6 +343,26 @@ mod tests {
                 })),
                 IngestFailure::TooLarge,
             );
+        }
+
+        /// RFC 0065 §6.3: a group that did not commit the export, or a
+        /// node that does not lead it, gives the retryable rejection.
+        #[test]
+        fn a_replication_failure_is_retryable() {
+            use crate::replicated::write::WriteError;
+            for error in [
+                WriteError::NotEnoughReplicas { group: 3 },
+                WriteError::NotLeader {
+                    group: 3,
+                    leader: Some("receiver-1".to_owned()),
+                },
+                WriteError::NotHosted { group: 3 },
+            ] {
+                assert_eq!(
+                    IngestFailure::classify(&ReceiveError::Replication(error)),
+                    IngestFailure::Unavailable,
+                );
+            }
         }
     }
 

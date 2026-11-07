@@ -32,7 +32,7 @@
 //!   wrapping the same pipeline: controlled `Status` mapping + concurrent
 //!   WAL-before-ack (RFC0003.11 gRPC arms / .15).
 
-mod admission;
+pub(crate) mod admission;
 pub mod commit;
 pub mod decode;
 mod error;

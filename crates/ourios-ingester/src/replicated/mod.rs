@@ -6,7 +6,7 @@
 //! [`replica_id`] keeps a replica's identity on its own disk. [`raft`] is
 //! a group's consensus storage, and [`write`](mod@write) and [`ingest`] the write
 //! path over it (§6.3), with [`forward`] its leader's side of `Forward`
-//! (§6.8), not yet wired into a served role.
+//! and [`route`] its sender's (§6.8), not yet wired into a served role.
 
 pub mod forward;
 pub mod ingest;
@@ -14,4 +14,5 @@ pub mod layout;
 pub mod placement;
 pub mod raft;
 pub mod replica_id;
+pub mod route;
 pub mod write;

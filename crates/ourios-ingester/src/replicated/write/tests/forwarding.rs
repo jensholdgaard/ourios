@@ -127,3 +127,32 @@ async fn an_uncommitted_forward_and_a_follower_without_a_router_are_unavailable(
     }
     cluster.shutdown().await;
 }
+
+/// An export too large for a WAL frame is the permanent size rejection on
+/// a follower too: it is refused before routing and never forwarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversize_export_is_refused_before_it_is_forwarded() {
+    let cluster = Cluster::start(3, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    serve_forwards(&cluster, COMMIT_TIMEOUT);
+    let follower = followers(leader)[0];
+    let before = cluster.node(leader).log(0).await.len();
+    let line = "x".repeat(ourios_wal::ReplicatedRecord::MAX_ENTRY_PAYLOAD_BYTES + 1);
+    let refused = forwarding(&cluster, follower, COMMIT_TIMEOUT)
+        .ingest_with(export(&line), TOKEN)
+        .await
+        .expect_err("too large");
+    assert!(
+        matches!(
+            refused,
+            ReceiveError::Replication(WriteError::TooLarge { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        cluster.node(leader).log(0).await.len(),
+        before,
+        "never forwarded"
+    );
+    cluster.shutdown().await;
+}

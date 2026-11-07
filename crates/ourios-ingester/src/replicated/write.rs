@@ -167,6 +167,22 @@ impl GroupWriter {
         self.layout.group_of(tenant)
     }
 
+    /// Whether `batch` fits one WAL frame's entry, on any node.
+    ///
+    /// # Errors
+    ///
+    /// [`WriteError::TooLarge`], the permanent size rejection.
+    pub fn fits(batch: &TenantBatchBytes) -> Result<(), WriteError> {
+        let (len, limit) = (
+            batch.as_bytes().len(),
+            ourios_wal::ReplicatedRecord::MAX_ENTRY_PAYLOAD_BYTES,
+        );
+        if len > limit {
+            return Err(WriteError::TooLarge { len, limit });
+        }
+        Ok(())
+    }
+
     /// Whether this node leads `tenant`'s group, as its Raft last knew.
     #[must_use]
     pub fn leading(&self, tenant: &str) -> Leading {
@@ -209,13 +225,7 @@ impl GroupWriter {
         tenant: &str,
         batch: TenantBatchBytes,
     ) -> Result<GroupPosition, WriteError> {
-        let (len, limit) = (
-            batch.as_bytes().len(),
-            ourios_wal::ReplicatedRecord::MAX_ENTRY_PAYLOAD_BYTES,
-        );
-        if len > limit {
-            return Err(WriteError::TooLarge { len, limit });
-        }
+        Self::fits(&batch)?;
         let group = self.layout.group_of(tenant);
         let raft = self
             .groups

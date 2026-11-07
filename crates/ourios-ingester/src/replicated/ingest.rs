@@ -206,8 +206,10 @@ impl ReplicatedIngest {
     }
 
     /// Commit here if this node leads the group, else forward to its
-    /// leader. Leadership is read before the commit, which takes the batch:
-    /// should it change in between, the commit's not-leader answer is the
+    /// leader. The size check comes first, so an export too large for a
+    /// WAL frame is the permanent rejection wherever its leader is.
+    /// Leadership is read before the commit, which takes the batch: should
+    /// it change in between, the commit's not-leader answer is the
     /// retryable rejection.
     async fn commit(
         &self,
@@ -215,6 +217,7 @@ impl ReplicatedIngest {
         batch: TenantBatchBytes,
         credential: Option<&str>,
     ) -> Result<GroupPosition, Uncommitted> {
+        GroupWriter::fits(&batch).map_err(Uncommitted::Write)?;
         let (Leading::Elsewhere { group, leader }, Some(router)) =
             (self.writer.leading(tenant.as_str()), &self.router)
         else {

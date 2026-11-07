@@ -944,7 +944,10 @@ the mass-failover time and vote-log batching as tuning signals.
   `wal_root/groups/<group>/snapshot` (tmp, fsync, rename, directory
   fsync) and returns from `install_snapshot` or `build_snapshot` only
   once that is durable, so the purge `openraft` makes after either
-  never runs ahead of it.
+  never runs ahead of it. Builds and installs write one at a time,
+  and a record newer than the one being written is kept: a build can
+  finish after its host was replaced and the new host recorded a
+  later snapshot.
   The record carries a format version and a CRC32C. The group's state
   machine opens from it, applied through the snapshot; a record that
   fails either check fails the group's open, and a group without one

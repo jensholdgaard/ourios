@@ -949,16 +949,24 @@ the mass-failover time and vote-log batching as tuning signals.
   an absent voter and the group runs on the rest of its quorum. A
   membership never holds two voters with the same `node_id`, and a node
   never rejoins under an identity whose vote it has lost (§4.5).
-- **A group's first membership** comes from its voters' own answers. Only
-  the group's first-ranked voter, and only while its log for the group
-  is empty, initializes it: it calls `Identify` on each of the group's
-  other voters at its configured address (§6.8), and once every one has
-  answered it initializes the group with each voter's UUID paired with
-  its `node_id`. Until then it retries and the group has no leader; the
-  other voters wait to be contacted. A first-ranked voter that restarts
-  on a wiped `wal_root` and initializes again cannot take the group:
-  the other voters hold a later term and a longer log, so it never gets
-  a majority, and the group's leader replaces it as above.
+- **A group's first membership** comes from its voters' own answers and
+  is recorded in the bucket, so a group forms once. Only the group's
+  first-ranked voter forms it, and only while its log for the group is
+  empty: it calls `Identify` on each of the group's other voters at its
+  configured address (§6.8) and, once every one has answered, writes
+  `<bucket>/wal/replicated/groups/<group>/formed.json`, the membership
+  as each voter's UUID paired with its `node_id`, with
+  `put_if_absent`. It initializes the group only with the membership
+  that object holds, and only if its own UUID is in it: the voter whose
+  write won initializes, and so does that voter restarting on the same
+  `wal_root` before its log took the first entry. A voter that finds
+  the object naming another UUID for its `node_id`, a first-ranked voter
+  restarting on a wiped `wal_root` above all, never initializes; it
+  answers `Identify` under its new UUID and joins through the committed
+  replacement above, so an empty log never forms a second membership
+  beside one that may hold acknowledged batches. Until the object exists
+  and the group is initialized, the group has no leader; the other
+  voters wait to be contacted.
 - **Each replica keeps one RFC 0008 WAL per group** under
   `wal_root/groups/<group>/`, with RFC 0008's segments, fsync policy
   and CRCs unchanged, and its RFC 0052 reclaim sidecar sized for the
@@ -1578,7 +1586,14 @@ never count toward an ack (learners, under §4.3's shape).
   log, committed or not, and a new kind and a membership change are
   never in flight together (§6.5). So a lost
   member holds back a new kind but never the reassignment of its own
-  flusher, and no replica is asked to apply an entry it cannot read. A leader calls each
+  flusher, and no admitted replica is asked to apply an entry it cannot
+  read. A member rolled back afterwards, under its UUID, is not
+  admitted again, so the check is also its own: a replica refuses an
+  append that carries a control kind above the highest it reads before
+  it writes or acknowledges it, as well as such an entry already in its
+  log or checkpoint (§6.5), and stops serving and voting in that group
+  as if it were down, until a release that reads the kind restarts it.
+  A leader calls each
   peer of a group's tail placement, and each voter of the group, at
   the address its own configuration gives, and acts on the answer
   through a committed membership change only: it adds a node it does

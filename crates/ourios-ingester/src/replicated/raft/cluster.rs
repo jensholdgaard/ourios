@@ -362,8 +362,12 @@ impl Cluster {
     }
 
     /// Crash every node still up, leaving each directory as its last
-    /// fsync left it.
+    /// fsync left it. Every gate stops first, so no node fsyncs while
+    /// another shuts down.
     pub(crate) async fn crash_all(&mut self) {
+        for (_, node) in self.up() {
+            node.gate.crash();
+        }
         for i in 0..self.slots.len() {
             if matches!(self.slots[i], Slot::Up(_)) {
                 self.crash(i).await;

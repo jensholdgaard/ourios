@@ -10,8 +10,9 @@ use opentelemetry_sdk::metrics::data::{
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use ourios_semconv as semconv;
 
-use super::ReplicationTelemetry;
-use crate::replicated::raft::cluster::{Cluster, Node, name, write};
+use super::Meters;
+use crate::replicated::raft::cluster::{Cluster, name, write};
+use crate::replicated::raft::types::{NodeId, Vote};
 
 /// One meter provider and what it exports.
 struct Reader {
@@ -70,10 +71,6 @@ fn values<'a>(attributes: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> 
     pairs.into_iter().map(|(_, value)| value).collect()
 }
 
-fn watch(meter: &Meter, node: &Node) -> ReplicationTelemetry {
-    ReplicationTelemetry::watch(meter, node.host.groups().map(|g| (g, node.raft(g))))
-}
-
 /// Collect `name` from `reader` until `done` holds of its points.
 async fn until(reader: &Reader, name: &str, done: impl Fn(&[(Vec<String>, u64)]) -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -103,13 +100,10 @@ fn lag_of(points: &[(Vec<String>, u64)], replica: &str) -> Option<u64> {
 /// writes it misses while the other's settles back to zero.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_leader_reports_each_followers_lag_and_every_voter_the_term() {
-    let mut cluster = Cluster::start(3, &[0]).await;
+    let readers: Vec<_> = (0..3).map(|_| Reader::new()).collect();
+    let mut cluster = Cluster::start_metered(3, &[0], |i| Meters::on(&readers[i].meter())).await;
     let leader = cluster.leader(0, None).await;
     write(cluster.node(leader).raft(0), 1).await;
-    let readers: Vec<_> = (0..3).map(|_| Reader::new()).collect();
-    let _telemetry: Vec<_> = (0..3)
-        .map(|i| watch(&readers[i].meter(), cluster.node(i)))
-        .collect();
 
     let term = cluster
         .node(leader)
@@ -152,11 +146,8 @@ async fn the_leader_reports_each_followers_lag_and_every_voter_the_term() {
 /// the nodes is the number of leadership changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_term_a_node_leads_is_counted_once() {
-    let mut cluster = Cluster::start(3, &[0]).await;
     let reader = Reader::new();
-    let _telemetry: Vec<_> = (0..3)
-        .map(|i| watch(&reader.meter(), cluster.node(i)))
-        .collect();
+    let mut cluster = Cluster::start_metered(3, &[0], |_| Meters::on(&reader.meter())).await;
     let old = cluster.leader(0, None).await;
     write(cluster.node(old).raft(0), 1).await;
     let takeovers = semconv::OURIOS_WAL_REPLICATION_TAKEOVERS;
@@ -173,4 +164,54 @@ async fn each_term_a_node_leads_is_counted_once() {
         "a later write is not a takeover"
     );
     cluster.shutdown().await;
+}
+
+/// A closed host stops reporting and its watches are freed, so a node
+/// reopened in its place reports once and the gauges hold one host, not
+/// one per host the node has had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_host_stops_reporting_and_a_reopened_one_reports_once() {
+    let readers: Vec<_> = (0..3).map(|_| Reader::new()).collect();
+    let meters: Vec<_> = readers.iter().map(|r| Meters::on(&r.meter())).collect();
+    let mut cluster = Cluster::start_metered(3, &[0], |i| meters[i].clone()).await;
+    let held = |i: usize| super::live(&meters[i].gauges.hosts).len();
+    let leader = cluster.leader(0, None).await;
+    write(cluster.node(leader).raft(0), 1).await;
+    let follower = (0..3).find(|&i| i != leader).expect("a follower");
+    let term = semconv::OURIOS_WAL_REPLICATION_TERM;
+    until(&readers[follower], term, |p| p.len() == 1).await;
+
+    cluster.crash(follower).await;
+    let reported = readers[follower].points(term);
+    assert_eq!(reported, [], "a closed host reports nothing");
+    assert_eq!(held(follower), 0, "a closed host's watches are freed");
+    for _ in 0..2 {
+        cluster.restart(follower).await;
+        until(&readers[follower], term, |p| p.len() == 1).await;
+        assert_eq!(held(follower), 1, "one host per node");
+        cluster.crash(follower).await;
+    }
+    cluster.shutdown().await;
+}
+
+/// A takeover is a saved vote that is committed and names this node:
+/// each such vote counts, whatever else the node saw in between, and no
+/// other vote does.
+#[test]
+fn every_committed_vote_for_this_node_is_one_takeover() {
+    let reader = Reader::new();
+    let (me, other) = (NodeId::from(1), NodeId::from(2));
+    let takeovers = Meters::on(&reader.meter()).takeovers(me, 0);
+    for vote in [
+        Vote::new(1, me),
+        Vote::new_committed(1, me),
+        Vote::new_committed(2, other),
+        Vote::new(3, me),
+        Vote::new_committed(3, me),
+        Vote::new_committed(4, other),
+    ] {
+        takeovers.saved(&vote);
+    }
+    let counted = reader.points(semconv::OURIOS_WAL_REPLICATION_TAKEOVERS);
+    assert_eq!(counted, [(vec!["0".to_owned()], 2)], "terms 1 and 3");
 }

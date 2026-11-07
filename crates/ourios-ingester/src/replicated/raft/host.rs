@@ -16,7 +16,7 @@ use super::gate::SyncGate;
 use super::group_config;
 use super::log_store::{GroupLog, group_dir};
 use super::state_machine::GroupSm;
-use super::telemetry::ReplicationTelemetry;
+use super::telemetry::{Meters, ReplicationTelemetry};
 use super::transport::{Peers, ReplicationServer};
 use super::types::{NodeId, RaftTypes};
 use super::vote_log::VoteLog;
@@ -94,6 +94,7 @@ struct Launch<'a> {
     votes: VoteLog,
     gate: Arc<SyncGate>,
     config: Arc<openraft::Config>,
+    meters: &'a Meters,
 }
 
 impl Launch<'_> {
@@ -104,12 +105,12 @@ impl Launch<'_> {
             ..self.spec.wal.clone()
         };
         let (votes, gate) = (self.votes.clone(), Arc::clone(&self.gate));
-        #[cfg_attr(not(test), allow(unused_mut))] // the test probe borrows it mutably
         let mut log = blocking(move || GroupLog::open_with(wal, group, votes, gate))
             .await
             .map_err(|source| HostError::Log { group, source })?;
         #[cfg(test)]
         let probe = probe::Probe::of(&mut log).await;
+        log.count_takeovers(self.meters.takeovers(self.spec.id, group));
         let gate = Arc::clone(&self.gate);
         let sm = blocking(move || GroupSm::open(&dir, gate))
             .await
@@ -152,13 +153,15 @@ impl GroupHost {
     ///
     /// [`HostError`] naming the vote log or the group that failed.
     pub async fn open(spec: HostSpec) -> Result<Self, HostError> {
-        Self::open_with(spec, ReplicationServer::default(), Arc::default()).await
+        let meters = Meters::global();
+        Self::open_with(spec, ReplicationServer::default(), Arc::default(), &meters).await
     }
 
     pub(super) async fn open_with(
         spec: HostSpec,
         server: ReplicationServer<GroupSm>,
         gate: Arc<SyncGate>,
+        meters: &Meters,
     ) -> Result<Self, HostError> {
         let config = Arc::new(group_config().map_err(HostError::Config)?);
         let root = spec.wal.root.clone();
@@ -170,6 +173,7 @@ impl GroupHost {
             votes,
             gate,
             config,
+            meters,
         };
         let mut host = Self {
             groups: BTreeMap::new(),
@@ -190,8 +194,7 @@ impl GroupHost {
             }
         }
         let rafts = host.groups.iter().map(|(&g, hosted)| (g, &hosted.raft));
-        let meter = ourios_core::telemetry::meter("ourios.wal");
-        host.telemetry = Some(ReplicationTelemetry::watch(&meter, rafts));
+        host.telemetry = Some(meters.watch(rafts));
         Ok(host)
     }
 

@@ -279,6 +279,21 @@ fn rfc0065_24_a_wiped_voter_without_a_quorum_fails_closed() {
     );
 }
 
+/// Scenario RFC0065.24 — the interrupted-formation arm (B4, B6).
+/// Given a fresh cluster whose first-ranked voter records `formed.json`
+/// and restarts on an empty volume before it initializes, the other two
+/// initialize with the recorded membership and the restarted voter joins
+/// by replacement.
+#[test]
+#[ignore = "RFC0065.24 stub — implemented with group formation"]
+fn rfc0065_24_a_formation_interrupted_by_a_wiped_voter_still_forms_once() {
+    todo!(
+        "RFC0065.24 — the other two initialize with exactly the recorded \
+         membership and elect a leader; the restarted voter never initializes a \
+         second membership and joins under its new identity by replacement"
+    );
+}
+
 /// Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13).
 /// Given the other two voters lost for good with acked records above the
 /// checkpoint, some flushed, when `ourios wal force-leader` runs on the

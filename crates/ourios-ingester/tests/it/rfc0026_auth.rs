@@ -22,9 +22,9 @@ use crate::ingest_support::{
 };
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use ourios_core::auth::{TokenSpec, TokenStore, build_token_store};
-use ourios_ingester::receiver::ReceiveError;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
+use ourios_ingester::receiver::{Export, ReceiveError};
 use ourios_serving::{AuthBinding, AuthResolver, authenticate_bearer};
 use prost::Message;
 
@@ -218,15 +218,15 @@ async fn rfc0026_3_ingest_tenant_binding() {
     // A batch selecting an in-set tenant acks normally — whatever its
     // resources say (service names are not tenancy inputs).
     let accepted = pipeline
-        .ingest_bound(
-            request(vec![
+        .ingest_bound(Export {
+            request: request(vec![
                 resource_logs("tenant-a", &["a line"]),
                 resource_logs("tenant-c", &["another producer"]),
             ]),
-            ourios_core::tenant::TenantId::new("tenant-b"),
-            Some(&bound),
-            false,
-        )
+            tenant: ourios_core::tenant::TenantId::new("tenant-b"),
+            binding: Some(&bound),
+            lenient_json: false,
+        })
         .await
         .expect("in-set selector acks");
     assert_eq!(accepted, 2);
@@ -235,12 +235,12 @@ async fn rfc0026_3_ingest_tenant_binding() {
     // An out-of-set selector rejects the WHOLE batch with no WAL append and
     // no partial success.
     let denied = pipeline
-        .ingest_bound(
-            request(vec![resource_logs("tenant-a", &["a line"])]),
-            ourios_core::tenant::TenantId::new("tenant-c"),
-            Some(&bound),
-            false,
-        )
+        .ingest_bound(Export {
+            request: request(vec![resource_logs("tenant-a", &["a line"])]),
+            tenant: ourios_core::tenant::TenantId::new("tenant-c"),
+            binding: Some(&bound),
+            lenient_json: false,
+        })
         .await
         .expect_err("out-of-set selector is denied");
     assert!(
@@ -306,12 +306,12 @@ async fn rfc0026_5_wildcard_binding_ingest() {
     // every tenant were listed.
     for tenant in ["alpha", "beta", "entirely-new-tenant"] {
         let accepted = pipeline
-            .ingest_bound(
-                request(vec![resource_logs("svc", &["a line"])]),
-                ourios_core::tenant::TenantId::new(tenant),
-                Some(&bound),
-                false,
-            )
+            .ingest_bound(Export {
+                request: request(vec![resource_logs("svc", &["a line"])]),
+                tenant: ourios_core::tenant::TenantId::new(tenant),
+                binding: Some(&bound),
+                lenient_json: false,
+            })
             .await
             .unwrap_or_else(|e| panic!("wildcard ingests to {tenant}: {e}"));
         assert_eq!(accepted, 1);

@@ -18,8 +18,8 @@ use ingest_support::{request, resource_logs};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use ourios_core::audit::{AuditPayload, SharedAuditSink};
 use ourios_core::auth::{TokenSpec, build_token_store};
-use ourios_ingester::receiver::ReceiveError;
 use ourios_ingester::receiver::grpc::AuthLayer;
+use ourios_ingester::receiver::{Export, ReceiveError};
 use ourios_serving::AuthResolver;
 use ourios_serving::authenticate_bearer;
 
@@ -104,12 +104,12 @@ async fn rfc0026_7_rejection_telemetry_and_audit() {
         .expect("known token")
         .expect("bound");
     let denied = pipeline
-        .ingest_bound(
-            request(vec![resource_logs("svc", &["intruding line"])]),
-            ourios_core::tenant::TenantId::new("tenant-b"),
-            Some(&binding),
-            false,
-        )
+        .ingest_bound(Export {
+            request: request(vec![resource_logs("svc", &["intruding line"])]),
+            tenant: ourios_core::tenant::TenantId::new("tenant-b"),
+            binding: Some(&binding),
+            lenient_json: false,
+        })
         .await
         .expect_err("out-of-set");
     assert!(matches!(&denied, ReceiveError::TenantDenied { .. }));

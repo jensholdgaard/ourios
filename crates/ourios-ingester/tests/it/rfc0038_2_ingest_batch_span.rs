@@ -17,6 +17,7 @@ use crate::ingest_support::{
 };
 use opentelemetry::trace::{SpanId, SpanKind, Status};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
+use ourios_ingester::receiver::Export;
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;
 
@@ -47,12 +48,12 @@ async fn ingest_and_collect_spans(record_count: usize) -> Vec<SpanData> {
     let export = request(vec![resource_logs("checkout", &body_refs)]);
 
     let acked = pipeline
-        .ingest_bound(
-            export,
-            ourios_core::tenant::TenantId::new("checkout"),
-            None,
-            false,
-        )
+        .ingest_bound(Export {
+            request: export,
+            tenant: ourios_core::tenant::TenantId::new("checkout"),
+            binding: None,
+            lenient_json: false,
+        })
         .with_subscriber(subscriber)
         .await
         .expect("ingest acks");
@@ -193,12 +194,12 @@ async fn failed_ingest_spans(pipeline: ourios_ingester::receiver::IngestPipeline
         .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
     let export = request(vec![resource_logs("checkout", &["a line"])]);
     pipeline
-        .ingest_bound(
-            export,
-            ourios_core::tenant::TenantId::new("checkout"),
-            None,
-            false,
-        )
+        .ingest_bound(Export {
+            request: export,
+            tenant: ourios_core::tenant::TenantId::new("checkout"),
+            binding: None,
+            lenient_json: false,
+        })
         .with_subscriber(subscriber)
         .await
         .expect_err("the append fails");

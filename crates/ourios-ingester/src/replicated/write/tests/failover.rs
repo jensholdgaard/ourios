@@ -39,6 +39,26 @@ fn carries(entry: &Entry, marker: &str) -> bool {
     }
 }
 
+fn carried(log: &[Entry], n: u32) -> bool {
+    log.iter().any(|e| carries(e, &marker(n)))
+}
+
+/// Wait until node `i`'s log holds every export in `ns`.
+async fn appended(cluster: &Cluster, i: usize, ns: std::ops::Range<u32>) {
+    let waiting = async {
+        loop {
+            let log = cluster.node(i).log(0).await;
+            if ns.clone().all(|n| carried(&log, n)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the exports are appended");
+}
+
 fn holds(log: &[Entry], (marker, position): &Acked) -> bool {
     log.iter()
         .any(|e| e.log_id.index == position.seq && carries(e, marker))
@@ -171,18 +191,7 @@ async fn rfc0065_4_a_replaced_writer_cannot_acknowledge() {
             tokio::spawn(async move { stale.ingest(export(&marker(n))).await })
         })
         .collect();
-    let appended = async {
-        loop {
-            let log = cluster.node(old).log(0).await;
-            if (100..105).all(|n| log.iter().any(|e| carries(e, &marker(n)))) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(10), appended)
-        .await
-        .expect("the cut-off leader appends every queued export");
+    appended(&cluster, old, 100..105).await;
 
     let new = cluster.leader(0, Some(old)).await;
     write(cluster.node(new).raft(0), 0).await;
@@ -204,12 +213,11 @@ async fn rfc0065_4_a_replaced_writer_cannot_acknowledge() {
         }
     }
     let log = cluster.node(new).log(0).await;
-    for n in 100..105 {
-        assert!(
-            !log.iter().any(|e| carries(e, &marker(n))),
-            "the replaced leader's export {n} reached the new leader's log"
-        );
-    }
+    let reached = (100..105).find(|&n| carried(&log, n));
+    assert_eq!(
+        reached, None,
+        "a replaced leader's export reached the new log"
+    );
     assert_two_fsynced_copies(&mut cluster, &all).await;
 }
 

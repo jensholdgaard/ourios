@@ -6,8 +6,9 @@
 //! committed, learner-only membership change; the voters, the write quorum
 //! and voter placement never move.
 //!
-//! The flusher (§6.5) is not named yet, so no learner is held back from
-//! removal for being it.
+//! No learner is held back from removal for being the flusher yet: §6.1
+//! removes it last once it mines. Once it has gone, the leader's next
+//! [`super::flusher`] pass names another.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -16,6 +17,7 @@ use openraft::async_runtime::WatchReceiver as _;
 use openraft::{ChangeMembers, Precondition};
 
 use super::host::GroupRaft;
+use super::log_store::GroupLogReader;
 use super::transport::{Identity, Peers};
 use super::types::{LogId, Membership, NodeId};
 use crate::replicated::placement::place;
@@ -38,6 +40,23 @@ impl TailPool {
     pub fn placed(&self, group: u32) -> Vec<&str> {
         place(group, self.peers.iter().map(String::as_str), self.replicas)
     }
+}
+
+/// A group this node hosts: its `Raft` and a view of its log.
+#[derive(Clone, Copy)]
+pub struct Group<'a> {
+    pub raft: &'a GroupRaft,
+    pub log: &'a GroupLogReader,
+}
+
+/// A group's tail placement and how a pass reaches it.
+#[derive(Clone, Copy)]
+pub struct Tail<'a> {
+    /// The tail replicas' `node_id`s, in placement order.
+    pub placed: &'a [&'a str],
+    pub peers: &'a Peers,
+    /// How long each `Identify` call may take.
+    pub patience: Duration,
 }
 
 /// The learner changes one pass makes.
@@ -115,34 +134,36 @@ fn removals(
 }
 
 /// One pass for `group` on this node: if it leads the group, identify the
-/// placed tail peers and commit the changes [`plan`] gives, adding before
+/// `tail` peers and commit the changes [`plan`] gives, adding before
 /// removing. It plans from the committed membership only, and changes
 /// nothing while a membership change is in flight, while the membership
-/// is joint, or on a node that does not lead the group; a later pass
-/// picks up from there.
+/// is joint, while the newest entry of a new control kind in its log is
+/// uncommitted (§6.5), or on a node that does not lead the group; a later
+/// pass picks up from there.
 ///
 /// # Errors
 ///
 /// The membership change the leader could not commit; the next pass
 /// starts again from the committed membership.
-pub async fn reconcile(
-    raft: &GroupRaft,
-    placed: &[&str],
-    peers: &Peers,
-    patience: Duration,
-) -> Result<Changes, String> {
-    let Some((members, planned_at)) = led_members(raft) else {
+pub async fn reconcile(group: Group<'_>, tail: Tail<'_>) -> Result<Changes, String> {
+    let Some((members, planned_at)) = led_members(group) else {
         return Ok(Changes::default());
     };
     let mut answers = BTreeMap::new();
-    for &node_id in placed {
-        if let Ok(identity) = peers.identify(node_id, patience).await {
+    for &node_id in tail.placed {
+        if let Ok(identity) = tail.peers.identify(node_id, tail.patience).await {
             answers.insert(node_id.to_owned(), identity);
         }
     }
-    // No control kind exists yet (§6.5), so every learner reads the log.
-    let changes = plan(&members, placed, &answers, 0);
-    apply(raft, &changes, planned_at).await?;
+    // A new learner reads every kind in the log, committed or not (§6.8).
+    let log_kind = group.log.controls().highest_kind;
+    let changes = plan(&members, tail.placed, &answers, log_kind);
+    // An entry of a new kind appended during the `Identify` calls holds
+    // the change back until it commits.
+    if !kinds_settled(group) {
+        return Ok(Changes::default());
+    }
+    apply(group.raft, &changes, planned_at).await?;
     Ok(changes)
 }
 
@@ -179,11 +200,13 @@ pub(super) async fn apply(
     Ok(())
 }
 
-/// The group's committed membership, if this node leads it and no change
-/// to it is in flight: one still uncommitted would be planned against as
-/// if it had been.
-fn led_members(raft: &GroupRaft) -> Option<(Members, Option<LogId>)> {
-    let metrics = raft.metrics().borrow_watched().clone();
+/// The group's committed membership, if this node leads it, no change to
+/// it is in flight, and `log`'s newest entry of a new kind has committed:
+/// a membership still uncommitted would be planned against as if it had
+/// been, and §6.5 never has a new kind and a membership change in flight
+/// together.
+fn led_members(group: Group<'_>) -> Option<(Members, Option<LogId>)> {
+    let metrics = group.raft.metrics().borrow_watched().clone();
     if metrics.current_leader != Some(metrics.id) {
         return None;
     }
@@ -191,7 +214,21 @@ fn led_members(raft: &GroupRaft) -> Option<(Members, Option<LogId>)> {
     if committed.log_id() != metrics.membership_config.log_id() {
         return None;
     }
+    if !kinds_settled(group) {
+        return None;
+    }
     stable(committed.membership()).map(|members| (members, *committed.log_id()))
+}
+
+/// Whether `log`'s newest entry of a new control kind, if any, has
+/// committed.
+fn kinds_settled(group: Group<'_>) -> bool {
+    let committed = group.raft.metrics().borrow_watched().local_committed;
+    group
+        .log
+        .controls()
+        .introduced
+        .is_none_or(|i| committed.is_some_and(|c| c.index >= i))
 }
 
 /// The members of `membership`, unless it is joint: a learner edit there

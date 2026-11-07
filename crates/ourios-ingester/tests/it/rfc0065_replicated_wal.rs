@@ -9,9 +9,10 @@
 //! red; each names the slice that discharges it.
 //!
 //! RFC0065.2, RFC0065.5, RFC0065.6, RFC0065.7, RFC0065.3's takeover arm,
-//! RFC0065.4's paused-writer arm and RFC0065.15's write arm run on the
-//! crate-internal cluster harness, so they are unit tests:
-//! `replicated::write::tests` and `replicated::raft::cluster::tests`.
+//! RFC0065.4's paused-writer arm, RFC0065.15's write arm, RFC0065.29's
+//! kind-gate arm and RFC0065.30 run on the crate-internal cluster harness,
+//! so they are unit tests: `replicated::write::tests`,
+//! `replicated::raft::cluster::tests` and `replicated::raft::flusher::tests`.
 
 /// Scenario RFC0065.4 — a replaced writer cannot acknowledge (B5), the
 /// clock arm: the resumed former writer, with its clock set arbitrarily,
@@ -452,32 +453,4 @@ async fn rfc0065_29_an_unreadable_control_entry_stops_the_open() {
         };
         assert!(error.to_string().contains(why), "{error}");
     }
-}
-
-/// Scenario RFC0065.29 — the leader's kind gate. A leader whose members have
-/// not all reported, through `Identify`, reading a kind the log has never
-/// held does not append it; one whose log already holds the kind appends it
-/// with a member lost.
-#[test]
-#[ignore = "RFC0065.29 stub — implemented with Identify and the flusher-assignment entry"]
-fn rfc0065_29_a_kind_not_every_member_reads_is_not_appended() {
-    todo!(
-        "RFC0065.29 — a kind the log has never held waits for every member's \
-         Identify answer; one it holds is appended with a member lost"
-    );
-}
-
-/// Scenario RFC0065.30 — the leader names one flusher and keeps it (B11).
-/// Given three tail learners and no assignment, the leader assigns the
-/// first healthy one in placement order, replaces it only once it has been
-/// unhealthy for the patience or has left the placement, and a new leader
-/// keeps it.
-#[test]
-#[ignore = "RFC0065.30 stub — implemented with the leader's flusher assignment"]
-fn rfc0065_30_the_leader_names_one_flusher_and_keeps_it() {
-    todo!(
-        "RFC0065.30 — first healthy in placement order; replaced after the \
-         patience or on leaving the placement, never taken back on recovery; \
-         none appended with none healthy; kept across a failover"
-    );
 }

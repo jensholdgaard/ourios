@@ -7,6 +7,7 @@
 //! the previous one ran.
 
 mod codec;
+pub mod flusher;
 pub mod host;
 pub mod learners;
 pub mod log_store;

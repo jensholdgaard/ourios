@@ -347,8 +347,9 @@ testing and without membership change.
 The shape, replacing §6.2–§6.4:
 - **Storage:** `RaftLogStorage` over RFC 0008 segments; frame kind
   `0x04` (`ReplicatedEntry`) carries the Raft log id `(term, index)`
-  where §6.3 has `(epoch, seq)`, as a tagged record: a blank, normal or
-  membership entry, or a truncation, purge or commit marker. The log id
+  where §6.3 has `(epoch, seq)`, as a tagged record: a blank, normal,
+  membership or control entry (§6.5), or a truncation, purge or commit
+  marker. The log id
   is `(term, index)` because the type config uses `openraft`'s
   standard leader id (`impls::leader_id_std::LeaderId`); its default
   would add the node id. Votes go in one group-committed vote log per
@@ -860,6 +861,22 @@ the mass-failover time and vote-log batching as tuning signals.
 >   pre-request row a flusher publishes after the confirming pass is
 >   RFC 0009 D3's residual, pinned by RFC0009.22, not this scenario)
 
+> **Scenario RFC0065.29 — a log entry a replica cannot read stops it (B11)**
+> - **Given** a group WAL holding a flusher assignment, then a control
+>   entry of a kind the replica does not know, or a flusher assignment
+>   whose body is shorter or longer than 16 bytes
+> - **When** the replica opens the group's log
+> - **Then** it reads the first assignment's UUID, and it refuses to
+>   open the log at the unreadable entry rather than skip it; a leader
+>   whose members have not all reported reading a kind the log has never
+>   held does not append it, and one whose log already holds a kind
+>   appends it with a member lost; a leader holding an uncommitted entry
+>   of a new kind admits no learner until it commits, and a learner it
+>   then admits reads that kind, and one with a membership change in
+>   flight appends no new kind until that change commits; a replica
+>   whose checkpoint records a kind above the highest it reads refuses
+>   to open the log at the checkpoint
+
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
@@ -1175,6 +1192,56 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   version the tenant's audit trail holds, and its next widen of that
   template takes the version above it, so no `(template_id,
   template_version)` key ever names two token sequences.
+- **Control entries.** The flusher assignment, the checkpoint, id-block
+  and miner-configuration entries below, and §6.7's published and
+  erasure entries are log entries the leader appends beside the tenant
+  batches, so every replica applies them at the same position. In the
+  group WAL each is a `ReplicatedEntry` record with its own tag, `0x04`,
+  followed by `term: u64_le | index: u64_le` as every entry is, a
+  one-byte `kind`, and that kind's body.
+
+  | `kind` | Entry | Body |
+  |---|---|---|
+  | `0x01` | Flusher assignment | the flusher's replica UUID, 16 bytes big-endian |
+  | `0x02` | Checkpoint | reserved |
+  | `0x03` | Id-block reservation | reserved |
+  | `0x04` | Miner configuration | reserved |
+  | `0x05` | Published (§6.7) | reserved |
+  | `0x06` | Erasure (§6.7) | reserved |
+
+  A reserved kind's body is fixed by the amendment that implements it,
+  and kinds are implemented in order: a release reads a kind only if it
+  reads every kind below it. A release's highest readable kind,
+  `0x00` when it reads none, is therefore exactly the set of kinds it
+  reads.
+  A replica that reads a kind it does not know, or a body of the wrong
+  length, refuses to open the group's log rather than skip the entry:
+  mining and flushing depend on applying every control entry in order.
+  So the group's log has a highest kind, the highest it has ever held,
+  and a leader appends a kind above it only once every member of the
+  group, voters and learners, has answered its `Identify` call (§6.8)
+  with a highest readable kind at or above the new kind. A kind at or
+  below the log's highest kind needs no answers: every member already
+  reads it, since a member joins only reading the log's highest kind
+  (§6.8) and so, kinds being in order, every kind below. A lost member
+  therefore never blocks the flusher reassignment that replaces it. A
+  rolling upgrade holds new kinds back until it has reached every
+  member, with no setting to change. The log's highest kind is the
+  highest of the latest checkpoint's recorded value and every kind
+  committed after that checkpoint, and the checkpoint body records it,
+  so purging the log below a checkpoint loses none of it. A replica
+  whose release reads below that recorded kind, one rolled back past a
+  kind the group has used, refuses to open the group's log at the
+  checkpoint rather than catch up into entries it cannot read; it
+  serves and votes in no group whose log it has not opened, and rejoins
+  only on a release that reads the group's highest kind. A leader
+  gates on its own log, committed or not: the kinds of its uncommitted
+  entries count too, so a learner it admits reads an entry of a new kind
+  still in flight, and an entry a later leader truncates only ever made
+  the gate stricter. The two changes never overlap: a leader appends a
+  new kind only while no membership change is in flight, asking every
+  member of its latest membership, and changes the membership only
+  once its newest entry of a new kind has committed.
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
   when the flusher reports its remaining ids. A miner that exhausts them
@@ -1685,6 +1752,9 @@ from rows.
   toolchain for a single-maintainer project would cost more than it
   finds. With the §6 fallback, a model of the whole protocol, checked
   in CI to a bounded depth, since nothing upstream covers it.
+- RFC0065.29: codec and open tests in `ourios-wal` and the group log
+  beside the existing record codec tests, and the leader's kind gate on
+  the in-process cluster.
 - RFC0065.16: the existing suites, unchanged.
 - RFC0065.17: `deploy/helm/render-tests.sh`.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process

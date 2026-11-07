@@ -867,9 +867,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   whose body is shorter or longer than 16 bytes
 > - **When** the replica opens the group's log
 > - **Then** it reads the first assignment's UUID, and it refuses to
->   open the log at the unreadable entry rather than skip it; and a
->   leader whose members have not all reported reading a kind does not
->   append one
+>   open the log at the unreadable entry rather than skip it; a leader
+>   whose members have not all reported reading a kind the log has never
+>   held does not append it, and one whose log already holds a kind
+>   appends it with a member lost
 
 ## 6. Proposed design
 
@@ -1207,11 +1208,14 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   A replica that reads a kind it does not know, or a body of the wrong
   length, refuses to open the group's log rather than skip the entry:
   mining and flushing depend on applying every control entry in order.
-  So a leader appends a kind only once every member of the group,
-  voters and learners, has answered its `Identify` call (§6.8) with a
-  highest readable kind at or above it; a rolling upgrade therefore
-  holds new kinds back until it has reached every member, with no
-  setting to change.
+  So a leader appends a kind the group's log has never held only once
+  every member of the group, voters and learners, has answered its
+  `Identify` call (§6.8) with a highest readable kind at or above it; a
+  kind the committed log or the latest checkpoint already holds needs no
+  answers, so a lost member never blocks the flusher reassignment that
+  replaces it. A rolling upgrade therefore holds new kinds back until it
+  has reached every member, with no setting to change, and the
+  checkpoint body records the highest kind its log has held.
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
   when the flusher reports its remaining ids. A miner that exhausts them

@@ -883,6 +883,19 @@ the mass-failover time and vote-log batching as tuning signals.
 >   whose checkpoint records a kind above the highest it reads refuses
 >   to open the log at the checkpoint
 
+> **Scenario RFC0065.30 — the leader names one flusher and keeps it (B11)**
+> - **Given** a group with three tail replicas as learners and no
+>   flusher assignment
+> - **When** the leader has led for the flusher patience, and then the
+>   flusher stops acknowledging, recovers, leaves the tail placement, or
+>   the leader fails over
+> - **Then** it assigns the first healthy replica in tail placement
+>   order; a flusher unhealthy for the patience is replaced by the next
+>   healthy one and does not take the role back on recovery; one that
+>   leaves the placement is replaced; with no replica healthy no
+>   assignment is appended; and a new leader keeps the flusher its log
+>   names for the patience
+
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
@@ -1171,7 +1184,17 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
 - **The flusher mines and writes Parquet (B11).** One tail replica per
   group is the **flusher**, named by a log entry the leader appends (the
   lowest-numbered healthy tail replica; reassigned by another entry when
-  it fails). It feeds committed frames to the miner and the record sink
+  it fails). Lowest-numbered is first in the group's tail placement
+  order (§6.1); healthy is a learner of the group's committed membership
+  whose acknowledgement of one of the leader's appends or heartbeats is
+  younger than the flusher patience, a fixed 10 s. The leader appends an
+  assignment when the group has none, or when the current flusher is no
+  longer a learner or has been unhealthy for the patience, naming the
+  first healthy replica in that order; with none healthy it appends
+  nothing and keeps the current one. A replica that recovers does not
+  take the role back, so a flapping replica moves the flusher at most
+  once per patience. A new leader keeps the flusher its log names until
+  it has led for the patience, so a failover does not move it. It feeds committed frames to the miner and the record sink
   exactly as the local receiver does after the ack today, with the
   sink's size and age triggers unchanged (RFC 0014 §3.2, RFC 0063).
   Every other tail replica mines the same log for the tail (§6.7) and
@@ -1818,6 +1841,8 @@ from rows.
 - RFC0065.29: codec and open tests in `ourios-wal` and the group log
   beside the existing record codec tests, and the leader's kind gate on
   the in-process cluster.
+- RFC0065.30: the in-process cluster with tail learners, the patience
+  shortened for the test and each failure driven by a gate or a kill.
 - RFC0065.16: the existing suites, unchanged.
 - RFC0065.17: `deploy/helm/render-tests.sh`.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process

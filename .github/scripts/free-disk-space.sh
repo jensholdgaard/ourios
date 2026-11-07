@@ -13,6 +13,16 @@ set -euo pipefail
 echo "Disk before:"
 df -h /
 
+# Current images give / far more than the original ~14 GiB, and deleting
+# the SDKs then costs a minute or more of the job for nothing; clean only
+# when the runner is short of room.
+min_free_gib=50
+free_gib="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
+if [ "$free_gib" -ge "$min_free_gib" ]; then
+  echo "${free_gib} GiB free (at least ${min_free_gib}); nothing to remove."
+  exit 0
+fi
+
 # `|| true`: the set is best-effort — a missing dir on a future image must
 # not fail the build (the goal is headroom, not a specific layout).
 sudo rm -rf \

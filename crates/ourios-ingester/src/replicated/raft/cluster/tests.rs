@@ -11,7 +11,10 @@ use tokio::task::JoinHandle;
 
 use super::super::host::HostError;
 use super::super::types::Entry;
-use super::{Cluster, GroupHost, HostSpec, Peers, Replica, batch, group_dir, wal_config, write};
+use super::{
+    Cluster, GroupHost, GroupRaft, HostSpec, NodeId, Peers, Replica, WAIT, batch, group_dir,
+    wal_config, write,
+};
 
 const GROUP: u32 = 0;
 
@@ -250,6 +253,22 @@ fn matched(cluster: &Cluster, leader: usize, group: u32, i: usize) -> Option<u64
         .map(|id| id.index)
 }
 
+/// Wait until the leader `raft` has seen node `id` match `index`: a node
+/// applying an entry does not mean its ack has reached the leader yet.
+async fn seen_matching(raft: &GroupRaft, id: NodeId, index: u64) {
+    raft.wait(WAIT)
+        .metrics(
+            |m| {
+                let replication = m.replication.as_ref();
+                let seen = replication.and_then(|r| r.get(&id).copied().flatten());
+                seen.map(|log_id| log_id.index) == Some(index)
+            },
+            "the leader sees the match",
+        )
+        .await
+        .expect("the leader sees the match");
+}
+
 /// With node `held`'s fsyncs stopped, commit four writes to `group` and check
 /// its leader never saw `held` match past `synced`.
 async fn commit_past(cluster: &Cluster, group: u32, held: usize, synced: u64) -> u64 {
@@ -284,6 +303,8 @@ async fn a_crash_keeps_each_group_on_the_node_through_its_own_last_fsync() {
     for (group, &leader) in GROUPS.iter().zip(&leaders) {
         let index = write(cluster.node(leader).raft(*group), 0).await;
         cluster.node(held).applied_through(*group, index).await;
+        let raft = cluster.node(leader).raft(*group);
+        seen_matching(raft, cluster.id(held), index).await;
         synced.push(index);
     }
 

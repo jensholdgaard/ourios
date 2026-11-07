@@ -331,6 +331,11 @@ impl Cluster {
         }
     }
 
+    /// The pool every node dials its peers through.
+    pub(crate) fn peers(&self) -> &Peers {
+        &self.peers
+    }
+
     pub(crate) fn id(&self, i: usize) -> NodeId {
         match &self.slots[i] {
             Slot::Up(node) => node.id,

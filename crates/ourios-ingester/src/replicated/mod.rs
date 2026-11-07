@@ -5,8 +5,10 @@
 //! the voting layout in the store and checks every start against it, and
 //! [`replica_id`] keeps a replica's identity on its own disk. [`raft`] is
 //! a group's consensus storage, and [`write`](mod@write) and [`ingest`] the write
-//! path over it (§6.3), not yet wired into a served role.
+//! path over it (§6.3), with [`forward`] its leader's side of `Forward`
+//! (§6.8), not yet wired into a served role.
 
+pub mod forward;
 pub mod ingest;
 pub mod layout;
 pub mod placement;

@@ -138,6 +138,12 @@ impl GroupWriter {
         }
     }
 
+    /// The group `tenant`'s exports commit to.
+    #[must_use]
+    pub fn group_of(&self, tenant: &str) -> u32 {
+        self.layout.group_of(tenant)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_timeout(self, timeout: Duration) -> Self {
         Self { timeout, ..self }

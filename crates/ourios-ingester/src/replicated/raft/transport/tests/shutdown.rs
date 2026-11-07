@@ -11,7 +11,7 @@ use tonic_prost::ProstCodec;
 
 use super::super::wire::{AppendRequest, StreamAppendResponse};
 use super::super::{Peers, ReplicationServer, STREAM_APPEND};
-use super::{Node, bind, consecutive, serve, wire_append};
+use super::{GROUP, bind, consecutive, serve, start, wire_append};
 
 /// `requests` sent as one `StreamAppend` stream, held open after its last
 /// message, and the replies.
@@ -60,7 +60,7 @@ async fn a_server_shutdown_ends_a_stream_still_waiting_for_its_first_message() {
 async fn a_server_shutdown_ends_an_open_idle_stream_while_its_group_runs() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = Node::start(1, incoming, &peers, ReplicationServer::default()).await;
+    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let valid = wire_append(node.id, &consecutive(&[1])[0]);
     let mut replies = open_raw(addr, futures_util::stream::iter([valid]))
         .await
@@ -73,5 +73,5 @@ async fn a_server_shutdown_ends_an_open_idle_stream_while_its_group_runs() {
         .expect("server task");
     let ended = replies.message().await;
     assert_eq!(ended.err().map(|s| s.code()), Some(Code::Unavailable));
-    node.raft.shutdown().await.expect("shutdown");
+    node.raft(GROUP).shutdown().await.expect("shutdown");
 }

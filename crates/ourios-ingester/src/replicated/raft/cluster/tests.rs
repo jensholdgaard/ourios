@@ -1,0 +1,321 @@
+//! Groups on the in-process cluster: log repair after a failover, a
+//! crash under §8's model, two groups on one host, and a host whose
+//! group fails to open.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use openraft::EntryPayload;
+use openraft::async_runtime::WatchReceiver as _;
+use tokio::task::JoinHandle;
+
+use super::super::host::HostError;
+use super::super::types::Entry;
+use super::{Cluster, GroupHost, HostSpec, Peers, Replica, batch, group_dir, wal_config, write};
+
+const GROUP: u32 = 0;
+
+/// Write `ns` through node `i`, returning the last index.
+async fn commit(cluster: &Cluster, i: usize, ns: std::ops::Range<u64>) -> u64 {
+    let mut last = 0;
+    for n in ns {
+        last = write(cluster.node(i).raft(GROUP), n).await;
+    }
+    last
+}
+
+/// Node `i`'s log once it equals node `j`'s: an election after the last
+/// write can append a blank entry to one before the other.
+async fn converged(cluster: &Cluster, i: usize, j: usize) -> Vec<Entry> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (log, other) = (
+            cluster.node(i).log(GROUP).await,
+            cluster.node(j).log(GROUP).await,
+        );
+        if log == other {
+            return log;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {i}'s log never matched node {j}'s:\n{log:?}\n{other:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Cut node `i` off from `others`, have it append an entry it cannot
+/// commit, and return that entry and the write's task.
+async fn strand(
+    cluster: &Cluster,
+    i: usize,
+    others: &[usize],
+    after: u64,
+) -> (Entry, JoinHandle<Result<(), String>>) {
+    for &other in others {
+        cluster.cut(i, other);
+    }
+    let raft = cluster.node(i).raft(GROUP).clone();
+    let write = tokio::spawn(async move {
+        raft.client_write(batch(100))
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = cluster.node(i).log(GROUP).await;
+        if let Some(last) = log.last().filter(|e| e.log_id.index > after) {
+            return (last.clone(), write);
+        }
+        assert!(
+            !write.is_finished(),
+            "the write ended before appending: {:?}",
+            write.await
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {i} appended nothing past {after}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Scenario RFC0065.7 — a diverged follower is repaired (B6).
+/// A leader cut off from both followers appends an entry it can never
+/// commit and is killed; the others elect a leader and commit past it.
+/// The old leader comes back holding that entry; once its links heal its
+/// log converges to the new leader's and no committed entry is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0065_7_a_diverged_follower_is_repaired() {
+    let mut cluster = Cluster::start(3, &[GROUP]).await;
+    let old = cluster.leader(GROUP, None).await;
+    let committed = commit(&cluster, old, 0..3).await;
+    for i in 0..3 {
+        cluster.node(i).applied_through(GROUP, committed).await;
+    }
+    let before = cluster.node(old).log(GROUP).await;
+    assert_eq!(before.last().map(|e| e.log_id.index), Some(committed));
+
+    let others: Vec<usize> = (0..3).filter(|&i| i != old).collect();
+    let (diverged, stranded) = strand(&cluster, old, &others, committed).await;
+    cluster.kill(old).await;
+    let stranded = tokio::time::timeout(Duration::from_secs(10), stranded)
+        .await
+        .expect("the stranded write ends")
+        .expect("join");
+    assert!(stranded.is_err(), "the cut-off write never committed");
+
+    let new = cluster.leader(GROUP, Some(old)).await;
+    let last = commit(&cluster, new, 3..6).await;
+    cluster.restart(old).await;
+    let held = cluster.node(old).log(GROUP).await;
+    assert!(
+        held.contains(&diverged),
+        "the returning replica holds the uncommitted entry"
+    );
+
+    for &i in &others {
+        cluster.heal(old, i);
+    }
+    cluster.node(old).applied_through(GROUP, last).await;
+    let repaired = converged(&cluster, old, new).await;
+    assert!(
+        !repaired.contains(&diverged),
+        "the uncommitted entry is gone"
+    );
+    for entry in &before {
+        let kept = repaired
+            .iter()
+            .find(|e| e.log_id.index == entry.log_id.index);
+        assert_eq!(kept, Some(entry), "committed index {}", entry.log_id.index);
+    }
+    cluster.shutdown().await;
+}
+
+/// A follower crashed with appends written but not fsynced loses only
+/// those, restarts from what it fsynced, and catches up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crashed_follower_restarts_from_its_fsynced_log_and_catches_up() {
+    let mut cluster = Cluster::start(3, &[GROUP]).await;
+    let leader = cluster.leader(GROUP, None).await;
+    let follower = (leader + 1) % 3;
+    let first = write(cluster.node(leader).raft(GROUP), 0).await;
+    cluster.node(follower).applied_through(GROUP, first).await;
+
+    let gate = Arc::clone(&cluster.node(follower).gate);
+    gate.close();
+    let last = commit(&cluster, leader, 1..5).await;
+    tokio::task::spawn_blocking(move || gate.wait_for_writer())
+        .await
+        .expect("join");
+    let dropped = cluster.crash(follower).await;
+    assert!(dropped > 0, "the held appends were on disk, unsynced");
+
+    cluster.restart(follower).await;
+    cluster.node(follower).applied_through(GROUP, last).await;
+    converged(&cluster, follower, leader).await;
+    cluster.shutdown().await;
+}
+
+fn normal(log: &[Entry]) -> usize {
+    log.iter()
+        .filter(|e| matches!(e.payload, EntryPayload::Normal(_)))
+        .count()
+}
+
+/// Write `writes` entries to `group` through its leader.
+async fn write_to(cluster: &Cluster, group: u32, writes: u64) {
+    let leader = cluster.leader(group, None).await;
+    for n in 0..writes {
+        write(cluster.node(leader).raft(group), n).await;
+    }
+}
+
+/// Every node's log of `group` is its leader's, which holds `writes`
+/// entries of its own.
+async fn assert_holds_only(cluster: &Cluster, group: u32, writes: u64) {
+    let leader = cluster.leader(group, None).await;
+    let expected = cluster.node(leader).log(group).await;
+    let last = expected.last().expect("entries").log_id.index;
+    assert_eq!(normal(&expected) as u64, writes, "group {group}");
+    for i in 0..3 {
+        cluster.node(i).applied_through(group, last).await;
+        let mut log = cluster.node(i).log(group).await;
+        log.retain(|e| e.log_id.index <= last);
+        assert_eq!(log, expected, "node {i}, group {group}");
+    }
+}
+
+/// Two groups on the same three nodes keep separate logs: each node's log
+/// of a group is its leader's, holding only that group's writes, after a
+/// node restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_groups_on_the_same_nodes_keep_separate_logs() {
+    const WRITES: [(u32, u64); 2] = [(0, 3), (1, 1)];
+    let mut cluster = Cluster::start(3, &[0, 1]).await;
+    for (group, writes) in WRITES {
+        write_to(&cluster, group, writes).await;
+    }
+    cluster.kill(2).await;
+    cluster.restart(2).await;
+    for (group, writes) in WRITES {
+        assert_holds_only(&cluster, group, writes).await;
+    }
+    cluster.shutdown().await;
+}
+
+/// A group that cannot be opened fails the host and stops the groups
+/// opened before it, so the root opens again once the fault is gone.
+#[tokio::test]
+async fn a_group_that_fails_to_open_stops_the_ones_before_it() {
+    let replica = Replica::new(1, &[0, 1]);
+    let blocked = group_dir(replica.dir.path(), 1);
+    std::fs::create_dir_all(blocked.parent().expect("the groups directory")).expect("mkdir");
+    std::fs::write(&blocked, b"").expect("a file where group 1's directory goes");
+    let spec = || HostSpec {
+        id: replica.id,
+        wal: wal_config(replica.dir.path()),
+        groups: replica.groups.clone(),
+        peers: Peers::plaintext(),
+    };
+    match GroupHost::open(spec()).await {
+        Err(HostError::Log { group: 1, .. }) => {}
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("opened with group 1 blocked"),
+    }
+
+    std::fs::remove_file(&blocked).expect("unblock");
+    let host = tokio::time::timeout(Duration::from_secs(10), GroupHost::open(spec()))
+        .await
+        .expect("group 0's log and the vote log were released")
+        .expect("open");
+    assert_eq!(host.groups().collect::<Vec<_>>(), [0, 1]);
+    host.shutdown().await.expect("shutdown");
+}
+
+/// The highest index `leader` has seen node `i` match in `group`.
+fn matched(cluster: &Cluster, leader: usize, group: u32, i: usize) -> Option<u64> {
+    let metrics = cluster
+        .node(leader)
+        .raft(group)
+        .metrics()
+        .borrow_watched()
+        .clone();
+    let replication = metrics.replication.expect("the leader's replication");
+    replication
+        .get(&cluster.id(i))
+        .copied()
+        .flatten()
+        .map(|id| id.index)
+}
+
+/// With node `held`'s fsyncs stopped, commit four writes to `group` and check
+/// its leader never saw `held` match past `synced`.
+async fn commit_past(cluster: &Cluster, group: u32, held: usize, synced: u64) -> u64 {
+    let leader = cluster.leader(group, None).await;
+    let mut last = 0;
+    for n in 1..5 {
+        last = write(cluster.node(leader).raft(group), n).await;
+    }
+    assert_eq!(
+        matched(cluster, leader, group, held),
+        Some(synced),
+        "group {group}"
+    );
+    last
+}
+
+/// A crash takes every group on a node at once. Each group's log keeps
+/// exactly what it had fsynced, which no peer saw it match past, and
+/// each catches up once the node is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_keeps_each_group_on_the_node_through_its_own_last_fsync() {
+    const GROUPS: [u32; 2] = [0, 1];
+    let mut cluster = Cluster::start(3, &GROUPS).await;
+    let mut leaders = Vec::new();
+    for group in GROUPS {
+        leaders.push(cluster.leader(group, None).await);
+    }
+    let held = (0..3)
+        .find(|i| !leaders.contains(i))
+        .expect("a node leading neither group");
+    let mut synced = Vec::new();
+    for (group, &leader) in GROUPS.iter().zip(&leaders) {
+        let index = write(cluster.node(leader).raft(*group), 0).await;
+        cluster.node(held).applied_through(*group, index).await;
+        synced.push(index);
+    }
+
+    let gate = Arc::clone(&cluster.node(held).gate);
+    gate.close();
+    let mut last = Vec::new();
+    for (&group, &index) in GROUPS.iter().zip(&synced) {
+        last.push(commit_past(&cluster, group, held, index).await);
+    }
+    assert!(
+        cluster.crash(held).await > 0,
+        "appends were written, unsynced"
+    );
+
+    let others: Vec<_> = (0..3).filter(|&i| i != held).collect();
+    for &other in &others {
+        cluster.cut(held, other);
+    }
+    cluster.restart(held).await;
+    for (&group, &index) in GROUPS.iter().zip(&synced) {
+        let log = cluster.node(held).log(group).await;
+        assert_eq!(
+            log.last().map(|e| e.log_id.index),
+            Some(index),
+            "group {group}"
+        );
+    }
+    for &other in &others {
+        cluster.heal(held, other);
+    }
+    for (&group, &index) in GROUPS.iter().zip(&last) {
+        cluster.node(held).applied_through(group, index).await;
+    }
+    cluster.shutdown().await;
+}

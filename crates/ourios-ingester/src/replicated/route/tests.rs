@@ -12,7 +12,9 @@ use super::{Routed, Router};
 use crate::replicated::forward::LeaderTarget;
 use crate::replicated::layout::VotingLayout;
 use crate::replicated::raft::cluster::{Cluster, name, write};
-use crate::replicated::raft::transport::{ForwardTarget, Forwarded, Refusal, Rejection};
+use crate::replicated::raft::transport::{
+    ForwardTarget, Forwarded, IdentifyError, Refusal, Rejection,
+};
 use crate::replicated::raft::types::{Entry, TenantBatchBytes};
 use crate::replicated::write::{COMMIT_TIMEOUT, GroupWriter};
 
@@ -146,6 +148,14 @@ async fn a_hinted_node_that_is_down_is_passed_over() {
     serve_forwards(&cluster, COMMIT_TIMEOUT);
     let dead = name(cluster.id(other));
     cluster.kill(other).await;
+    // The pool still holds the connection the group's own traffic opened
+    // to it, and a call that dies on an open connection may have been
+    // sent. One failed call drops it, so the forward has to connect.
+    let probed = cluster.peers().identify(&dead, COMMIT_TIMEOUT).await;
+    assert!(
+        matches!(probed, Err(IdentifyError::Unanswered(_))),
+        "{probed:?}"
+    );
     let routed = router(&cluster, from, COMMIT_TIMEOUT)
         .forward(export("<passed over>", TOKEN), Some(dead))
         .await;

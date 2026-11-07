@@ -20,7 +20,9 @@ use super::codec::raft_id;
 use super::gate::SyncGate;
 use super::log_store::{GroupLog, group_dir};
 use super::state_machine::GroupSm;
-use super::types::{Entry, LogId, Membership, NodeId, RaftTypes, TenantBatchBytes, Vote};
+use super::types::{
+    Entry, GroupEntry, LogId, Membership, NodeId, RaftTypes, TenantBatchBytes, Vote,
+};
 use super::vote_log::{self, VoteLog};
 
 const GROUP: u32 = 3;
@@ -42,7 +44,7 @@ fn entry(term: u64, index: u64) -> Entry {
     let batch = TenantBatch::encode("acme", format!("record {index}").as_bytes()).expect("batch");
     Entry {
         log_id: log_id(term, index),
-        payload: EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid")),
+        payload: EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid").into()),
     }
 }
 
@@ -550,6 +552,7 @@ fn a_failed_ancestor_fsync_fails_the_open() {
 /// yet stops the group log's open rather than being skipped, and the
 /// entries before it are what a later release would replay.
 #[tokio::test]
+#[ignore = "superseded: control entries apply since kind 0x01 (RFC 0065 §6.5)"]
 async fn a_control_entry_this_replica_cannot_apply_stops_the_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     {
@@ -585,4 +588,72 @@ async fn a_control_entry_this_replica_cannot_apply_stops_the_open() {
     .expect("join");
     let error = refused.expect_err("the control entry stops the open");
     assert!(error.to_string().contains("control entry"), "{error}");
+}
+
+/// Append `frames`, each a `0x04` payload, to the group WAL after `entries`
+/// were appended through the log, and open the log again.
+async fn reopen_after(wal_root: &Path, entries: Vec<Entry>, frames: &[Vec<u8>]) -> io::Result<()> {
+    {
+        let (mut log, _) = open(wal_root);
+        append(&mut log, entries).await.await.expect("fsynced");
+        log.shutdown();
+    }
+    let mut wal = ourios_wal::Wal::open(wal_config(&group_dir(wal_root, GROUP))).expect("WAL");
+    for frame in frames {
+        wal.append(ourios_wal::FrameKind::ReplicatedEntry, frame)
+            .expect("append");
+    }
+    wal.sync().expect("sync");
+    drop(wal);
+    let root = wal_root.to_path_buf();
+    std::thread::spawn(move || {
+        let votes = VoteLog::open(&root).expect("vote log");
+        let config = wal_config(&group_dir(&root, GROUP));
+        GroupLog::open(config, GROUP, votes).map(drop)
+    })
+    .join()
+    .expect("join")
+}
+
+fn flusher(term: u64, index: u64, replica: u64) -> Entry {
+    let replica = *NodeId::from(replica).uuid().as_bytes();
+    Entry {
+        log_id: log_id(term, index),
+        payload: EntryPayload::Normal(GroupEntry::Control(ourios_wal::Control::FlusherAssignment(
+            replica,
+        ))),
+    }
+}
+
+/// RFC0065.29, the log arm: a flusher assignment reopens as written, and
+/// a control kind above the highest this release reads stops the open
+/// rather than being skipped.
+#[tokio::test]
+async fn a_flusher_assignment_reopens_and_an_unknown_kind_stops_the_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut written = entries(1, 0..=1);
+    written.push(flusher(1, 2, 7));
+    reopen_after(dir.path(), written.clone(), &[])
+        .await
+        .expect("an assignment reopens");
+    let (mut log, _) = open(dir.path());
+    let all = log.try_get_log_entries(..).await.expect("read");
+    assert_eq!(all, written);
+    log.shutdown();
+
+    let mut unknown = ourios_wal::ReplicatedRecord::Entry {
+        log_id: ourios_wal::RaftLogId { term: 1, index: 3 },
+        body: ourios_wal::EntryBody::Control(ourios_wal::Control::FlusherAssignment([7; 16])),
+    }
+    .encode()
+    .expect("encode");
+    unknown[17] = ourios_wal::Control::HIGHEST_KIND + 1;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let refused = reopen_after(dir.path(), written, &[unknown]).await;
+    let error = refused.expect_err("the unknown kind stops the open");
+    let kind = format!(
+        "control kind 0x{:02x}",
+        ourios_wal::Control::HIGHEST_KIND + 1
+    );
+    assert!(error.to_string().contains(&kind), "{error}");
 }

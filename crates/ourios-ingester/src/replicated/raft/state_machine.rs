@@ -1,10 +1,13 @@
-//! A group's state machine (RFC 0065 §6.1): what it has applied and the
-//! membership it applied last.
+//! A group's state machine (RFC 0065 §6.1): what it has applied, the
+//! membership it applied last, and the flusher the last flusher
+//! assignment named (§6.5).
 //!
 //! It lives in memory, except for its snapshot: `openraft` purges the log
 //! up to a snapshot it installs or builds, so the snapshot is recorded
 //! in `wal_root/groups/<group>/snapshot` before the call returns,
 //! and a restart opens applied through it and replays the log after it.
+//! The record holds no flusher: one assigned at or below a snapshot is not
+//! known until §6.5's checkpoint carries it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,16 +17,19 @@ use futures_util::TryStreamExt as _;
 use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::type_config::alias::{SnapshotOf, StoredMembershipOf};
 use openraft::{EntryPayload, OptionalSend};
+use ourios_wal::Control;
+use uuid::Uuid;
 
 use super::gate::SyncGate;
 use super::snapshot_record::{self, SnapshotMeta};
-use super::types::{LogId, RaftTypes};
+use super::types::{GroupEntry, LogId, NodeId, RaftTypes};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
 
 struct State {
     applied: Option<LogId>,
     membership: StoredMembership,
+    flusher: Option<NodeId>,
     snapshot: Option<SnapshotMeta>,
 }
 
@@ -59,6 +65,7 @@ impl GroupSm {
                 .as_ref()
                 .map(|meta| meta.last_membership.clone())
                 .unwrap_or_default(),
+            flusher: None,
             snapshot,
         };
         Ok(Self {
@@ -98,6 +105,12 @@ impl GroupSm {
     #[must_use]
     pub fn membership(&self) -> StoredMembership {
         self.state().membership.clone()
+    }
+
+    /// The replica the last applied flusher assignment named.
+    #[must_use]
+    pub fn flusher(&self) -> Option<NodeId> {
+        self.state().flusher
     }
 }
 
@@ -143,8 +156,14 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
             {
                 let mut state = self.state();
                 state.applied = Some(entry.log_id);
-                if let EntryPayload::Membership(m) = entry.payload {
-                    state.membership = StoredMembership::new(Some(entry.log_id), m);
+                match entry.payload {
+                    EntryPayload::Membership(m) => {
+                        state.membership = StoredMembership::new(Some(entry.log_id), m);
+                    }
+                    EntryPayload::Normal(GroupEntry::Control(Control::FlusherAssignment(
+                        replica,
+                    ))) => state.flusher = Some(NodeId::from(Uuid::from_bytes(replica))),
+                    EntryPayload::Blank | EntryPayload::Normal(GroupEntry::Batch(_)) => {}
                 }
             }
             if let Some(responder) = responder {
@@ -165,6 +184,7 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
         let mut state = self.state();
         state.applied = meta.last_log_id;
         state.membership = meta.last_membership.clone();
+        state.flusher = None;
         Ok(())
     }
 
@@ -182,6 +202,8 @@ mod tests {
 
     use openraft::vote::leader_id_std::CommittedLeaderId;
 
+    use super::super::types::Membership;
+
     use super::*;
 
     fn at(index: u64) -> SnapshotMeta {
@@ -192,6 +214,62 @@ mod tests {
             }),
             last_membership: StoredMembership::default(),
         }
+    }
+
+    fn entry(
+        index: u64,
+        payload: EntryPayload<GroupEntry, Membership>,
+    ) -> EntryResponder<RaftTypes> {
+        let log_id = LogId {
+            leader_id: CommittedLeaderId::new(2),
+            index,
+        };
+        (super::super::types::Entry { log_id, payload }, None)
+    }
+
+    fn assign(index: u64, replica: u64) -> EntryResponder<RaftTypes> {
+        let replica = *NodeId::from(replica).uuid().as_bytes();
+        let control = GroupEntry::Control(Control::FlusherAssignment(replica));
+        entry(index, EntryPayload::Normal(control))
+    }
+
+    fn batch(index: u64) -> EntryResponder<RaftTypes> {
+        let payload = ourios_wal::TenantBatch::encode("acme", b"p").expect("batch");
+        let batch = super::super::types::TenantBatchBytes::new(payload).expect("valid");
+        entry(index, EntryPayload::Normal(GroupEntry::Batch(batch)))
+    }
+
+    async fn apply(sm: &mut GroupSm, entries: Vec<EntryResponder<RaftTypes>>) {
+        let stream = futures_util::stream::iter(entries.into_iter().map(Ok));
+        sm.apply(stream).await.expect("apply");
+    }
+
+    /// The last assignment names the flusher; batches and blanks leave it.
+    #[tokio::test]
+    async fn the_last_flusher_assignment_applied_names_the_flusher() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        apply(&mut sm, vec![batch(1)]).await;
+        assert_eq!(sm.flusher(), None);
+        apply(&mut sm, vec![assign(2, 7), batch(3)]).await;
+        assert_eq!(sm.flusher(), Some(NodeId::from(7)));
+        apply(
+            &mut sm,
+            vec![entry(4, EntryPayload::Blank), assign(5, 9), batch(6)],
+        )
+        .await;
+        assert_eq!(sm.flusher(), Some(NodeId::from(9)));
+        assert_eq!(sm.applied().map(|id| id.index), Some(6));
+    }
+
+    /// A snapshot holds no flusher, so an install leaves none known.
+    #[tokio::test]
+    async fn an_installed_snapshot_leaves_no_flusher_known() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        apply(&mut sm, vec![assign(1, 7)]).await;
+        sm.install_snapshot(&at(5), ()).await.expect("install");
+        assert_eq!(sm.flusher(), None);
     }
 
     /// A build that starts while an install is held at its fsync waits for

@@ -19,7 +19,7 @@ use openraft::vote::leader_id_std::CommittedLeaderId;
 use ourios_wal::{EntryBody, RaftLogId, ReplicatedRecord};
 use uuid::Uuid;
 
-use super::types::{Entry, LogId, Membership, NodeId, TenantBatchBytes};
+use super::types::{Entry, GroupEntry, LogId, Membership, NodeId, TenantBatchBytes};
 
 /// A record as replay applies it.
 #[derive(Debug, PartialEq)]
@@ -53,7 +53,8 @@ pub(super) fn encode_entry(entry: &Entry) -> io::Result<Vec<u8>> {
     let membership;
     let body = match &entry.payload {
         EntryPayload::Blank => EntryBody::Blank,
-        EntryPayload::Normal(batch) => EntryBody::Normal(batch.as_bytes()),
+        EntryPayload::Normal(GroupEntry::Batch(batch)) => EntryBody::Normal(batch.as_bytes()),
+        EntryPayload::Normal(GroupEntry::Control(control)) => EntryBody::Control(*control),
         EntryPayload::Membership(m) => {
             membership = encode_membership(m)?;
             EntryBody::Membership(&membership)
@@ -76,16 +77,11 @@ pub(super) fn decode(payload: &[u8]) -> io::Result<Replayed> {
             let payload = match body {
                 EntryBody::Blank => EntryPayload::Blank,
                 EntryBody::Normal(bytes) => {
-                    EntryPayload::Normal(TenantBatchBytes::new(bytes.to_vec()).map_err(invalid)?)
+                    let batch = TenantBatchBytes::new(bytes.to_vec()).map_err(invalid)?;
+                    EntryPayload::Normal(GroupEntry::Batch(batch))
                 }
                 EntryBody::Membership(bytes) => EntryPayload::Membership(decode_membership(bytes)?),
-                // Not applied yet (RFC 0065 §6.5): refuse the log rather
-                // than skip an entry that mining will depend on.
-                EntryBody::Control(control) => {
-                    return Err(invalid(format!(
-                        "a control entry this replica does not apply yet: {control:?}"
-                    )));
-                }
+                EntryBody::Control(control) => EntryPayload::Normal(GroupEntry::Control(control)),
             };
             let log_id = raft_id(log_id);
             Ok(Replayed::Entry(Entry { log_id, payload }))
@@ -172,7 +168,7 @@ pub(super) fn decode_membership(bytes: &[u8]) -> io::Result<Membership> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ourios_wal::TenantBatch;
+    use ourios_wal::{Control, ReplicatedRecordError, TenantBatch};
 
     fn id(n: u64) -> NodeId {
         NodeId::from(n)
@@ -193,7 +189,10 @@ mod tests {
     #[test]
     fn every_payload_round_trips() {
         let batch = TenantBatch::encode("acme", b"proto").expect("batch");
-        let normal = EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid"));
+        let normal = EntryPayload::Normal(GroupEntry::Batch(
+            TenantBatchBytes::new(batch).expect("valid"),
+        ));
+        let flusher = Control::FlusherAssignment(*id(4).uuid().as_bytes());
         let nodes = BTreeMap::from([
             (id(1), "ourios-receiver-0".to_owned()),
             (id(2), "ourios-receiver-1".to_owned()),
@@ -204,6 +203,7 @@ mod tests {
         for payload in [
             EntryPayload::Blank,
             normal,
+            EntryPayload::Normal(GroupEntry::Control(flusher)),
             EntryPayload::Membership(membership),
         ] {
             round_trip(&Entry {
@@ -211,6 +211,40 @@ mod tests {
                 payload,
             });
         }
+    }
+
+    #[test]
+    fn a_flusher_assignment_is_the_wal_codecs_control_record() {
+        let flusher = Control::FlusherAssignment(*id(4).uuid().as_bytes());
+        let entry = Entry {
+            log_id: log_id(3, 7),
+            payload: EntryPayload::Normal(GroupEntry::Control(flusher)),
+        };
+        let record = ReplicatedRecord::Entry {
+            log_id: RaftLogId { term: 3, index: 7 },
+            body: EntryBody::Control(flusher),
+        };
+        assert_eq!(
+            encode_entry(&entry).expect("encode"),
+            record.encode().expect("encode")
+        );
+    }
+
+    #[test]
+    fn an_unknown_control_kind_is_refused() {
+        let flusher = Control::FlusherAssignment([7; 16]);
+        let mut bytes = ReplicatedRecord::Entry {
+            log_id: RaftLogId { term: 1, index: 1 },
+            body: EntryBody::Control(flusher),
+        }
+        .encode()
+        .expect("encode");
+        bytes[17] = Control::HIGHEST_KIND + 1;
+        let e = decode(&bytes).expect_err("an unknown kind");
+        let unknown = ReplicatedRecordError::UnknownControlKind {
+            found: Control::HIGHEST_KIND + 1,
+        };
+        assert_eq!(e.to_string(), unknown.to_string());
     }
 
     #[test]

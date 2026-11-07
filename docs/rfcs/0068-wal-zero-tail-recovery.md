@@ -101,7 +101,8 @@ corruption, on the all-segments-stop path, exactly as today:
 A healed torn tail is a recovery event, never a silent one. Recovery
 logs one `WARN` event, `ourios.wal.recovery.tail.truncated`, per healed
 segment, and adds `E - B` to the counter
-`ourios.wal.recovery.truncated.size` (unit `By`). Both names are in the
+`ourios.wal.recovery.truncated.size` (unit `By`), recorded with the
+same `ourios.wal.recovery.tail.shape` as the event. Both names are in the
 shared `ourios-semconv` registry from v0.3.25. The event carries:
 
 - `ourios.wal.recovery.tail.shape`: `partial_frame` (T1) or
@@ -334,7 +335,8 @@ remove. It may still be worth having for real corruption, separately.
 >   carries the segment's `file.path`, `B` as
 >   `ourios.wal.recovery.tail.offset`, `E` as `file.size` and the shape
 >   as `ourios.wal.recovery.tail.shape`
-> - **And** `ourios.wal.recovery.truncated.size` grows by `E - B`
+> - **And** `ourios.wal.recovery.truncated.size` grows by `E - B`, with
+>   the same `ourios.wal.recovery.tail.shape`
 
 ## 6. Testing strategy
 

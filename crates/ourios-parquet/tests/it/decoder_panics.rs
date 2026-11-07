@@ -31,6 +31,21 @@ const AUDIT_FIXTURES: [&str; 6] = [
     "audit-bit-width-assert.parquet",
 ];
 
+/// The audit fixtures whose decoder panic parquet 60 still has.
+const PANICKING_AUDIT_FIXTURES: [&str; 4] = [
+    "audit-dict-decoder-unset.parquet",
+    "audit-negative-column-range.parquet",
+    "audit-page-header-unwrap.parquet",
+    "audit-byte-stream-split-oob.parquet",
+];
+
+/// The audit fixtures parquet 60 rejects with an error of its own where
+/// earlier versions panicked.
+const REJECTED_AUDIT_FIXTURES: [&str; 2] = [
+    "audit-dictionary-index-oob.parquet",
+    "audit-bit-width-assert.parquet",
+];
+
 /// Data-file fixtures: dictionary decoder unset, a negative column range in
 /// the footer, a zero divisor in the byte-array reader.
 const DATA_FIXTURES: [&str; 3] = [
@@ -75,6 +90,10 @@ fn decode_via(via: Via, name: &str) -> Result<PathBuf, String> {
 }
 
 #[test]
+#[ignore = "superseded: parquet 60 rejects two of the audit fixtures with its own error \
+            instead of panicking; see \
+            both_readers_turn_the_remaining_decoder_panics_into_typed_errors and \
+            fixtures_parquet_now_rejects_are_parquet_errors"]
 fn both_readers_turn_decoder_panics_into_typed_errors_naming_the_object() {
     let cases = AUDIT_FIXTURES
         .map(|name| (Via::AuditReader, name))
@@ -86,6 +105,39 @@ fn both_readers_turn_decoder_panics_into_typed_errors_naming_the_object() {
 
         // Assert
         assert_eq!(named, Ok(PathBuf::from(name)), "{via:?}");
+    }
+}
+
+#[test]
+fn both_readers_turn_the_remaining_decoder_panics_into_typed_errors() {
+    let cases = PANICKING_AUDIT_FIXTURES
+        .map(|name| (Via::AuditReader, name))
+        .into_iter()
+        .chain(DATA_FIXTURES.map(|name| (Via::DataReader, name)));
+    for (via, name) in cases {
+        // Act
+        let named = decode_via(via, name);
+
+        // Assert
+        assert_eq!(named, Ok(PathBuf::from(name)), "{via:?}");
+    }
+}
+
+/// An out-of-bounds dictionary index and an oversized bit width no longer
+/// panic in parquet 60: each file is still refused, with parquet's own
+/// error, and yields no rows.
+#[test]
+fn fixtures_parquet_now_rejects_are_parquet_errors() {
+    for name in REJECTED_AUDIT_FIXTURES {
+        // Act
+        let read =
+            AuditReader::open_object_bytes(fixture(name), name).and_then(AuditReader::read_all);
+
+        // Assert
+        assert!(
+            matches!(read, Err(AuditReaderError::Parquet(_))),
+            "{name}: {read:?}"
+        );
     }
 }
 

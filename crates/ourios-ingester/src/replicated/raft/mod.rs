@@ -8,6 +8,7 @@
 
 mod codec;
 pub mod host;
+pub mod learners;
 pub mod log_store;
 mod snapshot_record;
 pub mod state_machine;

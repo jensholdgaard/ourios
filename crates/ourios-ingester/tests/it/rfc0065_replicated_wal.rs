@@ -347,3 +347,29 @@ fn rfc0065_28_no_erased_row_returns_during_a_store_outage() {
          `parquet_unavailable` and no tail replica serves the erased rows"
     );
 }
+
+/// Scenario RFC0065.29 — a log entry a replica cannot read stops it (B11),
+/// the log arm. Given a flusher assignment and then an unknown control kind,
+/// or an assignment whose body is not 16 bytes, when the replica opens the
+/// group's log, then it reads the first UUID and refuses the rest.
+#[test]
+#[ignore = "RFC0065.29 stub — implemented with the flusher-assignment entry"]
+fn rfc0065_29_an_unreadable_control_entry_stops_the_open() {
+    todo!(
+        "RFC0065.29 — the replica reads the first flusher assignment and refuses to \
+         open the log at an unknown kind or a body of the wrong length"
+    );
+}
+
+/// Scenario RFC0065.29 — the leader's kind gate. A leader whose members have
+/// not all reported, through `Identify`, reading a kind the log has never
+/// held does not append it; one whose log already holds the kind appends it
+/// with a member lost.
+#[test]
+#[ignore = "RFC0065.29 stub — implemented with Identify and the flusher-assignment entry"]
+fn rfc0065_29_a_kind_not_every_member_reads_is_not_appended() {
+    todo!(
+        "RFC0065.29 — a kind the log has never held waits for every member's \
+         Identify answer; one it holds is appended with a member lost"
+    );
+}

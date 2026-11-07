@@ -33,6 +33,7 @@ use super::super::types::{NodeId, RaftTypes, Vote};
 use super::connect::PlainConnector;
 use super::connect::TlsConnector;
 use super::forward;
+use super::identify::{self, IdentifyError, Identity};
 use super::links::{Link, Links};
 use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing};
 use super::wire::{
@@ -149,6 +150,24 @@ impl Peers {
             commit: commit_timeout,
         };
         forward::traced_call(channel, (&addr, self.tracing.clone()), request, deadlines).await
+    }
+
+    /// Ask the peer configured as `node_id` who it is (RFC 0065 §6.8),
+    /// within `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// [`IdentifyError::Unanswered`] when it could not be asked or did not
+    /// answer; [`IdentifyError::Mismatched`] when it answered for another
+    /// `node_id` or with a malformed identity.
+    pub async fn identify(
+        &self,
+        node_id: &str,
+        timeout: Duration,
+    ) -> Result<Identity, IdentifyError> {
+        let (addr, channel) = self.resolve(node_id);
+        let channel = channel.map_err(|e| IdentifyError::Unanswered(e.to_string()))?;
+        identify::call(channel, (node_id, &addr, self.tracing.clone()), timeout).await
     }
 
     /// The address `node_id` is reached at, and its channel: a peer

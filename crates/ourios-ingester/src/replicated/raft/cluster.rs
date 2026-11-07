@@ -23,7 +23,7 @@ use super::host::{GroupHost, GroupRaft, HostSpec};
 use super::log_store::group_dir;
 use super::state_machine::GroupSm;
 use super::telemetry::Meters;
-use super::transport::{Peers, ReplicationServer};
+use super::transport::{Identity, Peers, ReplicationServer};
 use super::types::{Entry, NodeId, RaftTypes, TenantBatchBytes};
 use super::vote_log;
 
@@ -160,6 +160,7 @@ impl Node {
             groups: replica.groups.clone(),
             peers: peers.clone(),
         };
+        server.identify_as(Identity::new(name(replica.id), replica.id));
         let host = GroupHost::open_with(spec, server, Arc::clone(&gate), &replica.meters)
             .await
             .expect("host");

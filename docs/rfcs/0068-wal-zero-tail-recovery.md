@@ -99,11 +99,20 @@ corruption, on the all-segments-stop path, exactly as today:
 ### 3.3 Operator visibility
 
 A healed torn tail is a recovery event, never a silent one. Recovery
-logs one structured `WARN` event naming the segment UUIDv7, `B`, `E`
-and the shape (T1 or T2), and adds `E - B` to a counter of healed tail
-bytes. The counter's name goes through the shared `ourios-semconv`
-registry. The event covers today's T1 heal too, so one signal reports
-both shapes. No audit event is emitted, consistent with the RFC0008.5
+logs one `WARN` event, `ourios.wal.recovery.tail.truncated`, per healed
+segment, and adds `E - B` to the counter
+`ourios.wal.recovery.truncated.size` (unit `By`). Both names are in the
+shared `ourios-semconv` registry from v0.3.25. The event carries:
+
+- `ourios.wal.recovery.tail.shape`: `partial_frame` (T1) or
+  `zero_tail` (T2);
+- `ourios.wal.recovery.tail.offset`: `B`, the segment's length after
+  the cut;
+- `file.path`: the segment, whose file name carries its UUIDv7;
+- `file.size`: `E`, its length before the cut.
+
+The event covers today's T1 heal too, so one signal reports both
+shapes. No audit event is emitted, consistent with the RFC0008.5
 audit event being deferred (RFC 0008 §5, 2026-06-13 amendment).
 
 ### 3.4 Why this cannot drop an acknowledged frame
@@ -321,9 +330,11 @@ remove. It may still be worth having for real corruption, separately.
 > **Scenario RFC0068.5 — a heal is reported**
 > - **Given** a newest segment whose tail is torn as T1 or T2
 > - **When** `Wal::replay` completes recovery
-> - **Then** exactly one structured `WARN` event names the segment, `B`,
->   `E` and the shape
-> - **And** the healed-bytes counter grows by `E - B`
+> - **Then** exactly one `WARN` event `ourios.wal.recovery.tail.truncated`
+>   carries the segment's `file.path`, `B` as
+>   `ourios.wal.recovery.tail.offset`, `E` as `file.size` and the shape
+>   as `ourios.wal.recovery.tail.shape`
+> - **And** `ourios.wal.recovery.truncated.size` grows by `E - B`
 
 ## 6. Testing strategy
 
@@ -355,8 +366,9 @@ remove. It may still be worth having for real corruption, separately.
 - [x] **Heal §4.2's shape later?** Not in this RFC. Only §4.3's
   sequential design heals it, so it is revisited with §4.3 in RFC
   0065's fault tests.
-- [ ] **The counter's name and unit.** These go through the
-  `ourios-semconv` registry.
+- [x] **The counter's name and unit.** `ourios.wal.recovery.truncated.size`
+  in `By`, with the event and attributes §3.3 names (`ourios-semconv`
+  v0.3.25).
 
 ## 8. References
 

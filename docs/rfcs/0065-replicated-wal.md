@@ -892,7 +892,9 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Then** it assigns the first healthy replica in tail placement
 >   order; a flusher unhealthy for the patience is replaced by the next
 >   healthy one and does not take the role back on recovery; one that
->   leaves the placement is replaced; with no replica healthy no
+>   leaves the placement is replaced at once, by a remaining replica that
+>   has mined through the commit point, before its learner is removed;
+>   with no replica healthy no
 >   assignment is appended; and a new leader keeps the flusher its log
 >   names for the patience
 
@@ -1194,7 +1196,12 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   nothing and keeps the current one. A replica that recovers does not
   take the role back, so a flapping replica moves the flusher at most
   once per patience. A new leader keeps the flusher its log names until
-  it has led for the patience, so a failover does not move it. It feeds committed frames to the miner and the record sink
+  it has led for the patience, so a failover does not move it. A
+  flusher that leaves the tail placement while still a learner is the
+  one planned move: §6.1's handoff reassigns it at once, with no
+  patience or failover wait, to the first healthy remaining replica in
+  order that has also mined through the commit point, and only that
+  assignment's commit lets the learner go. It feeds committed frames to the miner and the record sink
   exactly as the local receiver does after the ack today, with the
   sink's size and age triggers unchanged (RFC 0014 §3.2, RFC 0063).
   Every other tail replica mines the same log for the tail (§6.7) and

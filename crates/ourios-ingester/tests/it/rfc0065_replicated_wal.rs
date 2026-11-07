@@ -8,44 +8,21 @@
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC is
 //! red; each names the slice that discharges it.
 //!
-//! RFC0065.2, RFC0065.7 and RFC0065.15's write arm run on the crate-internal
-//! cluster harness, so they are unit tests: `replicated::write::tests` and
-//! `replicated::raft::cluster::tests`.
+//! RFC0065.2, RFC0065.5, RFC0065.6, RFC0065.7, RFC0065.3's takeover arm,
+//! RFC0065.4's paused-writer arm and RFC0065.15's write arm run on the
+//! crate-internal cluster harness, so they are unit tests:
+//! `replicated::write::tests` and `replicated::raft::cluster::tests`.
 
-/// Scenario RFC0065.4 — a replaced writer cannot acknowledge (B5).
-/// Given the acknowledging replica paused while another takes over, when it
-/// resumes with its clock set arbitrarily, then it commits nothing new.
+/// Scenario RFC0065.4 — a replaced writer cannot acknowledge (B5), the
+/// clock arm: the resumed former writer, with its clock set arbitrarily,
+/// commits nothing new.
 #[test]
-#[ignore = "RFC0065.4 stub — implemented with the write path on the in-process cluster"]
-fn rfc0065_4_a_replaced_writer_cannot_acknowledge() {
+#[ignore = "RFC0065.4 stub — the clock arm, implemented with the seeded simulation suite"]
+fn rfc0065_4_a_replaced_writer_with_any_clock_cannot_acknowledge() {
     todo!(
-        "RFC0065.4 — the resumed former writer commits nothing new: every success \
-         it sends is for a record the new writer holds, other waiters get the \
-         retryable rejection"
-    );
-}
-
-/// Scenario RFC0065.5 — takeover only by a replica with every ack (B6, B8).
-/// Given only `a` and `b` hold every acked record, when both are down, then
-/// lagging `c` does not take over, and `b` does when it returns.
-#[test]
-#[ignore = "RFC0065.5 stub — implemented with the write path on the in-process cluster"]
-fn rfc0065_5_takeover_only_by_a_replica_with_every_ack() {
-    todo!(
-        "RFC0065.5 — `c` does not take over, exports get the retryable rejection, \
-         and returning `b` takes over with every acked record"
-    );
-}
-
-/// Scenario RFC0065.6 — losing and regaining a follower (B1, B3).
-/// When one of three voters stops and returns, acks continue on two, and
-/// the returning follower catches up before it counts toward an ack.
-#[test]
-#[ignore = "RFC0065.6 stub — implemented with the write path on the in-process cluster"]
-fn rfc0065_6_losing_and_regaining_a_follower() {
-    todo!(
-        "RFC0065.6 — acks continue with two replicas, the returning follower \
-         catches up before it counts again, no ack counted an unfsynced replica"
+        "RFC0065.4 — with its clock set arbitrarily, the resumed former writer \
+         commits nothing new: every success it sends is for a record the new \
+         writer holds, other waiters get the retryable rejection"
     );
 }
 

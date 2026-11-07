@@ -22,6 +22,7 @@ use super::gate::SyncGate;
 use super::host::{GroupHost, GroupRaft, HostSpec};
 use super::log_store::group_dir;
 use super::state_machine::GroupSm;
+use super::telemetry::Meters;
 use super::transport::{Peers, ReplicationServer};
 use super::types::{Entry, NodeId, RaftTypes, TenantBatchBytes};
 use super::vote_log;
@@ -102,12 +103,13 @@ pub(crate) fn name(id: NodeId) -> String {
     id.to_string()
 }
 
-/// A replica's identity, the directory its logs and votes live in, and
-/// the groups it votes in.
+/// A replica's identity, the directory its logs and votes live in, the
+/// groups it votes in, and where its host reports.
 pub(crate) struct Replica {
     pub(crate) id: NodeId,
     pub(crate) dir: TempDir,
     pub(crate) groups: Vec<u32>,
+    pub(crate) meters: Meters,
 }
 
 impl Replica {
@@ -118,6 +120,7 @@ impl Replica {
             id: NodeId::from(n),
             dir,
             groups: groups.to_vec(),
+            meters: Meters::global(),
         }
     }
 }
@@ -157,7 +160,7 @@ impl Node {
             groups: replica.groups.clone(),
             peers: peers.clone(),
         };
-        let host = GroupHost::open_with(spec, server, Arc::clone(&gate))
+        let host = GroupHost::open_with(spec, server, Arc::clone(&gate), &replica.meters)
             .await
             .expect("host");
         let (stop, serving) = serve(host.server());
@@ -287,6 +290,15 @@ impl Cluster {
     /// Start `size` nodes and bootstrap each of `groups` from node 0
     /// with every node a voter.
     pub(crate) async fn start(size: u64, groups: &[u32]) -> Self {
+        Self::start_metered(size, groups, |_| Meters::global()).await
+    }
+
+    /// [`Self::start`], node `i` reporting to `meters(i)`.
+    pub(crate) async fn start_metered(
+        size: u64,
+        groups: &[u32],
+        meters: impl Fn(usize) -> Meters,
+    ) -> Self {
         let bound: Vec<_> = (1..=size).map(|n| (NodeId::from(n), bind())).collect();
         let addresses = bound.iter().map(|(id, (_, a))| (name(*id), a.to_string()));
         let peers = Peers::plaintext().with_addresses(addresses);
@@ -297,7 +309,10 @@ impl Cluster {
             slots: Vec::new(),
         };
         for (n, (_, (incoming, _))) in (1..).zip(bound) {
-            let replica = Replica::new(n, groups);
+            let replica = Replica {
+                meters: meters(cluster.slots.len()),
+                ..Replica::new(n, groups)
+            };
             let server = ReplicationServer::default();
             let node = Node::open(replica, incoming, &cluster.peers, server).await;
             cluster.slots.push(Slot::Up(node));

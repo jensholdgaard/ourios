@@ -341,3 +341,46 @@ async fn an_edit_planned_before_another_change_committed_is_refused() {
     assert_eq!(learners_of(&cluster, leader), BTreeSet::from([first]));
     cluster.shutdown().await;
 }
+
+/// A pass that adds and removes, as replacing a wiped tail node's UUID
+/// does, guards its second edit by the membership its first committed:
+/// both commit, and the old learner is gone from the committed membership.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_add_and_a_remove_in_one_pass_both_commit() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let raft = cluster.node(leader).raft(0);
+    let committed_at = || {
+        *raft
+            .metrics()
+            .borrow_watched()
+            .committed_membership_config
+            .log_id()
+    };
+    let (old, new) = (cluster.id(3), cluster.id(4));
+    let add_old = Changes {
+        add: BTreeMap::from([(old, name(old))]),
+        remove: BTreeSet::new(),
+    };
+    super::apply(raft, &add_old, committed_at())
+        .await
+        .expect("the old learner added");
+
+    let replace = Changes {
+        add: BTreeMap::from([(new, name(new))]),
+        remove: BTreeSet::from([old]),
+    };
+    super::apply(raft, &replace, committed_at())
+        .await
+        .expect("both edits commit");
+    assert_eq!(learners_of(&cluster, leader), BTreeSet::from([new]));
+    let committed = raft
+        .metrics()
+        .borrow_watched()
+        .committed_membership_config
+        .membership()
+        .non_write_voter_ids()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(committed, BTreeSet::from([new]), "the old UUID is gone");
+    cluster.shutdown().await;
+}

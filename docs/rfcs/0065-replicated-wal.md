@@ -1492,11 +1492,14 @@ never count toward an ack (learners, under §4.3's shape).
   its `node_id`, the UUID in its `replica.id`, and the highest control
   entry kind it reads (§6.5). Kinds are numbered in the order they are
   introduced and a release reads every kind up to its highest, so one
-  number states what a node can apply. A leader appends a new kind only
-  once every member has answered with a kind at or above it, a member
-  that has not answered counting as below, and adds a learner only if
-  its kind covers every kind the group's log already holds, so no
-  replica is asked to apply an entry it cannot read. A leader calls each
+  number states what a node can apply. A kind the group's log has never
+  held is appended only once every member has answered with a kind at
+  or above it, a member that has not answered counting as below. A kind
+  the committed log already holds, or the latest checkpoint records as
+  held, needs no answers: every member then read it, and a learner is
+  added only if its kind covers every kind the log has held. So a lost
+  member holds back a new kind but never the reassignment of its own
+  flusher, and no replica is asked to apply an entry it cannot read. A leader calls each
   peer of a group's tail placement, and each voter of the group, at
   the address its own configuration gives, and acts on the answer
   through a committed membership change only: it adds a node it does

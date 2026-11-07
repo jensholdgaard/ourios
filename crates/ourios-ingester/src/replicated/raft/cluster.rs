@@ -361,6 +361,24 @@ impl Cluster {
         lost
     }
 
+    /// Crash every node still up, leaving each directory as its last
+    /// fsync left it.
+    pub(crate) async fn crash_all(&mut self) {
+        for i in 0..self.slots.len() {
+            if matches!(self.slots[i], Slot::Up(_)) {
+                self.crash(i).await;
+            }
+        }
+    }
+
+    /// The directory node `i` keeps its logs and votes in.
+    pub(crate) fn dir(&self, i: usize) -> &Path {
+        match &self.slots[i] {
+            Slot::Up(node) => node.replica.dir.path(),
+            Slot::Down(replica) => replica.dir.path(),
+        }
+    }
+
     /// Start node `i` again from its directory, at its address.
     pub(crate) async fn restart(&mut self, i: usize) {
         let Slot::Down(replica) = self.slots.remove(i) else {

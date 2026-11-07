@@ -51,9 +51,9 @@ pub enum WriteError {
         group: u32,
         source: Box<ClientWriteFailure>,
     },
-    /// The export was forwarded and no leader committed it (§6.8): every
-    /// node tried proved it did not take it, or an answer left the outcome
-    /// uncertain.
+    /// The export was forwarded and no leader confirmed a commit (§6.8):
+    /// every node tried proved it did not take it, or an answer left the
+    /// outcome uncertain, in which case it may still commit (B3).
     Unforwarded { group: u32, reason: String },
 }
 
@@ -106,12 +106,11 @@ impl std::fmt::Display for WriteError {
                 "the export's {len} bytes exceed the {limit} a WAL frame's entry can hold"
             ),
             Self::Raft { group, source } => write!(f, "group {group}: {source}"),
-            Self::Unforwarded { group, reason } => {
-                write!(
-                    f,
-                    "no leader of group {group} committed the export: {reason}"
-                )
-            }
+            Self::Unforwarded { group, reason } => write!(
+                f,
+                "no leader of group {group} confirmed committing the forwarded export, \
+                 which may still commit: {reason}"
+            ),
         }
     }
 }

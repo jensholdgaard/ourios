@@ -884,8 +884,9 @@ the mass-failover time and vote-log batching as tuning signals.
   `tail_replicas` can change at any time. Each group's tail replicas are
   the `tail_replicas` members of `tail_peers` with the highest
   `xxh3_64(group, node_id)`; when that set changes, the group's leader
-  adds the new members as `openraft` learners (they catch up from the
-  checkpoint snapshot) and removes the old ones, a learner-only
+  adds the new members as `openraft` learners, under the replica UUID
+  each answers its `Identify` call with (§6.8; they catch up from the
+  checkpoint snapshot), and removes the old ones, a learner-only
   membership change that never touches the voters, the write quorum or
   voter placement. Adding tail capacity is adding tail nodes. The
   current flusher (§6.5) is removed last: when it leaves the set, the
@@ -914,9 +915,11 @@ the mass-failover time and vote-log batching as tuning signals.
   `node_id`, so membership pairs every UUID with the `node_id` it runs
   under, and it is replicated and persisted like any log entry. A node
   whose `wal_root` is empty or unreadable joins as a new replica: it
-  asks the leader to join under its new UUID and `node_id`; the leader
-  adds it as a learner, waits until its applied index reaches the
-  commit point, and then commits **one** membership change that
+  answers the leader's `Identify` call with its new UUID under its
+  `node_id` (§6.8); the leader, seeing a voter's `node_id` under a UUID
+  the membership does not hold, adds it as a learner, waits until its
+  applied index reaches the commit point, and then commits **one**
+  membership change that
   replaces the voter with the same `node_id` and a different UUID by the
   new UUID (joint consensus, so the voter count never drops). Each step
   is decided from the committed membership alone, so a new leader after
@@ -1473,12 +1476,22 @@ never count toward an ack (learners, under §4.3's shape).
   to follower, entries and heartbeats), `Vote` and `PreVote` (candidate
   to voter), and
   `InstallSnapshot` (leader to a follower behind the checkpoint); then
-  `Forward` (any node to a leader), and `Tail` and `TailScan` (querier
-  to tail replica: the read point and published keys, then the rows
-  under that read point, §6.7). Catch-up needs no call of its own: the
+  `Forward` (any node to a leader), `Identify` (a leader to a
+  configured peer: the `node_id` and replica UUID it runs under, §6.1),
+  and `Tail` and `TailScan` (querier to tail replica: the read point and
+  published keys, then the rows under that read point, §6.7). Catch-up needs no call of its own: the
   leader sends a lagging follower its missing entries by
   `StreamAppend`, or the checkpoint by `InstallSnapshot` when they are
   already purged.
+- `Identify` names no group and changes nothing: the node answers with
+  its `node_id` and the UUID in its `replica.id`. A leader calls each
+  peer of a group's tail placement, and each voter of the group, at
+  the address its own configuration gives, and acts on the answer
+  through a committed membership change only: it adds a node it does
+  not hold as a learner under the UUID it reported, and starts §6.1's
+  replacement for a voter's `node_id` that answers under a new UUID. An
+  unreachable peer is identified on a later pass, and an answer whose
+  `node_id` is not the one the leader called is ignored.
 - `Forward` carries one export to the node the sender believes leads
   its group: the group, the `TenantOtlpBatch` payload and the
   credential the client presented, if any. It names no target replica.

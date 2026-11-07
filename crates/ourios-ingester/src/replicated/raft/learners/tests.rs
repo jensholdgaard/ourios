@@ -309,3 +309,35 @@ async fn a_shrunk_placement_removes_the_learner_that_left() {
     assert_eq!(left, vec![kept]);
     cluster.shutdown().await;
 }
+
+/// Each edit is guarded by the membership it was planned from: once
+/// another change has committed meanwhile, as a joint change would during
+/// a pass's `Identify` calls, the stale edit is refused and changes
+/// nothing; planned from the current membership, it commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_planned_before_another_change_committed_is_refused() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let raft = cluster.node(leader).raft(0);
+    let planned_at = *raft
+        .metrics()
+        .borrow_watched()
+        .committed_membership_config
+        .log_id();
+    let (first, second) = (cluster.id(3), cluster.id(4));
+    let add = |replica: NodeId| Changes {
+        add: BTreeMap::from([(replica, name(replica))]),
+        remove: BTreeSet::new(),
+    };
+    super::apply(raft, &add(first), planned_at)
+        .await
+        .expect("planned from the current membership");
+
+    let stale = super::apply(raft, &add(second), planned_at).await;
+    assert!(
+        stale.is_err(),
+        "an edit planned before the change committed"
+    );
+    assert_eq!(learners_of(&cluster, leader), BTreeSet::from([first]));
+    cluster.shutdown().await;
+}

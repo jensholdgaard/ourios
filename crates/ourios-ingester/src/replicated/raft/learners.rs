@@ -12,12 +12,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use openraft::ChangeMembers;
 use openraft::async_runtime::WatchReceiver as _;
+use openraft::{ChangeMembers, Precondition};
 
 use super::host::GroupRaft;
 use super::transport::{Identity, Peers};
-use super::types::{Membership, NodeId};
+use super::types::{LogId, Membership, NodeId};
 use crate::replicated::placement::place;
 
 /// The tail pool: its members' `node_id`s and the learners per group.
@@ -131,7 +131,7 @@ pub async fn reconcile(
     peers: &Peers,
     patience: Duration,
 ) -> Result<Changes, String> {
-    let Some(members) = led_members(raft) else {
+    let Some((members, planned_at)) = led_members(raft) else {
         return Ok(Changes::default());
     };
     let mut answers = BTreeMap::new();
@@ -142,24 +142,47 @@ pub async fn reconcile(
     }
     // No control kind exists yet (§6.5), so every learner reads the log.
     let changes = plan(&members, placed, &answers, 0);
-    for (replica, node_id) in &changes.add {
-        raft.add_learner(*replica, node_id.clone(), false)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    if !changes.remove.is_empty() {
-        let remove = ChangeMembers::RemoveNodes(changes.remove.clone());
-        raft.change_membership(remove, false)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    apply(raft, &changes, planned_at).await?;
     Ok(changes)
+}
+
+/// Commit `changes`, each edit only while the effective membership is
+/// still the one stored at `planned_at`, the membership they were planned
+/// from, or the one the previous edit of this pass committed. A change
+/// committed meanwhile, a joint one above all, fails the edit rather than
+/// being flattened by it.
+///
+/// # Errors
+///
+/// The edit the leader refused or could not commit; nothing after it is
+/// tried.
+pub(super) async fn apply(
+    raft: &GroupRaft,
+    changes: &Changes,
+    planned_at: Option<LogId>,
+) -> Result<(), String> {
+    let edits = [
+        (!changes.add.is_empty()).then(|| ChangeMembers::AddNodes(changes.add.clone())),
+        (!changes.remove.is_empty()).then(|| ChangeMembers::RemoveNodes(changes.remove.clone())),
+    ];
+    let mut at = planned_at;
+    for edit in edits.into_iter().flatten() {
+        let guard = Precondition::LastMembershipLogId {
+            last_membership_log_id: at,
+        };
+        let committed = raft
+            .change_membership_if(edit, false, [guard])
+            .await
+            .map_err(|e| e.to_string())?;
+        at = Some(committed.log_id);
+    }
+    Ok(())
 }
 
 /// The group's committed membership, if this node leads it and no change
 /// to it is in flight: one still uncommitted would be planned against as
 /// if it had been.
-fn led_members(raft: &GroupRaft) -> Option<Members> {
+fn led_members(raft: &GroupRaft) -> Option<(Members, Option<LogId>)> {
     let metrics = raft.metrics().borrow_watched().clone();
     if metrics.current_leader != Some(metrics.id) {
         return None;
@@ -168,7 +191,7 @@ fn led_members(raft: &GroupRaft) -> Option<Members> {
     if committed.log_id() != metrics.membership_config.log_id() {
         return None;
     }
-    stable(committed.membership())
+    stable(committed.membership()).map(|members| (members, *committed.log_id()))
 }
 
 /// The members of `membership`, unless it is joint: a learner edit there

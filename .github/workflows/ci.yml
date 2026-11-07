@@ -130,10 +130,17 @@ jobs:
       - run: cargo doc --workspace --no-deps --all-features
 
   test:
-    name: cargo test
+    name: cargo test (${{ matrix.partition }}/2)
     # Not part of the scheduled hygiene canary (see `on:`).
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    # The suite already runs four tests at a time on the runner's four
+    # cores, and is this workflow's longest job on a PR; halving it across
+    # two runners halves the run step. `ci-success` needs every partition.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Free runner disk space
@@ -148,8 +155,11 @@ jobs:
       - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
-      - run: cargo test --workspace --all-features --doc
+      - run: >-
+          cargo nextest run --workspace --all-features --no-fail-fast --profile ci
+          --partition hash:${{ matrix.partition }}/2
+      - if: matrix.partition == 1
+        run: cargo test --workspace --all-features --doc
       # Codecov Test Analytics (informational, like the coverage job):
       # nextest's JUnit report (the `ci` profile in .config/nextest.toml)
       # feeds run times / failure rates / flake detection. `!cancelled()`

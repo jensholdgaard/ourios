@@ -912,13 +912,14 @@ the mass-failover time and vote-log batching as tuning signals.
 >   purged below the cut installs the snapshot and catches up
 > - **Then** only the flusher's checkpoint with a cut above the last is
 >   applied; its snapshot's last log id is the cut and it holds the
->   membership, flusher, highest kind and miner configuration as of
->   the cut; the installing
+>   membership, flusher, highest kind, miner configuration and latest
+>   id block as of the cut; the installing
 >   replica ends with the same flusher, membership, blocks and
 >   configuration as one that applied the whole log, and mines the
 >   lines after the configuration change into the same templates as a
 >   replica that mined through it; a block below the previous one is
->   ignored; a miner configuration body that `MinerConfig` refuses, or
+>   ignored, also by a replica whose log is purged below that previous
+>   block; a miner configuration body that `MinerConfig` refuses, or
 >   one that changes `prefix_depth` or `max_node_children` from the
 >   group's first, stops the replica as RFC0065.29's unreadable entry
 >   does, and a leader whose own `prefix_depth` differs appends the
@@ -1064,7 +1065,8 @@ the mass-failover time and vote-log batching as tuning signals.
   state a checkpoint snapshot holds at its cut (§6.5): the flusher
   (`present: u8 | uuid`), the highest kind (`u8`) and the miner
   configuration in force (`kind: u8`, `0` when none has committed,
-  then that kind's body). The data
+  then that kind's body) and the latest id block (`after: u64 |
+  through: u64`, both `0` when none has been applied). The data
   `InstallSnapshot` sends is those same bytes, so an installing
   replica gets them with the metadata. Snapshots are built only at a
   checkpoint's cut (the snapshot policy is `Never`; applying a
@@ -1350,12 +1352,14 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     it makes it the group's checkpoint and builds a snapshot **at the
     cut**, not at the last applied entry: its last log id is the cut,
     and it holds the group's membership, flusher and highest kind as
-    they stood at the cut, and the miner configuration in force there,
+    they stood at the cut, and the miner configuration and latest id
+    block in force there,
     so a replica that installs it and then
     receives the entries after the cut mines every one of them from the
     bundle. To know them, the state machine keeps the positions at
     which the membership and the flusher changed since the last applied
-    checkpoint, and the same for the miner configuration; that list
+    checkpoint, and the same for the miner configuration and the id
+    blocks; that list
     grows only with those changes. `openraft`
     accepts a built snapshot below its applied index provided it is
     above the current snapshot, then purges below it.
@@ -1365,7 +1369,11 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     the store, and the group's miner allocates from the blocks in log
     order. A block whose `after` is below the previous block's `through`
     is ignored by every replica: the store's compare-and-swap never
-    returns one, and allocating it could issue an id twice.
+    returns one, and allocating it could issue an id twice. The
+    previous block is the latest in the log after the snapshot or,
+    when it holds none, the snapshot's, so a replica restored from a
+    checkpoint and one that applied the whole log ignore the same
+    blocks.
   - **Miner configuration.** The `MinerConfig` fields (RFC 0004 §3.2,
     RFC 0023 §3.1, RFC 0050 §3.2) in declaration order, each `f32` as
     its IEEE 754 bits and `upstream_templates` as `0` ignore, `1`

@@ -919,7 +919,8 @@ the mass-failover time and vote-log batching as tuning signals.
 >   lines after the configuration change into the same templates as a
 >   replica that mined through it; a block below the previous one is
 >   ignored, also by a replica whose log is purged below that previous
->   block; a miner configuration body that `MinerConfig` refuses, or
+>   block, and after `(0, 100]` is applied and `(0, 50]` ignored,
+>   `(50, 150]` is ignored too; a miner configuration body that `MinerConfig` refuses, or
 >   one that changes `prefix_depth` or `max_node_children` from the
 >   group's first, stops the replica as RFC0065.29's unreadable entry
 >   does, and a leader whose own `prefix_depth` differs appends the
@@ -1066,7 +1067,8 @@ the mass-failover time and vote-log batching as tuning signals.
   (`present: u8 | uuid`), the highest kind (`u8`) and the miner
   configuration in force (`kind: u8`, `0` when none has committed,
   then that kind's body) and the latest id block (`after: u64 |
-  through: u64`, both `0` when none has been applied). The data
+  through: u64`, the latest applied, both `0` when none has been).
+  The data
   `InstallSnapshot` sends is those same bytes, so an installing
   replica gets them with the metadata. Snapshots are built only at a
   checkpoint's cut (the snapshot policy is `Never`; applying a
@@ -1370,10 +1372,10 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     order. A block whose `after` is below the previous block's `through`
     is ignored by every replica: the store's compare-and-swap never
     returns one, and allocating it could issue an id twice. The
-    previous block is the latest in the log after the snapshot or,
-    when it holds none, the snapshot's, so a replica restored from a
-    checkpoint and one that applied the whole log ignore the same
-    blocks.
+    previous block is the latest one applied, never an ignored one: the
+    latest applied after the snapshot or, when none has been, the
+    snapshot's, so a replica restored from a checkpoint and one that
+    applied the whole log ignore the same blocks.
   - **Miner configuration.** The `MinerConfig` fields (RFC 0004 §3.2,
     RFC 0023 §3.1, RFC 0050 §3.2) in declaration order, each `f32` as
     its IEEE 754 bits and `upstream_templates` as `0` ignore, `1`

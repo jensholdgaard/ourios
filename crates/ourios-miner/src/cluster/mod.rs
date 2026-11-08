@@ -337,10 +337,8 @@ struct TenantState {
     /// lazy allocation time. Resolves to the per-tenant override
     /// (set via [`MinerCluster::with_tenant_config`]) if one
     /// exists; otherwise the cluster default. RFC 0004 §3.4 pins
-    /// this as the per-tenant tunable surface; further mutation
-    /// after allocation is out of scope (the RFC names dynamic
-    /// reconfiguration as an open question; today's contract is
-    /// startup-only).
+    /// this as the per-tenant tunable surface. Without an override,
+    /// [`MinerCluster::reconfigure`] replaces it.
     config: MinerConfig,
     /// RFC 0052 §3.1's folded horizon: the WAL offset of this
     /// tenant's own last frame folded into the state above. Opaque
@@ -465,7 +463,8 @@ impl MinerCluster {
     /// Order of preference:
     ///
     /// 1. If `TenantState` already exists, its captured config
-    ///    (set at lazy allocation, never mutated thereafter).
+    ///    (set at lazy allocation, replaced by
+    ///    [`Self::reconfigure`] unless the tenant has an override).
     /// 2. Else, the per-tenant override registered via
     ///    [`Self::with_tenant_config`].
     /// 3. Else, the cluster-default config.
@@ -646,14 +645,16 @@ mod canonicals;
 mod id_alloc;
 mod persist;
 mod plan;
+mod reconfigure;
 mod structured;
 
 use id_alloc::IdRange;
 pub use id_alloc::{
-    ID_RESERVATION_FAILED, IdBlock, IdReservationError, IdReserver, IdSpaceExhausted,
-    MAX_TEMPLATE_ID,
+    ID_RESERVATION_FAILED, IdBlock, IdCursor, IdCursorBehind, IdReservationError, IdReserver,
+    IdSpaceExhausted, MAX_TEMPLATE_ID,
 };
 pub use persist::{AdoptedSnapshot, LeafSnapshot, RestoreError};
+pub use reconfigure::{TreeShape, TreeShapeChanged};
 
 impl MinerCluster {
     /// Ingest a structured OTLP log record. Returns the

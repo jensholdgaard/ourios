@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use ourios_wal::{Control, TenantBatch, TenantBatchError};
+use ourios_wal::{Control, RaftLogId, TenantBatch, TenantBatchError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -99,6 +99,19 @@ pub enum GroupEntry {
 #[serde(remote = "Control")]
 enum ControlDef {
     FlusherAssignment([u8; 16]),
+    Checkpoint {
+        proposer: [u8; 16],
+        #[serde(with = "RaftLogIdDef")]
+        cut: RaftLogId,
+        highest_kind: u8,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "RaftLogId")]
+struct RaftLogIdDef {
+    term: u64,
+    index: u64,
 }
 
 impl From<TenantBatchBytes> for GroupEntry {
@@ -114,6 +127,17 @@ impl fmt::Display for GroupEntry {
             Self::Control(Control::FlusherAssignment(replica)) => {
                 write!(f, "FlusherAssignment({})", Uuid::from_bytes(*replica))
             }
+            Self::Control(Control::Checkpoint {
+                proposer,
+                cut,
+                highest_kind,
+            }) => write!(
+                f,
+                "Checkpoint({} at {}-{}, kind {highest_kind})",
+                Uuid::from_bytes(*proposer),
+                cut.term,
+                cut.index
+            ),
         }
     }
 }
@@ -156,6 +180,22 @@ mod tests {
         assert_eq!(
             entry.to_string(),
             "FlusherAssignment(0190b3c8-1a2b-7c3d-9e4f-50607080a0b0)"
+        );
+        let json = serde_json::to_string(&entry).expect("serialise");
+        assert_eq!(serde_json::from_str::<GroupEntry>(&json).ok(), Some(entry));
+    }
+
+    #[test]
+    fn a_checkpoint_displays_its_proposer_and_cut() {
+        let uuid = Uuid::from_u128(0x0190_b3c8_1a2b_7c3d_9e4f_5060_7080_a0b0);
+        let entry = GroupEntry::Control(Control::Checkpoint {
+            proposer: *uuid.as_bytes(),
+            cut: RaftLogId { term: 3, index: 41 },
+            highest_kind: 2,
+        });
+        assert_eq!(
+            entry.to_string(),
+            "Checkpoint(0190b3c8-1a2b-7c3d-9e4f-50607080a0b0 at 3-41, kind 2)"
         );
         let json = serde_json::to_string(&entry).expect("serialise");
         assert_eq!(serde_json::from_str::<GroupEntry>(&json).ok(), Some(entry));

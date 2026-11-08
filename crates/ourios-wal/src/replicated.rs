@@ -22,9 +22,15 @@
 //! exactly as a `TenantOtlpBatch` frame does, so RFC 0052's ledger keys
 //! on it. The membership bytes are the consensus layer's own encoding;
 //! this codec only bounds them. A `Control` entry is one the leader
-//! appends beside the batches (RFC 0065 §6.5); kind `0x01`, the flusher
-//! assignment, carries the flusher's replica UUID, 16 bytes big-endian,
-//! and every other kind is reserved. Any other tag, an unknown control
+//! appends beside the batches (RFC 0065 §6.5), a kind byte and its body:
+//!
+//! ```text
+//! | 0x01 FlusherAssignment | replica: uuid                                   |
+//! | 0x02 Checkpoint        | proposer: uuid | cut term: u64_le | cut index: u64_le |
+//! |                        | highest kind: u8                                |
+//! ```
+//!
+//! A UUID is 16 bytes big-endian; every other kind is reserved. Any other tag, an unknown control
 //! kind, a fixed-size body of the wrong length, or a `Normal` body whose
 //! tenant prefix is malformed is a [`ReplicatedRecordError`], so a replay
 //! refuses the log rather than skip an entry it cannot apply.
@@ -36,7 +42,9 @@ const TAG_NORMAL: u8 = 0x02;
 const TAG_MEMBERSHIP: u8 = 0x03;
 const TAG_CONTROL: u8 = 0x04;
 const KIND_FLUSHER_ASSIGNMENT: u8 = 0x01;
+const KIND_CHECKPOINT: u8 = 0x02;
 const REPLICA_LEN: usize = 16;
+const CHECKPOINT_LEN: usize = REPLICA_LEN + LOG_ID_LEN + 1;
 const TAG_TRUNCATE_AFTER: u8 = 0x10;
 const TAG_TRUNCATE_ALL: u8 = 0x11;
 const TAG_PURGE: u8 = 0x12;
@@ -89,18 +97,33 @@ pub enum EntryBody<'a> {
 pub enum Control {
     /// The group's flusher: its replica UUID, 16 bytes big-endian.
     FlusherAssignment([u8; REPLICA_LEN]),
+    /// The group's checkpoint: the replica that proposed it, the log id of
+    /// the last entry its bundle mined, and the log's highest kind there.
+    Checkpoint {
+        proposer: [u8; REPLICA_LEN],
+        cut: RaftLogId,
+        highest_kind: u8,
+    },
 }
 
 impl Control {
     /// The highest control kind this codec reads; every lower one is read
     /// too (RFC 0065 §6.8).
-    pub const HIGHEST_KIND: u8 = KIND_FLUSHER_ASSIGNMENT;
+    pub const HIGHEST_KIND: u8 = KIND_CHECKPOINT;
 
     /// The entry's kind byte.
     #[must_use]
     pub const fn kind(self) -> u8 {
         match self {
             Self::FlusherAssignment(_) => KIND_FLUSHER_ASSIGNMENT,
+            Self::Checkpoint { .. } => KIND_CHECKPOINT,
+        }
+    }
+
+    const fn body_len(self) -> usize {
+        match self {
+            Self::FlusherAssignment(_) => REPLICA_LEN,
+            Self::Checkpoint { .. } => CHECKPOINT_LEN,
         }
     }
 
@@ -108,6 +131,27 @@ impl Control {
         out.push(self.kind());
         match self {
             Self::FlusherAssignment(replica) => out.extend_from_slice(&replica),
+            Self::Checkpoint {
+                proposer,
+                cut,
+                highest_kind,
+            } => {
+                out.extend_from_slice(&proposer);
+                cut.write(out);
+                out.push(highest_kind);
+            }
+        }
+    }
+
+    fn checkpoint(body: [u8; CHECKPOINT_LEN]) -> Self {
+        let mut proposer = [0; REPLICA_LEN];
+        proposer.copy_from_slice(&body[..REPLICA_LEN]);
+        let mut cut = [0; LOG_ID_LEN];
+        cut.copy_from_slice(&body[REPLICA_LEN..REPLICA_LEN + LOG_ID_LEN]);
+        Self::Checkpoint {
+            proposer,
+            cut: RaftLogId::read(cut),
+            highest_kind: body[CHECKPOINT_LEN - 1],
         }
     }
 
@@ -116,13 +160,14 @@ impl Control {
         let Some((&kind, rest)) = body.split_first() else {
             return Err(wrong_length(TAG_CONTROL, LOG_ID_LEN + 1, LOG_ID_LEN));
         };
+        let wrong = |len| wrong_length(TAG_CONTROL, LOG_ID_LEN + 1 + len, LOG_ID_LEN + body.len());
         match kind {
             KIND_FLUSHER_ASSIGNMENT => <[u8; REPLICA_LEN]>::try_from(rest)
                 .map(Self::FlusherAssignment)
-                .map_err(|_| {
-                    let expected = LOG_ID_LEN + 1 + REPLICA_LEN;
-                    wrong_length(TAG_CONTROL, expected, LOG_ID_LEN + body.len())
-                }),
+                .map_err(|_| wrong(REPLICA_LEN)),
+            KIND_CHECKPOINT => <[u8; CHECKPOINT_LEN]>::try_from(rest)
+                .map(Self::checkpoint)
+                .map_err(|_| wrong(CHECKPOINT_LEN)),
             found => Err(ReplicatedRecordError::UnknownControlKind { found }),
         }
     }
@@ -192,9 +237,9 @@ impl<'a> ReplicatedRecord<'a> {
                 ..
             } => bytes.len(),
             Self::Entry {
-                body: EntryBody::Control(_),
+                body: EntryBody::Control(control),
                 ..
-            } => 1 + REPLICA_LEN,
+            } => 1 + control.body_len(),
             _ => 0,
         }
     }
@@ -406,6 +451,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded: kind 0x02 is the checkpoint (RFC 0065 §6.5); see \
+                malformed_payloads_and_control_kinds_above_the_highest_are_refused"]
     fn malformed_payloads_and_unknown_control_kinds_are_refused() {
         let decode = |bytes: &[u8]| ReplicatedRecord::decode(bytes).map(|_| ());
         assert_eq!(decode(&[]), Err(ReplicatedRecordError::Empty));
@@ -440,9 +487,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn malformed_payloads_and_control_kinds_above_the_highest_are_refused() {
+        let unknown = Control::HIGHEST_KIND + 1;
+        let mut short_checkpoint = vec![0x02];
+        short_checkpoint.extend_from_slice(&[0; 32]);
+        let mut long_checkpoint = short_checkpoint.clone();
+        long_checkpoint.extend_from_slice(&[0; 2]);
+        let refused = [
+            (vec![], ReplicatedRecordError::Empty),
+            (
+                vec![0x05],
+                ReplicatedRecordError::UnknownTag { found: 0x05 },
+            ),
+            (vec![0x11, 0], wrong_length(0x11, 0, 1)),
+            (vec![0x12, 0, 0], wrong_length(0x12, 16, 2)),
+            (golden(0x13, &[0]), wrong_length(0x13, 16, 17)),
+            (vec![0x01; 9], wrong_length(0x01, 16, 8)),
+            (golden(0x01, &[0]), wrong_length(0x01, 16, 17)),
+            (
+                golden(0x02, &[0, 0]),
+                ReplicatedRecordError::TenantBatch(TenantBatchError::EmptyTenant),
+            ),
+            (vec![0x04], wrong_length(0x04, 16, 0)),
+            (golden(0x04, &[]), wrong_length(0x04, 17, 16)),
+            (
+                golden(0x04, &[unknown]),
+                ReplicatedRecordError::UnknownControlKind { found: unknown },
+            ),
+            (golden(0x04, &[0x01; 16]), wrong_length(0x04, 33, 32)),
+            (golden(0x04, &[0x01; 18]), wrong_length(0x04, 33, 34)),
+            (golden(0x04, &short_checkpoint), wrong_length(0x04, 50, 49)),
+            (golden(0x04, &long_checkpoint), wrong_length(0x04, 50, 51)),
+        ];
+        for (payload, error) in refused {
+            let decoded = ReplicatedRecord::decode(&payload).map(|_| ());
+            assert_eq!(decoded, Err(error), "{payload:02x?}");
+        }
+    }
+
     /// A flusher assignment is tag `0x04`, the log id, kind `0x01` and the
     /// replica UUID (RFC 0065 §6.5).
     #[test]
+    #[ignore = "superseded: the highest kind is 0x02, the checkpoint (RFC 0065 §6.5); see \
+                a_flusher_assignment_and_a_checkpoint_encode_to_the_documented_bytes"]
     fn a_flusher_assignment_encodes_to_the_documented_bytes() {
         let replica: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).expect("small"));
         let assignment = ReplicatedRecord::Entry {
@@ -454,6 +542,43 @@ mod tests {
         round_trip(assignment, &golden(0x04, &tail));
         assert_eq!(Control::HIGHEST_KIND, 0x01);
         assert_eq!(Control::FlusherAssignment(replica).kind(), 0x01);
+    }
+
+    /// A checkpoint is kind `0x02`: the proposer's UUID, the cut's term and
+    /// index, and the highest kind at the cut (RFC 0065 §6.5).
+    #[test]
+    fn a_flusher_assignment_and_a_checkpoint_encode_to_the_documented_bytes() {
+        let replica: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).expect("small"));
+        let assignment = ReplicatedRecord::Entry {
+            log_id: ID,
+            body: EntryBody::Control(Control::FlusherAssignment(replica)),
+        };
+        let mut tail = vec![0x01];
+        tail.extend_from_slice(&replica);
+        round_trip(assignment, &golden(0x04, &tail));
+
+        let checkpoint = Control::Checkpoint {
+            proposer: replica,
+            cut: RaftLogId {
+                term: 0x21,
+                index: 0x0302,
+            },
+            highest_kind: 0x02,
+        };
+        let entry = ReplicatedRecord::Entry {
+            log_id: ID,
+            body: EntryBody::Control(checkpoint),
+        };
+        let mut tail = vec![0x02];
+        tail.extend_from_slice(&replica);
+        tail.extend_from_slice(&[0x21, 0, 0, 0, 0, 0, 0, 0]);
+        tail.extend_from_slice(&[0x02, 0x03, 0, 0, 0, 0, 0, 0]);
+        tail.push(0x02);
+        assert_eq!(tail.len(), 1 + 33);
+        round_trip(entry, &golden(0x04, &tail));
+        assert_eq!(Control::HIGHEST_KIND, 0x02);
+        assert_eq!(Control::FlusherAssignment(replica).kind(), 0x01);
+        assert_eq!(checkpoint.kind(), 0x02);
     }
 
     #[test]
@@ -490,7 +615,7 @@ mod tests {
 
     fn any_record() -> impl Strategy<Value = (u8, u64, u64, Vec<u8>)> {
         (
-            0u8..8,
+            0u8..9,
             any::<u64>(),
             any::<u64>(),
             proptest::collection::vec(any::<u8>(), 0..64),
@@ -512,6 +637,13 @@ mod tests {
                 6 => {
                     let replica = core::array::from_fn(|i| bytes.get(i).copied().unwrap_or(0));
                     let control = Control::FlusherAssignment(replica);
+                    ReplicatedRecord::Entry { log_id, body: EntryBody::Control(control) }
+                }
+                7 => {
+                    let proposer = core::array::from_fn(|i| bytes.get(i).copied().unwrap_or(0));
+                    let highest_kind = bytes.first().copied().unwrap_or(0);
+                    let cut = RaftLogId { term: index, index: term };
+                    let control = Control::Checkpoint { proposer, cut, highest_kind };
                     ReplicatedRecord::Entry { log_id, body: EntryBody::Control(control) }
                 }
                 _ => ReplicatedRecord::Committed(log_id),

@@ -691,6 +691,7 @@ async fn the_log_controls_follow_its_entries() {
         highest_kind: 1,
         introduced: Some(3),
         flusher: Some(NodeId::from(9)),
+        miner_config: None,
     };
     assert_eq!(reader.controls(), both);
 
@@ -721,6 +722,7 @@ async fn the_log_controls_follow_its_entries() {
         highest_kind: 1,
         introduced: None,
         flusher: None,
+        miner_config: None,
     };
     assert_eq!(reader.controls(), purged, "a purged entry keeps its kind");
     drop(reader);
@@ -758,12 +760,14 @@ async fn the_log_controls_fall_back_to_the_snapshot() {
             flusher: Some(NodeId::from(7)),
             highest_kind: 1,
             id_block: None,
+            miner_config: None,
         },
     };
     let over = LogControls {
         highest_kind: 1,
         introduced: None,
         flusher: Some(NodeId::from(7)),
+        miner_config: None,
     };
     assert_eq!(reader.held_controls().over(Some(&snapshot)), over);
 
@@ -772,6 +776,83 @@ async fn the_log_controls_fall_back_to_the_snapshot() {
     let after = reader.held_controls().over(Some(&snapshot));
     assert_eq!(after.flusher, Some(NodeId::from(9)), "the log's newer one");
     assert_eq!(after.introduced, None, "the snapshot committed the kind");
+}
+
+fn miner_config(at: LogId, similarity_threshold: f32) -> Entry {
+    let body = ourios_wal::MinerConfigV1 {
+        similarity_threshold,
+        similarity_floor: 0.4,
+        param_byte_limit: 256,
+        prefix_depth: 2,
+        max_node_children: 100,
+        max_templates: 20_000,
+        max_line_tokens: 512,
+        upstream_templates: ourios_wal::UpstreamTemplates::Ignore,
+        upstream_template_byte_limit: 8192,
+        upstream_association_limit: 4,
+    };
+    Entry {
+        log_id: at,
+        payload: EntryPayload::Normal(GroupEntry::Control(ourios_wal::Control::MinerConfig(body))),
+    }
+}
+
+fn body_of(entry: &Entry) -> Option<ourios_wal::MinerConfigV1> {
+    match entry.payload {
+        EntryPayload::Normal(GroupEntry::Control(ourios_wal::Control::MinerConfig(body))) => {
+            Some(body)
+        }
+        _ => None,
+    }
+}
+
+/// The miner configuration in force on the control view is the newest in
+/// the log after the snapshot or, when the log holds none there, the
+/// snapshot's, also once the log purged every configuration entry.
+#[tokio::test]
+async fn the_log_controls_hold_the_miner_configuration_in_force() {
+    use super::snapshot_record::{GroupMinerConfig, GroupSnapshot, GroupState, SnapshotMeta};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut log, _) = open(dir.path());
+    let reader = log.get_log_reader().await;
+    let first = miner_config(log_id(1, 2), 0.7);
+    let mut batch = entries(1, 1..=1);
+    batch.push(first.clone());
+    batch.extend(entries(1, 3..=4));
+    append(&mut log, batch).await.await.expect("fsynced");
+    assert_eq!(reader.controls().miner_config, body_of(&first));
+    assert_eq!(reader.controls().highest_kind, 4);
+
+    log.purge(log_id(1, 3)).await.expect("purge");
+    assert_eq!(
+        reader.controls().miner_config,
+        None,
+        "the log alone lost it"
+    );
+    let recorded = body_of(&first).map(|body| GroupMinerConfig::new(body).expect("valid"));
+    let snapshot = GroupSnapshot {
+        meta: SnapshotMeta {
+            last_log_id: Some(log_id(1, 3)),
+            ..SnapshotMeta::default()
+        },
+        state: GroupState {
+            flusher: None,
+            highest_kind: 4,
+            id_block: None,
+            miner_config: recorded,
+        },
+    };
+    let over = reader.held_controls().over(Some(&snapshot));
+    assert_eq!(over.miner_config, body_of(&first), "the snapshot's");
+
+    let newer = miner_config(log_id(1, 5), 0.8);
+    append(&mut log, vec![newer.clone()])
+        .await
+        .await
+        .expect("fsynced");
+    let over = reader.held_controls().over(Some(&snapshot));
+    assert_eq!(over.miner_config, body_of(&newer), "the log's newer one");
 }
 
 /// The controls read from the log before a purge, over the snapshot
@@ -799,6 +880,7 @@ async fn controls_read_before_a_purge_over_its_snapshot_keep_the_flusher() {
             flusher: Some(NodeId::from(7)),
             highest_kind: 1,
             id_block: None,
+            miner_config: None,
         },
     };
     log.purge(log_id(1, 4)).await.expect("purge");

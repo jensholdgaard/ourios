@@ -7,6 +7,7 @@
 //! the previous one ran.
 
 mod codec;
+mod controls;
 pub mod flusher;
 pub mod formation;
 pub mod host;

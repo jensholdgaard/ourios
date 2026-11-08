@@ -56,7 +56,11 @@ impl Group<'_> {
     /// The controls the log holds over those of the group's snapshot.
     #[must_use]
     pub fn controls(&self) -> LogControls {
-        self.log.controls_over(self.sm.snapshot().as_ref())
+        // The log first: a snapshot is recorded before the log is purged
+        // through it, so one read after the log covers whatever that read
+        // found purged.
+        let held = self.log.held_controls();
+        held.over(self.sm.snapshot().as_ref())
     }
 }
 

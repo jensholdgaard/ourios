@@ -765,11 +765,47 @@ async fn the_log_controls_fall_back_to_the_snapshot() {
         introduced: None,
         flusher: Some(NodeId::from(7)),
     };
-    assert_eq!(reader.controls_over(Some(&snapshot)), over);
+    assert_eq!(reader.held_controls().over(Some(&snapshot)), over);
 
     let newer = vec![assignment(log_id(1, 6), NodeId::from(9))];
     append(&mut log, newer).await.await.expect("fsynced");
-    let after = reader.controls_over(Some(&snapshot));
+    let after = reader.held_controls().over(Some(&snapshot));
     assert_eq!(after.flusher, Some(NodeId::from(9)), "the log's newer one");
     assert_eq!(after.introduced, None, "the snapshot committed the kind");
+}
+
+/// The controls read from the log before a purge, over the snapshot
+/// recorded for that purge, still name the purged assignment's flusher:
+/// the order `Group::controls` reads them in.
+#[tokio::test]
+async fn controls_read_before_a_purge_over_its_snapshot_keep_the_flusher() {
+    use super::snapshot_record::{GroupSnapshot, GroupState, SnapshotMeta};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut log, _) = open(dir.path());
+    let reader = log.get_log_reader().await;
+    let mut batch = entries(1, 1..=2);
+    batch.push(assignment(log_id(1, 3), NodeId::from(7)));
+    batch.extend(entries(1, 4..=5));
+    append(&mut log, batch).await.await.expect("fsynced");
+
+    let before_purge = reader.held_controls();
+    let recorded = GroupSnapshot {
+        meta: SnapshotMeta {
+            last_log_id: Some(log_id(1, 4)),
+            ..SnapshotMeta::default()
+        },
+        state: GroupState {
+            flusher: Some(NodeId::from(7)),
+            highest_kind: 1,
+            id_block: None,
+        },
+    };
+    log.purge(log_id(1, 4)).await.expect("purge");
+    let after_purge = reader.held_controls();
+
+    for (held, read) in [(before_purge, "before"), (after_purge, "after")] {
+        let flusher = held.over(Some(&recorded)).flusher;
+        assert_eq!(flusher, Some(NodeId::from(7)), "log read {read} the purge");
+    }
 }

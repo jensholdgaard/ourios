@@ -817,8 +817,9 @@ the mass-failover time and vote-log batching as tuning signals.
 >   initializes, the other two initialize with the recorded membership,
 >   elect a leader, and the restarted voter joins under its new identity
 >   by the replacement above, never by initializing a second membership;
->   and a `formed.json` with another `format` or `group`, or whose
->   `node_id`s are not the group's voters, forms nothing
+>   and a `formed.json` that does not parse, is truncated, has another
+>   `format` or `group`, or whose `node_id`s are not the group's voters,
+>   forms nothing
 
 > **Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13)**
 > - **Given** a group whose other two voters are lost for good, with
@@ -995,7 +996,8 @@ the mass-failover time and vote-log batching as tuning signals.
   ```json
   {"format": 1, "group": 3, "members": [
     {"node_id": "ourios-receiver-0", "replica": "0190d2a8-7c1e-7b3a-9f00-5e1c2d3a4b5c"},
-    {"node_id": "ourios-receiver-2", "replica": "0190d2a8-91f4-7c02-8a11-0c9d8e7f6a5b"}]}
+    {"node_id": "ourios-receiver-2", "replica": "0190d2a8-91f4-7c02-8a11-0c9d8e7f6a5b"},
+    {"node_id": "ourios-receiver-4", "replica": "0190d2a8-a3b7-7d4e-b622-1f2e3d4c5b6a"}]}
   ```
 
   `format` is `1`; `group` is the group number; `members` holds one

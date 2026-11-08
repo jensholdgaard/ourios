@@ -296,14 +296,15 @@ fn rfc0065_24_a_formation_interrupted_by_a_wiped_voter_still_forms_once() {
 }
 
 /// Scenario RFC0065.24 — the unreadable-record arm (B4, B6).
-/// Given a `formed.json` with another `format` or `group`, or whose
-/// `node_id`s are not the group's voters, no voter initializes from it.
+/// Given a `formed.json` that does not parse, is truncated, has another
+/// `format` or `group`, or whose `node_id`s are not the group's voters, no
+/// voter initializes from it.
 #[test]
 #[ignore = "RFC0065.24 stub — implemented with group formation"]
 fn rfc0065_24_an_unreadable_formation_record_forms_nothing() {
     todo!(
-        "RFC0065.24 — another format, another group or other node_ids: no voter \
-         initializes, and each reports why"
+        "RFC0065.24 — malformed or truncated JSON, another format, another group \
+         or other node_ids: no voter initializes, and each reports why"
     );
 }
 

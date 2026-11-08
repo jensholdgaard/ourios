@@ -901,6 +901,23 @@ the mass-failover time and vote-log batching as tuning signals.
 >   assignment is appended; and a new leader keeps the flusher its log
 >   names for the patience
 
+> **Scenario RFC0065.31 — a checkpoint snapshot holds the group at its cut (B11)**
+> - **Given** a group whose log holds a miner configuration, id blocks,
+>   a flusher change and a learner added after the cut of a checkpoint
+>   entry, and checkpoint entries proposed by a replica that is not the
+>   flusher at their position, or with a cut not above the last applied
+>   one
+> - **When** every replica applies the log, and a replica whose log is
+>   purged below the cut installs the snapshot and catches up
+> - **Then** only the flusher's checkpoint with a cut above the last is
+>   applied; its snapshot's last log id is the cut and it holds the
+>   membership, flusher and highest kind as of the cut; the installing
+>   replica ends with the same flusher, membership, blocks and
+>   configuration as one that applied the whole log; a block below the
+>   previous one is ignored; and a miner configuration body that
+>   `MinerConfig` refuses stops the replica as RFC0065.29's unreadable
+>   entry does
+
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
@@ -1035,8 +1052,16 @@ the mass-failover time and vote-log batching as tuning signals.
   The record carries a format version and a CRC32C. The group's state
   machine opens from it, applied through the snapshot; a record that
   fails either check fails the group's open, and a group without one
-  has no snapshot. Until §4.3's checkpoint adds its Parquet manifest
-  reference, a snapshot is this metadata only.
+  has no snapshot. Format version 2 adds, after the membership, the
+  state a checkpoint snapshot holds at its cut (§6.5): the flusher
+  (`present: u8 | uuid`) and the highest kind (`u8`). The data
+  `InstallSnapshot` sends is those same bytes, so an installing
+  replica gets them with the metadata. Snapshots are built only at a
+  checkpoint's cut (the snapshot policy is `Never`; applying a
+  checkpoint entry triggers the build), so a snapshot's last log id is
+  a cut, and its index the `seq` of the bundle that holds the miner
+  state. No deployment runs this backend yet, so version 1 is not
+  read: a version-1 record fails the open like an unknown version.
 - **No storage operation blocks the Raft runtime's workers.** Vote
   writes, `sync`, truncation and purge markers run on the WAL's own
   threads. An append completes through `openraft`'s `IOFlushed`
@@ -1285,11 +1310,69 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   | `kind` | Entry | Body |
   |---|---|---|
   | `0x01` | Flusher assignment | the flusher's replica UUID, 16 bytes big-endian |
-  | `0x02` | Checkpoint | reserved |
-  | `0x03` | Id-block reservation | reserved |
-  | `0x04` | Miner configuration | reserved |
+  | `0x02` | Checkpoint | 33 bytes, below |
+  | `0x03` | Id-block reservation | 16 bytes, below |
+  | `0x04` | Miner configuration, algorithm 1 | 28 bytes, below |
   | `0x05` | Published (§6.7) | reserved |
   | `0x06` | Erasure (§6.7) | reserved |
+
+  The bodies of kinds `0x02` to `0x04`, every integer little-endian and
+  every UUID 16 bytes big-endian, as in `0x01`:
+
+  ```text
+  0x02 checkpoint    | proposer: uuid | cut term: u64 | cut index: u64 | highest kind: u8 |
+  0x03 id block      | after: u64 | through: u64 |
+  0x04 miner config  | similarity_threshold: f32 | similarity_floor: f32 |
+                     | param_byte_limit: u32 | prefix_depth: u8 | max_node_children: u16 |
+                     | max_templates: u32 | max_line_tokens: u16 | upstream_templates: u8 |
+                     | upstream_template_byte_limit: u32 | upstream_association_limit: u16 |
+  ```
+
+  - **Checkpoint.** `proposer` is the replica that proposed it, the cut
+    is the log id of the last entry its bundle has mined (the bundle's
+    `seq` is the cut index), and `highest kind` is the log's highest
+    kind at the cut. Every replica applies it only if `proposer` is the
+    flusher in force at the entry's own position and the cut is above
+    the last applied checkpoint's, below the entry, the log id of an
+    entry in its log, with the log's highest kind at the cut equal to
+    the body's; otherwise every replica ignores it alike, purging
+    nothing, as the leader's own check (above) already should. Applying
+    it makes it the group's checkpoint and builds a snapshot **at the
+    cut**, not at the last applied entry: its last log id is the cut,
+    and it holds the group's membership, flusher and highest kind as
+    they stood at the cut, so a replica that installs it and then
+    receives the entries after the cut mines every one of them from the
+    bundle. To know them, the state machine keeps the positions at
+    which the membership and the flusher changed since the last applied
+    checkpoint; that list grows only with those changes. `openraft`
+    accepts a built snapshot below its applied index provided it is
+    above the current snapshot, then purges below it.
+  - **Id block.** The block `(after, through]` of RFC 0059 §3.3, with
+    `after < through <= 2^63 - 1`; any other body refuses the log as a
+    wrong length does. The leader appends it only after reserving it in
+    the store, and the group's miner allocates from the blocks in log
+    order. A block whose `after` is below the previous block's `through`
+    is ignored by every replica: the store's compare-and-swap never
+    returns one, and allocating it could issue an id twice.
+  - **Miner configuration.** The `MinerConfig` fields (RFC 0004 §3.2,
+    RFC 0023 §3.1, RFC 0050 §3.2) in declaration order, each `f32` as
+    its IEEE 754 bits and `upstream_templates` as `0` ignore, `1`
+    observe, `2` adopt. A body that `MinerConfig` validation refuses
+    refuses the log, as a wrong length does. It takes effect for every
+    tenant of the group from its own position, and the entries before
+    a group's first configuration entry are mined under that first
+    entry, so a replica mines nothing until one has committed. The
+    leader appends one when its log holds none, or when its own
+    effective configuration differs from the latest in its log; during
+    a rollout that changes the configuration, the leader's wins.
+    **Algorithm 1** is the miner this amendment ships. A miner change
+    that mines any input differently under the same configuration is a
+    new algorithm and takes a new kind, a miner configuration entry of
+    algorithm 2 with that algorithm's body, so the kind gate above
+    holds it back until every member reads it and every replica changes
+    algorithm at the same position. That kind is the algorithm version
+    the checkpoint bundle records. No per-tenant override exists yet;
+    one would be a later kind too.
 
   A reserved kind's body is fixed by the amendment that implements it,
   and kinds are implemented in order: a release reads a kind only if it

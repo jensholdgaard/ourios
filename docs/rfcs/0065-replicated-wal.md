@@ -912,7 +912,8 @@ the mass-failover time and vote-log batching as tuning signals.
 >   purged below the cut installs the snapshot and catches up
 > - **Then** only the flusher's checkpoint with a cut above the last is
 >   applied; its snapshot's last log id is the cut and it holds the
->   membership, flusher and highest kind as of the cut; the installing
+>   membership, flusher, highest kind and miner configuration as of
+>   the cut; the installing
 >   replica ends with the same flusher, membership, blocks and
 >   configuration as one that applied the whole log, and mines the
 >   lines after the configuration change into the same templates as a
@@ -921,7 +922,8 @@ the mass-failover time and vote-log batching as tuning signals.
 >   one that changes `prefix_depth` or `max_node_children` from the
 >   group's first, stops the replica as RFC0065.29's unreadable entry
 >   does, and a leader whose own `prefix_depth` differs appends the
->   log's; and an
+>   log's, also when elected after a checkpoint purged every
+>   configuration entry; and an
 >   otherwise valid version-1 snapshot record fails the group's open
 
 ## 6. Proposed design
@@ -1060,7 +1062,9 @@ the mass-failover time and vote-log batching as tuning signals.
   fails either check fails the group's open, and a group without one
   has no snapshot. Format version 2 adds, after the membership, the
   state a checkpoint snapshot holds at its cut (§6.5): the flusher
-  (`present: u8 | uuid`) and the highest kind (`u8`). The data
+  (`present: u8 | uuid`), the highest kind (`u8`) and the miner
+  configuration in force (`kind: u8`, `0` when none has committed,
+  then that kind's body). The data
   `InstallSnapshot` sends is those same bytes, so an installing
   replica gets them with the metadata. Snapshots are built only at a
   checkpoint's cut (the snapshot policy is `Never`; applying a
@@ -1346,11 +1350,13 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     it makes it the group's checkpoint and builds a snapshot **at the
     cut**, not at the last applied entry: its last log id is the cut,
     and it holds the group's membership, flusher and highest kind as
-    they stood at the cut, so a replica that installs it and then
+    they stood at the cut, and the miner configuration in force there,
+    so a replica that installs it and then
     receives the entries after the cut mines every one of them from the
     bundle. To know them, the state machine keeps the positions at
     which the membership and the flusher changed since the last applied
-    checkpoint; that list grows only with those changes. `openraft`
+    checkpoint, and the same for the miner configuration; that list
+    grows only with those changes. `openraft`
     accepts a built snapshot below its applied index provided it is
     above the current snapshot, then purges below it.
   - **Id block.** The block `(after, through]` of RFC 0059 §3.3, with
@@ -1376,10 +1382,14 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     changes either refuses the log, as a wrong length does. Every other
     field takes effect from the entry's position on the tree as it
     stands, which a replica that mined through the change and one that
-    restores a checkpoint cut after it hold alike. The leader appends
-    one when its log holds none, or when its own effective
-    configuration differs from the latest in its log in any other
-    field, carrying the log's `prefix_depth` and `max_node_children`
+    restores a checkpoint cut after it hold alike. A checkpoint can
+    purge every configuration entry, so the configuration in force is
+    the latest in the log after the snapshot or, when it holds none,
+    the snapshot's; a replica that opens from or installs the snapshot
+    takes it from the record before applying any entry. The leader
+    appends one when neither holds one, or when its own effective
+    configuration differs from the one in force in any other
+    field, carrying the in-force `prefix_depth` and `max_node_children`
     whatever its own; during a rollout that changes the configuration,
     the leader's wins.
     **Algorithm 1** is the miner this amendment ships. A miner change

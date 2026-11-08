@@ -694,10 +694,22 @@ mod tests {
         let flusher = any::<[u8; 16]>().prop_map(|replica| {
             EntryPayload::Normal(GroupEntry::Control(Control::FlusherAssignment(replica)))
         });
+        let checkpoint = (any::<[u8; 16]>(), any::<(u64, u64)>(), any::<u8>()).prop_map(
+            |(proposer, (term, index), highest_kind)| {
+                let cut = ourios_wal::RaftLogId { term, index };
+                let control = Control::Checkpoint {
+                    proposer,
+                    cut,
+                    highest_kind,
+                };
+                EntryPayload::Normal(GroupEntry::Control(control))
+            },
+        );
         let payload = prop_oneof![
             Just(EntryPayload::Blank),
             normal,
             flusher,
+            checkpoint,
             membership().prop_map(EntryPayload::Membership),
         ];
         (log_id(), payload).prop_map(|(log_id, payload)| Entry { log_id, payload })

@@ -45,13 +45,15 @@ impl HeldControls {
         let after = snapshot
             .and_then(|s| s.meta.last_log_id)
             .map_or(0, |last| last.index + 1);
-        // Every kind is an assignment so far; the next one filters here.
         let newest = self
             .controls
             .range(after..)
-            .next_back()
-            .map(|(_, c)| match *c {
-                Control::FlusherAssignment(replica) => NodeId::from(Uuid::from_bytes(replica)),
+            .rev()
+            .find_map(|(_, c)| match *c {
+                Control::FlusherAssignment(replica) => {
+                    Some(NodeId::from(Uuid::from_bytes(replica)))
+                }
+                Control::Checkpoint { .. } => None,
             });
         LogControls {
             highest_kind,

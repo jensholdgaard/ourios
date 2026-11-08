@@ -10,7 +10,7 @@ use openraft::async_runtime::WatchReceiver as _;
 use ourios_wal::Control;
 
 use super::{Assignment, Gate, Hold, Learner, Pass, Reason, Steward, View, plan, verdict};
-use crate::replicated::raft::cluster::{Cluster, WAIT, name, write};
+use crate::replicated::raft::cluster::{Cluster, WAIT, name, propose, write};
 use crate::replicated::raft::learners::{self, Changes, Group, Tail, TailPool, reconcile};
 use crate::replicated::raft::log_store::GroupLogReader;
 use crate::replicated::raft::telemetry::Meters;
@@ -426,6 +426,8 @@ async fn a_membership_change_in_flight_holds_back_a_new_kind() {
 /// still sees the snapshot's flusher, so a steward new to the lead keeps
 /// it for the patience rather than treating the group as unassigned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: RFC 0065 §6.5 builds a snapshot only at a checkpoint's cut; see \
+            a_flusher_purged_below_a_checkpoint_is_kept_for_the_patience"]
 async fn a_flusher_purged_below_the_snapshot_is_kept_for_the_patience() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -446,6 +448,43 @@ async fn a_flusher_purged_below_the_snapshot_is_kept_for_the_patience() {
     raft.trigger().purge_log(index).await.expect("purge");
     raft.wait(WAIT)
         .metrics(|m| reached(m.purged.as_ref()), "purged")
+        .await
+        .expect("purged");
+    assert_eq!(log(&cluster, leader).controls().flusher, None);
+    assert_eq!(group(&cluster, leader).controls().flusher, Some(flusher));
+
+    let mut new_to_the_lead = Steward::with_patience(PATIENCE);
+    let kept = pass(&mut new_to_the_lead, &cluster, leader, &placed).await;
+    assert_eq!(kept.assigned, None, "reassigned within the patience");
+    cluster.shutdown().await;
+}
+
+/// A leader whose log purged the last assignment below a checkpoint's
+/// cut still sees the snapshot's flusher, so a steward new to the lead
+/// keeps it for the patience rather than treating the group as unassigned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flusher_purged_below_a_checkpoint_is_kept_for_the_patience() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (placed, _) = placement(&cluster, 3..5);
+    let placed = strs(&placed);
+    let mut steward = Steward::with_patience(PATIENCE);
+    let flusher = pass_until_assigned(&mut steward, &cluster, leader, &placed).await;
+
+    let raft = cluster.node(leader).raft(0);
+    let index = write(raft, 1).await;
+    let entries = cluster.node(leader).log(0).await;
+    let written = entries.iter().find(|e| e.log_id.index == index);
+    let term = written.expect("in the log").log_id.leader_id.term;
+    let checkpoint = Control::Checkpoint {
+        proposer: *flusher.uuid().as_bytes(),
+        cut: ourios_wal::RaftLogId { term, index },
+        highest_kind: 1,
+    };
+    propose(raft, GroupEntry::Control(checkpoint)).await;
+    let reached = |id: Option<&LogId>| id.is_some_and(|id| id.index >= index);
+    raft.wait(WAIT)
+        .metrics(|m| reached(m.purged.as_ref()), "purged at the cut")
         .await
         .expect("purged");
     assert_eq!(log(&cluster, leader).controls().flusher, None);

@@ -11,7 +11,7 @@
 //! before it applies any entry after it.
 //!
 //! A snapshot is only ever the group at a checkpoint's cut: applying a
-//! checkpoint entry publishes its cut on [`GroupSm::checkpoints`], the
+//! checkpoint entry publishes its cut on `GroupSm::checkpoints`, the
 //! host triggers the build, and the builder records the checkpoint's
 //! snapshot rather than the state at the last entry applied.
 

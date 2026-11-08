@@ -295,6 +295,18 @@ fn rfc0065_24_a_formation_interrupted_by_a_wiped_voter_still_forms_once() {
     );
 }
 
+/// Scenario RFC0065.24 — the unreadable-record arm (B4, B6).
+/// Given a `formed.json` with another `format` or `group`, or whose
+/// `node_id`s are not the group's voters, no voter initializes from it.
+#[test]
+#[ignore = "RFC0065.24 stub — implemented with group formation"]
+fn rfc0065_24_an_unreadable_formation_record_forms_nothing() {
+    todo!(
+        "RFC0065.24 — another format, another group or other node_ids: no voter \
+         initializes, and each reports why"
+    );
+}
+
 /// Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13).
 /// Given the other two voters lost for good with acked records above the
 /// checkpoint, some flushed, when `ourios wal force-leader` runs on the

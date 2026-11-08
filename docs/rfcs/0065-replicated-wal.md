@@ -816,7 +816,9 @@ the mass-failover time and vote-log batching as tuning signals.
 >   voter records it and then restarts on an empty volume before it
 >   initializes, the other two initialize with the recorded membership,
 >   elect a leader, and the restarted voter joins under its new identity
->   by the replacement above, never by initializing a second membership
+>   by the replacement above, never by initializing a second membership;
+>   and a `formed.json` with another `format` or `group`, or whose
+>   `node_id`s are not the group's voters, forms nothing
 
 > **Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13)**
 > - **Given** a group whose other two voters are lost for good, with
@@ -988,7 +990,22 @@ the mass-failover time and vote-log batching as tuning signals.
   its new UUID and joins through that committed replacement, so an
   empty log never forms a second membership beside one that may hold
   acknowledged batches. Until the object exists the group has no
-  leader.
+  leader. The object is UTF-8 JSON:
+
+  ```json
+  {"format": 1, "group": 3, "members": [
+    {"node_id": "ourios-receiver-0", "replica": "0190d2a8-7c1e-7b3a-9f00-5e1c2d3a4b5c"},
+    {"node_id": "ourios-receiver-2", "replica": "0190d2a8-91f4-7c02-8a11-0c9d8e7f6a5b"}]}
+  ```
+
+  `format` is `1`; `group` is the group number; `members` holds one
+  entry per voter of the group, sorted by `node_id` bytewise, each
+  `replica` the lowercase hyphenated UUID that voter answered with. A
+  voter initializes from the object only if `format` is `1`, `group` is
+  the group it read it for, and the `node_id`s are exactly the group's
+  voters under the recorded layout; any other object, or one that does
+  not parse, it treats as unreadable: it does not initialize, and
+  reports why, so a group never forms from a record it cannot trust.
 - **Each replica keeps one RFC 0008 WAL per group** under
   `wal_root/groups/<group>/`, with RFC 0008's segments, fsync policy
   and CRCs unchanged, and its RFC 0052 reclaim sidecar sized for the

@@ -903,7 +903,8 @@ the mass-failover time and vote-log batching as tuning signals.
 
 > **Scenario RFC0065.31 — a checkpoint snapshot holds the group at its cut (B11)**
 > - **Given** a group whose log holds a miner configuration, id blocks,
->   a flusher change and a learner added after the cut of a checkpoint
+>   a change of `prefix_depth` after templates were mined, a flusher
+>   change and a learner added after the cut of a checkpoint
 >   entry, and checkpoint entries proposed by a replica that is not the
 >   flusher at their position, or with a cut not above the last applied
 >   one
@@ -913,10 +914,12 @@ the mass-failover time and vote-log batching as tuning signals.
 >   applied; its snapshot's last log id is the cut and it holds the
 >   membership, flusher and highest kind as of the cut; the installing
 >   replica ends with the same flusher, membership, blocks and
->   configuration as one that applied the whole log; a block below the
->   previous one is ignored; and a miner configuration body that
->   `MinerConfig` refuses stops the replica as RFC0065.29's unreadable
->   entry does
+>   configuration as one that applied the whole log, and mines the
+>   lines after the configuration change into the same templates as a
+>   replica that mined through it; a block below the previous one is
+>   ignored; a miner configuration body that `MinerConfig` refuses
+>   stops the replica as RFC0065.29's unreadable entry does; and an
+>   otherwise valid version-1 snapshot record fails the group's open
 
 ## 6. Proposed design
 
@@ -1361,8 +1364,17 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     refuses the log, as a wrong length does. It takes effect for every
     tenant of the group from its own position, and the entries before
     a group's first configuration entry are mined under that first
-    entry, so a replica mines nothing until one has committed. The
-    leader appends one when its log holds none, or when its own
+    entry, so a replica mines nothing until one has committed. An
+    entry that changes the configuration in force rebuilds every
+    tenant's miner in the group at its position, as a checkpoint restore
+    does: each tenant's state is snapshotted and restored under the new
+    configuration (`MinerCluster::restore_tenant`), which re-inserts
+    every template under the new `prefix_depth` and `max_node_children`.
+    So a replica that mined through the change and one that restores a
+    checkpoint cut after it hold the same tree; without the rebuild a
+    structural change would leave live templates at the old depth while
+    a restore placed them at the new one, and the two would choose
+    different templates for the same next line. The leader appends one when its log holds none, or when its own
     effective configuration differs from the latest in its log; during
     a rollout that changes the configuration, the leader's wins.
     **Algorithm 1** is the miner this amendment ships. A miner change

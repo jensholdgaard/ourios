@@ -9,7 +9,7 @@ use openraft::Instant as _;
 use openraft::async_runtime::WatchReceiver as _;
 use ourios_wal::Control;
 
-use super::{Assignment, Learner, Pass, Reason, Steward, View, plan};
+use super::{Assignment, Gate, Hold, Learner, Pass, Reason, Steward, View, plan, verdict};
 use crate::replicated::raft::cluster::{Cluster, WAIT, name, write};
 use crate::replicated::raft::learners::{self, Changes, Group, Tail, TailPool, reconcile};
 use crate::replicated::raft::log_store::GroupLogReader;
@@ -571,4 +571,24 @@ fn rfc0065_30_a_flusher_leaving_the_placement_is_handed_off() {
         "RFC0065.30 — reassigned at once to a replica mined through the \
          commit point; the learner goes only once that assignment commits"
     );
+}
+
+/// A lost term or a changed membership outranks an unconfirmed member: an
+/// `Identify` that failed while either happened may have failed because of
+/// it, so the round is not a `member_unconfirmed` hold.
+#[test]
+fn a_lost_term_or_a_changed_membership_outranks_an_unconfirmed_member() {
+    for confirmed in [false, true] {
+        assert_eq!(verdict(false, true, confirmed), Gate::Deposed);
+        assert_eq!(verdict(false, false, confirmed), Gate::Deposed);
+        assert_eq!(
+            verdict(true, false, confirmed),
+            Gate::Held(Hold::MembershipChange)
+        );
+    }
+    assert_eq!(
+        verdict(true, true, false),
+        Gate::Held(Hold::MemberUnconfirmed)
+    );
+    assert_eq!(verdict(true, true, true), Gate::Reads);
 }

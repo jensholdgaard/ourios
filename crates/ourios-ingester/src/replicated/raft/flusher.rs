@@ -338,6 +338,31 @@ async fn gate(
     if !membership_settled(metrics) {
         return Gate::Held(Hold::MembershipChange);
     }
+    let confirmed = every_member_confirms(metrics, tail, kind).await;
+    let now = raft.metrics().borrow_watched().clone();
+    let unchanged = membership_settled(&now)
+        && now.membership_config.log_id() == metrics.membership_config.log_id();
+    verdict(
+        now.current_term == metrics.current_term,
+        unchanged,
+        confirmed,
+    )
+}
+
+/// What a gate round found. A lost term or a changed membership outranks
+/// an unconfirmed member, which may only have failed because of it.
+fn verdict(same_term: bool, membership_unchanged: bool, confirmed: bool) -> Gate {
+    match (same_term, membership_unchanged, confirmed) {
+        (false, _, _) => Gate::Deposed,
+        (true, false, _) => Gate::Held(Hold::MembershipChange),
+        (true, true, false) => Gate::Held(Hold::MemberUnconfirmed),
+        (true, true, true) => Gate::Reads,
+    }
+}
+
+/// Whether every member of `metrics`' latest membership but this node
+/// answered `Identify` under the UUID it is a member as, reading `kind`.
+async fn every_member_confirms(metrics: &RaftMetrics<RaftTypes>, tail: Tail<'_>, kind: u8) -> bool {
     let membership = metrics.membership_config.membership();
     let members: BTreeSet<_> = membership
         .voter_ids()
@@ -346,7 +371,7 @@ async fn gate(
         .collect();
     for replica in members {
         let Some(node_id) = membership.get_node(&replica) else {
-            return Gate::Held(Hold::MemberUnconfirmed);
+            return false;
         };
         let reads = tail
             .peers
@@ -354,17 +379,10 @@ async fn gate(
             .await
             .is_ok_and(|answer| answer.replica == replica && answer.highest_control_kind >= kind);
         if !reads {
-            return Gate::Held(Hold::MemberUnconfirmed);
+            return false;
         }
     }
-    let now = raft.metrics().borrow_watched().clone();
-    let unchanged = membership_settled(&now)
-        && now.membership_config.log_id() == metrics.membership_config.log_id();
-    match (now.current_term == metrics.current_term, unchanged) {
-        (false, _) => Gate::Deposed,
-        (true, false) => Gate::Held(Hold::MembershipChange),
-        (true, true) => Gate::Reads,
-    }
+    true
 }
 
 /// Whether the latest membership has committed.

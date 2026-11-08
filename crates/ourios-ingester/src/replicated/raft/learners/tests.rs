@@ -365,13 +365,18 @@ async fn an_add_and_a_remove_in_one_pass_both_commit() {
         .await
         .expect("both edits commit");
     assert_eq!(learners_of(&cluster, leader), BTreeSet::from([new]));
-    let committed = raft
-        .metrics()
-        .borrow_watched()
-        .committed_membership_config
-        .membership()
-        .non_write_voter_ids()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(committed, BTreeSet::from([new]), "the old UUID is gone");
+    // The metrics watch can trail the commit `apply` has already seen.
+    raft.wait(WAIT)
+        .metrics(
+            |m| {
+                m.committed_membership_config
+                    .membership()
+                    .non_write_voter_ids()
+                    .eq([new])
+            },
+            "the old UUID is gone",
+        )
+        .await
+        .expect("the old UUID is gone");
     cluster.shutdown().await;
 }

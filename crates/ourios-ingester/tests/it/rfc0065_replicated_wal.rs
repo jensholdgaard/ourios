@@ -453,3 +453,21 @@ async fn rfc0065_29_an_unreadable_control_entry_stops_the_open() {
         assert!(error.to_string().contains(why), "{error}");
     }
 }
+
+/// Scenario RFC0065.31 — a checkpoint snapshot holds the group at its cut
+/// (B11). Only the flusher's checkpoint with a cut above the last applies;
+/// its snapshot is at the cut and holds the membership, flusher and highest
+/// kind as of it, and a replica installing it catches up to the state of one
+/// that applied the whole log.
+#[test]
+#[ignore = "RFC0065.31 stub — implemented with the checkpoint, id-block and miner-configuration entries"]
+fn rfc0065_31_a_checkpoint_snapshot_holds_the_group_at_its_cut() {
+    todo!(
+        "RFC0065.31 — non-flusher and non-advancing checkpoints ignored; \
+         snapshot at the cut with that cut's membership, flusher and kind; \
+         installer matches a full replay, across a threshold change on a populated \
+         miner; a block below the previous ignored; a refused miner configuration, \
+         or one changing prefix_depth or max_node_children, stops the replica; a \
+         version-1 snapshot record fails the open"
+    );
+}

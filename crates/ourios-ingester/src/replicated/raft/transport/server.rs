@@ -13,7 +13,7 @@ use futures_util::{Stream, StreamExt as _};
 use openraft::Raft;
 use openraft::errors::Fatal;
 use openraft::raft::{AppendEntriesRequest, StreamAppendResult};
-use openraft::storage::{RaftStateMachine, Snapshot};
+use openraft::storage::RaftStateMachine;
 use ourios_serving::tls_serve::{ReloadingAcceptor, tls_incoming};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{oneshot, watch};
@@ -25,6 +25,7 @@ use tonic::{Code, Request, Response, Status, Streaming};
 use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
 
+use super::super::snapshot_record::GroupState;
 use super::super::types::RaftTypes;
 use super::forward::{self, ForwardTarget};
 use super::identify::{self, Identity};
@@ -102,7 +103,7 @@ fn stopped(e: &impl std::fmt::Display) -> Status {
 
 impl<SM> ReplicationServer<SM>
 where
-    SM: RaftStateMachine<RaftTypes, SnapshotData = ()>,
+    SM: RaftStateMachine<RaftTypes, SnapshotData = GroupState>,
 {
     /// Route `group`'s requests to `raft`, replacing any earlier handle.
     pub fn insert(&self, group: u32, raft: Raft<RaftTypes, SM>) {
@@ -281,8 +282,7 @@ where
         mut request: SnapshotRequest,
     ) -> Result<WireSnapshotResponse, Status> {
         let raft = self.route(request.header.take())?;
-        let (vote, meta) = request.into_raft()?;
-        let snapshot = Snapshot { meta, snapshot: () };
+        let (vote, snapshot) = request.into_raft()?;
         let response = raft
             .install_full_snapshot(vote, snapshot)
             .await
@@ -541,7 +541,7 @@ where
 
 impl<SM> StreamingService<AppendRequest> for AppendStreams<SM>
 where
-    SM: RaftStateMachine<RaftTypes, SnapshotData = ()>,
+    SM: RaftStateMachine<RaftTypes, SnapshotData = GroupState>,
 {
     type Response = StreamAppendResponse;
     type ResponseStream = AnswerStream;
@@ -561,7 +561,7 @@ fn streaming<SM, B>(
     request: http::Request<B>,
 ) -> BoxFuture<http::Response<Body>, Infallible>
 where
-    SM: RaftStateMachine<RaftTypes, SnapshotData = ()>,
+    SM: RaftStateMachine<RaftTypes, SnapshotData = GroupState>,
     B: HttpBody + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
 {
@@ -579,7 +579,7 @@ fn unimplemented() -> BoxFuture<http::Response<Body>, Infallible> {
 
 impl<SM, B> tonic::codegen::Service<http::Request<B>> for ReplicationServer<SM>
 where
-    SM: RaftStateMachine<RaftTypes, SnapshotData = ()>,
+    SM: RaftStateMachine<RaftTypes, SnapshotData = GroupState>,
     B: HttpBody + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
 {

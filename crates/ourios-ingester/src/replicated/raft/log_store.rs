@@ -28,12 +28,12 @@ use ourios_wal::{
     Control, FrameKind, FrameSink, RecoveryError, ReplicatedRecord, Wal, WalConfig, WalOffset,
 };
 use tokio::sync::oneshot;
-use uuid::Uuid;
 
 use super::codec::{self, Replayed};
+pub use super::controls::{HeldControls, LogControls};
 use super::gate::SyncGate;
 use super::telemetry::Takeovers;
-use super::types::{Entry, GroupEntry, LogId, NodeId, RaftTypes, Vote};
+use super::types::{Entry, GroupEntry, LogId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
 use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership, writer_gone};
 
@@ -149,26 +149,8 @@ impl Index {
         Ok(())
     }
 
-    fn log_controls(&self) -> LogControls {
-        let highest_kind = self
-            .controls
-            .values()
-            .map(|c| c.kind())
-            .fold(self.purged_kind, u8::max);
-        let introduced = self
-            .controls
-            .iter()
-            .find(|(_, c)| c.kind() == highest_kind && highest_kind > self.purged_kind)
-            .map(|(&index, _)| index);
-        // Every kind is an assignment so far; the next one filters here.
-        let flusher = self.controls.values().next_back().map(|c| match *c {
-            Control::FlusherAssignment(replica) => NodeId::from(Uuid::from_bytes(replica)),
-        });
-        LogControls {
-            highest_kind,
-            introduced,
-            flusher,
-        }
+    fn held_controls(&self) -> HeldControls {
+        HeldControls::new(self.controls.clone(), self.purged_kind)
     }
 
     fn last_log_id(&self) -> Option<LogId> {
@@ -178,18 +160,6 @@ impl Index {
             .map(|e| e.log_id)
             .or(self.last_purged)
     }
-}
-
-/// What the control entries of a log, committed or not, say (§6.5).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LogControls {
-    /// The highest control kind the log holds, `0` with none.
-    pub highest_kind: u8,
-    /// The index of the first entry of `highest_kind`, the newest entry of
-    /// a new kind, unless it was purged (and so committed).
-    pub introduced: Option<u64>,
-    /// The replica the newest flusher assignment names.
-    pub flusher: Option<NodeId>,
 }
 
 /// Fsync `groups/` and `wal_root`, the directories holding the group
@@ -506,9 +476,16 @@ impl GroupLogReader {
         self.group
     }
 
+    /// The controls the log holds, without a snapshot's.
     #[must_use]
     pub fn controls(&self) -> LogControls {
-        lock_index(&self.index).log_controls()
+        self.held_controls().over(None)
+    }
+
+    /// The control entries the log holds now.
+    #[must_use]
+    pub fn held_controls(&self) -> HeldControls {
+        lock_index(&self.index).held_controls()
     }
 }
 

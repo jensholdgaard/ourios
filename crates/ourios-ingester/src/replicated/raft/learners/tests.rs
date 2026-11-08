@@ -147,6 +147,7 @@ fn group(cluster: &Cluster, i: usize) -> Group<'_> {
     Group {
         raft: cluster.node(i).raft(0),
         log: cluster.node(i).host.log(0).expect("hosted"),
+        sm: cluster.node(i).host.state_machine(0).expect("hosted"),
     }
 }
 

@@ -8,6 +8,7 @@ use openraft::raft::VoteRequest;
 use tonic::Code;
 
 use super::super::super::cluster::{Node, name};
+use super::super::super::snapshot_record::GroupState;
 use super::super::super::types::{Membership, NodeId, RaftTypes, Vote};
 use super::super::wire::{AppendRequest, SnapshotRequest, WireSnapshotResponse, WireVote};
 use super::super::{INSTALL_SNAPSHOT, Peers, ReplicationServer, VERSION};
@@ -17,40 +18,82 @@ use super::{
 
 fn snapshot_of(
     last: openraft::type_config::alias::LogIdOf<RaftTypes>,
-) -> openraft::type_config::alias::SnapshotOf<RaftTypes, ()> {
+) -> openraft::type_config::alias::SnapshotOf<RaftTypes, GroupState> {
     let voters = std::collections::BTreeSet::from([NodeId::from(1), NodeId::from(2)]);
     let nodes = BTreeMap::from([
         (NodeId::from(1), name(NodeId::from(1))),
         (NodeId::from(2), name(NodeId::from(2))),
     ]);
     let membership = Membership::new(vec![voters], nodes).expect("membership");
-    openraft::type_config::alias::SnapshotOf::<RaftTypes, ()> {
+    openraft::type_config::alias::SnapshotOf::<RaftTypes, GroupState> {
         meta: openraft::type_config::alias::SnapshotMetaOf::<RaftTypes> {
             last_log_id: Some(last),
             last_membership: openraft::StoredMembership::new(Some(last), membership),
         },
-        snapshot: (),
+        snapshot: GroupState::default(),
     }
 }
 
-#[tokio::test]
-async fn a_full_snapshot_installs_over_grpc() {
+/// A fresh node that installed `snapshot`, ending at index 5, over gRPC
+/// from a leader at term 2, and answered with that leader's vote.
+async fn installed(
+    peers: &Peers,
+    snapshot: openraft::type_config::alias::SnapshotOf<RaftTypes, GroupState>,
+) -> Node {
     let (incoming, addr) = bind();
-    let peers = Peers::plaintext();
-    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
-    let mut client = client_to(&peers, node.id, addr).await;
+    let node = start(1, incoming, peers, ReplicationServer::default()).await;
+    let mut client = client_to(peers, node.id, addr).await;
     let vote = Vote::new_committed(2, NodeId::from(2));
-    let snapshot = snapshot_of(log(2, 5));
-    let meta = snapshot.meta.clone();
     let never = std::future::pending::<openraft::errors::ReplicationClosed>();
     let response = client.full_snapshot(vote, snapshot, never, option()).await;
     assert_eq!(response.expect("installed").vote, vote);
     node.applied_through(GROUP, 5).await;
-    let installed = {
-        let sm = node.host.state_machine(GROUP).expect("hosted");
-        (sm.applied(), sm.membership())
-    };
-    assert_eq!(installed, (meta.last_log_id, meta.last_membership));
+    node
+}
+
+/// `node` killed and opened again from its replica directory.
+async fn restarted(mut node: Node, peers: &Peers) -> Node {
+    node.kill().await;
+    Node::open(
+        node.into_replica(),
+        bind().0,
+        peers,
+        ReplicationServer::default(),
+    )
+    .await
+}
+
+/// `node`'s group is applied through `meta`'s last log id, with its
+/// membership.
+fn assert_holds(node: &Node, meta: &openraft::type_config::alias::SnapshotMetaOf<RaftTypes>) {
+    let sm = node.host.state_machine(GROUP).expect("hosted");
+    let held = (sm.applied(), sm.membership());
+    assert_eq!(held, (meta.last_log_id, meta.last_membership.clone()));
+}
+
+#[tokio::test]
+async fn a_full_snapshot_installs_over_grpc() {
+    let snapshot = snapshot_of(log(2, 5));
+    let mut node = installed(&Peers::plaintext(), snapshot.clone()).await;
+    assert_holds(&node, &snapshot.meta);
+    node.kill().await;
+}
+
+/// The record an install carries holds the flusher, so the installing
+/// node knows it, and keeps it across a restart.
+#[tokio::test]
+async fn an_installed_snapshot_carries_its_flusher_over_grpc() {
+    let peers = Peers::plaintext();
+    let mut snapshot = snapshot_of(log(2, 5));
+    snapshot.snapshot.flusher = Some(NodeId::from(2));
+    snapshot.snapshot.highest_kind = 1;
+    let node = installed(&peers, snapshot).await;
+    let flusher = node.host.state_machine(GROUP).expect("hosted").flusher();
+    assert_eq!(flusher, Some(NodeId::from(2)));
+
+    let mut node = restarted(node, &peers).await;
+    let restored = node.host.state_machine(GROUP).expect("hosted").flusher();
+    assert_eq!(restored, Some(NodeId::from(2)));
     node.kill().await;
 }
 
@@ -96,11 +139,19 @@ async fn requests_no_leader_sends_are_refused_and_the_group_keeps_serving() {
         (vote, membership_ahead),
         (Vote::new(1, NodeId::from(2)), snapshot_of(log(1, 5)).meta),
     ] {
-        let snapshot = SnapshotRequest::new(to, &vote, &meta).expect("encode");
+        let mut record = snapshot_of(log(1, 5));
+        record.meta = meta.clone();
+        let snapshot = SnapshotRequest::new(to, &vote, record).expect("encode");
         let refused = raw::<_, WireSnapshotResponse>(addr, INSTALL_SNAPSHOT, snapshot).await;
         let code = refused.map(drop).map_err(|s| s.code());
         assert_eq!(code, Err(Code::InvalidArgument), "{vote} {meta:?}");
     }
+
+    let mut corrupt = SnapshotRequest::new(to, &vote, snapshot_of(log(1, 5))).expect("encode");
+    corrupt.record[1] ^= 1;
+    let refused = raw::<_, WireSnapshotResponse>(addr, INSTALL_SNAPSHOT, corrupt).await;
+    let code = refused.map(drop).map_err(|s| s.code());
+    assert_eq!(code, Err(Code::InvalidArgument), "a record failing its CRC");
 
     let uncommitted = AppendRequest {
         header: Some(header(VERSION)),
@@ -137,26 +188,11 @@ async fn requests_no_leader_sends_are_refused_and_the_group_keeps_serving() {
 /// membership, though `openraft` purged the log up to it.
 #[tokio::test]
 async fn an_installed_snapshot_survives_a_restart() {
-    let (incoming, addr) = bind();
     let peers = Peers::plaintext();
-    let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
-    let mut client = client_to(&peers, node.id, addr).await;
-    let vote = Vote::new_committed(2, NodeId::from(2));
     let snapshot = snapshot_of(log(2, 5));
-    let meta = snapshot.meta.clone();
-    let never = std::future::pending::<openraft::errors::ReplicationClosed>();
-    let response = client.full_snapshot(vote, snapshot, never, option()).await;
-    response.expect("installed");
-    node.applied_through(GROUP, 5).await;
-    node.kill().await;
-
-    let replica = node.into_replica();
-    let mut node = Node::open(replica, bind().0, &peers, ReplicationServer::default()).await;
-    let restored = {
-        let sm = node.host.state_machine(GROUP).expect("hosted");
-        (sm.applied(), sm.membership())
-    };
-    assert_eq!(restored, (meta.last_log_id, meta.last_membership));
+    let node = installed(&peers, snapshot.clone()).await;
+    let mut node = restarted(node, &peers).await;
+    assert_holds(&node, &snapshot.meta);
     node.kill().await;
 }
 

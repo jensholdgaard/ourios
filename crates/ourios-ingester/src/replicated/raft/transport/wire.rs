@@ -14,11 +14,12 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, StreamAppendError,
     StreamAppendResult, VoteRequest, VoteResponse,
 };
-use openraft::type_config::alias::{SnapshotMetaOf, StoredMembershipOf};
+use openraft::type_config::alias::{SnapshotMetaOf, SnapshotOf};
 use prost::Message as _;
 use uuid::Uuid;
 
 use super::super::codec::{self, Replayed};
+use super::super::snapshot_record::{self, GroupSnapshot, GroupState};
 use super::super::types::{Entry, LogId, NodeId, RaftTypes, Vote};
 
 /// A request or response the wire cannot carry, or one that arrived
@@ -139,31 +140,6 @@ fn leader_vote_of(vote: Option<WireVote>) -> Result<Vote, Malformed> {
         Err(Malformed(format!(
             "{vote} is not a leader's committed vote"
         )))
-    }
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct WireMembership {
-    #[prost(message, optional, tag = "1")]
-    pub log_id: Option<WireLogId>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub config: Vec<u8>,
-}
-
-impl WireMembership {
-    fn new(stored: &StoredMembershipOf<RaftTypes>) -> Result<Self, Malformed> {
-        Ok(Self {
-            log_id: wire_id(stored.log_id().as_ref()),
-            config: codec::encode_membership(stored.membership())?,
-        })
-    }
-
-    fn into_raft(self) -> Result<StoredMembershipOf<RaftTypes>, Malformed> {
-        let membership = codec::decode_membership(&self.config)?;
-        Ok(StoredMembershipOf::<RaftTypes>::new(
-            raft_id(self.log_id),
-            membership,
-        ))
     }
 }
 
@@ -567,17 +543,17 @@ impl Reply for WireVoteResponse {
     }
 }
 
-/// A metadata-only snapshot (§4.3): the checkpoint carries no data.
+/// A snapshot (§6.1): the group's snapshot record, whose bytes carry the
+/// metadata and the group state at it.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct SnapshotRequest {
     #[prost(message, optional, tag = "1")]
     pub header: Option<Header>,
     #[prost(message, optional, tag = "2")]
     pub vote: Option<WireVote>,
-    #[prost(message, optional, tag = "3")]
-    pub last_log_id: Option<WireLogId>,
-    #[prost(message, optional, tag = "4")]
-    pub membership: Option<WireMembership>,
+    /// Tags 3 and 4 held the metadata alone, before the record carried it.
+    #[prost(bytes = "vec", tag = "5")]
+    pub record: Vec<u8>,
 }
 
 impl SnapshotRequest {
@@ -587,28 +563,24 @@ impl SnapshotRequest {
     pub fn new(
         to: Recipient,
         vote: &Vote,
-        meta: &SnapshotMetaOf<RaftTypes>,
+        snapshot: SnapshotOf<RaftTypes, GroupState>,
     ) -> Result<Self, Malformed> {
         Ok(Self {
             header: Some(Header::to(to)),
             vote: Some(WireVote::from(vote)),
-            last_log_id: wire_id(meta.last_log_id.as_ref()),
-            membership: Some(WireMembership::new(&meta.last_membership)?),
+            record: snapshot_record::encode(&GroupSnapshot::from(snapshot))?,
         })
     }
 
     /// # Errors
     ///
     /// [`Malformed`] when a field is missing or does not decode.
-    pub fn into_raft(self) -> Result<(Vote, SnapshotMetaOf<RaftTypes>), Malformed> {
-        let meta = SnapshotMetaOf::<RaftTypes> {
-            last_log_id: raft_id(self.last_log_id),
-            last_membership: required(self.membership, "membership")?.into_raft()?,
-        };
+    pub fn into_raft(self) -> Result<(Vote, SnapshotOf<RaftTypes, GroupState>), Malformed> {
+        let snapshot = snapshot_record::decode(&self.record)?;
         let vote = leader_vote_of(self.vote)?;
-        within_vote(meta.last_log_id.as_ref(), &vote)?;
-        membership_within(&meta)?;
-        Ok((vote, meta))
+        within_vote(snapshot.meta.last_log_id.as_ref(), &vote)?;
+        membership_within(&snapshot.meta)?;
+        Ok((vote, snapshot.into()))
     }
 }
 
@@ -658,12 +630,20 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use openraft::EntryPayload;
+    use openraft::type_config::alias::StoredMembershipOf;
     use ourios_wal::{Control, TenantBatch};
     use proptest::prelude::*;
     use prost::Message;
 
     use super::*;
     use crate::replicated::raft::types::{GroupEntry, Membership, TenantBatchBytes};
+
+    fn bare(meta: SnapshotMetaOf<RaftTypes>) -> SnapshotOf<RaftTypes, GroupState> {
+        SnapshotOf::<RaftTypes, GroupState> {
+            meta,
+            snapshot: GroupState::default(),
+        }
+    }
 
     fn through_wire<M: Message + Default>(message: &M) -> M {
         M::decode(message.encode_to_vec().as_slice()).expect("decode")
@@ -864,6 +844,8 @@ mod tests {
             vote in leader_vote(),
             last_log_id in proptest::option::of(log_id()),
             last_membership in stored_membership(),
+            flusher in proptest::option::of(any::<u64>()),
+            highest_kind in 0..=Control::HIGHEST_KIND,
         ) {
             let last_log_id = last_log_id
                 .map(|id| log(id.leader_id.term.min(vote.leader_id.term), id.index));
@@ -875,9 +857,12 @@ mod tests {
                 last_membership.membership().clone(),
             );
             let meta = SnapshotMetaOf::<RaftTypes> { last_log_id, last_membership };
-            let wire = through_wire(&SnapshotRequest::new(to, &vote, &meta).expect("encode"));
+            let state = GroupState { flusher: flusher.map(node), highest_kind, id_block: None };
+            let snapshot = SnapshotOf::<RaftTypes, GroupState> { meta: meta.clone(), snapshot: state };
+            let wire = through_wire(&SnapshotRequest::new(to, &vote, snapshot).expect("encode"));
             prop_assert_eq!(wire.header.clone(), Some(Header::to(to)));
-            prop_assert_eq!(wire.into_raft().expect("decode"), (vote, meta));
+            let (back_vote, back) = wire.into_raft().expect("decode");
+            prop_assert_eq!((back_vote, back.meta, back.snapshot), (vote, meta, state));
         }
 
         #[test]
@@ -1031,7 +1016,7 @@ mod tests {
             last_log_id: Some(log(term, 9)),
             last_membership: StoredMembershipOf::<RaftTypes>::default(),
         };
-        let request = |term| SnapshotRequest::new(to(), &vote, &meta(term)).expect("encode");
+        let request = |term| SnapshotRequest::new(to(), &vote, bare(meta(term))).expect("encode");
         assert!(request(4).into_raft().is_err());
         assert!(request(3).into_raft().is_ok());
     }
@@ -1048,7 +1033,7 @@ mod tests {
         let (request, _) = AppendRequest::bounded(to(), &append).expect("encode");
         assert!(request.into_raft().is_err());
         let meta = SnapshotMetaOf::<RaftTypes>::default();
-        let snapshot = SnapshotRequest::new(to(), &candidate, &meta).expect("encode");
+        let snapshot = SnapshotRequest::new(to(), &candidate, bare(meta)).expect("encode");
         assert!(snapshot.into_raft().is_err());
     }
 
@@ -1065,7 +1050,7 @@ mod tests {
                 last_log_id: last,
                 last_membership: StoredMembershipOf::<RaftTypes>::new(at, membership.clone()),
             };
-            let request = SnapshotRequest::new(to(), &vote, &meta).expect("encode");
+            let request = SnapshotRequest::new(to(), &vote, bare(meta)).expect("encode");
             request.into_raft().is_ok()
         };
         let cases = [

@@ -14,6 +14,7 @@ pub mod formation;
 pub mod host;
 pub mod learners;
 pub mod log_store;
+mod miner_config;
 mod snapshot_record;
 pub mod state_machine;
 mod telemetry;

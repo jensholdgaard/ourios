@@ -9,16 +9,19 @@
 //!
 //! A node id is the replica's UUID in its 16 big-endian bytes. The
 //! membership is rebuilt with `Membership::new`, so a voter without a
-//! node is refused as `openraft` refuses it.
+//! node is refused as `openraft` refuses it, and a miner configuration
+//! entry whose body `MinerConfig` refuses is refused as a wrong length is,
+//! read or written (RFC 0065 §6.5).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use openraft::EntryPayload;
 use openraft::vote::leader_id_std::CommittedLeaderId;
-use ourios_wal::{EntryBody, RaftLogId, ReplicatedRecord};
+use ourios_wal::{Control, EntryBody, RaftLogId, ReplicatedRecord};
 use uuid::Uuid;
 
+use super::miner_config::GroupMinerConfig;
 use super::types::{Entry, GroupEntry, LogId, Membership, NodeId, TenantBatchBytes};
 
 /// A record as replay applies it.
@@ -41,6 +44,18 @@ pub(super) fn wal_id(id: &LogId) -> RaftLogId {
     }
 }
 
+/// `control`, unless it is a miner configuration `MinerConfig` refuses.
+fn checked(control: Control) -> io::Result<Control> {
+    match control {
+        Control::MinerConfig(body) => GroupMinerConfig::new(body)
+            .map(|_| control)
+            .map_err(|e| invalid(format!("miner configuration: {e}"))),
+        Control::FlusherAssignment(_) | Control::Checkpoint { .. } | Control::IdBlock { .. } => {
+            Ok(control)
+        }
+    }
+}
+
 pub(super) fn raft_id(id: RaftLogId) -> LogId {
     LogId {
         leader_id: CommittedLeaderId::new(id.term),
@@ -54,7 +69,9 @@ pub(super) fn encode_entry(entry: &Entry) -> io::Result<Vec<u8>> {
     let body = match &entry.payload {
         EntryPayload::Blank => EntryBody::Blank,
         EntryPayload::Normal(GroupEntry::Batch(batch)) => EntryBody::Normal(batch.as_bytes()),
-        EntryPayload::Normal(GroupEntry::Control(control)) => EntryBody::Control(*control),
+        EntryPayload::Normal(GroupEntry::Control(control)) => {
+            EntryBody::Control(checked(*control)?)
+        }
         EntryPayload::Membership(m) => {
             membership = encode_membership(m)?;
             EntryBody::Membership(&membership)
@@ -81,7 +98,9 @@ pub(super) fn decode(payload: &[u8]) -> io::Result<Replayed> {
                     EntryPayload::Normal(GroupEntry::Batch(batch))
                 }
                 EntryBody::Membership(bytes) => EntryPayload::Membership(decode_membership(bytes)?),
-                EntryBody::Control(control) => EntryPayload::Normal(GroupEntry::Control(control)),
+                EntryBody::Control(control) => {
+                    EntryPayload::Normal(GroupEntry::Control(checked(control)?))
+                }
             };
             let log_id = raft_id(log_id);
             Ok(Replayed::Entry(Entry { log_id, payload }))
@@ -252,6 +271,45 @@ mod tests {
             found: Control::HIGHEST_KIND + 1,
         };
         assert_eq!(e.to_string(), unknown.to_string());
+    }
+
+    fn miner_config(similarity_threshold: f32) -> ourios_wal::MinerConfigV1 {
+        ourios_wal::MinerConfigV1 {
+            similarity_threshold,
+            similarity_floor: 0.4,
+            param_byte_limit: 256,
+            prefix_depth: 2,
+            max_node_children: 100,
+            max_templates: 20_000,
+            max_line_tokens: 512,
+            upstream_templates: ourios_wal::UpstreamTemplates::Observe,
+            upstream_template_byte_limit: 8192,
+            upstream_association_limit: 4,
+        }
+    }
+
+    /// A configuration `MinerConfig` accepts round-trips; one it refuses is
+    /// neither written nor read, though the WAL codec alone takes it.
+    #[test]
+    fn a_miner_configuration_minerconfig_refuses_is_refused() {
+        let entry = |config| Entry {
+            log_id: log_id(3, 7),
+            payload: EntryPayload::Normal(GroupEntry::Control(Control::MinerConfig(config))),
+        };
+        round_trip(&entry(miner_config(0.7)));
+
+        let refused = Control::MinerConfig(miner_config(0.0));
+        let e = encode_entry(&entry(miner_config(0.0))).expect_err("not written");
+        assert!(e.to_string().contains("similarity_threshold"), "{e}");
+        let bytes = ReplicatedRecord::Entry {
+            log_id: RaftLogId { term: 3, index: 7 },
+            body: EntryBody::Control(refused),
+        }
+        .encode()
+        .expect("the WAL codec checks only the length and mode");
+        let e = decode(&bytes).expect_err("not read");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("similarity_threshold"), "{e}");
     }
 
     #[test]

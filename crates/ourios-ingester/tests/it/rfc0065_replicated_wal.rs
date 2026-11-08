@@ -9,10 +9,11 @@
 //! red; each names the slice that discharges it.
 //!
 //! RFC0065.2, RFC0065.5, RFC0065.6, RFC0065.7, RFC0065.3's takeover arm,
-//! RFC0065.4's paused-writer arm, RFC0065.15's write arm, RFC0065.29's
-//! kind-gate arm and RFC0065.30 run on the crate-internal cluster harness,
-//! so they are unit tests: `replicated::write::tests`,
-//! `replicated::raft::cluster::tests` and `replicated::raft::flusher::tests`.
+//! RFC0065.4's paused-writer arm, RFC0065.15's write arm, RFC0065.24's
+//! formation and unreadable-record arms, RFC0065.29's kind-gate arm and
+//! RFC0065.30 run on the crate-internal cluster harness, so they are unit
+//! tests: `replicated::write::tests`, `replicated::raft::cluster::tests`,
+//! `replicated::raft::formation::tests` and `replicated::raft::flusher::tests`.
 
 /// Scenario RFC0065.4 — a replaced writer cannot acknowledge (B5), the
 /// clock arm: the resumed former writer, with its clock set arbitrarily,
@@ -280,31 +281,16 @@ fn rfc0065_24_a_wiped_voter_without_a_quorum_fails_closed() {
     );
 }
 
-/// Scenario RFC0065.24 — the interrupted-formation arm (B4, B6).
-/// Given a fresh cluster whose first-ranked voter records `formed.json`
-/// and restarts on an empty volume before it initializes, the other two
-/// initialize with the recorded membership and the restarted voter joins
-/// by replacement.
+/// Scenario RFC0065.24 — the interrupted-formation arm (B4, B6), the
+/// rejoin half. The formation half, the other two forming from the record
+/// while the wiped first-ranked voter never initializes, is
+/// `replicated::raft::formation::tests`.
 #[test]
-#[ignore = "RFC0065.24 stub — implemented with group formation"]
-fn rfc0065_24_a_formation_interrupted_by_a_wiped_voter_still_forms_once() {
+#[ignore = "RFC0065.24 stub — the rejoin half, implemented with replica identity and rejoin"]
+fn rfc0065_24_a_formation_interrupted_by_a_wiped_voter_rejoins_by_replacement() {
     todo!(
-        "RFC0065.24 — the other two initialize with exactly the recorded \
-         membership and elect a leader; the restarted voter never initializes a \
-         second membership and joins under its new identity by replacement"
-    );
-}
-
-/// Scenario RFC0065.24 — the unreadable-record arm (B4, B6).
-/// Given a `formed.json` that does not parse, is truncated, has another
-/// `format` or `group`, or whose `node_id`s are not the group's voters, no
-/// voter initializes from it.
-#[test]
-#[ignore = "RFC0065.24 stub — implemented with group formation"]
-fn rfc0065_24_an_unreadable_formation_record_forms_nothing() {
-    todo!(
-        "RFC0065.24 — malformed or truncated JSON, another format, another group \
-         or other node_ids: no voter initializes, and each reports why"
+        "RFC0065.24 — the restarted first-ranked voter joins under its new \
+         identity by replacement, never by initializing a second membership"
     );
 }
 

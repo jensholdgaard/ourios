@@ -96,12 +96,18 @@ impl Control {
     /// too (RFC 0065 §6.8).
     pub const HIGHEST_KIND: u8 = KIND_FLUSHER_ASSIGNMENT;
 
-    fn write(self, out: &mut Vec<u8>) {
+    /// The entry's kind byte.
+    #[must_use]
+    pub const fn kind(self) -> u8 {
         match self {
-            Self::FlusherAssignment(replica) => {
-                out.push(KIND_FLUSHER_ASSIGNMENT);
-                out.extend_from_slice(&replica);
-            }
+            Self::FlusherAssignment(_) => KIND_FLUSHER_ASSIGNMENT,
+        }
+    }
+
+    fn write(self, out: &mut Vec<u8>) {
+        out.push(self.kind());
+        match self {
+            Self::FlusherAssignment(replica) => out.extend_from_slice(&replica),
         }
     }
 
@@ -447,6 +453,7 @@ mod tests {
         tail.extend_from_slice(&replica);
         round_trip(assignment, &golden(0x04, &tail));
         assert_eq!(Control::HIGHEST_KIND, 0x01);
+        assert_eq!(Control::FlusherAssignment(replica).kind(), 0x01);
     }
 
     #[test]

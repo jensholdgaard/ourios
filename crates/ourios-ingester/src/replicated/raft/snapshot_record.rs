@@ -13,6 +13,7 @@
 //! | flusher: present: u8 | uuid, 16 bytes big-endian |
 //! | highest kind: u8 |
 //! | miner configuration: kind: u8, 0 when none has committed | that kind's body |
+//! |   (kind 0x04: the 28-byte body of the miner configuration entry)     |
 //! | latest id block: after: u64 | through: u64, both 0 when none |
 //! | crc32c of everything before it: u32 |
 //! ```
@@ -30,9 +31,10 @@ use uuid::Uuid;
 
 use super::codec::{encode_membership, raft_id, take_membership, wal_id};
 use super::gate::SyncGate;
+pub use super::miner_config::GroupMinerConfig;
 use super::types::{LogId, NodeId, RaftTypes};
 use super::{OWNER_WAIT, sync_through, take_ownership, writer_gone};
-use ourios_wal::{Control, RaftLogId};
+use ourios_wal::{Control, MinerConfigV1, RaftLogId};
 
 pub(super) type SnapshotMeta = SnapshotMetaOf<RaftTypes>;
 
@@ -43,6 +45,7 @@ const ID_LEN: usize = 1 + 8 + 8;
 const FLUSHER_LEN: usize = 1 + 16;
 const ID_BLOCK_LEN: usize = 8 + 8;
 const NO_MINER_CONFIG: u8 = 0;
+const MINER_CONFIG_V1: u8 = 0x04;
 const CRC_LEN: usize = 4;
 
 /// An id block `(after, through]` of RFC 0059 §3.3.
@@ -80,6 +83,8 @@ pub struct GroupState {
     pub highest_kind: u8,
     /// The latest id block applied.
     pub id_block: Option<IdBlock>,
+    /// The miner configuration in force.
+    pub miner_config: Option<GroupMinerConfig>,
 }
 
 /// A group's snapshot: `openraft`'s metadata and the group's state there.
@@ -125,7 +130,13 @@ fn put_state(out: &mut Vec<u8>, state: &GroupState) {
     out.push(u8::from(state.flusher.is_some()));
     out.extend_from_slice(state.flusher.map_or(Uuid::nil(), NodeId::uuid).as_bytes());
     out.push(state.highest_kind);
-    out.push(NO_MINER_CONFIG);
+    match state.miner_config {
+        None => out.push(NO_MINER_CONFIG),
+        Some(config) => {
+            out.push(MINER_CONFIG_V1);
+            out.extend_from_slice(&config.body().to_bytes());
+        }
+    }
     let (after, through) = state
         .id_block
         .map_or((0, 0), |block| (block.after, block.through));
@@ -182,11 +193,15 @@ fn take_state(bytes: &[u8]) -> io::Result<GroupState> {
             Control::HIGHEST_KIND
         )));
     }
-    match bytes[FLUSHER_LEN + 1] {
-        NO_MINER_CONFIG => {}
+    let rest = &bytes[fixed..];
+    let (miner_config, id_block) = match bytes[FLUSHER_LEN + 1] {
+        NO_MINER_CONFIG => (None, rest),
+        MINER_CONFIG_V1 => match rest.split_first_chunk::<{ MinerConfigV1::LEN }>() {
+            Some((body, rest)) => (Some(take_miner_config(*body)?), rest),
+            None => return Err(invalid("truncated miner configuration")),
+        },
         kind => return Err(invalid(format!("miner configuration kind {kind}"))),
-    }
-    let id_block = &bytes[fixed..];
+    };
     if id_block.len() != ID_BLOCK_LEN {
         return Err(invalid(format!(
             "id block of {} bytes, not {ID_BLOCK_LEN}",
@@ -197,7 +212,13 @@ fn take_state(bytes: &[u8]) -> io::Result<GroupState> {
         flusher,
         highest_kind,
         id_block: take_id_block(id_block)?,
+        miner_config,
     })
+}
+
+fn take_miner_config(body: [u8; MinerConfigV1::LEN]) -> io::Result<GroupMinerConfig> {
+    let body = MinerConfigV1::from_bytes(body).map_err(invalid)?;
+    GroupMinerConfig::new(body).map_err(invalid)
 }
 
 pub(super) fn encode(snapshot: &GroupSnapshot) -> io::Result<Vec<u8>> {
@@ -318,6 +339,7 @@ mod tests {
                 flusher: Some(NodeId::from(2)),
                 highest_kind: 1,
                 id_block: IdBlock::new(1 << 20, 2 << 20),
+                miner_config: None,
             },
         }
     }
@@ -365,6 +387,7 @@ mod tests {
                 flusher: Some(a),
                 highest_kind: 1,
                 id_block: IdBlock::new(5, 7),
+                miner_config: None,
             },
         };
         let uuid = a.uuid().into_bytes();
@@ -420,12 +443,101 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded: kind 0x04 is the miner configuration (RFC 0065 §6.5); see \
+                a_record_with_a_miner_configuration_round_trips_and_another_kind_is_refused"]
     fn a_record_with_a_miner_configuration_kind_is_refused() {
         let mut bytes = encode(&with_flusher()).expect("encode");
         let kind = bytes.len() - CRC_LEN - ID_BLOCK_LEN - 1;
         bytes[kind] = 4;
         let e = decode(&resealed(bytes)).expect_err("refused");
         assert!(e.to_string().contains("miner configuration kind 4"), "{e}");
+    }
+
+    fn miner_config() -> MinerConfigV1 {
+        MinerConfigV1 {
+            similarity_threshold: 0.75,
+            similarity_floor: 0.5,
+            param_byte_limit: 512,
+            prefix_depth: 3,
+            max_node_children: 64,
+            max_templates: 1_000,
+            max_line_tokens: 256,
+            upstream_templates: ourios_wal::UpstreamTemplates::Observe,
+            upstream_template_byte_limit: 0,
+            upstream_association_limit: 2,
+        }
+    }
+
+    fn with_miner_config() -> GroupSnapshot {
+        let mut snapshot = with_flusher();
+        snapshot.state.highest_kind = 4;
+        snapshot.state.miner_config = GroupMinerConfig::new(miner_config()).ok();
+        snapshot
+    }
+
+    /// The configuration in force is kind `0x04` and its 28-byte body,
+    /// between the highest kind and the id block.
+    #[test]
+    fn a_record_with_a_miner_configuration_round_trips_and_another_kind_is_refused() {
+        let snapshot = with_miner_config();
+        assert!(
+            snapshot.state.miner_config.is_some(),
+            "a valid configuration"
+        );
+        let bytes = encode(&snapshot).expect("encode");
+        let at = bytes.len() - CRC_LEN - ID_BLOCK_LEN - MinerConfigV1::LEN - 1;
+        assert_eq!(bytes[at - 1], 4, "the highest kind");
+        assert_eq!(bytes[at], 4, "the configuration's kind");
+        assert_eq!(
+            bytes[at + 1..=at + MinerConfigV1::LEN],
+            miner_config().to_bytes()
+        );
+        assert_eq!(decode(&bytes).expect("decode"), snapshot);
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), &snapshot, &SyncGate::default()).expect("write");
+        assert_eq!(read(dir.path()).expect("read"), Some(snapshot));
+
+        for kind in [3, 5] {
+            let mut other = bytes.clone();
+            other[at] = kind;
+            let e = decode(&resealed(other)).expect_err("refused");
+            let named = format!("miner configuration kind {kind}");
+            assert!(e.to_string().contains(&named), "{e}");
+        }
+        let mut none = bytes;
+        none[at] = 0;
+        decode(&resealed(none)).expect_err("a configuration's bytes past kind 0");
+    }
+
+    /// A recorded configuration that `MinerConfig` refuses, or with an
+    /// unknown `upstream_templates`, fails the open.
+    #[test]
+    fn a_record_with_a_configuration_minerconfig_refuses_is_refused() {
+        let bytes = encode(&with_miner_config()).expect("encode");
+        let body = bytes.len() - CRC_LEN - ID_BLOCK_LEN - MinerConfigV1::LEN;
+        let refused = [
+            MinerConfigV1 {
+                similarity_floor: 0.9,
+                ..miner_config()
+            },
+            MinerConfigV1 {
+                prefix_depth: 9,
+                ..miner_config()
+            },
+            MinerConfigV1 {
+                max_templates: 0,
+                ..miner_config()
+            },
+        ];
+        for config in refused {
+            let mut bytes = bytes.clone();
+            bytes[body..body + MinerConfigV1::LEN].copy_from_slice(&config.to_bytes());
+            decode(&resealed(bytes)).expect_err("refused");
+        }
+        let mut mode = bytes;
+        mode[body + 21] = 3;
+        let e = decode(&resealed(mode)).expect_err("refused");
+        assert!(e.to_string().contains("upstream_templates 3"), "{e}");
     }
 
     #[test]

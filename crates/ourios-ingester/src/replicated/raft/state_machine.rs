@@ -6,9 +6,15 @@
 //! up to a snapshot it installs or builds, so the snapshot is recorded
 //! in `wal_root/groups/<group>/snapshot` before the call returns,
 //! and a restart opens applied through it and replays the log after it.
-//! The record holds the flusher, the highest control kind and the latest
-//! id block with the membership, so a replica that opens from or installs
-//! it knows them before it applies any entry after it.
+//! The record holds the flusher, the highest control kind, the latest
+//! id block and the miner configuration in force with the membership, so
+//! a replica that opens from or installs it knows them before it applies
+//! any entry after it.
+//!
+//! A miner configuration that changes the tree's shape from the one in
+//! force fails the apply, which stops the replica: the group's first
+//! configuration fixes `prefix_depth` and `max_node_children` for the life
+//! of its log.
 //!
 //! A snapshot is only ever the group at a checkpoint's cut: applying a
 //! checkpoint entry publishes its cut on `GroupSm::checkpoints`, the
@@ -23,13 +29,15 @@ use futures_util::TryStreamExt as _;
 use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::type_config::alias::{SnapshotOf, StoredMembershipOf};
 use openraft::{EntryPayload, OptionalSend};
-use ourios_wal::Control;
+use ourios_wal::{Control, MinerConfigV1};
 use tokio::sync::watch;
 use uuid::Uuid;
 
 use super::checkpoint::{Change, History, Proposal};
 use super::gate::SyncGate;
-use super::snapshot_record::{self, GroupSnapshot, GroupState, IdBlock, SnapshotMeta};
+use super::snapshot_record::{
+    self, GroupMinerConfig, GroupSnapshot, GroupState, IdBlock, SnapshotMeta,
+};
 use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
@@ -68,11 +76,16 @@ impl State {
     }
 
     /// Apply one entry; returns the cut of a checkpoint it applied.
+    ///
+    /// # Errors
+    ///
+    /// A miner configuration the group cannot apply (see
+    /// [`Self::apply_miner_config`]).
     fn apply(
         &mut self,
         log_id: LogId,
         payload: EntryPayload<GroupEntry, Membership>,
-    ) -> Option<LogId> {
+    ) -> io::Result<Option<LogId>> {
         self.applied = Some(log_id);
         self.history.entered(log_id);
         match payload {
@@ -80,16 +93,16 @@ impl State {
                 self.membership = StoredMembership::new(Some(log_id), m);
                 let change = Change::Membership(self.membership.clone());
                 self.history.changed(log_id.index, change);
-                None
+                Ok(None)
             }
             EntryPayload::Normal(GroupEntry::Control(control)) => {
                 self.apply_control(log_id, control)
             }
-            EntryPayload::Blank | EntryPayload::Normal(GroupEntry::Batch(_)) => None,
+            EntryPayload::Blank | EntryPayload::Normal(GroupEntry::Batch(_)) => Ok(None),
         }
     }
 
-    fn apply_control(&mut self, at: LogId, control: Control) -> Option<LogId> {
+    fn apply_control(&mut self, at: LogId, control: Control) -> io::Result<Option<LogId>> {
         let kind = control.kind();
         if kind > self.group.highest_kind {
             self.group.highest_kind = kind;
@@ -100,7 +113,7 @@ impl State {
                 let flusher = NodeId::from(Uuid::from_bytes(replica));
                 self.group.flusher = Some(flusher);
                 self.history.changed(at.index, Change::Flusher(flusher));
-                None
+                Ok(None)
             }
             Control::Checkpoint {
                 proposer,
@@ -108,11 +121,47 @@ impl State {
                 highest_kind,
             } => {
                 let proposal = Proposal::new(proposer, cut, highest_kind);
-                self.history.apply(at, self.group.flusher, proposal)
+                Ok(self.history.apply(at, self.group.flusher, proposal))
             }
             Control::IdBlock { after, through } => {
                 self.apply_id_block(at, IdBlock::new(after, through));
-                None
+                Ok(None)
+            }
+            Control::MinerConfig(body) => {
+                self.apply_miner_config(at, body)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Put the configuration in force from `at`.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` when `MinerConfig` refuses the body, or it changes
+    /// `prefix_depth` or `max_node_children` from the configuration in
+    /// force: a snapshot's routes are valid only at the shape it was mined
+    /// at, so every replica stops rather than apply it.
+    fn apply_miner_config(&mut self, at: LogId, body: MinerConfigV1) -> io::Result<()> {
+        let refused = |why: String| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("miner configuration at {at}: {why}"),
+            )
+        };
+        let config = GroupMinerConfig::new(body).map_err(|e| refused(e.to_string()))?;
+        match self.group.miner_config {
+            Some(first) if !first.same_shape(config) => Err(refused(format!(
+                "prefix_depth {} and max_node_children {} are fixed for the log, not {} and {}",
+                first.body().prefix_depth,
+                first.body().max_node_children,
+                body.prefix_depth,
+                body.max_node_children
+            ))),
+            _ => {
+                self.group.miner_config = Some(config);
+                self.history.changed(at.index, Change::MinerConfig(config));
+                Ok(())
             }
         }
     }
@@ -212,6 +261,13 @@ impl GroupSm {
         self.state().group.id_block
     }
 
+    /// The miner configuration in force: the latest applied, or the
+    /// snapshot's when none has been since.
+    #[must_use]
+    pub fn miner_config(&self) -> Option<GroupMinerConfig> {
+        self.state().group.miner_config
+    }
+
     /// The group's current snapshot, opened, built or installed.
     pub(super) fn snapshot(&self) -> Option<GroupSnapshot> {
         self.state().snapshot.clone()
@@ -268,7 +324,7 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
             + OptionalSend,
     {
         while let Some((entry, responder)) = entries.try_next().await? {
-            let checkpoint = self.state().apply(entry.log_id, entry.payload);
+            let checkpoint = self.state().apply(entry.log_id, entry.payload)?;
             if let Some(cut) = checkpoint {
                 self.cuts.send_replace(Some(cut));
             }
@@ -404,6 +460,7 @@ mod tests {
             flusher: Some(NodeId::from(9)),
             highest_kind: 1,
             id_block: None,
+            miner_config: None,
         };
         sm.install_snapshot(&at(5), group).await.expect("install");
         assert_eq!(sm.flusher(), Some(NodeId::from(9)));
@@ -428,6 +485,7 @@ mod tests {
             flusher: Some(NodeId::from(7)),
             highest_kind: 1,
             id_block: None,
+            miner_config: None,
         };
         assert_eq!(built.snapshot, expected);
         let reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
@@ -487,6 +545,7 @@ mod tests {
             flusher: Some(NodeId::from(7)),
             highest_kind: 1,
             id_block: None,
+            miner_config: None,
         };
         assert_eq!(built.snapshot, expected);
         let reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
@@ -601,6 +660,137 @@ mod tests {
         assert_eq!(installed.id_block(), block(0, 100));
         apply(&mut installed, vec![entry(4, id_block(block(100, 200)))]).await;
         assert_eq!(installed.id_block(), sm.id_block(), "as the whole log");
+    }
+
+    const FIRST: MinerConfigV1 = MinerConfigV1 {
+        similarity_threshold: 0.7,
+        similarity_floor: 0.4,
+        param_byte_limit: 256,
+        prefix_depth: 2,
+        max_node_children: 100,
+        max_templates: 20_000,
+        max_line_tokens: 512,
+        upstream_templates: ourios_wal::UpstreamTemplates::Ignore,
+        upstream_template_byte_limit: 8192,
+        upstream_association_limit: 4,
+    };
+    const RAISED: MinerConfigV1 = MinerConfigV1 {
+        similarity_threshold: 0.8,
+        ..FIRST
+    };
+    const DEEPER: MinerConfigV1 = MinerConfigV1 {
+        prefix_depth: 3,
+        ..RAISED
+    };
+    const ABOVE_ONE: MinerConfigV1 = MinerConfigV1 {
+        similarity_threshold: 1.5,
+        ..FIRST
+    };
+
+    fn configured(body: MinerConfigV1) -> EntryPayload<GroupEntry, Membership> {
+        EntryPayload::Normal(GroupEntry::Control(Control::MinerConfig(body)))
+    }
+
+    fn in_force(body: MinerConfigV1) -> GroupMinerConfig {
+        GroupMinerConfig::new(body).expect("valid")
+    }
+
+    async fn applied(sm: &mut GroupSm, entry: EntryResponder<RaftTypes>) -> io::Result<()> {
+        sm.apply(futures_util::stream::iter([Ok(entry)])).await
+    }
+
+    /// The first configuration fixes the tree's shape: a later one that
+    /// keeps it takes effect from its position, whatever else it changes,
+    /// and one that changes `prefix_depth` or `max_node_children` fails the
+    /// apply, leaving the one in force.
+    #[tokio::test]
+    async fn a_configuration_changing_the_trees_shape_stops_the_apply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        assert_eq!(sm.miner_config(), None);
+        apply(&mut sm, vec![batch(1), entry(2, configured(FIRST))]).await;
+        assert_eq!(sm.miner_config(), Some(in_force(FIRST)));
+        assert_eq!(sm.state().group.highest_kind, 4);
+        apply(&mut sm, vec![entry(3, configured(RAISED))]).await;
+        assert_eq!(sm.miner_config(), Some(in_force(RAISED)), "the threshold");
+
+        let deeper = entry(4, configured(DEEPER));
+        let e = applied(&mut sm, deeper).await.expect_err("prefix_depth");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("prefix_depth 2"), "{e}");
+        let wider = MinerConfigV1 {
+            max_node_children: 101,
+            ..RAISED
+        };
+        let e = applied(&mut sm, entry(5, configured(wider)))
+            .await
+            .expect_err("width");
+        assert!(e.to_string().contains("max_node_children 100"), "{e}");
+        assert_eq!(sm.miner_config(), Some(in_force(RAISED)));
+    }
+
+    /// A body `MinerConfig` refuses fails the apply; the codec refuses it
+    /// first, so only a body that skipped it gets here.
+    #[tokio::test]
+    async fn a_configuration_minerconfig_refuses_stops_the_apply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let e = applied(&mut sm, entry(1, configured(ABOVE_ONE)))
+            .await
+            .expect_err("a threshold above 1");
+        assert!(e.to_string().contains("similarity_threshold"), "{e}");
+        assert_eq!(sm.miner_config(), None);
+    }
+
+    /// The checkpoint's snapshot holds the configuration in force at its
+    /// cut; a reopen and an install take it from the record, so it is in
+    /// force until an entry after the cut replaces it and it fixes the
+    /// shape for the entries after the cut.
+    #[tokio::test]
+    async fn a_snapshot_holds_the_miner_configuration_in_force_at_its_cut() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let entries = vec![
+            assign(1, 7),
+            entry(2, configured(FIRST)),
+            batch(3),
+            entry(4, configured(RAISED)),
+            checkpoint(5, 7, (2, 3), 4),
+        ];
+        apply(&mut sm, entries).await;
+        assert_eq!(sm.miner_config(), Some(in_force(RAISED)), "applied");
+        let built = sm.build_snapshot().await.expect("build");
+        assert_eq!(built.meta.last_log_id, cut(3));
+        assert_eq!(
+            built.snapshot.miner_config,
+            Some(in_force(FIRST)),
+            "at the cut"
+        );
+
+        let mut reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
+        assert_eq!(reopened.miner_config(), Some(in_force(FIRST)));
+        let deeper = applied(&mut reopened, entry(4, configured(DEEPER))).await;
+        deeper.expect_err("the snapshot's shape is fixed");
+
+        let other = tempfile::tempdir().expect("tempdir");
+        let mut installed = GroupSm::open(other.path(), Arc::default()).expect("open");
+        installed
+            .install_snapshot(&built.meta, built.snapshot)
+            .await
+            .expect("install");
+        assert_eq!(installed.miner_config(), Some(in_force(FIRST)));
+        apply(&mut installed, vec![batch(4)]).await;
+        assert_eq!(
+            installed.miner_config(),
+            Some(in_force(FIRST)),
+            "none since"
+        );
+        apply(&mut installed, vec![entry(5, configured(RAISED))]).await;
+        assert_eq!(
+            installed.miner_config(),
+            sm.miner_config(),
+            "as the whole log"
+        );
     }
 
     /// A build that starts while an install is held at its fsync waits for

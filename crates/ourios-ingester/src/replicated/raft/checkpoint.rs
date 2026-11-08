@@ -3,7 +3,7 @@
 //!
 //! Since the group's checkpoint, the state machine keeps only the
 //! positions at which the term, the membership, the flusher, the highest
-//! kind and the applied id block changed. That gives the term of every
+//! kind, the applied id block and the miner configuration changed. That gives the term of every
 //! entry since the checkpoint, and the group at any of them, without
 //! holding the entries.
 
@@ -12,7 +12,7 @@ use ourios_wal::RaftLogId;
 use uuid::Uuid;
 
 use super::codec::raft_id;
-use super::snapshot_record::{GroupSnapshot, GroupState, IdBlock, SnapshotMeta};
+use super::snapshot_record::{GroupMinerConfig, GroupSnapshot, GroupState, IdBlock, SnapshotMeta};
 use super::types::{LogId, NodeId, RaftTypes};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
@@ -25,6 +25,7 @@ pub(super) enum Change {
     Flusher(NodeId),
     HighestKind(u8),
     IdBlock(IdBlock),
+    MinerConfig(GroupMinerConfig),
 }
 
 /// A checkpoint entry's body.
@@ -123,6 +124,7 @@ impl History {
                 Change::Flusher(flusher) => snapshot.state.flusher = Some(*flusher),
                 Change::HighestKind(kind) => snapshot.state.highest_kind = *kind,
                 Change::IdBlock(block) => snapshot.state.id_block = Some(*block),
+                Change::MinerConfig(config) => snapshot.state.miner_config = Some(*config),
             }
         }
         snapshot

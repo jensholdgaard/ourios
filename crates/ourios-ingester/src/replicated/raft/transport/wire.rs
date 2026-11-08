@@ -636,6 +636,7 @@ mod tests {
     use prost::Message;
 
     use super::*;
+    use crate::replicated::raft::snapshot_record::GroupMinerConfig;
     use crate::replicated::raft::types::{GroupEntry, Membership, TenantBatchBytes};
 
     fn bare(meta: SnapshotMetaOf<RaftTypes>) -> SnapshotOf<RaftTypes, GroupState> {
@@ -686,6 +687,31 @@ mod tests {
         })
     }
 
+    /// A miner configuration `MinerConfig` accepts.
+    fn miner_config() -> impl Strategy<Value = ourios_wal::MinerConfigV1> {
+        let mode = prop_oneof![
+            Just(ourios_wal::UpstreamTemplates::Ignore),
+            Just(ourios_wal::UpstreamTemplates::Observe),
+            Just(ourios_wal::UpstreamTemplates::Adopt),
+        ];
+        (0.4f32..=1.0, 0..=8u8, 1..=1024u32, 1..=u16::MAX, mode).prop_map(
+            |(similarity_threshold, prefix_depth, param_byte_limit, max_node_children, mode)| {
+                ourios_wal::MinerConfigV1 {
+                    similarity_threshold,
+                    similarity_floor: 0.4,
+                    param_byte_limit,
+                    prefix_depth,
+                    max_node_children,
+                    max_templates: 20_000,
+                    max_line_tokens: 512,
+                    upstream_templates: mode,
+                    upstream_template_byte_limit: 8192,
+                    upstream_association_limit: 4,
+                }
+            },
+        )
+    }
+
     fn entry() -> impl Strategy<Value = Entry> {
         let normal = proptest::collection::vec(any::<u8>(), 0..64).prop_map(|body| {
             let batch = TenantBatch::encode("acme", &body).expect("batch");
@@ -710,12 +736,16 @@ mod tests {
             let control = Control::IdBlock { after, through };
             EntryPayload::Normal(GroupEntry::Control(control))
         });
+        let configuration = miner_config().prop_map(|config| {
+            EntryPayload::Normal(GroupEntry::Control(Control::MinerConfig(config)))
+        });
         let payload = prop_oneof![
             Just(EntryPayload::Blank),
             normal,
             flusher,
             checkpoint,
             id_block,
+            configuration,
             membership().prop_map(EntryPayload::Membership),
         ];
         (log_id(), payload).prop_map(|(log_id, payload)| Entry { log_id, payload })
@@ -864,6 +894,7 @@ mod tests {
             last_membership in stored_membership(),
             flusher in proptest::option::of(any::<u64>()),
             highest_kind in 0..=Control::HIGHEST_KIND,
+            miner_config in proptest::option::of(miner_config()),
         ) {
             let last_log_id = last_log_id
                 .map(|id| log(id.leader_id.term.min(vote.leader_id.term), id.index));
@@ -875,7 +906,13 @@ mod tests {
                 last_membership.membership().clone(),
             );
             let meta = SnapshotMetaOf::<RaftTypes> { last_log_id, last_membership };
-            let state = GroupState { flusher: flusher.map(node), highest_kind, id_block: None };
+            let miner_config = miner_config.map(|c| GroupMinerConfig::new(c).expect("valid"));
+            let state = GroupState {
+                flusher: flusher.map(node),
+                highest_kind,
+                id_block: None,
+                miner_config,
+            };
             let snapshot = SnapshotOf::<RaftTypes, GroupState> { meta: meta.clone(), snapshot: state };
             let wire = through_wire(&SnapshotRequest::new(to, &vote, snapshot).expect("encode"));
             prop_assert_eq!(wire.header.clone(), Some(Header::to(to)));

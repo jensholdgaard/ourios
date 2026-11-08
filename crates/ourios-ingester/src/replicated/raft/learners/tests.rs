@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use openraft::async_runtime::WatchReceiver as _;
 
-use super::{Changes, Members, TailPool, plan, reconcile};
+use super::{Changes, Group, Members, Tail, TailPool, plan, reconcile};
 use crate::replicated::raft::cluster::{Cluster, WAIT, name, write};
 use crate::replicated::raft::transport::Identity;
 use crate::replicated::raft::types::{Membership, NodeId};
@@ -143,6 +143,21 @@ fn a_joint_membership_is_left_alone() {
     );
 }
 
+fn group(cluster: &Cluster, i: usize) -> Group<'_> {
+    Group {
+        raft: cluster.node(i).raft(0),
+        log: cluster.node(i).host.log(0).expect("hosted"),
+    }
+}
+
+fn reaching<'a>(placed: &'a [&'a str], cluster: &'a Cluster) -> Tail<'a> {
+    Tail {
+        placed,
+        peers: cluster.peers(),
+        patience: PATIENCE,
+    }
+}
+
 /// The leader of group 0, once it has committed an entry of its term.
 async fn ready_leader(cluster: &Cluster) -> usize {
     let leader = cluster.leader(0, None).await;
@@ -172,21 +187,9 @@ async fn the_leader_adds_the_placed_tail_node_and_it_catches_up() {
         .expect("a placed tail node");
     let follower = (0..3).find(|&i| i != leader).expect("a follower");
 
-    let none = reconcile(
-        cluster.node(follower).raft(0),
-        &placed,
-        cluster.peers(),
-        PATIENCE,
-    )
-    .await;
+    let none = reconcile(group(&cluster, follower), reaching(&placed, &cluster)).await;
     assert_eq!(none, Ok(Changes::default()), "only the leader reconciles");
-    let added = reconcile(
-        cluster.node(leader).raft(0),
-        &placed,
-        cluster.peers(),
-        PATIENCE,
-    )
-    .await;
+    let added = reconcile(group(&cluster, leader), reaching(&placed, &cluster)).await;
     let expected = Changes {
         add: BTreeMap::from([(cluster.id(tail), placed[0].to_owned())]),
         remove: BTreeSet::new(),
@@ -199,13 +202,7 @@ async fn the_leader_adds_the_placed_tail_node_and_it_catches_up() {
 
     let index = write(cluster.node(leader).raft(0), 1).await;
     cluster.node(tail).applied_through(0, index).await;
-    let again = reconcile(
-        cluster.node(leader).raft(0),
-        &placed,
-        cluster.peers(),
-        PATIENCE,
-    )
-    .await;
+    let again = reconcile(group(&cluster, leader), reaching(&placed, &cluster)).await;
     assert_eq!(
         again,
         Ok(Changes::default()),
@@ -223,14 +220,9 @@ async fn a_learner_never_makes_a_quorum() {
     let leader = ready_leader(&cluster).await;
     let placed = [name(cluster.id(3))];
     let placed: Vec<&str> = placed.iter().map(String::as_str).collect();
-    reconcile(
-        cluster.node(leader).raft(0),
-        &placed,
-        cluster.peers(),
-        PATIENCE,
-    )
-    .await
-    .expect("added");
+    reconcile(group(&cluster, leader), reaching(&placed, &cluster))
+        .await
+        .expect("added");
     let followers: Vec<_> = (0..3).filter(|&i| i != leader).collect();
     for &f in &followers {
         cluster.node(f).gate.close();
@@ -288,17 +280,16 @@ async fn a_learner_never_makes_a_quorum() {
 async fn a_shrunk_placement_removes_the_learner_that_left() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
     let leader = ready_leader(&cluster).await;
-    let raft = cluster.node(leader).raft(0);
     let pool = vec![name(cluster.id(3)), name(cluster.id(4))];
     let both = TailPool::new(pool.clone(), 2);
-    reconcile(raft, &both.placed(0), cluster.peers(), PATIENCE)
+    reconcile(group(&cluster, leader), reaching(&both.placed(0), &cluster))
         .await
         .expect("both added");
     assert_eq!(learners_of(&cluster, leader).len(), 2);
 
     let one = TailPool::new(pool, 1);
     let kept = one.placed(0)[0].to_owned();
-    let removed = reconcile(raft, &one.placed(0), cluster.peers(), PATIENCE)
+    let removed = reconcile(group(&cluster, leader), reaching(&one.placed(0), &cluster))
         .await
         .expect("one removed");
     assert_eq!(removed.remove.len(), 1);

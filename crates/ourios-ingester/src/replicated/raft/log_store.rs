@@ -22,17 +22,18 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use openraft::OptionalSend;
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
+use openraft::{EntryPayload, OptionalSend};
 use ourios_wal::{
-    FrameKind, FrameSink, RecoveryError, ReplicatedRecord, Wal, WalConfig, WalOffset,
+    Control, FrameKind, FrameSink, RecoveryError, ReplicatedRecord, Wal, WalConfig, WalOffset,
 };
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 use super::codec::{self, Replayed};
 use super::gate::SyncGate;
 use super::telemetry::Takeovers;
-use super::types::{Entry, LogId, RaftTypes, Vote};
+use super::types::{Entry, GroupEntry, LogId, NodeId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
 use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership, writer_gone};
 
@@ -52,6 +53,12 @@ struct Index {
     entries: BTreeMap<u64, Entry>,
     last_purged: Option<LogId>,
     committed: Option<LogId>,
+    /// The control entries `entries` holds, kept beside it so a leader's
+    /// pass reads them without scanning the log under its lock.
+    controls: BTreeMap<u64, Control>,
+    /// The highest control kind purged: a purged entry was committed, so
+    /// the log still holds its kind (§6.5).
+    purged_kind: u8,
 }
 
 impl Index {
@@ -75,7 +82,11 @@ impl Index {
     fn place(&mut self, entry: Entry) {
         let index = entry.log_id.index;
         self.entries.split_off(&index);
+        self.controls.split_off(&index);
         if self.last_purged.is_none_or(|p| index > p.index) {
+            if let EntryPayload::Normal(GroupEntry::Control(control)) = &entry.payload {
+                self.controls.insert(index, *control);
+            }
             self.entries.insert(index, entry);
         }
     }
@@ -103,10 +114,17 @@ impl Index {
     fn truncate_after(&mut self, last: Option<LogId>) {
         let from = last.map_or(0, |l| l.index + 1);
         self.entries.split_off(&from);
+        self.controls.split_off(&from);
     }
 
     fn purge(&mut self, upto: LogId) {
         self.entries = self.entries.split_off(&(upto.index + 1));
+        let kept = self.controls.split_off(&(upto.index + 1));
+        let purged = std::mem::replace(&mut self.controls, kept);
+        self.purged_kind = purged
+            .values()
+            .map(|c| c.kind())
+            .fold(self.purged_kind, u8::max);
         if self.last_purged.is_none_or(|p| upto > p) {
             self.last_purged = Some(upto);
         }
@@ -131,6 +149,28 @@ impl Index {
         Ok(())
     }
 
+    fn log_controls(&self) -> LogControls {
+        let highest_kind = self
+            .controls
+            .values()
+            .map(|c| c.kind())
+            .fold(self.purged_kind, u8::max);
+        let introduced = self
+            .controls
+            .iter()
+            .find(|(_, c)| c.kind() == highest_kind && highest_kind > self.purged_kind)
+            .map(|(&index, _)| index);
+        // Every kind is an assignment so far; the next one filters here.
+        let flusher = self.controls.values().next_back().map(|c| match *c {
+            Control::FlusherAssignment(replica) => NodeId::from(Uuid::from_bytes(replica)),
+        });
+        LogControls {
+            highest_kind,
+            introduced,
+            flusher,
+        }
+    }
+
     fn last_log_id(&self) -> Option<LogId> {
         self.entries
             .values()
@@ -138,6 +178,18 @@ impl Index {
             .map(|e| e.log_id)
             .or(self.last_purged)
     }
+}
+
+/// What the control entries of a log, committed or not, say (§6.5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogControls {
+    /// The highest control kind the log holds, `0` with none.
+    pub highest_kind: u8,
+    /// The index of the first entry of `highest_kind`, the newest entry of
+    /// a new kind, unless it was purged (and so committed).
+    pub introduced: Option<u64>,
+    /// The replica the newest flusher assignment names.
+    pub flusher: Option<NodeId>,
 }
 
 /// Fsync `groups/` and `wal_root`, the directories holding the group
@@ -444,6 +496,13 @@ impl GroupLog {
         let (done, rx) = oneshot::channel();
         self.write(|_| Ok(()), Command::Fence { done })?;
         rx.await.map_err(|_| writer_gone())?
+    }
+}
+
+impl GroupLogReader {
+    #[must_use]
+    pub fn controls(&self) -> LogControls {
+        lock_index(&self.index).log_controls()
     }
 }
 

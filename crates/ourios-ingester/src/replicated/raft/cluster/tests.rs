@@ -9,11 +9,14 @@ use openraft::EntryPayload;
 use openraft::async_runtime::WatchReceiver as _;
 use tokio::task::JoinHandle;
 
+use openraft::type_config::alias::StoredMembershipOf;
+
 use super::super::host::HostError;
-use super::super::types::{Entry, GroupEntry};
+use super::super::snapshot_record::GroupSnapshot;
+use super::super::types::{Entry, GroupEntry, LogId};
 use super::{
-    Cluster, GroupHost, GroupRaft, HostSpec, NodeId, Peers, Replica, WAIT, batch, group_dir,
-    propose, wal_config, write,
+    Cluster, GroupHost, GroupRaft, HostSpec, NodeId, Peers, RaftTypes, Replica, WAIT, batch,
+    group_dir, name, propose, wal_config, write,
 };
 
 const GROUP: u32 = 0;
@@ -201,6 +204,125 @@ async fn a_crashed_follower_restarts_from_its_fsynced_log_and_catches_up() {
     cluster.restart(follower).await;
     cluster.node(follower).applied_through(GROUP, last).await;
     converged(&cluster, follower, leader).await;
+    cluster.shutdown().await;
+}
+
+/// A checkpoint entry proposed by `proposer` with its cut at `cut`.
+fn checkpoint(proposer: NodeId, cut: &Entry) -> GroupEntry {
+    GroupEntry::Control(ourios_wal::Control::Checkpoint {
+        proposer: *proposer.uuid().as_bytes(),
+        cut: ourios_wal::RaftLogId {
+            term: cut.log_id.leader_id.term,
+            index: cut.log_id.index,
+        },
+        highest_kind: 1,
+    })
+}
+
+/// Node `i`'s entry at `index`.
+async fn entry_at(cluster: &Cluster, i: usize, index: u64) -> Entry {
+    let log = cluster.node(i).log(GROUP).await;
+    log.into_iter()
+        .find(|e| e.log_id.index == index)
+        .expect("in the log")
+}
+
+/// Node `i`'s snapshot, flusher and membership once it has applied
+/// through `index` and snapshotted and purged its log through `cut`,
+/// both of which follow the apply.
+async fn group_on(
+    cluster: &Cluster,
+    i: usize,
+    (index, cut): (u64, LogId),
+) -> (GroupSnapshot, GroupView) {
+    let node = cluster.node(i);
+    node.applied_through(GROUP, index).await;
+    let cut = Some(cut);
+    node.raft(GROUP)
+        .wait(WAIT)
+        .metrics(
+            |m| m.snapshot >= cut && m.purged >= cut,
+            "snapshotted and purged through the cut",
+        )
+        .await
+        .expect("purged");
+    let sm = node.host.state_machine(GROUP).expect("hosted");
+    let snapshot = sm.snapshot().expect("a snapshot");
+    let first = node.log(GROUP).await.first().map(|e| e.log_id);
+    assert!(
+        first > cut,
+        "node {i} keeps {first:?}, below the cut {cut:?}"
+    );
+    (snapshot, (sm.flusher(), sm.membership()))
+}
+
+type GroupView = (Option<NodeId>, StoredMembershipOf<RaftTypes>);
+
+/// RFC0065.31's arms on the flusher, membership and highest kind: after
+/// a flusher change, a learner added and a checkpoint by a replica that is
+/// not the flusher, the flusher's checkpoint snapshots the group at its
+/// cut and purges the log through it; a replica whose log ends below the
+/// cut installs the snapshot and ends as one that applied the whole log,
+/// and a restart reopens from the snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_snapshots_the_group_at_its_cut_for_every_replica() {
+    let mut cluster = Cluster::start_with_tail(3, 1, &[GROUP]).await;
+    let leader = cluster.leader(GROUP, None).await;
+    let (lagging, voter) = ((leader + 1) % 3, (leader + 2) % 3);
+    cluster.kill(lagging).await;
+    let (first, second, learner) = (cluster.id(leader), cluster.id(voter), cluster.id(3));
+    let raft = cluster.node(leader).raft(GROUP);
+    propose(raft, assign(first)).await;
+    let cut = entry_at(&cluster, leader, commit(&cluster, leader, 0..2).await).await;
+    let sm = cluster
+        .node(leader)
+        .host
+        .state_machine(GROUP)
+        .expect("hosted");
+    let membership_at_cut = sm.membership();
+    let reassigned = propose(raft, assign(second)).await;
+    raft.add_learner(learner, name(learner), true)
+        .await
+        .expect("learner added");
+    let not_the_flusher = entry_at(&cluster, leader, reassigned).await;
+    propose(raft, checkpoint(first, &not_the_flusher)).await;
+    propose(raft, checkpoint(second, &cut)).await;
+    let last = commit(&cluster, leader, 2..4).await;
+
+    let (snapshot, whole_log) = group_on(&cluster, leader, (last, cut.log_id)).await;
+    assert_eq!(
+        snapshot.meta.last_log_id,
+        Some(cut.log_id),
+        "the flusher's cut"
+    );
+    assert_eq!(snapshot.meta.last_membership, membership_at_cut);
+    assert_eq!(
+        (snapshot.state.flusher, snapshot.state.highest_kind),
+        (Some(first), 1)
+    );
+    assert_eq!(whole_log.0, Some(second));
+    assert!(whole_log.1.nodes().any(|(&id, _)| id == learner));
+    assert_eq!(
+        group_on(&cluster, 3, (last, cut.log_id)).await,
+        (snapshot.clone(), whole_log.clone())
+    );
+
+    cluster.restart(lagging).await;
+    let installed = group_on(&cluster, lagging, (last, cut.log_id)).await;
+    assert_eq!(
+        installed,
+        (snapshot.clone(), whole_log.clone()),
+        "installed and caught up"
+    );
+
+    cluster.kill(leader).await;
+    cluster.restart(leader).await;
+    let reopened = group_on(&cluster, leader, (last, cut.log_id)).await;
+    assert_eq!(
+        reopened,
+        (snapshot, whole_log),
+        "reopened from the snapshot"
+    );
     cluster.shutdown().await;
 }
 

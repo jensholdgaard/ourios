@@ -8,10 +8,12 @@ use std::io;
 use std::sync::Arc;
 
 use openraft::Raft;
+use openraft::async_runtime::WatchReceiver as _;
 use openraft::errors::Fatal;
 use openraft::storage::RaftLogStorage as _;
 use openraft::type_config::alias::JoinErrorOf;
 use ourios_wal::WalConfig;
+use tokio::sync::watch;
 
 use super::gate::SyncGate;
 use super::group_config;
@@ -19,7 +21,7 @@ use super::log_store::{GroupLog, GroupLogReader, group_dir};
 use super::state_machine::GroupSm;
 use super::telemetry::{Meters, ReplicationTelemetry};
 use super::transport::{Peers, ReplicationServer};
-use super::types::{NodeId, RaftTypes};
+use super::types::{LogId, NodeId, RaftTypes};
 use super::vote_log::VoteLog;
 
 pub type GroupRaft = Raft<RaftTypes, GroupSm>;
@@ -122,6 +124,7 @@ impl Launch<'_> {
         let raft = Raft::new(id, Arc::clone(&self.config), network, log, sm.clone())
             .await
             .map_err(|source| HostError::Raft { group, source })?;
+        tokio::spawn(snapshot_at_checkpoints(raft.clone(), sm.checkpoints()));
         Ok(Hosted {
             raft,
             sm,
@@ -129,6 +132,28 @@ impl Launch<'_> {
             #[cfg(test)]
             probe,
         })
+    }
+}
+
+/// Build the snapshot at each checkpoint the group applies (§6.5): the
+/// snapshot policy is `Never`, so nothing else does. `openraft` drops a
+/// trigger while a build runs, so one is sent on every change of its
+/// metrics until the snapshot reaches the cut. Ends with the group.
+async fn snapshot_at_checkpoints(raft: GroupRaft, mut cuts: watch::Receiver<Option<LogId>>) {
+    let mut metrics = raft.metrics();
+    loop {
+        let cut = *cuts.borrow_and_update();
+        let built = metrics.borrow_and_update().snapshot;
+        if built < cut && raft.trigger().snapshot().await.is_err() {
+            return;
+        }
+        let changed = tokio::select! {
+            changed = cuts.changed() => changed.is_ok(),
+            changed = metrics.changed() => changed.is_ok(),
+        };
+        if !changed {
+            return;
+        }
     }
 }
 

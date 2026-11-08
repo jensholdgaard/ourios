@@ -6,6 +6,7 @@
 //! the writer's reply, so one fsync completes every record queued while
 //! the previous one ran.
 
+mod checkpoint;
 mod codec;
 mod controls;
 pub mod flusher;
@@ -37,7 +38,9 @@ use std::time::{Duration, Instant};
 ///
 /// Leader restore stays off: the group log's committed marker rides a
 /// later fsync, and `openraft`'s restore is unsafe without a synced
-/// commit index (§4.4, §6.1).
+/// commit index (§4.4, §6.1). A snapshot is only built at a checkpoint's
+/// cut, below which every entry is in Parquet, so the log keeps none of
+/// them.
 ///
 /// # Errors
 ///
@@ -48,6 +51,7 @@ pub fn group_config() -> Result<openraft::Config, openraft::ConfigError> {
         allow_log_reversion: Some(false),
         enable_pre_vote: Some(true),
         snapshot_policy: openraft::SnapshotPolicy::Never,
+        max_in_snapshot_log_to_keep: 0,
         ..openraft::Config::default()
     }
     .validate()

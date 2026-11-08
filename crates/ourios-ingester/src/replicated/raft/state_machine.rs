@@ -9,6 +9,11 @@
 //! The record holds the flusher and the highest control kind with the
 //! membership, so a replica that opens from or installs it knows them
 //! before it applies any entry after it.
+//!
+//! A snapshot is only ever the group at a checkpoint's cut: applying a
+//! checkpoint entry publishes its cut on [`GroupSm::checkpoints`], the
+//! host triggers the build, and the builder records the checkpoint's
+//! snapshot rather than the state at the last entry applied.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,11 +24,13 @@ use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::type_config::alias::{SnapshotOf, StoredMembershipOf};
 use openraft::{EntryPayload, OptionalSend};
 use ourios_wal::Control;
+use tokio::sync::watch;
 use uuid::Uuid;
 
+use super::checkpoint::{Change, History, Proposal};
 use super::gate::SyncGate;
 use super::snapshot_record::{self, GroupSnapshot, GroupState, SnapshotMeta};
-use super::types::{GroupEntry, LogId, NodeId, RaftTypes};
+use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
 
@@ -31,7 +38,80 @@ struct State {
     applied: Option<LogId>,
     membership: StoredMembership,
     group: GroupState,
+    history: History,
+    /// The snapshot recorded last.
     snapshot: Option<GroupSnapshot>,
+}
+
+impl State {
+    fn opened(snapshot: Option<GroupSnapshot>) -> Self {
+        Self {
+            applied: snapshot.as_ref().and_then(|s| s.meta.last_log_id),
+            membership: snapshot
+                .as_ref()
+                .map(|s| s.meta.last_membership.clone())
+                .unwrap_or_default(),
+            group: snapshot.as_ref().map(|s| s.state).unwrap_or_default(),
+            history: History::new(snapshot.clone()),
+            snapshot,
+        }
+    }
+
+    fn as_applied(&self) -> GroupSnapshot {
+        GroupSnapshot {
+            meta: SnapshotMeta {
+                last_log_id: self.applied,
+                last_membership: self.membership.clone(),
+            },
+            state: self.group,
+        }
+    }
+
+    /// Apply one entry; returns the cut of a checkpoint it applied.
+    fn apply(
+        &mut self,
+        log_id: LogId,
+        payload: EntryPayload<GroupEntry, Membership>,
+    ) -> Option<LogId> {
+        self.applied = Some(log_id);
+        self.history.entered(log_id);
+        match payload {
+            EntryPayload::Membership(m) => {
+                self.membership = StoredMembership::new(Some(log_id), m);
+                let change = Change::Membership(self.membership.clone());
+                self.history.changed(log_id.index, change);
+                None
+            }
+            EntryPayload::Normal(GroupEntry::Control(control)) => {
+                self.apply_control(log_id, control)
+            }
+            EntryPayload::Blank | EntryPayload::Normal(GroupEntry::Batch(_)) => None,
+        }
+    }
+
+    fn apply_control(&mut self, at: LogId, control: Control) -> Option<LogId> {
+        let kind = control.kind();
+        if kind > self.group.highest_kind {
+            self.group.highest_kind = kind;
+            self.history.changed(at.index, Change::HighestKind(kind));
+        }
+        match control {
+            Control::FlusherAssignment(replica) => {
+                let flusher = NodeId::from(Uuid::from_bytes(replica));
+                self.group.flusher = Some(flusher);
+                self.history.changed(at.index, Change::Flusher(flusher));
+                None
+            }
+            Control::Checkpoint {
+                proposer,
+                cut,
+                highest_kind,
+            } => {
+                let proposal = Proposal::new(proposer, cut, highest_kind);
+                self.history.apply(at, self.group.flusher, proposal)
+            }
+        }
+    }
 }
 
 /// Where the snapshot is recorded, and the gate its fsyncs pass.
@@ -49,6 +129,8 @@ struct Record {
 pub struct GroupSm {
     state: Arc<Mutex<State>>,
     record: Arc<Record>,
+    /// The cut of the group's checkpoint.
+    cuts: Arc<watch::Sender<Option<LogId>>>,
 }
 
 impl GroupSm {
@@ -59,16 +141,8 @@ impl GroupSm {
     ///
     /// The record cannot be read, or fails its CRC or version check.
     pub(super) fn open(dir: &Path, gate: Arc<SyncGate>) -> io::Result<Self> {
-        let snapshot = snapshot_record::read(dir)?;
-        let state = State {
-            applied: snapshot.as_ref().and_then(|s| s.meta.last_log_id),
-            membership: snapshot
-                .as_ref()
-                .map(|s| s.meta.last_membership.clone())
-                .unwrap_or_default(),
-            group: snapshot.as_ref().map(|s| s.state).unwrap_or_default(),
-            snapshot,
-        };
+        let state = State::opened(snapshot_record::read(dir)?);
+        let cuts = watch::Sender::new(state.history.cut());
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
             record: Arc::new(Record {
@@ -76,6 +150,7 @@ impl GroupSm {
                 gate,
                 publishing: tokio::sync::Mutex::new(()),
             }),
+            cuts: Arc::new(cuts),
         })
     }
 
@@ -118,37 +193,36 @@ impl GroupSm {
     pub(super) fn snapshot(&self) -> Option<GroupSnapshot> {
         self.state().snapshot.clone()
     }
-}
 
-fn apply_control(group: &mut GroupState, control: Control) {
-    group.highest_kind = group.highest_kind.max(control.kind());
-    match control {
-        Control::FlusherAssignment(replica) => {
-            group.flusher = Some(NodeId::from(Uuid::from_bytes(replica)));
-        }
+    /// The cut of the group's checkpoint, the last applied or the one its
+    /// snapshot was opened or installed at; it changes as each applies.
+    pub(super) fn checkpoints(&self) -> watch::Receiver<Option<LogId>> {
+        self.cuts.subscribe()
     }
 }
 
 impl RaftSnapshotBuilder<RaftTypes> for GroupSm {
     type SnapshotData = GroupState;
 
+    /// The group's checkpoint snapshot, recorded unless it already is.
+    /// Without a checkpoint only a forced build gets here, and it gets the
+    /// group as applied: `openraft` forces one only for a log purged with
+    /// no snapshot recorded, which recording before every purge rules out.
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<RaftTypes, GroupState>, io::Error> {
         let record = Arc::clone(&self.record);
         let _publishing = record.publishing.lock().await;
         // Read once publishing is ours: an install that overlapped this
         // build is then in the state, so it never records an older one.
-        let snapshot = {
+        let (checkpoint, recorded) = {
             let state = self.state();
-            GroupSnapshot {
-                meta: SnapshotMeta {
-                    last_log_id: state.applied,
-                    last_membership: state.membership.clone(),
-                },
-                state: state.group,
-            }
+            let recorded = state.snapshot.as_ref().map(|s| s.meta.last_log_id);
+            let checkpoint = state.history.checkpoint().cloned();
+            (checkpoint.unwrap_or_else(|| state.as_applied()), recorded)
         };
-        self.record(snapshot.clone()).await?;
-        Ok(snapshot.into())
+        if recorded.is_none_or(|last| last < checkpoint.meta.last_log_id) {
+            self.record(checkpoint.clone()).await?;
+        }
+        Ok(checkpoint.into())
     }
 }
 
@@ -171,24 +245,20 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
             + OptionalSend,
     {
         while let Some((entry, responder)) = entries.try_next().await? {
-            {
-                let mut state = self.state();
-                state.applied = Some(entry.log_id);
-                match entry.payload {
-                    EntryPayload::Membership(m) => {
-                        state.membership = StoredMembership::new(Some(entry.log_id), m);
-                    }
-                    EntryPayload::Normal(GroupEntry::Control(control)) => {
-                        apply_control(&mut state.group, control);
-                    }
-                    EntryPayload::Blank | EntryPayload::Normal(GroupEntry::Batch(_)) => {}
-                }
+            let checkpoint = self.state().apply(entry.log_id, entry.payload);
+            if let Some(cut) = checkpoint {
+                self.cuts.send_replace(Some(cut));
             }
             if let Some(responder) = responder {
                 responder.send(());
             }
         }
         Ok(())
+    }
+
+    async fn try_create_snapshot_builder(&mut self, force: bool) -> Option<Self> {
+        let checkpointed = self.state().history.checkpoint().is_some();
+        (force || checkpointed).then(|| self.clone())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self {
@@ -206,11 +276,9 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
             meta: meta.clone(),
             state: group,
         };
-        self.record(snapshot).await?;
-        let mut state = self.state();
-        state.applied = meta.last_log_id;
-        state.membership = meta.last_membership.clone();
-        state.group = group;
+        self.record(snapshot.clone()).await?;
+        *self.state() = State::opened(Some(snapshot));
+        self.cuts.send_replace(meta.last_log_id);
         Ok(())
     }
 
@@ -224,6 +292,7 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use openraft::vote::leader_id_std::CommittedLeaderId;
@@ -322,6 +391,8 @@ mod tests {
     /// A build records the flusher and the highest control kind applied,
     /// and a reopen restores the flusher from it.
     #[tokio::test]
+    #[ignore = "superseded: RFC 0065 §6.5 builds a snapshot only at a checkpoint's cut; see \
+                a_built_snapshot_is_the_group_at_the_checkpoints_cut"]
     async fn a_built_snapshot_records_the_flusher_and_highest_kind() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
@@ -339,6 +410,103 @@ mod tests {
         let reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
         assert_eq!(reopened.flusher(), Some(NodeId::from(7)));
         assert_eq!(reopened.applied().map(|id| id.index), Some(3));
+    }
+
+    fn checkpoint(
+        index: u64,
+        proposer: u64,
+        (term, cut): (u64, u64),
+        highest_kind: u8,
+    ) -> EntryResponder<RaftTypes> {
+        let control = Control::Checkpoint {
+            proposer: *NodeId::from(proposer).uuid().as_bytes(),
+            cut: ourios_wal::RaftLogId { term, index: cut },
+            highest_kind,
+        };
+        entry(index, EntryPayload::Normal(GroupEntry::Control(control)))
+    }
+
+    fn voters(ids: &[u64]) -> Membership {
+        let ids = ids.iter().map(|&n| NodeId::from(n));
+        let nodes: BTreeMap<_, _> = ids.clone().map(|id| (id, id.to_string())).collect();
+        Membership::new(vec![ids.collect()], nodes).expect("membership")
+    }
+
+    fn cut(index: u64) -> Option<LogId> {
+        at(index).last_log_id
+    }
+
+    /// A checkpoint snapshots the group at its cut: the membership,
+    /// flusher and highest kind there, not those changed after it, and a
+    /// reopen starts applied through the cut.
+    #[tokio::test]
+    async fn a_built_snapshot_is_the_group_at_the_checkpoints_cut() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let cuts = sm.checkpoints();
+        let entries = vec![
+            entry(1, EntryPayload::Membership(voters(&[1, 2]))),
+            assign(2, 7),
+            batch(3),
+            entry(4, EntryPayload::Membership(voters(&[1, 2, 3]))),
+            assign(5, 9),
+            checkpoint(6, 9, (2, 3), 1),
+        ];
+        apply(&mut sm, entries).await;
+        assert_eq!(*cuts.borrow(), cut(3));
+        assert_eq!(sm.flusher(), Some(NodeId::from(9)), "applied, not built");
+
+        let built = sm.build_snapshot().await.expect("build");
+        let at_cut = StoredMembership::new(cut(1), voters(&[1, 2]));
+        assert_eq!(built.meta.last_log_id, cut(3));
+        assert_eq!(built.meta.last_membership, at_cut);
+        let expected = GroupState {
+            flusher: Some(NodeId::from(7)),
+            highest_kind: 1,
+            id_block: None,
+        };
+        assert_eq!(built.snapshot, expected);
+        let reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
+        assert_eq!(reopened.applied(), cut(3));
+        assert_eq!(reopened.flusher(), Some(NodeId::from(7)));
+        assert_eq!(reopened.membership(), at_cut);
+        assert_eq!(*reopened.checkpoints().borrow(), cut(3));
+    }
+
+    /// Checkpoints every replica refuses change nothing, though the log's
+    /// highest kind counts them; with no checkpoint applied only a forced
+    /// build is offered.
+    #[tokio::test]
+    async fn a_checkpoint_every_replica_would_refuse_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let cuts = sm.checkpoints();
+        apply(&mut sm, vec![batch(1), assign(2, 7), batch(3)]).await;
+        let refused = [
+            (checkpoint(4, 9, (2, 3), 1), "not the flusher"),
+            (checkpoint(5, 7, (2, 6), 1), "a cut not below the entry"),
+            (checkpoint(6, 7, (3, 3), 1), "a cut not in the log"),
+            (
+                checkpoint(7, 7, (2, 3), 2),
+                "a highest kind not the log's at the cut",
+            ),
+        ];
+        for (entry, why) in refused {
+            apply(&mut sm, vec![entry]).await;
+            assert_eq!(*cuts.borrow(), None, "{why}");
+            let builder = sm.try_create_snapshot_builder(false).await;
+            assert!(builder.is_none(), "{why}");
+        }
+        let forced = sm.try_create_snapshot_builder(true).await;
+        assert!(forced.is_some(), "openraft must get a forced builder");
+
+        apply(&mut sm, vec![checkpoint(8, 7, (2, 6), 2)]).await;
+        assert_eq!(*cuts.borrow(), cut(6), "kind 2 since the first refused");
+        apply(&mut sm, vec![checkpoint(9, 7, (2, 3), 2)]).await;
+        assert_eq!(*cuts.borrow(), cut(6), "a cut not above the last");
+        let built = sm.build_snapshot().await.expect("build");
+        assert_eq!(built.meta.last_log_id, cut(6));
+        assert_eq!(built.snapshot.highest_kind, 2);
     }
 
     /// A build that starts while an install is held at its fsync waits for

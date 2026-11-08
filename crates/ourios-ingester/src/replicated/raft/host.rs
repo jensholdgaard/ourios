@@ -148,6 +148,14 @@ async fn blocking<T: Send + 'static>(
         .unwrap_or_else(|e| Err(io::Error::other(e)))
 }
 
+/// What a host is opened with besides its spec: the Raft settings, the
+/// server its groups register with, and the gate their fsyncs pass.
+pub(super) struct Wiring {
+    pub(super) config: openraft::Config,
+    pub(super) server: ReplicationServer<GroupSm>,
+    pub(super) gate: Arc<SyncGate>,
+}
+
 impl GroupHost {
     /// Open every group in `spec`, replaying each log off the runtime's
     /// workers, and start its `Raft`. A group that fails stops the ones
@@ -158,16 +166,25 @@ impl GroupHost {
     /// [`HostError`] naming the vote log or the group that failed.
     pub async fn open(spec: HostSpec) -> Result<Self, HostError> {
         let meters = Meters::global();
-        Self::open_with(spec, ReplicationServer::default(), Arc::default(), &meters).await
+        let config = group_config().map_err(HostError::Config)?;
+        let wiring = Wiring {
+            config,
+            server: ReplicationServer::default(),
+            gate: Arc::default(),
+        };
+        Self::open_with(spec, wiring, &meters).await
     }
 
     pub(super) async fn open_with(
         spec: HostSpec,
-        server: ReplicationServer<GroupSm>,
-        gate: Arc<SyncGate>,
+        Wiring {
+            config,
+            server,
+            gate,
+        }: Wiring,
         meters: &Meters,
     ) -> Result<Self, HostError> {
-        let config = Arc::new(group_config().map_err(HostError::Config)?);
+        let config = Arc::new(config);
         let root = spec.wal.root.clone();
         let votes = blocking(move || VoteLog::open(&root))
             .await

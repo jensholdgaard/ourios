@@ -14,7 +14,7 @@ use openraft::storage::RaftLogReader as _;
 use super::{committed, export, followers, held, ready_leader, rejected_as, writer};
 use crate::receiver::ReceiveError;
 use crate::replicated::ingest::ReplicatedIngest;
-use crate::replicated::raft::cluster::{Cluster, wal_config, write};
+use crate::replicated::raft::cluster::{Cluster, ELECTION_TIMEOUT_MAX, wal_config, write};
 use crate::replicated::raft::log_store::{GroupLog, group_dir};
 use crate::replicated::raft::types::{Entry, GroupEntry};
 use crate::replicated::raft::vote_log::VoteLog;
@@ -247,7 +247,7 @@ async fn rfc0065_5_takeover_only_by_a_replica_with_every_ack() {
     cluster.heal(a, c);
     cluster.heal(b, c);
     // Several election timeouts, with nothing to vote for c.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(ELECTION_TIMEOUT_MAX * 3).await;
     let seen = cluster
         .node(c)
         .raft(0)

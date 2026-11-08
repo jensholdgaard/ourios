@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
 use super::gate::SyncGate;
-use super::host::{GroupHost, GroupRaft, HostSpec};
+use super::host::{GroupHost, GroupRaft, HostSpec, Wiring};
 use super::log_store::group_dir;
 use super::state_machine::GroupSm;
 use super::telemetry::Meters;
@@ -42,6 +42,22 @@ pub(crate) fn wal_config(root: &Path) -> WalConfig {
         rotation_retry_attempts: ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS,
         macos_full_fsync: false,
     }
+}
+
+/// The longest election timeout [`raft_config`] allows.
+pub(crate) const ELECTION_TIMEOUT_MAX: Duration = Duration::from_secs(2);
+
+/// [`group_config`](super::group_config) with a longer election timeout.
+/// The default 150–300 ms is also the leader's quorum lease, which a loaded
+/// CI runner can miss, unseating a leader the test still writes to.
+pub(crate) fn raft_config() -> openraft::Config {
+    openraft::Config {
+        election_timeout_min: 1_000,
+        election_timeout_max: ELECTION_TIMEOUT_MAX.as_millis().try_into().expect("fits"),
+        ..super::group_config().expect("group config")
+    }
+    .validate()
+    .expect("test config")
 }
 
 /// §8's crash model: drop every byte past the boundary `synced` names.
@@ -165,7 +181,12 @@ impl Node {
             peers: peers.clone(),
         };
         server.identify_as(Identity::new(replica.node_id.clone(), replica.id));
-        let host = GroupHost::open_with(spec, server, Arc::clone(&gate), &replica.meters)
+        let wiring = Wiring {
+            config: raft_config(),
+            server,
+            gate: Arc::clone(&gate),
+        };
+        let host = GroupHost::open_with(spec, wiring, &replica.meters)
             .await
             .expect("host");
         let (stop, serving) = serve(host.server());

@@ -155,6 +155,25 @@ fn an_unparsable_or_foreign_record_is_refused_with_its_reason() {
             GOLDEN.replace(r#""group":3"#, r#""group":3,"extra":0"#),
             "malformed",
         ),
+        (
+            "a format named twice",
+            GOLDEN.replace(r#""format":1"#, r#""format":2,"format":1"#),
+            "malformed",
+        ),
+        (
+            "a group named twice",
+            GOLDEN.replace(r#""group":3"#, r#""group":4,"group":3"#),
+            "malformed",
+        ),
+        (
+            "a member's replica named twice",
+            GOLDEN.replacen(
+                r#""replica":""#,
+                &format!(r#""replica":"{R2}","replica":""#),
+                1,
+            ),
+            "malformed",
+        ),
     ]);
     let bad_bytes = Formation::decode(&[0xff, 0xfe], GROUP, &VOTERS).expect_err("bytes");
     assert_eq!(bad_bytes.error_type(), "malformed");

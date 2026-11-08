@@ -127,13 +127,16 @@ impl Formation {
             format: u32,
         }
         let malformed = |e: serde_json::Error| Unreadable::Malformed(e.to_string());
+        // The shape is checked on a `Value`, but the fields are read from
+        // the bytes: a `Value` keeps only the last of two equal keys, and
+        // a record naming a field twice is ambiguous, so it is refused.
         let value: Value = serde_json::from_slice(bytes).map_err(malformed)?;
         objects_only(&value)?;
-        let header = Header::deserialize(&value).map_err(malformed)?;
+        let header: Header = serde_json::from_slice(bytes).map_err(malformed)?;
         if header.format != FORMED_FORMAT {
             return Err(Unreadable::Format(header.format));
         }
-        let record = Record::deserialize(&value).map_err(malformed)?;
+        let record: Record = serde_json::from_slice(bytes).map_err(malformed)?;
         if record.group != group {
             return Err(Unreadable::Group(record.group));
         }

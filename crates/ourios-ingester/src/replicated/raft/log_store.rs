@@ -500,6 +500,12 @@ impl GroupLog {
 }
 
 impl GroupLogReader {
+    /// The group whose log this reads.
+    #[must_use]
+    pub fn group(&self) -> u32 {
+        self.group
+    }
+
     #[must_use]
     pub fn controls(&self) -> LogControls {
         lock_index(&self.index).log_controls()

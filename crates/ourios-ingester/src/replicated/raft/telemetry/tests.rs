@@ -12,16 +12,17 @@ use ourios_semconv as semconv;
 
 use super::Meters;
 use crate::replicated::raft::cluster::{Cluster, name, write};
+use crate::replicated::raft::flusher::{Hold, Reason};
 use crate::replicated::raft::types::{NodeId, Vote};
 
 /// One meter provider and what it exports.
-struct Reader {
+pub(crate) struct Reader {
     provider: SdkMeterProvider,
     exporter: InMemoryMetricExporter,
 }
 
 impl Reader {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
             .with_periodic_exporter(exporter.clone())
@@ -29,7 +30,7 @@ impl Reader {
         Self { provider, exporter }
     }
 
-    fn meter(&self) -> Meter {
+    pub(crate) fn meter(&self) -> Meter {
         self.provider
             .meter_with_scope(ourios_core::telemetry::scope("ourios.wal"))
     }
@@ -42,7 +43,7 @@ impl Reader {
 
     /// `name`'s points as `(attribute values, value)`, the attributes in
     /// key order.
-    fn points(&self, name: &str) -> Vec<(Vec<String>, u64)> {
+    pub(crate) fn points(&self, name: &str) -> Vec<(Vec<String>, u64)> {
         self.collect()
             .iter()
             .flat_map(ResourceMetrics::scope_metrics)
@@ -214,4 +215,35 @@ fn every_committed_vote_for_this_node_is_one_takeover() {
     }
     let counted = reader.points(semconv::OURIOS_WAL_REPLICATION_TAKEOVERS);
     assert_eq!(counted, [(vec!["0".to_owned()], 2)], "terms 1 and 3");
+}
+
+/// Each count carries its group and the registry's value for its reason.
+#[test]
+fn flusher_counts_carry_the_group_and_the_reason() {
+    let reader = Reader::new();
+    let counts = Meters::on(&reader.meter()).flusher();
+    for reason in [Reason::Unassigned, Reason::NotLearner, Reason::Unhealthy] {
+        counts.assigned(3, reason);
+    }
+    counts.assigned(4, Reason::Unhealthy);
+    counts.held(3, Hold::MemberUnconfirmed);
+    counts.held(3, Hold::MembershipChange);
+    let point = |group: &str, reason: &str| (vec![group.to_owned(), reason.to_owned()], 1);
+
+    let mut assigned = reader.points(semconv::OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS);
+    assigned.sort();
+    let expected = [
+        point("3", "not_learner"),
+        point("3", "unassigned"),
+        point("3", "unhealthy"),
+        point("4", "unhealthy"),
+    ];
+    assert_eq!(assigned, expected);
+    let mut held = reader.points(semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS);
+    held.sort();
+    let expected = [
+        point("3", "member_unconfirmed"),
+        point("3", "membership_change"),
+    ];
+    assert_eq!(held, expected);
 }

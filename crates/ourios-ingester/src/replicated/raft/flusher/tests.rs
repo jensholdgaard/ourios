@@ -9,12 +9,15 @@ use openraft::Instant as _;
 use openraft::async_runtime::WatchReceiver as _;
 use ourios_wal::Control;
 
-use super::{Learner, Pass, Steward, View, plan};
+use super::{Assignment, Learner, Pass, Reason, Steward, View, plan};
 use crate::replicated::raft::cluster::{Cluster, WAIT, name, write};
 use crate::replicated::raft::learners::{self, Changes, Group, Tail, TailPool, reconcile};
 use crate::replicated::raft::log_store::GroupLogReader;
+use crate::replicated::raft::telemetry::Meters;
+use crate::replicated::raft::telemetry::tests::Reader;
 use crate::replicated::raft::transport::Identity;
 use crate::replicated::raft::types::{GroupEntry, NodeId};
+use ourios_semconv as semconv;
 
 const P: Duration = Duration::from_secs(10);
 
@@ -38,6 +41,13 @@ fn learners(acked: &[Option<u64>]) -> Vec<Learner> {
         .collect()
 }
 
+fn assignment(n: u64, reason: Reason) -> Assignment {
+    Assignment {
+        replica: id(n),
+        reason,
+    }
+}
+
 fn view(flusher: Option<u64>, learners: Vec<Learner>, led_for: u64) -> View {
     View {
         flusher: flusher.map(id),
@@ -49,7 +59,11 @@ fn view(flusher: Option<u64>, learners: Vec<Learner>, led_for: u64) -> View {
 #[test]
 fn with_no_flusher_the_first_healthy_learner_in_order_is_assigned() {
     let planned = plan(&view(None, learners(&[Some(11), Some(1), Some(0)]), 0), P);
-    assert_eq!(planned, Some(id(2)), "the first is unhealthy");
+    assert_eq!(
+        planned,
+        Some(assignment(2, Reason::Unassigned)),
+        "the first is unhealthy"
+    );
 }
 
 /// A flusher is unhealthy once its last acknowledgement is the patience
@@ -59,7 +73,7 @@ fn an_unhealthy_flusher_is_kept_for_the_patience_then_replaced() {
     let kept = plan(&view(Some(1), learners(&[Some(19), Some(0)]), 60), P);
     assert_eq!(kept, None);
     let replaced = plan(&view(Some(1), learners(&[Some(20), Some(0)]), 60), P);
-    assert_eq!(replaced, Some(id(2)));
+    assert_eq!(replaced, Some(assignment(2, Reason::Unhealthy)));
 }
 
 #[test]
@@ -75,7 +89,7 @@ fn a_flusher_that_left_the_learners_is_replaced() {
     let mut rest = learners(&[Some(0), Some(0)]);
     rest[0].placed = false;
     let planned = plan(&view(Some(9), rest, 60), P);
-    assert_eq!(planned, Some(id(2)));
+    assert_eq!(planned, Some(assignment(2, Reason::NotLearner)));
 }
 
 #[test]
@@ -94,7 +108,10 @@ fn a_new_leader_keeps_the_flusher_for_the_patience() {
     let silent = learners(&[None, Some(0)]);
     assert_eq!(plan(&view(Some(1), silent.clone(), 9), P), None);
     assert_eq!(plan(&view(Some(9), silent.clone(), 9), P), None);
-    assert_eq!(plan(&view(Some(1), silent, 10), P), Some(id(2)));
+    assert_eq!(
+        plan(&view(Some(1), silent, 10), P),
+        Some(assignment(2, Reason::Unhealthy))
+    );
 }
 
 /// The cluster tests' patience: long against a heartbeat, short against a
@@ -328,7 +345,8 @@ async fn an_uncommitted_new_kind_holds_back_a_learner() {
 }
 
 /// RFC0065.29: with a membership change in flight the leader appends no
-/// new kind; once it commits, the assignment is appended.
+/// new kind, and counts the hold as one; once it commits, the assignment
+/// is appended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_membership_change_in_flight_holds_back_a_new_kind() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
@@ -357,7 +375,8 @@ async fn a_membership_change_in_flight_holds_back_a_new_kind() {
         .await
         .expect("in flight");
 
-    let mut steward = Steward::with_patience(PATIENCE);
+    let reader = Reader::new();
+    let mut steward = counted(&reader);
     let held = pass(&mut steward, &cluster, leader, &first).await;
     assert_eq!(
         held,
@@ -365,6 +384,8 @@ async fn a_membership_change_in_flight_holds_back_a_new_kind() {
         "a new kind beside a membership change"
     );
     assert_eq!(log(&cluster, leader).controls().highest_kind, 0);
+    let holds = reader.points(semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS);
+    assert_eq!(holds, [counted_as("membership_change", 1)]);
 
     for &f in &followers {
         cluster.node(f).gate.open();
@@ -372,6 +393,60 @@ async fn a_membership_change_in_flight_holds_back_a_new_kind() {
     membership.await.expect("join").expect("committed");
     let assigned = pass(&mut steward, &cluster, leader, &first).await;
     assert_eq!(assigned.assigned, Some(cluster.id(order[0])));
+    cluster.shutdown().await;
+}
+
+/// A steward on [`PATIENCE`] counting to `reader`.
+fn counted(reader: &Reader) -> Steward {
+    Steward::counting(PATIENCE, Meters::on(&reader.meter()).flusher())
+}
+
+/// A point of group 0 with `reason`.
+fn counted_as(reason: &str, value: u64) -> (Vec<String>, u64) {
+    (vec!["0".to_owned(), reason.to_owned()], value)
+}
+
+/// The leader counts each pass its kind gate holds back for a member
+/// reading below the kind, and the assignment once it commits, each by
+/// group and reason; a pass that assigns nothing counts neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_kinds_and_committed_assignments_are_counted() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (placed, order) = placement(&cluster, 3..5);
+    let placed = strs(&placed);
+    let voter = (0..3).find(|&i| i != leader).expect("a follower");
+    let reader = Reader::new();
+    let mut steward = counted(&reader);
+    let holds = semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS;
+    let assignments = semconv::OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS;
+
+    reconcile(group(&cluster, leader), tail(&placed, &cluster))
+        .await
+        .expect("the learners");
+    heard_from(&cluster, leader, &order).await;
+    reads_up_to(&cluster, voter, 0);
+    for n in 1..=2 {
+        let held = pass(&mut steward, &cluster, leader, &placed).await;
+        assert_eq!(held.assigned, None, "a voter reads below the kind");
+        let counted = reader.points(holds);
+        assert_eq!(counted, [counted_as("member_unconfirmed", n)]);
+    }
+    assert!(reader.points(assignments).is_empty(), "nothing committed");
+
+    reads_up_to(&cluster, voter, 1);
+    let first = pass(&mut steward, &cluster, leader, &placed).await;
+    assert_eq!(first.assigned, Some(cluster.id(order[0])));
+    let kept = pass(&mut steward, &cluster, leader, &placed).await;
+    assert_eq!(kept.assigned, None);
+    let counted = reader.points(assignments);
+    assert_eq!(counted, [counted_as("unassigned", 1)]);
+    let counted = reader.points(holds);
+    assert_eq!(
+        counted,
+        [counted_as("member_unconfirmed", 2)],
+        "an assignment held"
+    );
     cluster.shutdown().await;
 }
 

@@ -31,6 +31,7 @@ use ourios_wal::Control;
 
 use super::host::GroupRaft;
 use super::learners::{self, Changes, Group, Tail};
+use super::telemetry::{FlusherCounts, Meters};
 use super::types::{GroupEntry, NodeId, RaftTypes};
 
 /// How long a flusher may go unhealthy, and a new leader keep its log's
@@ -69,24 +70,100 @@ pub struct View {
     pub led_for: Duration,
 }
 
-/// The replica to assign, if the leader should append an assignment.
-#[must_use]
-pub fn plan(view: &View, patience: Duration) -> Option<NodeId> {
-    let current = view
-        .flusher
-        .map(|f| view.learners.iter().find(|l| l.replica == f));
-    let replace = match current {
-        Some(_) if view.led_for < patience => false,
-        Some(Some(flusher)) => flusher.unhealthy_for(view.led_for, patience) >= patience,
-        None | Some(None) => true,
-    };
-    if !replace {
-        return None;
+/// Why the leader names a flusher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// The group had no flusher.
+    Unassigned,
+    /// The flusher was no longer a learner of the committed membership.
+    NotLearner,
+    /// The flusher had been unhealthy for the patience.
+    Unhealthy,
+}
+
+impl Reason {
+    /// The `ourios.wal.replication.flusher.assignment.reason` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unassigned => "unassigned",
+            Self::NotLearner => "not_learner",
+            Self::Unhealthy => "unhealthy",
+        }
     }
+}
+
+/// An assignment the leader should append: the replica it names, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Assignment {
+    pub replica: NodeId,
+    pub reason: Reason,
+}
+
+impl Assignment {
+    fn control(self) -> Control {
+        Control::FlusherAssignment(*self.replica.uuid().as_bytes())
+    }
+}
+
+/// The assignment to append, if the leader should append one.
+#[must_use]
+pub fn plan(view: &View, patience: Duration) -> Option<Assignment> {
+    let reason = replacing(view, patience)?;
     view.learners
         .iter()
         .find(|l| l.placed && l.healthy(patience))
-        .map(|l| l.replica)
+        .map(|l| Assignment {
+            replica: l.replica,
+            reason,
+        })
+}
+
+/// Why the flusher the log names is to be replaced, if it is.
+fn replacing(view: &View, patience: Duration) -> Option<Reason> {
+    let current = view
+        .flusher
+        .map(|f| view.learners.iter().find(|l| l.replica == f));
+    match current {
+        Some(_) if view.led_for < patience => None,
+        None => Some(Reason::Unassigned),
+        Some(None) => Some(Reason::NotLearner),
+        Some(Some(flusher)) if flusher.unhealthy_for(view.led_for, patience) >= patience => {
+            Some(Reason::Unhealthy)
+        }
+        Some(Some(_)) => None,
+    }
+}
+
+/// Why the leader held back a kind its log has never held (§6.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// A member of the latest membership had not answered `Identify`
+    /// reading the kind.
+    MemberUnconfirmed,
+    /// A membership change was in flight.
+    MembershipChange,
+}
+
+impl Hold {
+    /// The `ourios.wal.replication.control.hold.reason` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MemberUnconfirmed => "member_unconfirmed",
+            Self::MembershipChange => "membership_change",
+        }
+    }
+}
+
+/// What the kind gate decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Every member reads the kind.
+    Reads,
+    Held(Hold),
+    /// The term changed during the round, so this node may no longer lead.
+    Deposed,
 }
 
 /// What one pass changed.
@@ -105,6 +182,7 @@ pub struct Steward {
     /// The term this node leads in, and when this node first saw itself
     /// leading it.
     led: Option<(u64, Instant)>,
+    counts: FlusherCounts,
 }
 
 impl Default for Steward {
@@ -118,9 +196,16 @@ impl Steward {
     /// tests.
     #[must_use]
     pub(crate) fn with_patience(patience: Duration) -> Self {
+        Self::counting(patience, Meters::global().flusher())
+    }
+
+    /// A steward with patience `patience` that counts to `counts`.
+    #[must_use]
+    pub(crate) fn counting(patience: Duration, counts: FlusherCounts) -> Self {
         Self {
             patience,
             led: None,
+            counts,
         }
     }
 
@@ -141,32 +226,53 @@ impl Steward {
     /// Append the assignment [`plan`] gives, held back while the log has
     /// never held its kind and not every member reads it.
     async fn assign(&mut self, group: Group<'_>, tail: Tail<'_>) -> Result<Option<NodeId>, String> {
-        let Some((next, highest_kind)) = self.choose(group, tail) else {
+        let Some(chosen) = self.choose(group, tail) else {
             return Ok(None);
         };
-        let control = Control::FlusherAssignment(*next.uuid().as_bytes());
-        if control.kind() > highest_kind {
-            let metrics = group.raft.metrics().borrow_watched().clone();
-            if !every_member_reads(group.raft, &metrics, tail, control.kind()).await {
-                return Ok(None);
-            }
-            // The round can outlast the patience, so `next` may no longer
-            // be healthy, or no longer the one to choose.
-            if self.choose(group, tail).map(|(chosen, _)| chosen) != Some(next) {
-                return Ok(None);
-            }
-        }
+        let Some(next) = self.admit(group, tail, chosen).await else {
+            return Ok(None);
+        };
         group
             .raft
-            .client_write(GroupEntry::Control(control))
+            .client_write(GroupEntry::Control(next.control()))
             .await
             .map_err(|e| e.to_string())?;
-        Ok(Some(next))
+        self.counts.assigned(group.log.group(), next.reason);
+        Ok(Some(next.replica))
     }
 
-    /// The replica [`plan`] assigns from what the leader sees now, with the
+    /// `planned`, unless its kind is above `highest_kind`, the highest the
+    /// log holds: then only once every member reads it and the leader still
+    /// chooses its replica.
+    async fn admit(
+        &mut self,
+        group: Group<'_>,
+        tail: Tail<'_>,
+        (planned, highest_kind): (Assignment, u8),
+    ) -> Option<Assignment> {
+        let kind = planned.control().kind();
+        if kind <= highest_kind {
+            return Some(planned);
+        }
+        let metrics = group.raft.metrics().borrow_watched().clone();
+        match gate(group.raft, &metrics, tail, kind).await {
+            Gate::Reads => {}
+            Gate::Held(hold) => {
+                self.counts.held(group.log.group(), hold);
+                return None;
+            }
+            Gate::Deposed => return None,
+        }
+        // The round can outlast the patience, so the replica may no longer
+        // be healthy, or no longer the one to choose.
+        self.choose(group, tail)
+            .map(|(chosen, _)| chosen)
+            .filter(|chosen| chosen.replica == planned.replica)
+    }
+
+    /// The assignment [`plan`] gives from what the leader sees now, with the
     /// highest kind its log holds.
-    fn choose(&mut self, group: Group<'_>, tail: Tail<'_>) -> Option<(NodeId, u8)> {
+    fn choose(&mut self, group: Group<'_>, tail: Tail<'_>) -> Option<(Assignment, u8)> {
         let metrics = group.raft.metrics().borrow_watched().clone();
         let led_for = self.led_for(&metrics)?;
         let controls = group.log.controls();
@@ -220,17 +326,17 @@ fn committed_learners(metrics: &RaftMetrics<RaftTypes>, placed: &[&str]) -> Vec<
 
 /// Whether every member of the leader's latest membership reads `kind`:
 /// with no membership change in flight, each answered `Identify` under
-/// the UUID it is a member as, with a kind at or above it, and the
-/// membership is unchanged once they have. The leader reads every kind it
-/// appends.
-async fn every_member_reads(
+/// the UUID it is a member as, with a kind at or above it, and the term
+/// and membership are unchanged once they have. The leader reads every
+/// kind it appends.
+async fn gate(
     raft: &GroupRaft,
     metrics: &RaftMetrics<RaftTypes>,
     tail: Tail<'_>,
     kind: u8,
-) -> bool {
+) -> Gate {
     if !membership_settled(metrics) {
-        return false;
+        return Gate::Held(Hold::MembershipChange);
     }
     let membership = metrics.membership_config.membership();
     let members: BTreeSet<_> = membership
@@ -240,7 +346,7 @@ async fn every_member_reads(
         .collect();
     for replica in members {
         let Some(node_id) = membership.get_node(&replica) else {
-            return false;
+            return Gate::Held(Hold::MemberUnconfirmed);
         };
         let reads = tail
             .peers
@@ -248,13 +354,17 @@ async fn every_member_reads(
             .await
             .is_ok_and(|answer| answer.replica == replica && answer.highest_control_kind >= kind);
         if !reads {
-            return false;
+            return Gate::Held(Hold::MemberUnconfirmed);
         }
     }
     let now = raft.metrics().borrow_watched().clone();
-    now.current_term == metrics.current_term
-        && membership_settled(&now)
-        && now.membership_config.log_id() == metrics.membership_config.log_id()
+    let unchanged = membership_settled(&now)
+        && now.membership_config.log_id() == metrics.membership_config.log_id();
+    match (now.current_term == metrics.current_term, unchanged) {
+        (false, _) => Gate::Deposed,
+        (true, false) => Gate::Held(Hold::MembershipChange),
+        (true, true) => Gate::Reads,
+    }
 }
 
 /// Whether the latest membership has committed.

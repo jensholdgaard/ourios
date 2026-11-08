@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use super::codec::{self, Replayed};
 use super::gate::SyncGate;
+use super::snapshot_record::GroupSnapshot;
 use super::telemetry::Takeovers;
 use super::types::{Entry, GroupEntry, LogId, NodeId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
@@ -149,25 +150,38 @@ impl Index {
         Ok(())
     }
 
-    fn log_controls(&self) -> LogControls {
+    /// The view of the controls in the log, over `snapshot`'s where it has
+    /// one: the snapshot holds every control at or below its last entry,
+    /// though the log may have purged them.
+    fn log_controls(&self, snapshot: Option<&GroupSnapshot>) -> LogControls {
+        let committed_kind = snapshot.map_or(self.purged_kind, |s| {
+            s.state.highest_kind.max(self.purged_kind)
+        });
         let highest_kind = self
             .controls
             .values()
             .map(|c| c.kind())
-            .fold(self.purged_kind, u8::max);
+            .fold(committed_kind, u8::max);
         let introduced = self
             .controls
             .iter()
-            .find(|(_, c)| c.kind() == highest_kind && highest_kind > self.purged_kind)
+            .find(|(_, c)| c.kind() == highest_kind && highest_kind > committed_kind)
             .map(|(&index, _)| index);
+        let after = snapshot
+            .and_then(|s| s.meta.last_log_id)
+            .map_or(0, |last| last.index + 1);
         // Every kind is an assignment so far; the next one filters here.
-        let flusher = self.controls.values().next_back().map(|c| match *c {
-            Control::FlusherAssignment(replica) => NodeId::from(Uuid::from_bytes(replica)),
-        });
+        let newest = self
+            .controls
+            .range(after..)
+            .next_back()
+            .map(|(_, c)| match *c {
+                Control::FlusherAssignment(replica) => NodeId::from(Uuid::from_bytes(replica)),
+            });
         LogControls {
             highest_kind,
             introduced,
-            flusher,
+            flusher: newest.or_else(|| snapshot.and_then(|s| s.state.flusher)),
         }
     }
 
@@ -506,9 +520,17 @@ impl GroupLogReader {
         self.group
     }
 
+    /// The controls the log holds, without a snapshot's.
     #[must_use]
     pub fn controls(&self) -> LogControls {
-        lock_index(&self.index).log_controls()
+        lock_index(&self.index).log_controls(None)
+    }
+
+    /// The controls the log holds over those of `snapshot`, the group's
+    /// current one: what a leader acts on once the log is purged below it.
+    #[must_use]
+    pub(super) fn controls_over(&self, snapshot: Option<&GroupSnapshot>) -> LogControls {
+        lock_index(&self.index).log_controls(snapshot)
     }
 }
 

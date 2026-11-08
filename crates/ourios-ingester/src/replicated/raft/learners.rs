@@ -17,7 +17,8 @@ use openraft::async_runtime::WatchReceiver as _;
 use openraft::{ChangeMembers, Precondition};
 
 use super::host::GroupRaft;
-use super::log_store::GroupLogReader;
+use super::log_store::{GroupLogReader, LogControls};
+use super::state_machine::GroupSm;
 use super::transport::{Identity, Peers};
 use super::types::{LogId, Membership, NodeId};
 use crate::replicated::placement::place;
@@ -42,11 +43,21 @@ impl TailPool {
     }
 }
 
-/// A group this node hosts: its `Raft` and a view of its log.
+/// A group this node hosts: its `Raft`, a view of its log, and its state
+/// machine, whose snapshot holds what the log purged.
 #[derive(Clone, Copy)]
 pub struct Group<'a> {
     pub raft: &'a GroupRaft,
     pub log: &'a GroupLogReader,
+    pub sm: &'a GroupSm,
+}
+
+impl Group<'_> {
+    /// The controls the log holds over those of the group's snapshot.
+    #[must_use]
+    pub fn controls(&self) -> LogControls {
+        self.log.controls_over(self.sm.snapshot().as_ref())
+    }
 }
 
 /// A group's tail placement and how a pass reaches it.
@@ -156,7 +167,7 @@ pub async fn reconcile(group: Group<'_>, tail: Tail<'_>) -> Result<Changes, Stri
         }
     }
     // A new learner reads every kind in the log, committed or not (§6.8).
-    let log_kind = group.log.controls().highest_kind;
+    let log_kind = group.controls().highest_kind;
     let changes = plan(&members, tail.placed, &answers, log_kind);
     // An entry of a new kind appended during the `Identify` calls holds
     // the change back until it commits.
@@ -225,7 +236,6 @@ fn led_members(group: Group<'_>) -> Option<(Members, Option<LogId>)> {
 fn kinds_settled(group: Group<'_>) -> bool {
     let committed = group.raft.metrics().borrow_watched().local_committed;
     group
-        .log
         .controls()
         .introduced
         .is_none_or(|i| committed.is_some_and(|c| c.index >= i))

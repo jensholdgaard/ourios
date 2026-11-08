@@ -113,6 +113,11 @@ impl GroupSm {
     pub fn flusher(&self) -> Option<NodeId> {
         self.state().group.flusher
     }
+
+    /// The group's current snapshot, opened, built or installed.
+    pub(super) fn snapshot(&self) -> Option<GroupSnapshot> {
+        self.state().snapshot.clone()
+    }
 }
 
 fn apply_control(group: &mut GroupState, control: Control) {

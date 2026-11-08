@@ -16,7 +16,7 @@ use crate::replicated::raft::log_store::GroupLogReader;
 use crate::replicated::raft::telemetry::Meters;
 use crate::replicated::raft::telemetry::tests::Reader;
 use crate::replicated::raft::transport::Identity;
-use crate::replicated::raft::types::{GroupEntry, NodeId};
+use crate::replicated::raft::types::{GroupEntry, LogId, NodeId};
 use ourios_semconv as semconv;
 
 const P: Duration = Duration::from_secs(10);
@@ -127,6 +127,7 @@ fn group(cluster: &Cluster, i: usize) -> Group<'_> {
     Group {
         raft: cluster.node(i).raft(0),
         log: log(cluster, i),
+        sm: cluster.node(i).host.state_machine(0).expect("hosted"),
     }
 }
 
@@ -393,6 +394,42 @@ async fn a_membership_change_in_flight_holds_back_a_new_kind() {
     membership.await.expect("join").expect("committed");
     let assigned = pass(&mut steward, &cluster, leader, &first).await;
     assert_eq!(assigned.assigned, Some(cluster.id(order[0])));
+    cluster.shutdown().await;
+}
+
+/// A leader whose log purged the last assignment below its snapshot
+/// still sees the snapshot's flusher, so a steward new to the lead keeps
+/// it for the patience rather than treating the group as unassigned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flusher_purged_below_the_snapshot_is_kept_for_the_patience() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (placed, order) = placement(&cluster, 3..5);
+    let placed = strs(&placed);
+    let mut steward = Steward::with_patience(PATIENCE);
+    let flusher = pass_until_assigned(&mut steward, &cluster, leader, &placed).await;
+    assert_eq!(flusher, cluster.id(order[0]));
+
+    let raft = cluster.node(leader).raft(0);
+    let index = write(raft, 1).await;
+    cluster.node(leader).applied_through(0, index).await;
+    let reached = |id: Option<&LogId>| id.is_some_and(|id| id.index >= index);
+    raft.trigger().snapshot().await.expect("snapshot");
+    raft.wait(WAIT)
+        .metrics(|m| reached(m.snapshot.as_ref()), "built")
+        .await
+        .expect("built");
+    raft.trigger().purge_log(index).await.expect("purge");
+    raft.wait(WAIT)
+        .metrics(|m| reached(m.purged.as_ref()), "purged")
+        .await
+        .expect("purged");
+    assert_eq!(log(&cluster, leader).controls().flusher, None);
+    assert_eq!(group(&cluster, leader).controls().flusher, Some(flusher));
+
+    let mut new_to_the_lead = Steward::with_patience(PATIENCE);
+    let kept = pass(&mut new_to_the_lead, &cluster, leader, &placed).await;
+    assert_eq!(kept.assigned, None, "reassigned within the patience");
     cluster.shutdown().await;
 }
 

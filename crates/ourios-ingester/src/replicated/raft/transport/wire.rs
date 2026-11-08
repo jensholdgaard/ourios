@@ -845,7 +845,7 @@ mod tests {
             last_log_id in proptest::option::of(log_id()),
             last_membership in stored_membership(),
             flusher in proptest::option::of(any::<u64>()),
-            highest_kind in any::<u8>(),
+            highest_kind in 0..=Control::HIGHEST_KIND,
         ) {
             let last_log_id = last_log_id
                 .map(|id| log(id.leader_id.term.min(vote.leader_id.term), id.index));

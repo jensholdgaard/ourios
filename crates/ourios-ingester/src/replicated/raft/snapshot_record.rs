@@ -32,7 +32,7 @@ use super::codec::{encode_membership, raft_id, take_membership, wal_id};
 use super::gate::SyncGate;
 use super::types::{LogId, NodeId, RaftTypes};
 use super::{OWNER_WAIT, sync_through, take_ownership, writer_gone};
-use ourios_wal::RaftLogId;
+use ourios_wal::{Control, RaftLogId};
 
 pub(super) type SnapshotMeta = SnapshotMetaOf<RaftTypes>;
 
@@ -166,6 +166,12 @@ fn take_state(bytes: &[u8]) -> io::Result<GroupState> {
     }
     let flusher = take_flusher(&bytes[..FLUSHER_LEN])?;
     let highest_kind = bytes[FLUSHER_LEN];
+    if highest_kind > Control::HIGHEST_KIND {
+        return Err(invalid(format!(
+            "highest kind {highest_kind} is above {}, the highest this release reads",
+            Control::HIGHEST_KIND
+        )));
+    }
     match bytes[FLUSHER_LEN + 1] {
         NO_MINER_CONFIG => {}
         kind => return Err(invalid(format!("miner configuration kind {kind}"))),
@@ -410,6 +416,16 @@ mod tests {
         bytes[kind] = 4;
         let e = decode(&resealed(bytes)).expect_err("refused");
         assert!(e.to_string().contains("miner configuration kind 4"), "{e}");
+    }
+
+    #[test]
+    fn a_record_with_a_kind_above_the_readable_one_is_refused() {
+        let mut bytes = encode(&with_flusher()).expect("encode");
+        let kind = bytes.len() - CRC_LEN - ID_BLOCK_LEN - 2;
+        bytes[kind] = Control::HIGHEST_KIND + 1;
+        let e = decode(&resealed(bytes)).expect_err("refused");
+        let unread = format!("highest kind {}", Control::HIGHEST_KIND + 1);
+        assert!(e.to_string().contains(&unread), "{e}");
     }
 
     #[test]

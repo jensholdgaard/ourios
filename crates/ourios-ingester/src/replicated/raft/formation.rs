@@ -14,6 +14,7 @@ use std::time::Duration;
 use openraft::errors::{Fatal, InitializeError, RaftError};
 use ourios_parquet::{Store, StoreError};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use super::host::GroupRaft;
@@ -126,11 +127,13 @@ impl Formation {
             format: u32,
         }
         let malformed = |e: serde_json::Error| Unreadable::Malformed(e.to_string());
-        let header: Header = serde_json::from_slice(bytes).map_err(malformed)?;
+        let value: Value = serde_json::from_slice(bytes).map_err(malformed)?;
+        objects_only(&value)?;
+        let header = Header::deserialize(&value).map_err(malformed)?;
         if header.format != FORMED_FORMAT {
             return Err(Unreadable::Format(header.format));
         }
-        let record: Record = serde_json::from_slice(bytes).map_err(malformed)?;
+        let record = Record::deserialize(&value).map_err(malformed)?;
         if record.group != group {
             return Err(Unreadable::Group(record.group));
         }
@@ -177,6 +180,19 @@ impl Formation {
             Some(&shared) => Err(Unreadable::SharedReplica(shared)),
             None => Ok(()),
         }
+    }
+}
+
+/// Refuse a record or member written as a JSON array: serde's derived
+/// structs also read their fields positionally, which the record's shape
+/// does not allow.
+fn objects_only(value: &Value) -> Result<(), Unreadable> {
+    let shape = |what: &str| Unreadable::Malformed(format!("{what} is not a JSON object"));
+    let record = value.as_object().ok_or_else(|| shape("the record"))?;
+    let members = record.get("members").and_then(Value::as_array);
+    match members {
+        Some(members) if !members.iter().all(Value::is_object) => Err(shape("a member")),
+        _ => Ok(()),
     }
 }
 
@@ -380,12 +396,59 @@ pub struct Reach<'a, P> {
     pub patience: Patience,
 }
 
+/// Why a pass ended without forming the group; the voter passes again
+/// after [`Patience::retry`].
+#[derive(Debug)]
+pub enum Waiting {
+    /// The record could not be read.
+    StoreRead(StoreError),
+    /// No record yet, and another voter records it.
+    NoRecord,
+    /// A voter has not answered `Identify`, or answered for another
+    /// `node_id` or with a malformed identity.
+    Unanswered { peer: String, error: IdentifyError },
+    /// The voters' answers are not a membership a reader would accept.
+    NotAMembership(Unreadable),
+    /// The answers could not be serialised.
+    Encode(serde_json::Error),
+    /// The record could not be written.
+    RecordWrite(StoreError),
+}
+
+impl Waiting {
+    /// The `error.type`-style reason the voter waits under.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StoreRead(_) => "store_read",
+            Self::NoRecord => "no_record",
+            Self::Unanswered { .. } => "unanswered",
+            Self::NotAMembership(_) => "not_a_membership",
+            Self::Encode(_) => "encode",
+            Self::RecordWrite(_) => "record_write",
+        }
+    }
+}
+
+impl fmt::Display for Waiting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StoreRead(e) => write!(f, "read the formation record: {e}"),
+            Self::NoRecord => write!(f, "no formation record yet"),
+            Self::Unanswered { peer, error } => write!(f, "{peer} has not answered: {error:?}"),
+            Self::NotAMembership(reason) => write!(f, "the answers are not a membership: {reason}"),
+            Self::Encode(e) => write!(f, "encode the formation record: {e}"),
+            Self::RecordWrite(e) => write!(f, "write the formation record: {e}"),
+        }
+    }
+}
+
 /// What one pass left to do.
 enum Pass {
     Done(Formed),
     /// This voter wrote the record, or lost the race to one: read it now.
     Recorded,
-    Wait,
+    Wait(Waiting),
 }
 
 /// Form `voter`'s group on its `raft` (§6.1), passing until it has formed: a voter
@@ -397,6 +460,7 @@ enum Pass {
 /// purged or not, and a vote still in term 0. A voter that has granted a
 /// peer's vote has been reached by an initialized group and joins it.
 ///
+/// Each pass that waits reports why to `waiting`, which the caller logs.
 /// Dropping the future cancels it between store, `Identify` and
 /// `openraft` calls, each of which is atomic, so a later call resumes.
 ///
@@ -408,6 +472,7 @@ pub async fn form<P: Identifier>(
     voter: Voter<'_>,
     raft: &GroupRaft,
     reach: &Reach<'_, P>,
+    waiting: &mut impl FnMut(&Waiting),
 ) -> Result<Formed, FormError> {
     if !voter.voters.contains(&voter.node_id) {
         return Err(not_a_voter(voter));
@@ -416,7 +481,10 @@ pub async fn form<P: Identifier>(
         match pass(voter, raft, reach).await? {
             Pass::Done(formed) => return Ok(formed),
             Pass::Recorded => {}
-            Pass::Wait => tokio::time::sleep(reach.patience.retry).await,
+            Pass::Wait(why) => {
+                waiting(&why);
+                tokio::time::sleep(reach.patience.retry).await;
+            }
         }
     }
 }
@@ -440,10 +508,7 @@ async fn pass<P: Identifier>(
     }
     let bytes = match read(reach.store, group).await {
         Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(group, error = %e, "read the group's formation record");
-            return Ok(Pass::Wait);
-        }
+        Err(e) => return Ok(Pass::Wait(Waiting::StoreRead(e))),
     };
     match bytes {
         Some(bytes) => {
@@ -452,7 +517,7 @@ async fn pass<P: Identifier>(
             initialize(voter, raft, &formation).await.map(Pass::Done)
         }
         None if voter.records() => Ok(record(voter, *raft.node_id(), reach).await),
-        None => Ok(Pass::Wait),
+        None => Ok(Pass::Wait(Waiting::NoRecord)),
     }
 }
 
@@ -480,27 +545,30 @@ async fn initialize(
 /// `Identify`, `replica` being this voter's own UUID; the first-ranked
 /// voter's pass while no record exists.
 async fn record<P: Identifier>(voter: Voter<'_>, replica: NodeId, reach: &Reach<'_, P>) -> Pass {
-    let group = voter.group;
-    let Some(members) = answers(voter, replica, reach).await else {
-        return Pass::Wait;
-    };
-    let encoded = Formation::new(group, members, voter.voters)
-        .map_err(|e| e.to_string())
-        .and_then(|formation| formation.encode().map_err(|e| e.to_string()));
-    let bytes = match encoded {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(group, error = %e, "the voters' answers are not a membership");
-            return Pass::Wait;
-        }
-    };
-    match reach.store.put_if_absent(&formed_key(group), bytes).await {
+    match encoded(voter, replica, reach).await {
+        Ok(bytes) => write(reach.store, voter.group, bytes).await,
+        Err(why) => Pass::Wait(why),
+    }
+}
+
+/// The record's bytes, once every voter has answered with a membership.
+async fn encoded<P: Identifier>(
+    voter: Voter<'_>,
+    replica: NodeId,
+    reach: &Reach<'_, P>,
+) -> Result<Vec<u8>, Waiting> {
+    let members = answers(voter, replica, reach).await?;
+    let formation =
+        Formation::new(voter.group, members, voter.voters).map_err(Waiting::NotAMembership)?;
+    formation.encode().map_err(Waiting::Encode)
+}
+
+/// Create the record; a record already there is the one the next pass reads.
+async fn write(store: &Store, group: u32, bytes: Vec<u8>) -> Pass {
+    match store.put_if_absent(&formed_key(group), bytes).await {
         Ok(()) => Pass::Recorded,
         Err(e) if e.is_already_exists() => Pass::Recorded,
-        Err(e) => {
-            tracing::warn!(group, error = %e, "write the group's formation record");
-            Pass::Wait
-        }
+        Err(e) => Pass::Wait(Waiting::RecordWrite(e)),
     }
 }
 
@@ -510,19 +578,20 @@ async fn answers<P: Identifier>(
     voter: Voter<'_>,
     replica: NodeId,
     reach: &Reach<'_, P>,
-) -> Option<BTreeMap<String, NodeId>> {
+) -> Result<BTreeMap<String, NodeId>, Waiting> {
     let mut members = BTreeMap::from([(voter.node_id.to_owned(), replica)]);
     for &peer in voter.voters.iter().filter(|&&peer| peer != voter.node_id) {
-        let answer = reach.peers.identify(peer, reach.patience.identify).await;
-        let identity = answer
-            .inspect_err(|e| {
-                let group = voter.group;
-                tracing::debug!(group, peer, error = ?e, "a voter has not answered Identify");
-            })
-            .ok()?;
+        let identity = reach
+            .peers
+            .identify(peer, reach.patience.identify)
+            .await
+            .map_err(|error| Waiting::Unanswered {
+                peer: peer.to_owned(),
+                error,
+            })?;
         members.insert(peer.to_owned(), identity.replica);
     }
-    Some(members)
+    Ok(members)
 }
 
 /// `group`'s record, if one exists. A missing record is expected until

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::{
     FormError, Formation, Formed, Identifier, Pass, Patience, Reach, Standing, Unreadable, Voter,
-    form, formed_key, record,
+    Waiting, form, formed_key, record,
 };
 use crate::replicated::layout::VotingLayout;
 use crate::replicated::raft::cluster::{Cluster, Node, leader, write};
@@ -129,6 +129,16 @@ fn an_unparsable_or_foreign_record_is_refused_with_its_reason() {
         ("not JSON", "format: 1".to_owned(), "malformed"),
         ("truncated", truncated.to_owned(), "malformed"),
         ("empty", String::new(), "malformed"),
+        (
+            "an array record",
+            format!("[1,{GROUP},[{}]]", all.join(",")),
+            "malformed",
+        ),
+        (
+            "an array member",
+            GOLDEN.replace(&member(4, R4), &format!(r#"["ourios-receiver-4","{R4}"]"#)),
+            "malformed",
+        ),
         (
             "another format",
             r#"{"format":2,"voters":[]}"#.to_owned(),
@@ -282,10 +292,12 @@ async fn the_record_waits_for_every_voter_and_holds_each_answer() {
         peers: &one,
         patience: PATIENCE,
     };
-    assert!(matches!(
-        record(RECORDER, uuid(R2), &reach).await,
-        Pass::Wait
-    ));
+    let waited = record(RECORDER, uuid(R2), &reach).await;
+    assert!(
+        matches!(&waited, Pass::Wait(Waiting::Unanswered { peer, .. }) if peer == "ourios-receiver-4"),
+        "{}",
+        waited_for(&waited)
+    );
     assert_eq!(
         recorded(&store, GROUP).await,
         None,
@@ -308,6 +320,40 @@ async fn the_record_waits_for_every_voter_and_holds_each_answer() {
         recorded(&store, GROUP).await.as_deref(),
         Some(GOLDEN.as_bytes())
     );
+}
+
+fn waited_for(pass: &Pass) -> &'static str {
+    match pass {
+        Pass::Wait(why) => why.as_str(),
+        Pass::Recorded => "recorded",
+        Pass::Done(_) => "done",
+    }
+}
+
+/// Answers that are not a membership, two voters under one UUID, are
+/// never written, and the pass says why it waits.
+#[tokio::test]
+async fn answers_under_one_uuid_are_not_recorded() {
+    let store = Store::in_memory();
+    let answering = Answering(BTreeMap::from([
+        ("ourios-receiver-0".to_owned(), uuid(R0)),
+        ("ourios-receiver-4".to_owned(), uuid(R0)),
+    ]));
+    let reach = Reach {
+        store: &store,
+        peers: &answering,
+        patience: PATIENCE,
+    };
+    let waited = record(RECORDER, uuid(R2), &reach).await;
+    assert!(
+        matches!(
+            &waited,
+            Pass::Wait(Waiting::NotAMembership(Unreadable::SharedReplica(_)))
+        ),
+        "{}",
+        waited_for(&waited)
+    );
+    assert_eq!(recorded(&store, GROUP).await, None);
 }
 
 /// A record already there is kept: losing the create race is a pass that
@@ -373,7 +419,53 @@ async fn form_on(
         peers,
         patience: PATIENCE,
     };
-    form(voter, node.raft(0), &reach).await
+    form(voter, node.raft(0), &reach, &mut |_| {}).await
+}
+
+/// The reasons `node`'s formation waited under until it was dropped.
+async fn waits_of(peers: &Peers, node: &Node, voters: &[&str], store: &Store) -> Vec<&'static str> {
+    let voter = Voter {
+        group: 0,
+        voters,
+        node_id: node.node_id(),
+    };
+    let reach = Reach {
+        store,
+        peers,
+        patience: PATIENCE,
+    };
+    let mut waits = Vec::new();
+    let mut observe = |why: &Waiting| waits.push(why.as_str());
+    let forming = form(voter, node.raft(0), &reach, &mut observe);
+    let ended = tokio::time::timeout(Duration::from_millis(300), forming).await;
+    assert!(ended.is_err(), "formed without every voter: {ended:?}");
+    waits
+}
+
+/// With one voter down and no record, the first-ranked voter waits for
+/// its answer and the other waits for the record, each telling the caller
+/// why on every pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voter_that_waits_reports_why_to_the_caller() {
+    let mut cluster = Cluster::start_unformed(3, &[0]).await;
+    let store = Store::in_memory();
+    let layout = layout(&cluster, 3);
+    let voters = layout.voters(0);
+    let [first, second, down] = [0, 1, 2].map(|rank| index_of(&cluster, 3, voters[rank]));
+    cluster.kill(down).await;
+
+    let waits = waits_of(cluster.peers(), cluster.node(first), &voters, &store).await;
+    assert!(
+        !waits.is_empty() && waits.iter().all(|&w| w == "unanswered"),
+        "{waits:?}"
+    );
+    let waits = waits_of(cluster.peers(), cluster.node(second), &voters, &store).await;
+    assert!(
+        !waits.is_empty() && waits.iter().all(|&w| w == "no_record"),
+        "{waits:?}"
+    );
+    assert_eq!(recorded(&store, 0).await, None);
+    cluster.shutdown().await;
 }
 
 fn voter_ids(node: &Node) -> BTreeSet<NodeId> {

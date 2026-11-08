@@ -2,16 +2,17 @@
 //! replica applies, and the group as it stood at the cut of one.
 //!
 //! Since the group's checkpoint, the state machine keeps only the
-//! positions at which the term, the membership, the flusher and the
-//! highest kind changed. That gives the term of every entry since the
-//! checkpoint, and the group at any of them, without holding the entries.
+//! positions at which the term, the membership, the flusher, the highest
+//! kind and the applied id block changed. That gives the term of every
+//! entry since the checkpoint, and the group at any of them, without
+//! holding the entries.
 
 use openraft::type_config::alias::StoredMembershipOf;
 use ourios_wal::RaftLogId;
 use uuid::Uuid;
 
 use super::codec::raft_id;
-use super::snapshot_record::{GroupSnapshot, GroupState, SnapshotMeta};
+use super::snapshot_record::{GroupSnapshot, GroupState, IdBlock, SnapshotMeta};
 use super::types::{LogId, NodeId, RaftTypes};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
@@ -23,6 +24,7 @@ pub(super) enum Change {
     Membership(StoredMembership),
     Flusher(NodeId),
     HighestKind(u8),
+    IdBlock(IdBlock),
 }
 
 /// A checkpoint entry's body.
@@ -120,6 +122,7 @@ impl History {
                 Change::Membership(m) => snapshot.meta.last_membership = m.clone(),
                 Change::Flusher(flusher) => snapshot.state.flusher = Some(*flusher),
                 Change::HighestKind(kind) => snapshot.state.highest_kind = *kind,
+                Change::IdBlock(block) => snapshot.state.id_block = Some(*block),
             }
         }
         snapshot
@@ -279,5 +282,37 @@ mod tests {
         let checkpoint = history.checkpoint().expect("applied");
         assert_eq!(checkpoint.state.flusher, flusher);
         assert_eq!(history.term_at(7), Some(3), "from the cut");
+    }
+
+    /// A checkpoint holds the id block in force at its cut, not one
+    /// applied after it, and the next keeps it over the trim.
+    #[test]
+    fn an_applied_checkpoint_holds_the_id_block_in_force_at_its_cut() {
+        let block = |after, through| IdBlock::new(after, through).expect("valid");
+        let flusher = Some(NodeId::from(7));
+        let mut history = History::default();
+        for index in 1..=8 {
+            history.entered(id(if index < 5 { 2 } else { 3 }, index));
+            match index {
+                1 => history.changed(1, Change::Flusher(NodeId::from(7))),
+                2 => {
+                    history.changed(2, Change::HighestKind(3));
+                    history.changed(2, Change::IdBlock(block(0, 100)));
+                }
+                6 => history.changed(6, Change::IdBlock(block(100, 200))),
+                _ => {}
+            }
+        }
+        let id_block_at = |history: &mut History, at, cut| {
+            let applied = history.apply(id(3, at), flusher, proposal(7, cut, 3));
+            assert_eq!(applied, Some(cut));
+            history.checkpoint().expect("applied").state.id_block
+        };
+        let at_cut = id_block_at(&mut history, 9, id(2, 4));
+        assert_eq!(at_cut, Some(block(0, 100)), "as of the cut");
+        let trimmed = id_block_at(&mut history, 10, id(3, 5));
+        assert_eq!(trimmed, Some(block(0, 100)), "kept over the trim");
+        let later = id_block_at(&mut history, 11, id(3, 7));
+        assert_eq!(later, Some(block(100, 200)));
     }
 }

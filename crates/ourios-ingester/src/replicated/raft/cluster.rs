@@ -47,13 +47,19 @@ pub(crate) fn wal_config(root: &Path) -> WalConfig {
 /// The longest election timeout [`raft_config`] allows.
 pub(crate) const ELECTION_TIMEOUT_MAX: Duration = Duration::from_secs(2);
 
-/// [`group_config`](super::group_config) with a longer election timeout.
-/// The default 150–300 ms is also the leader's quorum lease, which a loaded
-/// CI runner can miss, unseating a leader the test still writes to.
+/// [`group_config`](super::group_config) with a longer election timeout
+/// and heartbeat interval. The default 150–300 ms timeout is also the
+/// leader's quorum lease, which a loaded CI runner can miss, unseating a
+/// leader the test still writes to. `openraft` gives each heartbeat and
+/// append the heartbeat interval as its deadline, which the transport cuts
+/// to three quarters, so at the default 50 ms a loaded runner times many of
+/// them out and the leader's view of when it last heard from a replica
+/// goes stale.
 pub(crate) fn raft_config() -> openraft::Config {
     openraft::Config {
         election_timeout_min: 1_000,
         election_timeout_max: ELECTION_TIMEOUT_MAX.as_millis().try_into().expect("fits"),
+        heartbeat_interval: 200,
         ..super::group_config().expect("group config")
     }
     .validate()

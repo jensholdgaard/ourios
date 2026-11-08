@@ -1414,6 +1414,14 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     the override travels in the log too, as a later kind naming the
     tenant, since a replica that mined a tenant under a local override
     the others lack would mint different templates.
+    These rules are the two update primitives of DynSRV (Kristensen et
+    al., §10) carried onto a replicated log: the fixed tree shape is
+    its `defer`, set once by the first value, every other field its
+    `dynamic`, the most recent value in force, and the kind gate is
+    the guided adaptation it takes from Zhang and Cheng, where the new
+    algorithm applies only once every member reads it. DynSRV updates
+    one monitor at the step the update arrives. Here the update is an
+    entry, and its log position is that step on every replica.
 
   A reserved kind's body is fixed by the amendment that implements it,
   and kinds are implemented in order: a release reads a kind only if it
@@ -2063,6 +2071,13 @@ specification of our own (§8 gives the reasoning).
 - R. Alagappan et al., *Protocol-Aware Recovery for Consensus-Based
   Storage*, FAST 2018
 - Jepsen analyses of Kafka, Redpanda and etcd
+- M. H. Kristensen, T. Wright, C. Gomes, L. Esterle, P. G. Larsen,
+  *DynSRV: Dynamically Updated Properties for Stream Runtime
+  Verification*, RV 2025, pp. 101–119 (`defer` and `dynamic`; §5's
+  history kept for a dynamically added property)
+- J. Zhang, B. H. C. Cheng, *Using Temporal Logic to Specify Adaptive
+  Program Semantics*, Journal of Systems and Software 79(10), 2006
+  (one-point, guided and overlap adaptation)
 - `openraft` 0.9.25 / 0.10.0-alpha.37 (databendlabs/openraft: README,
   `RaftLogStorage`, `docs/protocol/read.md`, `jepsen/`, `tests-turmoil/`,
   issues #1722, #1795, #1802, #1808, #2167, #2245); `raft` 0.7.0

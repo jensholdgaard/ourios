@@ -6,8 +6,9 @@
 //! up to a snapshot it installs or builds, so the snapshot is recorded
 //! in `wal_root/groups/<group>/snapshot` before the call returns,
 //! and a restart opens applied through it and replays the log after it.
-//! The record holds no flusher: one assigned at or below a snapshot is not
-//! known until §6.5's checkpoint carries it.
+//! The record holds the flusher and the highest control kind with the
+//! membership, so a replica that opens from or installs it knows them
+//! before it applies any entry after it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use ourios_wal::Control;
 use uuid::Uuid;
 
 use super::gate::SyncGate;
-use super::snapshot_record::{self, SnapshotMeta};
+use super::snapshot_record::{self, GroupSnapshot, GroupState, SnapshotMeta};
 use super::types::{GroupEntry, LogId, NodeId, RaftTypes};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
@@ -29,8 +30,8 @@ type StoredMembership = StoredMembershipOf<RaftTypes>;
 struct State {
     applied: Option<LogId>,
     membership: StoredMembership,
-    flusher: Option<NodeId>,
-    snapshot: Option<SnapshotMeta>,
+    group: GroupState,
+    snapshot: Option<GroupSnapshot>,
 }
 
 /// Where the snapshot is recorded, and the gate its fsyncs pass.
@@ -60,12 +61,12 @@ impl GroupSm {
     pub(super) fn open(dir: &Path, gate: Arc<SyncGate>) -> io::Result<Self> {
         let snapshot = snapshot_record::read(dir)?;
         let state = State {
-            applied: snapshot.as_ref().and_then(|meta| meta.last_log_id),
+            applied: snapshot.as_ref().and_then(|s| s.meta.last_log_id),
             membership: snapshot
                 .as_ref()
-                .map(|meta| meta.last_membership.clone())
+                .map(|s| s.meta.last_membership.clone())
                 .unwrap_or_default(),
-            flusher: None,
+            group: snapshot.as_ref().map(|s| s.state).unwrap_or_default(),
             snapshot,
         };
         Ok(Self {
@@ -82,17 +83,17 @@ impl GroupSm {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Record `meta` durably, off the runtime's workers, then make it the
-    /// current snapshot. The caller holds `publishing`.
-    async fn record(&self, meta: SnapshotMeta) -> io::Result<()> {
+    /// Record `snapshot` durably, off the runtime's workers, then make it
+    /// the current one. The caller holds `publishing`.
+    async fn record(&self, snapshot: GroupSnapshot) -> io::Result<()> {
         let record = Arc::clone(&self.record);
-        let written = meta.clone();
+        let written = snapshot.clone();
         tokio::task::spawn_blocking(move || {
             snapshot_record::write(&record.dir, &written, &record.gate)
         })
         .await
         .unwrap_or_else(|e| Err(io::Error::other(e)))?;
-        self.state().snapshot = Some(meta);
+        self.state().snapshot = Some(snapshot);
         Ok(())
     }
 
@@ -110,27 +111,39 @@ impl GroupSm {
     /// The replica the last applied flusher assignment named.
     #[must_use]
     pub fn flusher(&self) -> Option<NodeId> {
-        self.state().flusher
+        self.state().group.flusher
+    }
+}
+
+fn apply_control(group: &mut GroupState, control: Control) {
+    group.highest_kind = group.highest_kind.max(control.kind());
+    match control {
+        Control::FlusherAssignment(replica) => {
+            group.flusher = Some(NodeId::from(Uuid::from_bytes(replica)));
+        }
     }
 }
 
 impl RaftSnapshotBuilder<RaftTypes> for GroupSm {
-    type SnapshotData = ();
+    type SnapshotData = GroupState;
 
-    async fn build_snapshot(&mut self) -> Result<SnapshotOf<RaftTypes, ()>, io::Error> {
+    async fn build_snapshot(&mut self) -> Result<SnapshotOf<RaftTypes, GroupState>, io::Error> {
         let record = Arc::clone(&self.record);
         let _publishing = record.publishing.lock().await;
         // Read once publishing is ours: an install that overlapped this
         // build is then in the state, so it never records an older one.
-        let meta = {
+        let snapshot = {
             let state = self.state();
-            SnapshotMeta {
-                last_log_id: state.applied,
-                last_membership: state.membership.clone(),
+            GroupSnapshot {
+                meta: SnapshotMeta {
+                    last_log_id: state.applied,
+                    last_membership: state.membership.clone(),
+                },
+                state: state.group,
             }
         };
-        self.record(meta.clone()).await?;
-        Ok(SnapshotOf::<RaftTypes, ()> { meta, snapshot: () })
+        self.record(snapshot.clone()).await?;
+        Ok(snapshot.into())
     }
 }
 
@@ -138,7 +151,7 @@ impl RaftSnapshotBuilder<RaftTypes> for GroupSm {
 // record's fsyncs.
 #[allow(clippy::unused_async_trait_impl)]
 impl RaftStateMachine<RaftTypes> for GroupSm {
-    type SnapshotData = ();
+    type SnapshotData = GroupState;
     type SnapshotBuilder = Self;
 
     async fn applied_state(&mut self) -> Result<(Option<LogId>, StoredMembership), io::Error> {
@@ -160,9 +173,9 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
                     EntryPayload::Membership(m) => {
                         state.membership = StoredMembership::new(Some(entry.log_id), m);
                     }
-                    EntryPayload::Normal(GroupEntry::Control(Control::FlusherAssignment(
-                        replica,
-                    ))) => state.flusher = Some(NodeId::from(Uuid::from_bytes(replica))),
+                    EntryPayload::Normal(GroupEntry::Control(control)) => {
+                        apply_control(&mut state.group, control);
+                    }
                     EntryPayload::Blank | EntryPayload::Normal(GroupEntry::Batch(_)) => {}
                 }
             }
@@ -177,22 +190,30 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
         self.clone()
     }
 
-    async fn install_snapshot(&mut self, meta: &SnapshotMeta, (): ()) -> Result<(), io::Error> {
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta,
+        group: GroupState,
+    ) -> Result<(), io::Error> {
         let record = Arc::clone(&self.record);
         let _publishing = record.publishing.lock().await;
-        self.record(meta.clone()).await?;
+        let snapshot = GroupSnapshot {
+            meta: meta.clone(),
+            state: group,
+        };
+        self.record(snapshot).await?;
         let mut state = self.state();
         state.applied = meta.last_log_id;
         state.membership = meta.last_membership.clone();
-        state.flusher = None;
+        state.group = group;
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<SnapshotOf<RaftTypes, ()>>, io::Error> {
+    ) -> Result<Option<SnapshotOf<RaftTypes, GroupState>>, io::Error> {
         let snapshot = self.state().snapshot.clone();
-        Ok(snapshot.map(|meta| SnapshotOf::<RaftTypes, ()> { meta, snapshot: () }))
+        Ok(snapshot.map(Into::into))
     }
 }
 
@@ -264,12 +285,55 @@ mod tests {
 
     /// A snapshot holds no flusher, so an install leaves none known.
     #[tokio::test]
+    #[ignore = "superseded: RFC 0065 snapshot record v2 carries the flusher"]
     async fn an_installed_snapshot_leaves_no_flusher_known() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
         apply(&mut sm, vec![assign(1, 7)]).await;
-        sm.install_snapshot(&at(5), ()).await.expect("install");
+        sm.install_snapshot(&at(5), GroupState::default())
+            .await
+            .expect("install");
         assert_eq!(sm.flusher(), None);
+    }
+
+    /// An install takes the flusher the snapshot names, and a reopen
+    /// restores it from the record.
+    #[tokio::test]
+    async fn an_installed_snapshot_names_its_flusher() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        apply(&mut sm, vec![assign(1, 7)]).await;
+        let group = GroupState {
+            flusher: Some(NodeId::from(9)),
+            highest_kind: 1,
+            id_block: None,
+        };
+        sm.install_snapshot(&at(5), group).await.expect("install");
+        assert_eq!(sm.flusher(), Some(NodeId::from(9)));
+        let reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
+        assert_eq!(reopened.flusher(), Some(NodeId::from(9)));
+    }
+
+    /// A build records the flusher and the highest control kind applied,
+    /// and a reopen restores the flusher from it.
+    #[tokio::test]
+    async fn a_built_snapshot_records_the_flusher_and_highest_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        apply(&mut sm, vec![batch(1)]).await;
+        let before = sm.build_snapshot().await.expect("build");
+        assert_eq!(before.snapshot, GroupState::default());
+        apply(&mut sm, vec![assign(2, 7), batch(3)]).await;
+        let built = sm.build_snapshot().await.expect("build");
+        let expected = GroupState {
+            flusher: Some(NodeId::from(7)),
+            highest_kind: 1,
+            id_block: None,
+        };
+        assert_eq!(built.snapshot, expected);
+        let reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
+        assert_eq!(reopened.flusher(), Some(NodeId::from(7)));
+        assert_eq!(reopened.applied().map(|id| id.index), Some(3));
     }
 
     /// A build that starts while an install is held at its fsync waits for
@@ -281,13 +345,17 @@ mod tests {
         let gate = Arc::new(SyncGate::default());
         let sm = GroupSm::open(dir.path(), Arc::clone(&gate)).expect("open");
         sm.clone()
-            .install_snapshot(&at(5), ())
+            .install_snapshot(&at(5), GroupState::default())
             .await
             .expect("install 5");
 
         gate.close();
         let mut installing = sm.clone();
-        let install = tokio::spawn(async move { installing.install_snapshot(&at(9), ()).await });
+        let install = tokio::spawn(async move {
+            installing
+                .install_snapshot(&at(9), GroupState::default())
+                .await
+        });
         let held = Arc::clone(&gate);
         tokio::task::spawn_blocking(move || held.wait_for_writer())
             .await

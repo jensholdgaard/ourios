@@ -144,6 +144,15 @@ impl<'a> Cursor<'a> {
 }
 
 pub(super) fn decode_membership(bytes: &[u8]) -> io::Result<Membership> {
+    let (membership, rest) = take_membership(bytes)?;
+    if !rest.is_empty() {
+        return Err(invalid("trailing bytes after the membership"));
+    }
+    Ok(membership)
+}
+
+/// The membership body at the start of `bytes`, and the bytes after it.
+pub(super) fn take_membership(bytes: &[u8]) -> io::Result<(Membership, &[u8])> {
     let mut c = Cursor(bytes);
     let mut configs = Vec::new();
     for _ in 0..c.len()? {
@@ -159,10 +168,8 @@ pub(super) fn decode_membership(bytes: &[u8]) -> io::Result<Membership> {
         let node_id = std::str::from_utf8(c.take(len)?).map_err(invalid)?;
         nodes.insert(id, node_id.to_owned());
     }
-    if !c.0.is_empty() {
-        return Err(invalid("trailing bytes after the membership"));
-    }
-    Membership::new(configs, nodes).map_err(invalid)
+    let membership = Membership::new(configs, nodes).map_err(invalid)?;
+    Ok((membership, c.0))
 }
 
 #[cfg(test)]

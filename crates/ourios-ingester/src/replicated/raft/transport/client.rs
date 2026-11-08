@@ -28,6 +28,7 @@ use tonic::{Code, Request, Status, Streaming};
 use tonic_prost::ProstCodec;
 use tracing::Instrument as _;
 
+use super::super::snapshot_record::GroupState;
 use super::super::types::{NodeId, RaftTypes, Vote};
 #[cfg(test)]
 use super::connect::PlainConnector;
@@ -625,7 +626,7 @@ impl Replies<'_> {
 }
 
 impl RaftNetworkV2<RaftTypes> for PeerClient {
-    type SnapshotData = ();
+    type SnapshotData = GroupState;
 
     /// Pipelined: messages go out as `openraft` yields them, without
     /// waiting for answers, and the follower answers them in order.
@@ -682,11 +683,11 @@ impl RaftNetworkV2<RaftTypes> for PeerClient {
     async fn full_snapshot(
         &mut self,
         vote: Vote,
-        snapshot: SnapshotOf<RaftTypes, ()>,
+        snapshot: SnapshotOf<RaftTypes, GroupState>,
         cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<RaftTypes>, StreamingError<RaftTypes>> {
-        let request = SnapshotRequest::new(self.to, &vote, &snapshot.meta);
+        let request = SnapshotRequest::new(self.to, &vote, snapshot);
         let install =
             self.exchange::<_, WireSnapshotResponse>(INSTALL_SNAPSHOT_RPC, request, &option);
         tokio::select! {

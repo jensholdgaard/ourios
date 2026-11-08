@@ -6,9 +6,9 @@
 //! up to a snapshot it installs or builds, so the snapshot is recorded
 //! in `wal_root/groups/<group>/snapshot` before the call returns,
 //! and a restart opens applied through it and replays the log after it.
-//! The record holds the flusher and the highest control kind with the
-//! membership, so a replica that opens from or installs it knows them
-//! before it applies any entry after it.
+//! The record holds the flusher, the highest control kind and the latest
+//! id block with the membership, so a replica that opens from or installs
+//! it knows them before it applies any entry after it.
 //!
 //! A snapshot is only ever the group at a checkpoint's cut: applying a
 //! checkpoint entry publishes its cut on `GroupSm::checkpoints`, the
@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::checkpoint::{Change, History, Proposal};
 use super::gate::SyncGate;
-use super::snapshot_record::{self, GroupSnapshot, GroupState, SnapshotMeta};
+use super::snapshot_record::{self, GroupSnapshot, GroupState, IdBlock, SnapshotMeta};
 use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
@@ -110,6 +110,22 @@ impl State {
                 let proposal = Proposal::new(proposer, cut, highest_kind);
                 self.history.apply(at, self.group.flusher, proposal)
             }
+            Control::IdBlock { after, through } => {
+                self.apply_id_block(at, IdBlock::new(after, through));
+                None
+            }
+        }
+    }
+
+    /// Apply the block unless it starts below the end of the latest one
+    /// applied: allocating from it could issue an id twice. An ignored
+    /// block never becomes the one the next is compared with.
+    fn apply_id_block(&mut self, at: LogId, block: Option<IdBlock>) {
+        let previous = self.group.id_block;
+        let follows = |block: &IdBlock| previous.is_none_or(|p| block.after() >= p.through());
+        if let Some(block) = block.filter(follows) {
+            self.group.id_block = Some(block);
+            self.history.changed(at.index, Change::IdBlock(block));
         }
     }
 }
@@ -187,6 +203,13 @@ impl GroupSm {
     #[must_use]
     pub fn flusher(&self) -> Option<NodeId> {
         self.state().group.flusher
+    }
+
+    /// The latest id block applied, or the snapshot's when none has been
+    /// since; the group's miner allocates from it.
+    #[must_use]
+    pub fn id_block(&self) -> Option<IdBlock> {
+        self.state().group.id_block
     }
 
     /// The group's current snapshot, opened, built or installed.
@@ -507,6 +530,77 @@ mod tests {
         let built = sm.build_snapshot().await.expect("build");
         assert_eq!(built.meta.last_log_id, cut(6));
         assert_eq!(built.snapshot.highest_kind, 2);
+    }
+
+    fn id_block(block: Option<IdBlock>) -> EntryPayload<GroupEntry, Membership> {
+        let block = block.expect("a valid block");
+        let control = Control::IdBlock {
+            after: block.after(),
+            through: block.through(),
+        };
+        EntryPayload::Normal(GroupEntry::Control(control))
+    }
+
+    /// A block below the latest applied one is ignored, and an ignored
+    /// block is never the one the next is compared with; a block starting
+    /// where the latest ends applies.
+    #[tokio::test]
+    async fn a_block_below_the_latest_applied_one_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let block = IdBlock::new;
+        let blocks = [
+            (block(0, 100), block(0, 100), "the first"),
+            (block(0, 50), block(0, 100), "below (0, 100]"),
+            (
+                block(50, 150),
+                block(0, 100),
+                "below (0, 100], not the ignored (0, 50]",
+            ),
+            (block(100, 200), block(100, 200), "from where (0, 100] ends"),
+            (block(300, 400), block(300, 400), "above, past a gap"),
+        ];
+        for (index, (body, latest, why)) in (1..).zip(blocks) {
+            apply(&mut sm, vec![entry(index, id_block(body))]).await;
+            assert_eq!(sm.id_block(), latest, "{why}");
+        }
+        assert_eq!(sm.state().group.highest_kind, 3);
+    }
+
+    /// The checkpoint's snapshot holds the block in force at its cut, a
+    /// reopen and an install restore it, and the restored block is the one
+    /// the next is compared with.
+    #[tokio::test]
+    async fn a_snapshot_holds_the_id_block_in_force_at_its_cut() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let block = IdBlock::new;
+        let entries = vec![
+            assign(1, 7),
+            entry(2, id_block(block(0, 100))),
+            batch(3),
+            entry(4, id_block(block(100, 200))),
+            checkpoint(5, 7, (2, 3), 3),
+        ];
+        apply(&mut sm, entries).await;
+        assert_eq!(sm.id_block(), block(100, 200), "applied, not built");
+        let built = sm.build_snapshot().await.expect("build");
+        assert_eq!(built.snapshot.id_block, block(0, 100), "as of the cut");
+
+        let mut reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
+        assert_eq!(reopened.id_block(), block(0, 100));
+        apply(&mut reopened, vec![entry(4, id_block(block(50, 150)))]).await;
+        assert_eq!(reopened.id_block(), block(0, 100), "below the snapshot's");
+
+        let other = tempfile::tempdir().expect("tempdir");
+        let mut installed = GroupSm::open(other.path(), Arc::default()).expect("open");
+        installed
+            .install_snapshot(&built.meta, built.snapshot)
+            .await
+            .expect("install");
+        assert_eq!(installed.id_block(), block(0, 100));
+        apply(&mut installed, vec![entry(4, id_block(block(100, 200)))]).await;
+        assert_eq!(installed.id_block(), sm.id_block(), "as the whole log");
     }
 
     /// A build that starts while an install is held at its fsync waits for

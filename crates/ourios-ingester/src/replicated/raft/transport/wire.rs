@@ -705,11 +705,17 @@ mod tests {
                 EntryPayload::Normal(GroupEntry::Control(control))
             },
         );
+        let id_block = (0..i64::MAX.unsigned_abs(), any::<u64>()).prop_map(|(after, span)| {
+            let through = after + 1 + span % (i64::MAX.unsigned_abs() - after);
+            let control = Control::IdBlock { after, through };
+            EntryPayload::Normal(GroupEntry::Control(control))
+        });
         let payload = prop_oneof![
             Just(EntryPayload::Blank),
             normal,
             flusher,
             checkpoint,
+            id_block,
             membership().prop_map(EntryPayload::Membership),
         ];
         (log_id(), payload).prop_map(|(log_id, payload)| Entry { log_id, payload })

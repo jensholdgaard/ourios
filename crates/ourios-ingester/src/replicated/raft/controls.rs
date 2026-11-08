@@ -53,7 +53,7 @@ impl HeldControls {
                 Control::FlusherAssignment(replica) => {
                     Some(NodeId::from(Uuid::from_bytes(replica)))
                 }
-                Control::Checkpoint { .. } => None,
+                Control::Checkpoint { .. } | Control::IdBlock { .. } => None,
             });
         LogControls {
             highest_kind,

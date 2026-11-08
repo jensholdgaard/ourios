@@ -105,6 +105,10 @@ enum ControlDef {
         cut: RaftLogId,
         highest_kind: u8,
     },
+    IdBlock {
+        after: u64,
+        through: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -138,6 +142,9 @@ impl fmt::Display for GroupEntry {
                 cut.term,
                 cut.index
             ),
+            Self::Control(Control::IdBlock { after, through }) => {
+                write!(f, "IdBlock({after}, {through}]")
+            }
         }
     }
 }
@@ -197,6 +204,17 @@ mod tests {
             entry.to_string(),
             "Checkpoint(0190b3c8-1a2b-7c3d-9e4f-50607080a0b0 at 3-41, kind 2)"
         );
+        let json = serde_json::to_string(&entry).expect("serialise");
+        assert_eq!(serde_json::from_str::<GroupEntry>(&json).ok(), Some(entry));
+    }
+
+    #[test]
+    fn an_id_block_displays_its_range() {
+        let entry = GroupEntry::Control(Control::IdBlock {
+            after: 100,
+            through: 200,
+        });
+        assert_eq!(entry.to_string(), "IdBlock(100, 200]");
         let json = serde_json::to_string(&entry).expect("serialise");
         assert_eq!(serde_json::from_str::<GroupEntry>(&json).ok(), Some(entry));
     }

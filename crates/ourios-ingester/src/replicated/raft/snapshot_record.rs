@@ -58,6 +58,16 @@ impl IdBlock {
     pub fn new(after: u64, through: u64) -> Option<Self> {
         (after < through && through <= i64::MAX.unsigned_abs()).then_some(Self { after, through })
     }
+
+    #[must_use]
+    pub fn after(self) -> u64 {
+        self.after
+    }
+
+    #[must_use]
+    pub fn through(self) -> u64 {
+        self.through
+    }
 }
 
 /// What a snapshot holds of the group besides `openraft`'s metadata: the

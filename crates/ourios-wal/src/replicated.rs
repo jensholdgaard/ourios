@@ -28,12 +28,15 @@
 //! | 0x01 FlusherAssignment | replica: uuid                                   |
 //! | 0x02 Checkpoint        | proposer: uuid | cut term: u64_le | cut index: u64_le |
 //! |                        | highest kind: u8                                |
+//! | 0x03 IdBlock           | after: u64_le | through: u64_le                   |
 //! ```
 //!
-//! A UUID is 16 bytes big-endian; every other kind is reserved. Any other tag, an unknown control
-//! kind, a fixed-size body of the wrong length, or a `Normal` body whose
-//! tenant prefix is malformed is a [`ReplicatedRecordError`], so a replay
-//! refuses the log rather than skip an entry it cannot apply.
+//! A UUID is 16 bytes big-endian; every other kind is reserved. An id
+//! block is RFC 0059 §3.3's `(after, through]`, with `after < through <=
+//! 2^63 - 1`. Any other tag, an unknown control kind, a fixed-size body of
+//! the wrong length, an id block outside that range, or a `Normal` body
+//! whose tenant prefix is malformed is a [`ReplicatedRecordError`], so a
+//! replay refuses the log rather than skip an entry it cannot apply.
 
 use crate::{FrameKind, TenantBatch, TenantBatchError};
 
@@ -43,8 +46,12 @@ const TAG_MEMBERSHIP: u8 = 0x03;
 const TAG_CONTROL: u8 = 0x04;
 const KIND_FLUSHER_ASSIGNMENT: u8 = 0x01;
 const KIND_CHECKPOINT: u8 = 0x02;
+const KIND_ID_BLOCK: u8 = 0x03;
 const REPLICA_LEN: usize = 16;
 const CHECKPOINT_LEN: usize = REPLICA_LEN + LOG_ID_LEN + 1;
+const ID_BLOCK_LEN: usize = 16;
+/// The highest template id (RFC 0059 §3.3).
+const MAX_TEMPLATE_ID: u64 = i64::MAX.unsigned_abs();
 const TAG_TRUNCATE_AFTER: u8 = 0x10;
 const TAG_TRUNCATE_ALL: u8 = 0x11;
 const TAG_PURGE: u8 = 0x12;
@@ -68,15 +75,17 @@ impl RaftLogId {
     }
 
     fn read(bytes: [u8; LOG_ID_LEN]) -> Self {
-        let mut term = [0u8; 8];
-        let mut index = [0u8; 8];
-        term.copy_from_slice(&bytes[..8]);
-        index.copy_from_slice(&bytes[8..]);
-        Self {
-            term: u64::from_le_bytes(term),
-            index: u64::from_le_bytes(index),
-        }
+        let (term, index) = u64_pair(bytes);
+        Self { term, index }
     }
+}
+
+fn u64_pair(bytes: [u8; 16]) -> (u64, u64) {
+    let mut first = [0u8; 8];
+    let mut second = [0u8; 8];
+    first.copy_from_slice(&bytes[..8]);
+    second.copy_from_slice(&bytes[8..]);
+    (u64::from_le_bytes(first), u64::from_le_bytes(second))
 }
 
 /// What a log entry carries.
@@ -104,12 +113,16 @@ pub enum Control {
         cut: RaftLogId,
         highest_kind: u8,
     },
+    /// A block `(after, through]` of template ids reserved in the store
+    /// (RFC 0059 §3.3); only `after < through <= 2^63 - 1` is encoded or
+    /// decoded.
+    IdBlock { after: u64, through: u64 },
 }
 
 impl Control {
     /// The highest control kind this codec reads; every lower one is read
     /// too (RFC 0065 §6.8).
-    pub const HIGHEST_KIND: u8 = KIND_CHECKPOINT;
+    pub const HIGHEST_KIND: u8 = KIND_ID_BLOCK;
 
     /// The entry's kind byte.
     #[must_use]
@@ -117,6 +130,7 @@ impl Control {
         match self {
             Self::FlusherAssignment(_) => KIND_FLUSHER_ASSIGNMENT,
             Self::Checkpoint { .. } => KIND_CHECKPOINT,
+            Self::IdBlock { .. } => KIND_ID_BLOCK,
         }
     }
 
@@ -124,6 +138,17 @@ impl Control {
         match self {
             Self::FlusherAssignment(_) => REPLICA_LEN,
             Self::Checkpoint { .. } => CHECKPOINT_LEN,
+            Self::IdBlock { .. } => ID_BLOCK_LEN,
+        }
+    }
+
+    /// The entry, unless it is an id block outside the id domain.
+    fn checked(self) -> Result<Self, ReplicatedRecordError> {
+        match self {
+            Self::IdBlock { after, through } if after >= through || through > MAX_TEMPLATE_ID => {
+                Err(ReplicatedRecordError::InvalidIdBlock { after, through })
+            }
+            _ => Ok(self),
         }
     }
 
@@ -140,6 +165,10 @@ impl Control {
                 cut.write(out);
                 out.push(highest_kind);
             }
+            Self::IdBlock { after, through } => {
+                out.extend_from_slice(&after.to_le_bytes());
+                out.extend_from_slice(&through.to_le_bytes());
+            }
         }
     }
 
@@ -155,6 +184,11 @@ impl Control {
         }
     }
 
+    fn id_block(body: [u8; ID_BLOCK_LEN]) -> Self {
+        let (after, through) = u64_pair(body);
+        Self::IdBlock { after, through }
+    }
+
     fn read(body: &[u8]) -> Result<Self, ReplicatedRecordError> {
         // `WrongLength` counts every byte after the tag, the log id too.
         let Some((&kind, rest)) = body.split_first() else {
@@ -168,6 +202,9 @@ impl Control {
             KIND_CHECKPOINT => <[u8; CHECKPOINT_LEN]>::try_from(rest)
                 .map(Self::checkpoint)
                 .map_err(|_| wrong(CHECKPOINT_LEN)),
+            KIND_ID_BLOCK => <[u8; ID_BLOCK_LEN]>::try_from(rest)
+                .map_err(|_| wrong(ID_BLOCK_LEN))
+                .and_then(|body| Self::id_block(body).checked()),
             found => Err(ReplicatedRecordError::UnknownControlKind { found }),
         }
     }
@@ -198,8 +235,10 @@ impl<'a> ReplicatedRecord<'a> {
     /// # Errors
     ///
     /// [`ReplicatedRecordError::TenantBatch`] when a `Normal` body is not
-    /// a well-formed `TenantOtlpBatch` payload, so no record is written
-    /// that [`Self::decode`] would refuse.
+    /// a well-formed `TenantOtlpBatch` payload, and
+    /// [`ReplicatedRecordError::InvalidIdBlock`] for an id block outside
+    /// the id domain, so no record is written that [`Self::decode`] would
+    /// refuse.
     pub fn encode(&self) -> Result<Vec<u8>, ReplicatedRecordError> {
         let mut out = Vec::with_capacity(ENTRY_PREFIX_LEN + self.body_len());
         match *self {
@@ -212,6 +251,7 @@ impl<'a> ReplicatedRecord<'a> {
                     }
                     EntryBody::Membership(bytes) => (TAG_MEMBERSHIP, bytes),
                     EntryBody::Control(control) => {
+                        let control = control.checked()?;
                         out.push(TAG_CONTROL);
                         log_id.write(&mut out);
                         control.write(&mut out);
@@ -335,6 +375,8 @@ pub enum ReplicatedRecordError {
     TenantBatch(TenantBatchError),
     /// A control entry of a kind this build does not read.
     UnknownControlKind { found: u8 },
+    /// An id block that is not `after < through <= 2^63 - 1`.
+    InvalidIdBlock { after: u64, through: u64 },
 }
 
 impl std::fmt::Display for ReplicatedRecordError {
@@ -356,6 +398,10 @@ impl std::fmt::Display for ReplicatedRecordError {
             Self::UnknownControlKind { found } => {
                 write!(f, "unknown ReplicatedEntry control kind 0x{found:02x}")
             }
+            Self::InvalidIdBlock { after, through } => write!(
+                f,
+                "ReplicatedEntry id block ({after}, {through}] is not after < through <= 2^63 - 1"
+            ),
         }
     }
 }
@@ -547,6 +593,8 @@ mod tests {
     /// A checkpoint is kind `0x02`: the proposer's UUID, the cut's term and
     /// index, and the highest kind at the cut (RFC 0065 §6.5).
     #[test]
+    #[ignore = "superseded: the highest kind is 0x03, the id block (RFC 0065 §6.5); see \
+                the_control_entries_encode_to_the_documented_bytes"]
     fn a_flusher_assignment_and_a_checkpoint_encode_to_the_documented_bytes() {
         let replica: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).expect("small"));
         let assignment = ReplicatedRecord::Entry {
@@ -579,6 +627,82 @@ mod tests {
         assert_eq!(Control::HIGHEST_KIND, 0x02);
         assert_eq!(Control::FlusherAssignment(replica).kind(), 0x01);
         assert_eq!(checkpoint.kind(), 0x02);
+    }
+
+    fn control(control: Control) -> ReplicatedRecord<'static> {
+        ReplicatedRecord::Entry {
+            log_id: ID,
+            body: EntryBody::Control(control),
+        }
+    }
+
+    /// The flusher assignment, the checkpoint and the id block, kind `0x03`:
+    /// `after` and `through`, each a `u64` little-endian (RFC 0065 §6.5).
+    #[test]
+    fn the_control_entries_encode_to_the_documented_bytes() {
+        let replica: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).expect("small"));
+        let mut tail = vec![0x01];
+        tail.extend_from_slice(&replica);
+        let assignment = Control::FlusherAssignment(replica);
+        round_trip(control(assignment), &golden(0x04, &tail));
+
+        let checkpoint = Control::Checkpoint {
+            proposer: replica,
+            cut: RaftLogId {
+                term: 0x21,
+                index: 0x0302,
+            },
+            highest_kind: 0x03,
+        };
+        let mut tail = vec![0x02];
+        tail.extend_from_slice(&replica);
+        tail.extend_from_slice(&[0x21, 0, 0, 0, 0, 0, 0, 0]);
+        tail.extend_from_slice(&[0x02, 0x03, 0, 0, 0, 0, 0, 0]);
+        tail.push(0x03);
+        round_trip(control(checkpoint), &golden(0x04, &tail));
+
+        let block = Control::IdBlock {
+            after: 0x0201,
+            through: 0x7fff_ffff_ffff_ffff,
+        };
+        let mut tail = vec![0x03, 0x01, 0x02, 0, 0, 0, 0, 0, 0];
+        tail.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
+        round_trip(control(block), &golden(0x04, &tail));
+
+        assert_eq!(Control::HIGHEST_KIND, 0x03);
+        let kinds = [assignment, checkpoint, block].map(Control::kind);
+        assert_eq!(kinds, [0x01, 0x02, 0x03]);
+    }
+
+    fn id_block_payload(after: u64, through: u64) -> Vec<u8> {
+        let mut tail = vec![0x03];
+        tail.extend_from_slice(&after.to_le_bytes());
+        tail.extend_from_slice(&through.to_le_bytes());
+        golden(0x04, &tail)
+    }
+
+    /// An id block is `after < through <= 2^63 - 1` in 16 bytes; any other
+    /// body is refused on decode, and never encoded.
+    #[test]
+    fn an_id_block_outside_the_id_domain_or_of_the_wrong_length_is_refused() {
+        let max = MAX_TEMPLATE_ID;
+        for (after, through) in [(0, 1), (0, max), (max - 1, max)] {
+            let block = Control::IdBlock { after, through };
+            round_trip(control(block), &id_block_payload(after, through));
+        }
+        for (after, through) in [(5, 5), (6, 5), (0, max + 1), (max, u64::MAX)] {
+            let invalid = ReplicatedRecordError::InvalidIdBlock { after, through };
+            let decoded = ReplicatedRecord::decode(&id_block_payload(after, through)).map(|_| ());
+            assert_eq!(decoded, Err(invalid.clone()), "({after}, {through}]");
+            let encoded = control(Control::IdBlock { after, through }).encode();
+            assert_eq!(encoded, Err(invalid), "({after}, {through}]");
+        }
+        let mut long = id_block_payload(0, 1);
+        long.push(0);
+        let short = &long[..long.len() - 2];
+        let decode = |bytes: &[u8]| ReplicatedRecord::decode(bytes).map(|_| ());
+        assert_eq!(decode(short), Err(wrong_length(0x04, 33, 32)));
+        assert_eq!(decode(&long), Err(wrong_length(0x04, 33, 34)));
     }
 
     #[test]
@@ -615,7 +739,7 @@ mod tests {
 
     fn any_record() -> impl Strategy<Value = (u8, u64, u64, Vec<u8>)> {
         (
-            0u8..9,
+            0u8..10,
             any::<u64>(),
             any::<u64>(),
             proptest::collection::vec(any::<u8>(), 0..64),
@@ -644,6 +768,12 @@ mod tests {
                     let highest_kind = bytes.first().copied().unwrap_or(0);
                     let cut = RaftLogId { term: index, index: term };
                     let control = Control::Checkpoint { proposer, cut, highest_kind };
+                    ReplicatedRecord::Entry { log_id, body: EntryBody::Control(control) }
+                }
+                8 => {
+                    let after = term % MAX_TEMPLATE_ID;
+                    let through = after + 1 + index % (MAX_TEMPLATE_ID - after);
+                    let control = Control::IdBlock { after, through };
                     ReplicatedRecord::Entry { log_id, body: EntryBody::Control(control) }
                 }
                 _ => ReplicatedRecord::Committed(log_id),

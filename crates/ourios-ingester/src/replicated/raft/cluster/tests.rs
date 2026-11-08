@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use openraft::type_config::alias::StoredMembershipOf;
 
 use super::super::host::HostError;
-use super::super::snapshot_record::GroupSnapshot;
+use super::super::snapshot_record::{GroupSnapshot, IdBlock};
 use super::super::types::{Entry, GroupEntry, LogId};
 use super::{
     Cluster, GroupHost, GroupRaft, HostSpec, NodeId, Peers, RaftTypes, Replica, WAIT, batch,
@@ -207,15 +207,20 @@ async fn a_crashed_follower_restarts_from_its_fsynced_log_and_catches_up() {
     cluster.shutdown().await;
 }
 
-/// A checkpoint entry proposed by `proposer` with its cut at `cut`.
+/// A checkpoint entry proposed by `proposer` with its cut at `cut`, where
+/// the log's highest kind is the flusher assignment's.
 fn checkpoint(proposer: NodeId, cut: &Entry) -> GroupEntry {
+    checkpoint_of_kind(proposer, cut, 1)
+}
+
+fn checkpoint_of_kind(proposer: NodeId, cut: &Entry, highest_kind: u8) -> GroupEntry {
     GroupEntry::Control(ourios_wal::Control::Checkpoint {
         proposer: *proposer.uuid().as_bytes(),
         cut: ourios_wal::RaftLogId {
             term: cut.log_id.leader_id.term,
             index: cut.log_id.index,
         },
-        highest_kind: 1,
+        highest_kind,
     })
 }
 
@@ -323,6 +328,52 @@ async fn a_checkpoint_snapshots_the_group_at_its_cut_for_every_replica() {
         (snapshot, whole_log),
         "reopened from the snapshot"
     );
+    cluster.shutdown().await;
+}
+
+fn id_block((after, through): (u64, u64)) -> GroupEntry {
+    GroupEntry::Control(ourios_wal::Control::IdBlock { after, through })
+}
+
+fn id_block_on(cluster: &Cluster, i: usize) -> Option<IdBlock> {
+    let sm = cluster.node(i).host.state_machine(GROUP).expect("hosted");
+    sm.id_block()
+}
+
+/// RFC0065.31's id-block arms: with a block before a checkpoint's cut and
+/// blocks after it, the snapshot holds the one in force at the cut; a
+/// replica whose log ends below the cut installs it and ends with the same
+/// latest block as one that applied the whole log, ignoring the blocks
+/// below `(0, 100]` though that block's entry was purged before it ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_carries_the_id_block_in_force_at_its_cut() {
+    let mut cluster = Cluster::start(3, &[GROUP]).await;
+    let leader = cluster.leader(GROUP, None).await;
+    let (lagging, voter) = ((leader + 1) % 3, (leader + 2) % 3);
+    cluster.kill(lagging).await;
+    let flusher = cluster.id(leader);
+    let raft = cluster.node(leader).raft(GROUP);
+    propose(raft, assign(flusher)).await;
+    propose(raft, id_block((0, 100))).await;
+    let cut = entry_at(&cluster, leader, commit(&cluster, leader, 0..2).await).await;
+    for block in [(0, 50), (50, 150), (100, 200)] {
+        propose(raft, id_block(block)).await;
+    }
+    propose(raft, checkpoint_of_kind(flusher, &cut, 3)).await;
+    let last = commit(&cluster, leader, 2..4).await;
+
+    let (snapshot, _) = group_on(&cluster, leader, (last, cut.log_id)).await;
+    assert_eq!(snapshot.state.id_block, IdBlock::new(0, 100), "at the cut");
+    let latest = IdBlock::new(100, 200);
+    cluster.node(voter).applied_through(GROUP, last).await;
+    for i in [leader, voter] {
+        assert_eq!(id_block_on(&cluster, i), latest, "node {i}");
+    }
+
+    cluster.restart(lagging).await;
+    let (installed, _) = group_on(&cluster, lagging, (last, cut.log_id)).await;
+    assert_eq!(installed, snapshot, "installed");
+    assert_eq!(id_block_on(&cluster, lagging), latest, "caught up");
     cluster.shutdown().await;
 }
 

@@ -456,22 +456,24 @@ async fn rfc0065_29_an_unreadable_control_entry_stops_the_open() {
 
 /// Scenario RFC0065.31 — a checkpoint snapshot holds the group at its cut
 /// (B11). Only the flusher's checkpoint with a cut above the last applies;
-/// its snapshot is at the cut and holds the membership, flusher and highest
-/// kind as of it, and a replica installing it catches up to the state of one
-/// that applied the whole log.
+/// its snapshot is at the cut and holds the membership, flusher, highest
+/// kind and latest id block as of it, and a replica installing it catches up
+/// to the state of one that applied the whole log.
 #[test]
-#[ignore = "RFC0065.31 stub — the checkpoint's arms are covered in the raft unit and cluster \
-            tests; the rest land with the id-block (0x03) and miner-configuration (0x04) entries"]
+#[ignore = "RFC0065.31 stub — the checkpoint's and id blocks' arms are covered in the raft unit \
+            and cluster tests; the rest land with the miner-configuration (0x04) entry"]
 fn rfc0065_31_a_checkpoint_snapshot_holds_the_group_at_its_cut() {
     todo!(
-        "RFC0065.31 — remaining arms: the snapshot holds the miner configuration and \
-         latest id block as of the cut; the installer matches a full replay across a \
-         threshold change on a populated miner; a block below the previous ignored; a \
-         refused miner configuration, or one changing prefix_depth or max_node_children, \
-         stops the replica. Covered: checkpoints not by the flusher at their position or \
-         with a cut not above the last are ignored, the snapshot is at the cut with its \
-         membership, flusher and kind, the installer and a restart match a full replay \
-         (raft::cluster::tests, raft::state_machine::tests), and a version-1 snapshot \
-         record fails the open (raft::snapshot_record::tests)"
+        "RFC0065.31 — remaining arms: the snapshot holds the miner configuration as of \
+         the cut; the installer matches a full replay across a threshold change on a \
+         populated miner; a refused miner configuration, or one changing prefix_depth or \
+         max_node_children, stops the replica. Covered: checkpoints not by the flusher at \
+         their position or with a cut not above the last are ignored, the snapshot is at \
+         the cut with its membership, flusher, kind and latest id block, the installer and \
+         a restart match a full replay, a block below the previous applied one is ignored \
+         (after (0, 100] and an ignored (0, 50], (50, 150] too), also by a replica whose \
+         log is purged below that block (raft::cluster::tests, raft::state_machine::tests, \
+         raft::checkpoint::tests), and a version-1 snapshot record fails the open \
+         (raft::snapshot_record::tests)"
     );
 }

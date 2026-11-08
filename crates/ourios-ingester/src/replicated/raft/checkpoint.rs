@@ -51,13 +51,20 @@ pub(super) struct History {
     checkpoint: Option<GroupSnapshot>,
     /// In index order, every index above the checkpoint's cut.
     changes: Vec<(u64, Change)>,
+    /// The term of the last entry applied.
+    term: Option<u64>,
 }
 
 impl History {
     pub(super) fn new(checkpoint: Option<GroupSnapshot>) -> Self {
+        let term = checkpoint
+            .as_ref()
+            .and_then(|c| c.meta.last_log_id)
+            .map(|cut| cut.leader_id.term);
         Self {
             checkpoint,
             changes: Vec::new(),
+            term,
         }
     }
 
@@ -72,7 +79,7 @@ impl History {
     /// Note the entry at `log_id` applied, before what it changes.
     pub(super) fn entered(&mut self, log_id: LogId) {
         let term = log_id.leader_id.term;
-        if self.term_at(log_id.index) != Some(term) {
+        if self.term.replace(term) != Some(term) {
             self.changes.push((log_id.index, Change::Term(term)));
         }
     }
@@ -194,6 +201,29 @@ mod tests {
             4,
             "a term change, not an entry, each"
         );
+    }
+
+    #[test]
+    fn entries_in_the_same_term_record_nothing() {
+        let mut same_term = History::new(None);
+        same_term.entered(id(4, 1));
+        for index in 2..1_000 {
+            same_term.entered(id(4, index));
+        }
+        assert_eq!(same_term.changes.len(), 1, "one term change");
+
+        let mut history = history();
+        let held = history.changes.len();
+        let flusher = Some(NodeId::from(7));
+        let cut = history.apply(id(3, 9), flusher, proposal(7, id(3, 6), 1));
+        assert_eq!(cut, Some(id(3, 6)));
+        history.entered(id(3, 9));
+        history.entered(id(3, 10));
+        assert!(
+            history.changes.len() < held,
+            "trimmed, nothing new in term 3"
+        );
+        assert_eq!(history.term_at(10), Some(3));
     }
 
     #[test]

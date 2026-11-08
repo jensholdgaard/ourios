@@ -9,7 +9,9 @@
 
 use std::fmt;
 
-use ourios_wal::{Control, RaftLogId, TenantBatch, TenantBatchError};
+use ourios_wal::{
+    Control, MinerConfigV1, RaftLogId, TenantBatch, TenantBatchError, UpstreamTemplates,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -109,6 +111,31 @@ enum ControlDef {
         after: u64,
         through: u64,
     },
+    MinerConfig(#[serde(with = "MinerConfigV1Def")] MinerConfigV1),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "MinerConfigV1")]
+struct MinerConfigV1Def {
+    similarity_threshold: f32,
+    similarity_floor: f32,
+    param_byte_limit: u32,
+    prefix_depth: u8,
+    max_node_children: u16,
+    max_templates: u32,
+    max_line_tokens: u16,
+    #[serde(with = "UpstreamTemplatesDef")]
+    upstream_templates: UpstreamTemplates,
+    upstream_template_byte_limit: u32,
+    upstream_association_limit: u16,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "UpstreamTemplates")]
+enum UpstreamTemplatesDef {
+    Ignore,
+    Observe,
+    Adopt,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -145,6 +172,11 @@ impl fmt::Display for GroupEntry {
             Self::Control(Control::IdBlock { after, through }) => {
                 write!(f, "IdBlock({after}, {through}]")
             }
+            Self::Control(Control::MinerConfig(config)) => write!(
+                f,
+                "MinerConfig(algorithm 1, prefix_depth {}, similarity_threshold {})",
+                config.prefix_depth, config.similarity_threshold
+            ),
         }
     }
 }
@@ -215,6 +247,28 @@ mod tests {
             through: 200,
         });
         assert_eq!(entry.to_string(), "IdBlock(100, 200]");
+        let json = serde_json::to_string(&entry).expect("serialise");
+        assert_eq!(serde_json::from_str::<GroupEntry>(&json).ok(), Some(entry));
+    }
+
+    #[test]
+    fn a_miner_configuration_displays_its_algorithm_and_round_trips() {
+        let entry = GroupEntry::Control(Control::MinerConfig(MinerConfigV1 {
+            similarity_threshold: 0.7,
+            similarity_floor: 0.4,
+            param_byte_limit: 256,
+            prefix_depth: 2,
+            max_node_children: 100,
+            max_templates: 20_000,
+            max_line_tokens: 512,
+            upstream_templates: UpstreamTemplates::Adopt,
+            upstream_template_byte_limit: 8192,
+            upstream_association_limit: 4,
+        }));
+        assert_eq!(
+            entry.to_string(),
+            "MinerConfig(algorithm 1, prefix_depth 2, similarity_threshold 0.7)"
+        );
         let json = serde_json::to_string(&entry).expect("serialise");
         assert_eq!(serde_json::from_str::<GroupEntry>(&json).ok(), Some(entry));
     }

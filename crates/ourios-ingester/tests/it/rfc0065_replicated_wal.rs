@@ -454,26 +454,98 @@ async fn rfc0065_29_an_unreadable_control_entry_stops_the_open() {
     }
 }
 
+/// A miner configuration entry at `index` carrying `config`.
+fn miner_config(index: u64, config: ourios_wal::MinerConfigV1) -> Vec<u8> {
+    let control = ourios_wal::Control::MinerConfig(config);
+    record(index, ourios_wal::EntryBody::Control(control))
+}
+
+fn default_miner_config() -> ourios_wal::MinerConfigV1 {
+    ourios_wal::MinerConfigV1 {
+        similarity_threshold: 0.7,
+        similarity_floor: 0.4,
+        param_byte_limit: 256,
+        prefix_depth: 2,
+        max_node_children: 100,
+        max_templates: 20_000,
+        max_line_tokens: 512,
+        upstream_templates: ourios_wal::UpstreamTemplates::Ignore,
+        upstream_template_byte_limit: 8192,
+        upstream_association_limit: 4,
+    }
+}
+
+/// Scenario RFC0065.31, the refused-configuration arm: a miner
+/// configuration body that `MinerConfig` refuses stops the open as
+/// RFC0065.29's unreadable entry does, as does one whose body is not 28
+/// bytes or whose `upstream_templates` is not 0, 1 or 2.
+#[tokio::test]
+async fn rfc0065_31_a_miner_configuration_minerconfig_refuses_stops_the_open() {
+    let accepted = miner_config(1, default_miner_config());
+    let (opened, _dir) = open_holding(&[&accepted]);
+    opened.expect("a log holding a valid configuration opens");
+
+    let refused = |edit: fn(&mut ourios_wal::MinerConfigV1)| {
+        let mut config = default_miner_config();
+        edit(&mut config);
+        miner_config(2, config)
+    };
+    let above_one = refused(|c| c.similarity_threshold = 1.5);
+    let floor_above = refused(|c| c.similarity_floor = 0.9);
+    let over_ceiling = refused(|c| c.param_byte_limit = 1025);
+    let too_deep = refused(|c| c.prefix_depth = 9);
+    let no_children = refused(|c| c.max_node_children = 0);
+    let mut short_body = accepted.clone();
+    short_body.pop();
+    let mut long_body = accepted.clone();
+    long_body.push(0);
+    let mut unknown_mode = accepted.clone();
+    unknown_mode[17 + 1 + 21] = 3;
+    for (unreadable, why) in [
+        (&above_one, "similarity_threshold"),
+        (&floor_above, "similarity_floor"),
+        (&over_ceiling, "param_byte_limit"),
+        (&too_deep, "prefix_depth"),
+        (&no_children, "max_node_children"),
+        (&short_body, "body is 44 byte(s); expected 45"),
+        (&long_body, "body is 46 byte(s); expected 45"),
+        (&unknown_mode, "upstream_templates 3"),
+    ] {
+        let (refused, _dir) = open_holding(&[&accepted, unreadable]);
+        let Err(error) = refused else {
+            panic!("{why}: the entry did not stop the open");
+        };
+        assert!(error.to_string().contains(why), "{error}");
+    }
+}
+
 /// Scenario RFC0065.31 — a checkpoint snapshot holds the group at its cut
 /// (B11). Only the flusher's checkpoint with a cut above the last applies;
 /// its snapshot is at the cut and holds the membership, flusher, highest
-/// kind and latest id block as of it, and a replica installing it catches up
-/// to the state of one that applied the whole log.
+/// kind, miner configuration and latest id block as of it, and a replica
+/// installing it catches up to the state of one that applied the whole log.
 #[test]
-#[ignore = "RFC0065.31 stub — the checkpoint's and id blocks' arms are covered in the raft unit \
-            and cluster tests; the rest land with the miner-configuration (0x04) entry"]
+#[ignore = "RFC0065.31 stub — every arm but mining under the configuration and the leader \
+            appending it is covered in the raft unit and cluster tests; those two land with \
+            the leader's miner-configuration append and mining against it"]
 fn rfc0065_31_a_checkpoint_snapshot_holds_the_group_at_its_cut() {
     todo!(
-        "RFC0065.31 — remaining arms: the snapshot holds the miner configuration as of \
-         the cut; the installer matches a full replay across a threshold change on a \
-         populated miner; a refused miner configuration, or one changing prefix_depth or \
-         max_node_children, stops the replica. Covered: checkpoints not by the flusher at \
-         their position or with a cut not above the last are ignored, the snapshot is at \
-         the cut with its membership, flusher, kind and latest id block, the installer and \
-         a restart match a full replay, a block below the previous applied one is ignored \
+        "RFC0065.31 — remaining arms: the installer mines the lines after a \
+         similarity_threshold change into the same templates as a replica that mined \
+         through it; a leader whose own prefix_depth differs appends the log's, also when \
+         elected after a checkpoint purged every configuration entry. Covered: checkpoints \
+         not by the flusher at their position or with a cut not above the last are \
+         ignored, the snapshot is at the cut with its membership, flusher, kind, miner \
+         configuration and latest id block, the installer and a restart match a full \
+         replay, configuration included, a block below the previous applied one is ignored \
          (after (0, 100] and an ignored (0, 50], (50, 150] too), also by a replica whose \
          log is purged below that block (raft::cluster::tests, raft::state_machine::tests, \
-         raft::checkpoint::tests), and a version-1 snapshot record fails the open \
+         raft::checkpoint::tests), a configuration changing prefix_depth or \
+         max_node_children from the group's first stops the apply \
+         (raft::state_machine::tests), one MinerConfig refuses stops the open \
+         (rfc0065_31_a_miner_configuration_minerconfig_refuses_stops_the_open, \
+         raft::codec::tests), the leader's control view holds the configuration in force \
+         (raft::tests), and a version-1 snapshot record fails the open \
          (raft::snapshot_record::tests)"
     );
 }

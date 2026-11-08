@@ -29,14 +29,24 @@
 //! | 0x02 Checkpoint        | proposer: uuid | cut term: u64_le | cut index: u64_le |
 //! |                        | highest kind: u8                                |
 //! | 0x03 IdBlock           | after: u64_le | through: u64_le                   |
+//! | 0x04 MinerConfig       | similarity_threshold: f32 | similarity_floor: f32 |
+//! |                        | param_byte_limit: u32 | prefix_depth: u8        |
+//! |                        | max_node_children: u16 | max_templates: u32     |
+//! |                        | max_line_tokens: u16 | upstream_templates: u8   |
+//! |                        | upstream_template_byte_limit: u32               |
+//! |                        | upstream_association_limit: u16                 |
 //! ```
 //!
-//! A UUID is 16 bytes big-endian; every other kind is reserved. An id
-//! block is RFC 0059 §3.3's `(after, through]`, with `after < through <=
-//! 2^63 - 1`. Any other tag, an unknown control kind, a fixed-size body of
-//! the wrong length, an id block outside that range, or a `Normal` body
-//! whose tenant prefix is malformed is a [`ReplicatedRecordError`], so a
-//! replay refuses the log rather than skip an entry it cannot apply.
+//! A UUID is 16 bytes big-endian and an `f32` its IEEE 754 bits; every
+//! other kind is reserved. An id block is RFC 0059 §3.3's `(after,
+//! through]`, with `after < through <= 2^63 - 1`, and `upstream_templates`
+//! is `0` ignore, `1` observe or `2` adopt. Any other tag, an unknown
+//! control kind, a fixed-size body of the wrong length, an id block
+//! outside that range, another `upstream_templates` value, or a `Normal`
+//! body whose tenant prefix is malformed is a [`ReplicatedRecordError`], so
+//! a replay refuses the log rather than skip an entry it cannot apply.
+//! The miner configuration's other bounds are `MinerConfig`'s, checked by
+//! the reader that applies it.
 
 use crate::{FrameKind, TenantBatch, TenantBatchError};
 
@@ -47,9 +57,11 @@ const TAG_CONTROL: u8 = 0x04;
 const KIND_FLUSHER_ASSIGNMENT: u8 = 0x01;
 const KIND_CHECKPOINT: u8 = 0x02;
 const KIND_ID_BLOCK: u8 = 0x03;
+const KIND_MINER_CONFIG: u8 = 0x04;
 const REPLICA_LEN: usize = 16;
 const CHECKPOINT_LEN: usize = REPLICA_LEN + LOG_ID_LEN + 1;
 const ID_BLOCK_LEN: usize = 16;
+const MINER_CONFIG_LEN: usize = MinerConfigV1::LEN;
 /// The highest template id (RFC 0059 §3.3).
 const MAX_TEMPLATE_ID: u64 = i64::MAX.unsigned_abs();
 const TAG_TRUNCATE_AFTER: u8 = 0x10;
@@ -117,12 +129,125 @@ pub enum Control {
     /// (RFC 0059 §3.3); only `after < through <= 2^63 - 1` is encoded or
     /// decoded.
     IdBlock { after: u64, through: u64 },
+    /// The group's miner configuration, algorithm 1.
+    MinerConfig(MinerConfigV1),
 }
+
+/// How the miner treats a record's `log.record.template` (RFC 0050 §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamTemplates {
+    Ignore,
+    Observe,
+    Adopt,
+}
+
+impl UpstreamTemplates {
+    const fn byte(self) -> u8 {
+        match self {
+            Self::Ignore => 0,
+            Self::Observe => 1,
+            Self::Adopt => 2,
+        }
+    }
+
+    const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Ignore),
+            1 => Some(Self::Observe),
+            2 => Some(Self::Adopt),
+            _ => None,
+        }
+    }
+}
+
+/// A miner configuration entry of algorithm 1: the `MinerConfig` fields
+/// (RFC 0004 §3.2, RFC 0023 §3.1, RFC 0050 §3.2) in declaration order.
+///
+/// Equality is bitwise, as the entry is.
+#[derive(Debug, Clone, Copy)]
+pub struct MinerConfigV1 {
+    pub similarity_threshold: f32,
+    pub similarity_floor: f32,
+    pub param_byte_limit: u32,
+    pub prefix_depth: u8,
+    pub max_node_children: u16,
+    pub max_templates: u32,
+    pub max_line_tokens: u16,
+    pub upstream_templates: UpstreamTemplates,
+    pub upstream_template_byte_limit: u32,
+    pub upstream_association_limit: u16,
+}
+
+impl MinerConfigV1 {
+    /// The body's length in bytes.
+    pub const LEN: usize = 28;
+
+    /// The body's bytes, little-endian.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::LEN] {
+        let mut out = [0; Self::LEN];
+        let fields: [&[u8]; 10] = [
+            &self.similarity_threshold.to_bits().to_le_bytes(),
+            &self.similarity_floor.to_bits().to_le_bytes(),
+            &self.param_byte_limit.to_le_bytes(),
+            &[self.prefix_depth],
+            &self.max_node_children.to_le_bytes(),
+            &self.max_templates.to_le_bytes(),
+            &self.max_line_tokens.to_le_bytes(),
+            &[self.upstream_templates.byte()],
+            &self.upstream_template_byte_limit.to_le_bytes(),
+            &self.upstream_association_limit.to_le_bytes(),
+        ];
+        let mut at = 0;
+        for field in fields {
+            out[at..at + field.len()].copy_from_slice(field);
+            at += field.len();
+        }
+        out
+    }
+
+    /// The body `bytes` hold.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicatedRecordError::InvalidUpstreamTemplates`] when
+    /// `upstream_templates` is not `0`, `1` or `2`.
+    pub fn from_bytes(bytes: [u8; Self::LEN]) -> Result<Self, ReplicatedRecordError> {
+        let u16_at = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let u32_at = |at: usize| {
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
+        let upstream = bytes[21];
+        let Some(upstream_templates) = UpstreamTemplates::from_byte(upstream) else {
+            return Err(ReplicatedRecordError::InvalidUpstreamTemplates { found: upstream });
+        };
+        Ok(Self {
+            similarity_threshold: f32::from_bits(u32_at(0)),
+            similarity_floor: f32::from_bits(u32_at(4)),
+            param_byte_limit: u32_at(8),
+            prefix_depth: bytes[12],
+            max_node_children: u16_at(13),
+            max_templates: u32_at(15),
+            max_line_tokens: u16_at(19),
+            upstream_templates,
+            upstream_template_byte_limit: u32_at(22),
+            upstream_association_limit: u16_at(26),
+        })
+    }
+}
+
+impl PartialEq for MinerConfigV1 {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_bytes() == other.to_bytes()
+    }
+}
+
+impl Eq for MinerConfigV1 {}
 
 impl Control {
     /// The highest control kind this codec reads; every lower one is read
     /// too (RFC 0065 §6.8).
-    pub const HIGHEST_KIND: u8 = KIND_ID_BLOCK;
+    pub const HIGHEST_KIND: u8 = KIND_MINER_CONFIG;
 
     /// The entry's kind byte.
     #[must_use]
@@ -131,6 +256,7 @@ impl Control {
             Self::FlusherAssignment(_) => KIND_FLUSHER_ASSIGNMENT,
             Self::Checkpoint { .. } => KIND_CHECKPOINT,
             Self::IdBlock { .. } => KIND_ID_BLOCK,
+            Self::MinerConfig(_) => KIND_MINER_CONFIG,
         }
     }
 
@@ -139,6 +265,7 @@ impl Control {
             Self::FlusherAssignment(_) => REPLICA_LEN,
             Self::Checkpoint { .. } => CHECKPOINT_LEN,
             Self::IdBlock { .. } => ID_BLOCK_LEN,
+            Self::MinerConfig(_) => MINER_CONFIG_LEN,
         }
     }
 
@@ -169,6 +296,7 @@ impl Control {
                 out.extend_from_slice(&after.to_le_bytes());
                 out.extend_from_slice(&through.to_le_bytes());
             }
+            Self::MinerConfig(config) => out.extend_from_slice(&config.to_bytes()),
         }
     }
 
@@ -205,6 +333,10 @@ impl Control {
             KIND_ID_BLOCK => <[u8; ID_BLOCK_LEN]>::try_from(rest)
                 .map_err(|_| wrong(ID_BLOCK_LEN))
                 .and_then(|body| Self::id_block(body).checked()),
+            KIND_MINER_CONFIG => <[u8; MINER_CONFIG_LEN]>::try_from(rest)
+                .map_err(|_| wrong(MINER_CONFIG_LEN))
+                .and_then(MinerConfigV1::from_bytes)
+                .map(Self::MinerConfig),
             found => Err(ReplicatedRecordError::UnknownControlKind { found }),
         }
     }
@@ -377,6 +509,9 @@ pub enum ReplicatedRecordError {
     UnknownControlKind { found: u8 },
     /// An id block that is not `after < through <= 2^63 - 1`.
     InvalidIdBlock { after: u64, through: u64 },
+    /// A miner configuration whose `upstream_templates` is not `0`, `1` or
+    /// `2`.
+    InvalidUpstreamTemplates { found: u8 },
 }
 
 impl std::fmt::Display for ReplicatedRecordError {
@@ -401,6 +536,10 @@ impl std::fmt::Display for ReplicatedRecordError {
             Self::InvalidIdBlock { after, through } => write!(
                 f,
                 "ReplicatedEntry id block ({after}, {through}] is not after < through <= 2^63 - 1"
+            ),
+            Self::InvalidUpstreamTemplates { found } => write!(
+                f,
+                "ReplicatedEntry miner configuration upstream_templates {found} is not 0, 1 or 2"
             ),
         }
     }
@@ -639,6 +778,8 @@ mod tests {
     /// The flusher assignment, the checkpoint and the id block, kind `0x03`:
     /// `after` and `through`, each a `u64` little-endian (RFC 0065 §6.5).
     #[test]
+    #[ignore = "superseded: the highest kind is 0x04, the miner configuration (RFC 0065 §6.5); \
+                see every_control_kind_encodes_to_the_documented_bytes"]
     fn the_control_entries_encode_to_the_documented_bytes() {
         let replica: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).expect("small"));
         let mut tail = vec![0x01];
@@ -672,6 +813,117 @@ mod tests {
         assert_eq!(Control::HIGHEST_KIND, 0x03);
         let kinds = [assignment, checkpoint, block].map(Control::kind);
         assert_eq!(kinds, [0x01, 0x02, 0x03]);
+    }
+
+    fn miner_config() -> MinerConfigV1 {
+        MinerConfigV1 {
+            similarity_threshold: 0.7,
+            similarity_floor: 0.4,
+            param_byte_limit: 256,
+            prefix_depth: 2,
+            max_node_children: 100,
+            max_templates: 20_000,
+            max_line_tokens: 512,
+            upstream_templates: UpstreamTemplates::Observe,
+            upstream_template_byte_limit: 8192,
+            upstream_association_limit: 4,
+        }
+    }
+
+    /// Every kind through the miner configuration, `0x04`: its 28 bytes
+    /// are the fields in order, each `f32` as its IEEE 754 bits and
+    /// `upstream_templates` `1` for observe (RFC 0065 §6.5).
+    #[test]
+    fn every_control_kind_encodes_to_the_documented_bytes() {
+        let replica: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).expect("small"));
+        let mut tail = vec![0x01];
+        tail.extend_from_slice(&replica);
+        let assignment = Control::FlusherAssignment(replica);
+        round_trip(control(assignment), &golden(0x04, &tail));
+
+        let checkpoint = Control::Checkpoint {
+            proposer: replica,
+            cut: RaftLogId {
+                term: 0x21,
+                index: 0x0302,
+            },
+            highest_kind: 0x04,
+        };
+        let mut tail = vec![0x02];
+        tail.extend_from_slice(&replica);
+        tail.extend_from_slice(&[0x21, 0, 0, 0, 0, 0, 0, 0]);
+        tail.extend_from_slice(&[0x02, 0x03, 0, 0, 0, 0, 0, 0]);
+        tail.push(0x04);
+        round_trip(control(checkpoint), &golden(0x04, &tail));
+
+        let block = Control::IdBlock {
+            after: 0x0201,
+            through: 0x7fff_ffff_ffff_ffff,
+        };
+        let mut tail = vec![0x03, 0x01, 0x02, 0, 0, 0, 0, 0, 0];
+        tail.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
+        round_trip(control(block), &golden(0x04, &tail));
+
+        let config = Control::MinerConfig(miner_config());
+        let tail = [
+            0x04, 0x33, 0x33, 0x33, 0x3f, 0xcd, 0xcc, 0xcc, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x02,
+            0x64, 0x00, 0x20, 0x4e, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x20, 0x00, 0x00, 0x04,
+            0x00,
+        ];
+        assert_eq!(tail.len(), 1 + 28);
+        round_trip(control(config), &golden(0x04, &tail));
+
+        assert_eq!(Control::HIGHEST_KIND, 0x04);
+        let kinds = [assignment, checkpoint, block, config].map(Control::kind);
+        assert_eq!(kinds, [0x01, 0x02, 0x03, 0x04]);
+    }
+
+    fn miner_config_payload(config: MinerConfigV1) -> Vec<u8> {
+        let mut tail = vec![0x04];
+        tail.extend_from_slice(&config.to_bytes());
+        golden(0x04, &tail)
+    }
+
+    /// A miner configuration is 28 bytes with `upstream_templates` `0`, `1`
+    /// or `2`; a body one byte short or long, or another mode, is refused.
+    #[test]
+    fn a_miner_configuration_of_the_wrong_length_or_mode_is_refused() {
+        for mode in [
+            UpstreamTemplates::Ignore,
+            UpstreamTemplates::Observe,
+            UpstreamTemplates::Adopt,
+        ] {
+            let config = MinerConfigV1 {
+                upstream_templates: mode,
+                ..miner_config()
+            };
+            let payload = miner_config_payload(config);
+            assert_eq!(payload[17 + 1 + 21], mode.byte(), "{mode:?}");
+            round_trip(control(Control::MinerConfig(config)), &payload);
+        }
+        let decode = |bytes: &[u8]| ReplicatedRecord::decode(bytes).map(|_| ());
+        let mut long = miner_config_payload(miner_config());
+        long.push(0);
+        let short = &long[..long.len() - 2];
+        assert_eq!(decode(short), Err(wrong_length(0x04, 45, 44)));
+        assert_eq!(decode(&long), Err(wrong_length(0x04, 45, 46)));
+        let mut mode = miner_config_payload(miner_config());
+        mode[17 + 1 + 21] = 3;
+        let invalid = ReplicatedRecordError::InvalidUpstreamTemplates { found: 3 };
+        assert_eq!(decode(&mode), Err(invalid));
+    }
+
+    /// Two configurations are equal when their bytes are, so a NaN equals
+    /// itself and `0.0` differs from `-0.0`.
+    #[test]
+    fn miner_configurations_compare_by_their_bits() {
+        let with = |similarity_threshold| MinerConfigV1 {
+            similarity_threshold,
+            ..miner_config()
+        };
+        assert_eq!(with(f32::NAN), with(f32::NAN));
+        assert_ne!(with(0.0), with(-0.0));
+        assert_ne!(with(0.7), with(0.75));
     }
 
     fn id_block_payload(after: u64, through: u64) -> Vec<u8> {
@@ -739,7 +991,7 @@ mod tests {
 
     fn any_record() -> impl Strategy<Value = (u8, u64, u64, Vec<u8>)> {
         (
-            0u8..10,
+            0u8..11,
             any::<u64>(),
             any::<u64>(),
             proptest::collection::vec(any::<u8>(), 0..64),
@@ -774,6 +1026,16 @@ mod tests {
                     let after = term % MAX_TEMPLATE_ID;
                     let through = after + 1 + index % (MAX_TEMPLATE_ID - after);
                     let control = Control::IdBlock { after, through };
+                    ReplicatedRecord::Entry { log_id, body: EntryBody::Control(control) }
+                }
+                9 => {
+                    let mut body = [0; MinerConfigV1::LEN];
+                    for (to, from) in body.iter_mut().zip(bytes.iter().chain(&term.to_le_bytes())) {
+                        *to = *from;
+                    }
+                    body[21] %= 3;
+                    let config = MinerConfigV1::from_bytes(body).expect("a mode below 3");
+                    let control = Control::MinerConfig(config);
                     ReplicatedRecord::Entry { log_id, body: EntryBody::Control(control) }
                 }
                 _ => ReplicatedRecord::Committed(log_id),

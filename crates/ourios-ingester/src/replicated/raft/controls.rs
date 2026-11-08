@@ -3,10 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use ourios_wal::Control;
+use ourios_wal::{Control, MinerConfigV1};
 use uuid::Uuid;
 
-use super::snapshot_record::GroupSnapshot;
+use super::snapshot_record::{GroupMinerConfig, GroupSnapshot};
 use super::types::NodeId;
 
 /// The control entries a log held at one read, and the highest kind it
@@ -45,20 +45,24 @@ impl HeldControls {
         let after = snapshot
             .and_then(|s| s.meta.last_log_id)
             .map_or(0, |last| last.index + 1);
-        let newest = self
-            .controls
-            .range(after..)
-            .rev()
-            .find_map(|(_, c)| match *c {
-                Control::FlusherAssignment(replica) => {
-                    Some(NodeId::from(Uuid::from_bytes(replica)))
-                }
-                Control::Checkpoint { .. } | Control::IdBlock { .. } => None,
-            });
+        let after_snapshot = || self.controls.range(after..).rev().map(|(_, c)| *c);
+        let flusher = after_snapshot().find_map(|c| match c {
+            Control::FlusherAssignment(replica) => Some(NodeId::from(Uuid::from_bytes(replica))),
+            Control::Checkpoint { .. } | Control::IdBlock { .. } | Control::MinerConfig(_) => None,
+        });
+        let miner_config = after_snapshot().find_map(|c| match c {
+            Control::MinerConfig(body) => Some(body),
+            Control::FlusherAssignment(_)
+            | Control::Checkpoint { .. }
+            | Control::IdBlock { .. } => None,
+        });
         LogControls {
             highest_kind,
             introduced,
-            flusher: newest.or_else(|| snapshot.and_then(|s| s.state.flusher)),
+            flusher: flusher.or_else(|| snapshot.and_then(|s| s.state.flusher)),
+            miner_config: miner_config.or_else(|| {
+                snapshot.and_then(|s| s.state.miner_config.map(GroupMinerConfig::body))
+            }),
         }
     }
 }
@@ -73,4 +77,7 @@ pub struct LogControls {
     pub introduced: Option<u64>,
     /// The replica the newest flusher assignment names.
     pub flusher: Option<NodeId>,
+    /// The miner configuration in force: the newest in the log after the
+    /// snapshot or, when it holds none, the snapshot's.
+    pub miner_config: Option<MinerConfigV1>,
 }

@@ -1,7 +1,9 @@
 //! RFC 0065 §6.9's per-group replication signals. Follower lag and the
 //! term are gauges read from each group's `openraft` metrics. A takeover
 //! is counted where the group log saves the leader's committed vote, so a
-//! term this node leads is counted however briefly it leads.
+//! term this node leads is counted however briefly it leads. The leader's
+//! flusher pass counts the assignments it commits and the passes its kind
+//! gate holds back (§6.5, §6.8).
 //!
 //! The SDK never unregisters an observable-instrument callback, so the
 //! gauges are registered once per meter provider over a registry of weakly
@@ -19,6 +21,7 @@ use opentelemetry::metrics::{Counter, Meter, MeterProvider, ObservableGauge};
 use ourios_core::sync::lock_recover;
 use ourios_semconv as semconv;
 
+use super::flusher::{Hold, Reason};
 use super::host::GroupRaft;
 use super::types::{NodeId, RaftTypes, Vote};
 
@@ -27,11 +30,12 @@ type Watches = Vec<(u32, Watch)>;
 type Hosts = Arc<Mutex<Vec<Weak<Watches>>>>;
 type GlobalProvider = Arc<dyn MeterProvider + Send + Sync>;
 
-/// Where a host reports: the gauges' registry and the takeover counter.
+/// Where a host reports: the gauges' registry and the counters.
 #[derive(Clone)]
 pub(crate) struct Meters {
     gauges: Arc<Gauges>,
     takeovers: Counter<u64>,
+    flusher: FlusherCounts,
 }
 
 impl Meters {
@@ -49,12 +53,21 @@ impl Meters {
     }
 
     fn with(meter: &Meter, gauges: Arc<Gauges>) -> Self {
-        let takeovers = meter
-            .u64_counter(semconv::OURIOS_WAL_REPLICATION_TAKEOVERS)
-            .with_description(semconv::OURIOS_WAL_REPLICATION_TAKEOVERS_DESCRIPTION)
-            .with_unit(semconv::OURIOS_WAL_REPLICATION_TAKEOVERS_UNIT)
-            .build();
-        Self { gauges, takeovers }
+        let takeovers = counter(meter, TAKEOVERS);
+        let flusher = FlusherCounts {
+            assignments: counter(meter, ASSIGNMENTS),
+            holds: counter(meter, HOLDS),
+        };
+        Self {
+            gauges,
+            takeovers,
+            flusher,
+        }
+    }
+
+    /// The counts of a group leader's flusher pass.
+    pub(crate) fn flusher(&self) -> FlusherCounts {
+        self.flusher.clone()
     }
 
     /// The takeover count of node `id` in `group`.
@@ -99,6 +112,63 @@ impl Takeovers {
             self.counter.add(1, &[group_kv(self.group)]);
         }
     }
+}
+
+/// What a leader's flusher pass counts: each assignment it commits, and
+/// each pass whose kind gate held a new kind back.
+#[derive(Clone, Debug)]
+pub(crate) struct FlusherCounts {
+    assignments: Counter<u64>,
+    holds: Counter<u64>,
+}
+
+impl FlusherCounts {
+    /// An assignment made for `reason` committed in `group`.
+    pub(crate) fn assigned(&self, group: u32, reason: Reason) {
+        let reason = KeyValue::new(
+            semconv::OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENT_REASON,
+            reason.as_str(),
+        );
+        self.assignments.add(1, &[group_kv(group), reason]);
+    }
+
+    /// A pass in `group` held back a kind its log has never held.
+    pub(crate) fn held(&self, group: u32, hold: Hold) {
+        let reason = KeyValue::new(
+            semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLD_REASON,
+            hold.as_str(),
+        );
+        self.holds.add(1, &[group_kv(group), reason]);
+    }
+}
+
+/// A counter's name, description and unit.
+type Spec = (&'static str, &'static str, &'static str);
+
+const TAKEOVERS: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_TAKEOVERS,
+    semconv::OURIOS_WAL_REPLICATION_TAKEOVERS_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_TAKEOVERS_UNIT,
+);
+
+const ASSIGNMENTS: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS,
+    semconv::OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS_UNIT,
+);
+
+const HOLDS: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS,
+    semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS_UNIT,
+);
+
+fn counter(meter: &Meter, (name, description, unit): Spec) -> Counter<u64> {
+    meter
+        .u64_counter(name)
+        .with_description(description)
+        .with_unit(unit)
+        .build()
 }
 
 /// One provider's gauges and the live hosts they read.
@@ -244,4 +314,4 @@ fn lags(metrics: &RaftMetrics<RaftTypes>) -> Vec<(String, u64)> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

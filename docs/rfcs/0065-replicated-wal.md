@@ -1408,8 +1408,12 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     algorithm 2 with that algorithm's body, so the kind gate above
     holds it back until every member reads it and every replica changes
     algorithm at the same position. That kind is the algorithm version
-    the checkpoint bundle records. No per-tenant override exists yet;
-    one would be a later kind too.
+    the checkpoint bundle records. This entry carries the cluster
+    default of RFC 0004 §3.4 only. The miner honours a per-tenant
+    override, but no deployment surface sets one yet; when one does,
+    the override travels in the log too, as a later kind naming the
+    tenant, since a replica that mined a tenant under a local override
+    the others lack would mint different templates.
 
   A reserved kind's body is fixed by the amendment that implements it,
   and kinds are implemented in order: a release reads a kind only if it

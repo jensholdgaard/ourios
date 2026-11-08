@@ -103,10 +103,12 @@ pub(crate) fn name(id: NodeId) -> String {
     id.to_string()
 }
 
-/// A replica's identity, the directory its logs and votes live in, the
-/// groups it votes in, and where its host reports.
+/// A replica's identity, the `node_id` it runs under, the directory its
+/// logs and votes live in, the groups it votes in, and where its host
+/// reports.
 pub(crate) struct Replica {
     pub(crate) id: NodeId,
+    pub(crate) node_id: String,
     pub(crate) dir: TempDir,
     pub(crate) groups: Vec<u32>,
     pub(crate) meters: Meters,
@@ -116,8 +118,10 @@ impl Replica {
     pub(crate) fn new(n: u64, groups: &[u32]) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         vote_log::create(dir.path()).expect("vote log");
+        let id = NodeId::from(n);
         Self {
-            id: NodeId::from(n),
+            id,
+            node_id: name(id),
             dir,
             groups: groups.to_vec(),
             meters: Meters::global(),
@@ -160,7 +164,7 @@ impl Node {
             groups: replica.groups.clone(),
             peers: peers.clone(),
         };
-        server.identify_as(Identity::new(name(replica.id), replica.id));
+        server.identify_as(Identity::new(replica.node_id.clone(), replica.id));
         let host = GroupHost::open_with(spec, server, Arc::clone(&gate), &replica.meters)
             .await
             .expect("host");
@@ -177,6 +181,10 @@ impl Node {
 
     pub(crate) fn raft(&self, group: u32) -> &GroupRaft {
         self.host.raft(group).expect("a hosted group")
+    }
+
+    pub(crate) fn node_id(&self) -> &str {
+        &self.replica.node_id
     }
 
     pub(crate) async fn kill(&mut self) {
@@ -321,6 +329,27 @@ impl Cluster {
         groups: &[u32],
         meters: impl Fn(usize) -> Meters,
     ) -> Self {
+        let (cluster, members) = Self::open_unformed((voters, tail), groups, meters).await;
+        for &group in groups {
+            let first = cluster.node(0).raft(group);
+            first.initialize(members.clone()).await.expect("initialize");
+        }
+        cluster
+    }
+
+    /// `size` nodes that host every group with none initialized, as a
+    /// fresh cluster starts before its groups form (§6.1).
+    pub(crate) async fn start_unformed(size: u64, groups: &[u32]) -> Self {
+        Self::open_unformed((size, 0), groups, |_| Meters::global())
+            .await
+            .0
+    }
+
+    async fn open_unformed(
+        (voters, tail): (u64, u64),
+        groups: &[u32],
+        meters: impl Fn(usize) -> Meters,
+    ) -> (Self, BTreeMap<NodeId, String>) {
         let bound: Vec<_> = (1..=voters + tail)
             .map(|n| (NodeId::from(n), bind()))
             .collect();
@@ -345,11 +374,7 @@ impl Cluster {
             let node = Node::open(replica, incoming, &cluster.peers, server).await;
             cluster.slots.push(Slot::Up(node));
         }
-        for &group in groups {
-            let first = cluster.node(0).raft(group);
-            first.initialize(members.clone()).await.expect("initialize");
-        }
-        cluster
+        (cluster, members)
     }
 
     pub(crate) fn node(&self, i: usize) -> &Node {
@@ -429,6 +454,20 @@ impl Cluster {
             Slot::Up(node) => node.replica.dir.path(),
             Slot::Down(replica) => replica.dir.path(),
         }
+    }
+
+    /// Replace down node `i`'s directory with an empty one, as a restart on
+    /// a wiped `wal_root` finds it: the node keeps its `node_id` and runs
+    /// as the new replica `n`.
+    pub(crate) fn wipe(&mut self, i: usize, n: u64) {
+        let Slot::Down(old) = &self.slots[i] else {
+            panic!("node {i} is up");
+        };
+        let replica = Replica {
+            node_id: old.node_id.clone(),
+            ..Replica::new(n, &old.groups)
+        };
+        self.slots[i] = Slot::Down(replica);
     }
 
     /// Start node `i` again from its directory, at its address.

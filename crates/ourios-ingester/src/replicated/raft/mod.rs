@@ -8,6 +8,7 @@
 
 mod codec;
 pub mod flusher;
+pub mod formation;
 pub mod host;
 pub mod learners;
 pub mod log_store;

@@ -809,6 +809,26 @@ pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE_DESCRIPTION: &str =
 /// `ourios.wal.recovery.truncated.size` unit (UCUM).
 pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE_UNIT: &str = "By";
 
+/// `ourios.wal.replication.control.holds` (counter, unit `{hold}`).
+pub const OURIOS_WAL_REPLICATION_CONTROL_HOLDS: &str = "ourios.wal.replication.control.holds";
+
+/// `ourios.wal.replication.control.holds` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_CONTROL_HOLDS_DESCRIPTION: &str = "Leader passes that held back a control entry of a kind the group's log has never held (RFC 0065 §6.5, §6.8).";
+
+/// `ourios.wal.replication.control.holds` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_CONTROL_HOLDS_UNIT: &str = "{hold}";
+
+/// `ourios.wal.replication.flusher.assignments` (counter, unit `{assignment}`).
+pub const OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS: &str =
+    "ourios.wal.replication.flusher.assignments";
+
+/// `ourios.wal.replication.flusher.assignments` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS_DESCRIPTION: &str =
+    "Flusher assignments a replication group's leader committed (RFC 0065 §6.5).";
+
+/// `ourios.wal.replication.flusher.assignments` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS_UNIT: &str = "{assignment}";
+
 /// `ourios.wal.replication.lag` (gauge, unit `{entry}`).
 pub const OURIOS_WAL_REPLICATION_LAG: &str = "ourios.wal.replication.lag";
 
@@ -1130,6 +1150,14 @@ pub const OURIOS_WAL_RECOVERY_TAIL_SHAPE: &str = "ourios.wal.recovery.tail.shape
 
 /// `ourios.wal.replica` attribute key.
 pub const OURIOS_WAL_REPLICA: &str = "ourios.wal.replica";
+
+/// `ourios.wal.replication.control.hold.reason` attribute key.
+pub const OURIOS_WAL_REPLICATION_CONTROL_HOLD_REASON: &str =
+    "ourios.wal.replication.control.hold.reason";
+
+/// `ourios.wal.replication.flusher.assignment.reason` attribute key.
+pub const OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENT_REASON: &str =
+    "ourios.wal.replication.flusher.assignment.reason";
 
 /// `ourios.wal.retain_floor.state` attribute key.
 pub const OURIOS_WAL_RETAIN_FLOOR_STATE: &str = "ourios.wal.retain_floor.state";

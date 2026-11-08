@@ -465,9 +465,9 @@ fn rfc0065_31_a_checkpoint_snapshot_holds_the_group_at_its_cut() {
     todo!(
         "RFC0065.31 — non-flusher and non-advancing checkpoints ignored; \
          snapshot at the cut with that cut's membership, flusher and kind; \
-         installer matches a full replay; a configuration change on a populated \
-         miner rebuilds it as a restore would; a block below the previous ignored; \
-         a refused miner configuration stops the replica; a version-1 snapshot \
-         record fails the open"
+         installer matches a full replay, across a threshold change on a populated \
+         miner; a block below the previous ignored; a refused miner configuration, \
+         or one changing prefix_depth or max_node_children, stops the replica; a \
+         version-1 snapshot record fails the open"
     );
 }

@@ -16,7 +16,7 @@ use crate::replicated::raft::log_store::GroupLogReader;
 use crate::replicated::raft::telemetry::Meters;
 use crate::replicated::raft::telemetry::tests::Reader;
 use crate::replicated::raft::transport::Identity;
-use crate::replicated::raft::types::{GroupEntry, NodeId};
+use crate::replicated::raft::types::{GroupEntry, LogId, NodeId};
 use ourios_semconv as semconv;
 
 const P: Duration = Duration::from_secs(10);
@@ -127,6 +127,7 @@ fn group(cluster: &Cluster, i: usize) -> Group<'_> {
     Group {
         raft: cluster.node(i).raft(0),
         log: log(cluster, i),
+        sm: cluster.node(i).host.state_machine(0).expect("hosted"),
     }
 }
 
@@ -199,6 +200,35 @@ async fn heard_from(cluster: &Cluster, leader: usize, nodes: &[usize]) {
         )
         .await
         .expect("acknowledged");
+}
+
+/// Reconcile on `leader` until each of `placed` is a committed learner:
+/// on a loaded runner an `Identify` can outlast its patience, which leaves
+/// a pass with nothing to add.
+async fn admit(cluster: &Cluster, leader: usize, placed: &[&str]) {
+    let deadline = tokio::time::Instant::now() + PATIENCE * 10;
+    loop {
+        let _ = reconcile(group(cluster, leader), tail(placed, cluster)).await;
+        let metrics = cluster
+            .node(leader)
+            .raft(0)
+            .metrics()
+            .borrow_watched()
+            .clone();
+        let membership = metrics.committed_membership_config.membership();
+        let learners: BTreeSet<_> = membership
+            .non_write_voter_ids()
+            .filter_map(|id| membership.get_node(&id).cloned())
+            .collect();
+        if placed.iter().all(|p| learners.contains(*p)) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{placed:?} never admitted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Run passes on `leader` until one assigns a flusher, returning it.
@@ -303,9 +333,7 @@ async fn an_uncommitted_new_kind_holds_back_a_learner() {
     let (placed, order) = placement(&cluster, 3..5);
     let raft = cluster.node(leader).raft(0);
     let first = [placed[0].as_str()];
-    reconcile(group(&cluster, leader), tail(&first, &cluster))
-        .await
-        .expect("the first learner");
+    admit(&cluster, leader, &first).await;
 
     let followers: Vec<_> = (0..3).filter(|&i| i != leader).collect();
     for &f in &followers {
@@ -354,9 +382,7 @@ async fn a_membership_change_in_flight_holds_back_a_new_kind() {
     let (placed, order) = placement(&cluster, 3..5);
     let raft = cluster.node(leader).raft(0);
     let first = [placed[0].as_str()];
-    reconcile(group(&cluster, leader), tail(&first, &cluster))
-        .await
-        .expect("the first learner");
+    admit(&cluster, leader, &first).await;
     heard_from(&cluster, leader, &order[..1]).await;
 
     let followers: Vec<_> = (0..3).filter(|&i| i != leader).collect();
@@ -396,6 +422,41 @@ async fn a_membership_change_in_flight_holds_back_a_new_kind() {
     cluster.shutdown().await;
 }
 
+/// A leader whose log purged the last assignment below its snapshot
+/// still sees the snapshot's flusher, so a steward new to the lead keeps
+/// it for the patience rather than treating the group as unassigned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flusher_purged_below_the_snapshot_is_kept_for_the_patience() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (placed, _) = placement(&cluster, 3..5);
+    let placed = strs(&placed);
+    let mut steward = Steward::with_patience(PATIENCE);
+    let flusher = pass_until_assigned(&mut steward, &cluster, leader, &placed).await;
+
+    let raft = cluster.node(leader).raft(0);
+    let index = write(raft, 1).await;
+    cluster.node(leader).applied_through(0, index).await;
+    let reached = |id: Option<&LogId>| id.is_some_and(|id| id.index >= index);
+    raft.trigger().snapshot().await.expect("snapshot");
+    raft.wait(WAIT)
+        .metrics(|m| reached(m.snapshot.as_ref()), "built")
+        .await
+        .expect("built");
+    raft.trigger().purge_log(index).await.expect("purge");
+    raft.wait(WAIT)
+        .metrics(|m| reached(m.purged.as_ref()), "purged")
+        .await
+        .expect("purged");
+    assert_eq!(log(&cluster, leader).controls().flusher, None);
+    assert_eq!(group(&cluster, leader).controls().flusher, Some(flusher));
+
+    let mut new_to_the_lead = Steward::with_patience(PATIENCE);
+    let kept = pass(&mut new_to_the_lead, &cluster, leader, &placed).await;
+    assert_eq!(kept.assigned, None, "reassigned within the patience");
+    cluster.shutdown().await;
+}
+
 /// A steward on [`PATIENCE`] counting to `reader`.
 fn counted(reader: &Reader) -> Steward {
     Steward::counting(PATIENCE, Meters::on(&reader.meter()).flusher())
@@ -421,9 +482,7 @@ async fn held_kinds_and_committed_assignments_are_counted() {
     let holds = semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS;
     let assignments = semconv::OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS;
 
-    reconcile(group(&cluster, leader), tail(&placed, &cluster))
-        .await
-        .expect("the learners");
+    admit(&cluster, leader, &placed).await;
     heard_from(&cluster, leader, &order).await;
     reads_up_to(&cluster, voter, 0);
     for n in 1..=2 {
@@ -465,9 +524,7 @@ async fn rfc0065_30_the_leader_names_one_flusher_and_keeps_it() {
     let all = strs(&placed);
     let mut steward = Steward::with_patience(PATIENCE);
 
-    reconcile(group(&cluster, leader), tail(&all, &cluster))
-        .await
-        .expect("the learners");
+    admit(&cluster, leader, &all).await;
     heard_from(&cluster, leader, &order).await;
     let first = pass(&mut steward, &cluster, leader, &all).await;
     assert_eq!(

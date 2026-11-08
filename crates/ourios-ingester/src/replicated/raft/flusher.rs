@@ -275,7 +275,7 @@ impl Steward {
     fn choose(&mut self, group: Group<'_>, tail: Tail<'_>) -> Option<(Assignment, u8)> {
         let metrics = group.raft.metrics().borrow_watched().clone();
         let led_for = self.led_for(&metrics)?;
-        let controls = group.log.controls();
+        let controls = group.controls();
         let view = View {
             flusher: controls.flusher,
             learners: committed_learners(&metrics, tail.placed),

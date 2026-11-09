@@ -587,15 +587,16 @@ async fn rfc0065_31_a_miner_configuration_minerconfig_refuses_stops_the_open() {
 /// kind, miner configuration and latest id block as of it, and a replica
 /// installing it catches up to the state of one that applied the whole log.
 #[test]
-#[ignore = "RFC0065.31 stub — every arm but mining under the configuration and the leader \
-            appending it is covered in the raft unit and cluster tests; those two land with \
-            the leader's miner-configuration append and mining against it"]
+#[ignore = "RFC0065.31 stub — every arm but mining under the configuration is covered in the \
+            raft unit and cluster tests; that one lands with restoring from the bundle"]
 fn rfc0065_31_a_checkpoint_snapshot_holds_the_group_at_its_cut() {
     todo!(
-        "RFC0065.31 — remaining arms: the installer mines the lines after a \
+        "RFC0065.31 — remaining arm: the installer mines the lines after a \
          similarity_threshold change into the same templates as a replica that mined \
-         through it; a leader whose own prefix_depth differs appends the log's, also when \
-         elected after a checkpoint purged every configuration entry. Covered: checkpoints \
+         through it. Covered: a leader whose own prefix_depth differs appends the log's, \
+         also when elected after a checkpoint purged every configuration entry \
+         (raft::flusher::tests::config, the in-process cluster, as the steward is not yet \
+         wired into the served role), checkpoints \
          not by the flusher at their position or with a cut not above the last are \
          ignored, the snapshot is at the cut with its membership, flusher, kind, miner \
          configuration and latest id block, the installer and a restart match a full \

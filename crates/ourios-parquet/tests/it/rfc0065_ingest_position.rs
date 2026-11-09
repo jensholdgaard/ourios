@@ -23,7 +23,7 @@ use ourios_parquet::{
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Encoding, Repetition};
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::statistics::Statistics;
 
 const TS0: u64 = 1_775_127_480_000_000_000;
@@ -158,6 +158,57 @@ fn local_records_write_no_ingest_columns() {
     }
 }
 
+/// The row-group min/max of a position column, widened to `i64`.
+fn chunk_bounds(name: &str, chunk: &ColumnChunkMetaData) -> Option<(i64, i64)> {
+    match chunk.statistics() {
+        Some(Statistics::Int32(s)) => s
+            .min_opt()
+            .zip(s.max_opt())
+            .map(|(lo, hi)| (i64::from(*lo), i64::from(*hi))),
+        Some(Statistics::Int64(s)) => s.min_opt().copied().zip(s.max_opt().copied()),
+        other => panic!("{name}: unexpected statistics {other:?}"),
+    }
+}
+
+/// One column chunk is dictionary-free, `DELTA_BINARY_PACKED`, and
+/// carries the expected min/max.
+fn assert_chunk(name: &str, chunk: &ColumnChunkMetaData, min: i64, max: i64) {
+    let encodings: Vec<Encoding> = chunk.encodings().collect();
+    assert!(
+        encodings.contains(&Encoding::DELTA_BINARY_PACKED),
+        "{name}: {encodings:?}",
+    );
+    assert!(
+        !encodings.contains(&Encoding::RLE_DICTIONARY)
+            && !encodings.contains(&Encoding::PLAIN_DICTIONARY),
+        "{name} has no dictionary: {encodings:?}",
+    );
+    assert!(chunk.dictionary_page_offset().is_none(), "{name}");
+    assert_eq!(
+        chunk_bounds(name, chunk),
+        Some((min, max)),
+        "{name} row-group min/max"
+    );
+}
+
+/// Column `name` is OPTIONAL and every row group's chunk of it passes
+/// [`assert_chunk`].
+fn assert_position_column(meta: &ParquetMetaData, name: &str, min: i64, max: i64) {
+    let descr = meta.file_metadata().schema_descr();
+    let leaf = (0..descr.num_columns())
+        .find(|&i| descr.column(i).path().string() == name)
+        .unwrap_or_else(|| panic!("{name} is written"));
+    assert_eq!(
+        descr.column(leaf).self_type().get_basic_info().repetition(),
+        Repetition::OPTIONAL,
+        "{name} is OPTIONAL",
+    );
+    assert!(meta.num_row_groups() >= 1);
+    for rg in meta.row_groups() {
+        assert_chunk(name, rg.column(leaf), min, max);
+    }
+}
+
 /// Positioned records round-trip their positions, and each of the three
 /// columns is OPTIONAL, dictionary-free, `DELTA_BINARY_PACKED`, and
 /// carries row-group min/max statistics.
@@ -169,45 +220,9 @@ fn positions_round_trip_with_the_specified_encoding_and_statistics() {
     let written = write_through_writer(&records, true);
     for bytes in [encoded, written] {
         let meta = metadata(&bytes);
-        let descr = meta.file_metadata().schema_descr();
-        for (name, min, max) in [
-            (columns::INGEST_GROUP, 7, 7),
-            (columns::INGEST_SEQ, 40, 41),
-            (columns::INGEST_INDEX, 0, 6),
-        ] {
-            let leaf = (0..descr.num_columns())
-                .find(|&i| descr.column(i).path().string() == name)
-                .unwrap_or_else(|| panic!("{name} is written"));
-            assert_eq!(
-                descr.column(leaf).self_type().get_basic_info().repetition(),
-                Repetition::OPTIONAL,
-                "{name} is OPTIONAL",
-            );
-            assert!(meta.num_row_groups() >= 1);
-            for rg in meta.row_groups() {
-                let chunk = rg.column(leaf);
-                let encodings: Vec<Encoding> = chunk.encodings().collect();
-                assert!(
-                    encodings.contains(&Encoding::DELTA_BINARY_PACKED),
-                    "{name}: {encodings:?}",
-                );
-                assert!(
-                    !encodings.contains(&Encoding::RLE_DICTIONARY)
-                        && !encodings.contains(&Encoding::PLAIN_DICTIONARY),
-                    "{name} has no dictionary: {encodings:?}",
-                );
-                assert!(chunk.dictionary_page_offset().is_none(), "{name}");
-                let bounds = match chunk.statistics() {
-                    Some(Statistics::Int32(s)) => s
-                        .min_opt()
-                        .zip(s.max_opt())
-                        .map(|(lo, hi)| (i64::from(*lo), i64::from(*hi))),
-                    Some(Statistics::Int64(s)) => s.min_opt().copied().zip(s.max_opt().copied()),
-                    other => panic!("{name}: unexpected statistics {other:?}"),
-                };
-                assert_eq!(bounds, Some((min, max)), "{name} row-group min/max");
-            }
-        }
+        assert_position_column(&meta, columns::INGEST_GROUP, 7, 7);
+        assert_position_column(&meta, columns::INGEST_SEQ, 40, 41);
+        assert_position_column(&meta, columns::INGEST_INDEX, 0, 6);
         assert_eq!(read(bytes).expect("read"), records, "positions round-trip");
     }
 }

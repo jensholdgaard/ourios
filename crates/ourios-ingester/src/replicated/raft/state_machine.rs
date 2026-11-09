@@ -29,6 +29,9 @@
 //! replica's apply; a tail replica is a learner, whose apply no
 //! acknowledgement waits on, and a voter opens with no channel. Each
 //! event owns its data, so purging the log never races a lagging miner.
+//! A snapshot the replica opens from or installs reaches the miner as
+//! [`AppliedEvent::Installed`], ahead of every entry after it: the
+//! entries below it never will.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -39,6 +42,7 @@ use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::type_config::alias::{SnapshotOf, StoredMembershipOf};
 use openraft::{EntryPayload, OptionalSend};
 use ourios_wal::{Control, MinerConfigV1};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
@@ -252,12 +256,14 @@ impl GroupSm {
     }
 
     /// [`Self::open`], sending an [`Applied`] event on `events` for every
-    /// entry applied after the snapshot it opens through, if any. Once
-    /// the receiver is dropped, the events are discarded.
+    /// entry applied after the snapshot it opens through, if any, and
+    /// first [`AppliedEvent::Installed`] with that snapshot. Once the
+    /// receiver is dropped, the events are discarded.
     ///
     /// # Errors
     ///
-    /// As [`Self::open`].
+    /// As [`Self::open`], or `events` has no room for the snapshot's
+    /// event.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "no host opens a tail replica's group yet")
@@ -267,7 +273,29 @@ impl GroupSm {
         gate: Arc<SyncGate>,
         events: mpsc::Sender<Applied>,
     ) -> io::Result<Self> {
-        Self::opened(dir, gate, Some(events))
+        let sm = Self::opened(dir, gate, Some(events))?;
+        sm.send_opened_snapshot()?;
+        Ok(sm)
+    }
+
+    /// Send the snapshot the group opened from, if any, as the first
+    /// event: the miner never sees the entries below it.
+    fn send_opened_snapshot(&self) -> io::Result<()> {
+        let installed = self.state().snapshot.as_ref().and_then(|snapshot| {
+            Some(Applied {
+                at: snapshot.meta.last_log_id?,
+                event: AppliedEvent::Installed(snapshot.state),
+            })
+        });
+        let (Some(events), Some(applied)) = (&self.events, installed) else {
+            return Ok(());
+        };
+        match events.try_send(applied) {
+            Err(TrySendError::Full(_)) => Err(io::Error::other(
+                "the miner's channel is full before the group opened",
+            )),
+            Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
+        }
     }
 
     fn opened(
@@ -984,6 +1012,45 @@ mod tests {
             drained(&mut received),
             vec![(5, AppliedEvent::Installed(group))]
         );
+    }
+
+    /// A mining open of a group with a recorded snapshot sends the
+    /// snapshot first, then the entries after it; one with no recorded
+    /// snapshot sends nothing at open.
+    #[tokio::test]
+    async fn a_mining_reopen_sends_its_snapshot_before_any_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut sm, mut received) = mining(dir.path(), 8);
+        assert!(drained(&mut received).is_empty(), "no snapshot recorded");
+        let entries = vec![
+            assign(1, 7),
+            entry(2, configured(FIRST)),
+            batch(3),
+            checkpoint(4, 7, (2, 3), 4),
+        ];
+        apply(&mut sm, entries).await;
+        let built = sm.build_snapshot().await.expect("build");
+        drop(sm);
+
+        let (mut reopened, mut received) = mining(dir.path(), 8);
+        apply(&mut reopened, vec![batch(4)]).await;
+        assert_eq!(
+            drained(&mut received),
+            vec![
+                (3, AppliedEvent::Installed(built.snapshot)),
+                (4, AppliedEvent::Batch(batch_bytes())),
+            ]
+        );
+
+        let (events, _received) = mpsc::channel(1);
+        events
+            .try_send(Applied {
+                at: cut(1).expect("id"),
+                event: AppliedEvent::Flusher(NodeId::from(7)),
+            })
+            .expect("room");
+        let full = GroupSm::open_mining(dir.path(), Arc::default(), events);
+        assert!(full.is_err(), "no room for the snapshot");
     }
 
     /// A build that starts while an install is held at its fsync waits for

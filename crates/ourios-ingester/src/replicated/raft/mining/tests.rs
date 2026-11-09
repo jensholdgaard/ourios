@@ -1,10 +1,13 @@
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use openraft::EntryPayload;
 use openraft::storage::RaftStateMachine as _;
 use openraft::vote::leader_id_std::CommittedLeaderId;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use ourios_core::audit::{AuditPayload, TemplateChange};
+use ourios_core::clock::TestClock;
 use ourios_wal::{Control, MinerConfigV1, UpstreamTemplates};
 use proptest::prelude::*;
 use tokio::sync::mpsc;
@@ -130,11 +133,18 @@ fn events_of(entries: &[GroupEntry], capacity: usize) -> Vec<Applied> {
     })
 }
 
-fn mined(events: Vec<Applied>) -> Vec<MinedRow> {
-    let mut miner = GroupMiner::new();
+/// What `miner` mined from `events`, one [`Mined`] per event.
+fn mined_each(mut miner: GroupMiner, events: Vec<Applied>) -> Vec<Mined> {
     events
         .into_iter()
-        .flat_map(|applied| miner.apply(applied).expect("mined"))
+        .map(|applied| miner.apply(applied).expect("mined"))
+        .collect()
+}
+
+fn mined(events: Vec<Applied>) -> Vec<MinedRow> {
+    mined_each(GroupMiner::new(), events)
+        .into_iter()
+        .flat_map(|mined| mined.rows)
         .collect()
 }
 
@@ -311,8 +321,8 @@ fn batches_before_the_first_configuration_are_mined_under_it() {
     let per_event: Vec<Vec<IngestPosition>> = events_of(&log(0.7), 8)
         .into_iter()
         .map(|applied| {
-            let rows = miner.apply(applied).expect("mined");
-            rows.iter().map(|row| row.position).collect()
+            let out = miner.apply(applied).expect("mined");
+            out.rows.iter().map(|row| row.position).collect()
         })
         .collect();
     let at = |seq| IngestPosition { seq, index: 0 };
@@ -437,4 +447,112 @@ fn log_blocks_hand_out_blocks_in_order_then_refuse() {
     assert_eq!((second.after(), second.through()), (10, 12));
     let error = blocks.reserve(12).expect_err("none left");
     assert!(error.to_string().contains("no id block"), "{error}");
+}
+
+fn applied_in(term: u64, index: u64, event: AppliedEvent) -> Applied {
+    Applied {
+        at: LogId {
+            leader_id: CommittedLeaderId::new(term),
+            index,
+        },
+        event,
+    }
+}
+
+/// Rows are positioned by index alone, so an index that repeats or goes
+/// back stops the miner even under a later term; a later index under a
+/// later term follows.
+#[test]
+fn an_index_that_does_not_advance_stops_the_miner_whatever_the_term() {
+    let config = || AppliedEvent::MinerConfig(in_force(BASE));
+    let flusher = || AppliedEvent::Flusher(1.into());
+    let follows = |term, index| {
+        let mut miner = GroupMiner::new();
+        miner.apply(applied_in(2, 5, config())).expect("first");
+        miner.apply(applied_in(term, index, flusher()))
+    };
+    for (term, index) in [(2, 5), (3, 5), (3, 4), (2, 4)] {
+        let outcome = follows(term, index);
+        assert!(
+            matches!(outcome, Err(GroupMinerError::OutOfOrder { .. })),
+            "({term}, {index}): {outcome:?}"
+        );
+    }
+    assert_eq!(follows(3, 6), Ok(Mined::default()));
+}
+
+fn change_of(event: &AuditEvent) -> Option<(u64, &TemplateChange)> {
+    match &event.payload {
+        AuditPayload::Template {
+            template_id,
+            change,
+            ..
+        } => Some((*template_id, change)),
+        _ => None,
+    }
+}
+
+/// A new template and a widening each come back with the row that needs
+/// them, from the event that mined it.
+#[test]
+fn template_events_come_with_the_rows_that_need_them() {
+    let entries = vec![
+        configured(0.7),
+        block(0, 100),
+        batch("acme", &["a b c d e"]),
+        batch("acme", &["a b c d x"]),
+    ];
+    let mined = mined_each(GroupMiner::new(), events_of(&entries, 8));
+    assert!(
+        mined[..2]
+            .iter()
+            .all(|m| m.audit.is_empty() && m.rows.is_empty())
+    );
+    let (created, widened) = (&mined[2], &mined[3]);
+    let id = created.rows[0].record.template_id;
+    let changes = |m: &Mined| -> Vec<(u64, bool)> {
+        m.audit
+            .iter()
+            .filter_map(change_of)
+            .map(|(id, change)| (id, matches!(change, TemplateChange::Widened { .. })))
+            .collect()
+    };
+    assert_eq!(changes(created), [(id, false)], "created");
+    assert!(matches!(
+        change_of(&created.audit[0]),
+        Some((_, TemplateChange::Created { .. }))
+    ));
+    assert_eq!(widened.rows[0].record.template_id, id);
+    assert_eq!(changes(widened), [(id, true)], "widened");
+}
+
+/// Two replicas emit the same audit events in the same order, apart from
+/// the wall-clock timestamps; an injected clock stamps them all.
+#[test]
+fn two_replicas_emit_the_same_audit_events_apart_from_timestamps() {
+    let mut entries = vec![configured(0.7), block(0, 10_000)];
+    entries.extend(corpus().chunks(5).map(|lines| batch("acme", lines)));
+    let audit = |miner: GroupMiner| -> Vec<AuditEvent> {
+        mined_each(miner, events_of(&entries, 8))
+            .into_iter()
+            .flat_map(|mined| mined.audit)
+            .collect()
+    };
+    let untimed = |events: Vec<AuditEvent>| -> Vec<AuditEvent> {
+        events
+            .into_iter()
+            .map(|event| AuditEvent {
+                timestamp: SystemTime::UNIX_EPOCH,
+                ..event
+            })
+            .collect()
+    };
+    let replica = audit(GroupMiner::new());
+    assert!(replica.iter().filter_map(change_of).count() >= 2);
+    assert_eq!(untimed(replica.clone()), untimed(audit(GroupMiner::new())));
+
+    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let stamped = audit(GroupMiner::with_clock(Box::new(TestClock::new(at))));
+    assert!(stamped.iter().all(|event| event.timestamp == at));
+    assert_eq!(untimed(stamped), untimed(replica));
 }

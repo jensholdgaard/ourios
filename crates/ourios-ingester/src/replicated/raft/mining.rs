@@ -10,12 +10,18 @@
 //! mines nothing until then. Anything it cannot mine exactly as its peers
 //! would, a batch it cannot decode or a snapshot installed over the log,
 //! stops it for good with the error naming the entry.
+//!
+//! Each event returns the audit events the miner emitted with the rows it
+//! mined, so the template events those rows need can be written ahead of
+//! them, as the local receiver writes them.
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use ourios_core::audit::{AuditEvent, SharedAuditSink};
+use ourios_core::clock::{Clock, SystemClock};
 use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
@@ -43,6 +49,16 @@ pub struct MinedRow {
     pub record: MinedRecord,
 }
 
+/// What one event mined: the audit events the miner emitted, in emission
+/// order, and the rows. A row's template events are in its own `Mined` or
+/// an earlier one, so writing each `Mined`'s events before its rows
+/// writes every template event ahead of the rows that need it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Mined {
+    pub audit: Vec<AuditEvent>,
+    pub rows: Vec<MinedRow>,
+}
+
 /// Why a group's miner stopped. It stays stopped, and every later event
 /// returns the same error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +71,7 @@ pub enum GroupMinerError {
     /// The configuration changes the tree's shape, which the state
     /// machine refuses first.
     ShapeChanged { at: LogId, source: TreeShapeChanged },
-    /// An event at or below the last one followed.
+    /// An event whose index is not above the last one followed.
     OutOfOrder { at: LogId, last: LogId },
     /// A snapshot replaced the log through `at`; the miner state at its
     /// cut is in the checkpoint bundle, not in the events.
@@ -185,8 +201,12 @@ impl Frame {
 }
 
 enum Stage {
-    /// No configuration has applied: the batches wait for the first.
-    Unconfigured(Vec<Frame>),
+    /// No configuration has applied: the batches wait for the first, and
+    /// the clock for the miner it builds.
+    Unconfigured {
+        pending: Vec<Frame>,
+        clock: Box<dyn Clock>,
+    },
     Mining(Box<MinerCluster>),
     Stopped(GroupMinerError),
 }
@@ -195,6 +215,7 @@ enum Stage {
 pub struct GroupMiner {
     stage: Stage,
     blocks: LogBlocks,
+    audit: SharedAuditSink,
     last: Option<LogId>,
 }
 
@@ -205,12 +226,23 @@ impl Default for GroupMiner {
 }
 
 impl GroupMiner {
-    /// A miner for a group whose log it follows from the start.
+    /// A miner for a group whose log it follows from the start, stamping
+    /// audit events from the system clock.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_clock(Box::new(SystemClock::new()))
+    }
+
+    /// [`Self::new`], stamping audit events from `clock`.
+    #[must_use]
+    pub fn with_clock(clock: Box<dyn Clock>) -> Self {
         Self {
-            stage: Stage::Unconfigured(Vec::new()),
+            stage: Stage::Unconfigured {
+                pending: Vec::new(),
+                clock,
+            },
             blocks: LogBlocks::default(),
+            audit: SharedAuditSink::new(),
             last: None,
         }
     }
@@ -221,26 +253,35 @@ impl GroupMiner {
         &self.blocks
     }
 
-    /// Follow one event; returns the rows it mined, in log order.
+    /// Follow one event; returns the audit events and rows it mined, in
+    /// log order.
     ///
     /// # Errors
     ///
     /// The [`GroupMinerError`] that stopped the miner, at this event or
     /// an earlier one.
-    pub fn apply(&mut self, applied: Applied) -> Result<Vec<MinedRow>, GroupMinerError> {
+    pub fn apply(&mut self, applied: Applied) -> Result<Mined, GroupMinerError> {
         let followed = match &self.stage {
             Stage::Stopped(error) => Err(error.clone()),
-            Stage::Unconfigured(_) | Stage::Mining(_) => self.follow(applied),
+            Stage::Unconfigured { .. } | Stage::Mining(_) => self.follow(applied),
         };
-        if let Err(error) = &followed {
-            self.stage = Stage::Stopped(error.clone());
+        let audit = self.audit.drain();
+        match followed {
+            Ok(rows) => Ok(Mined { audit, rows }),
+            Err(error) => {
+                self.stage = Stage::Stopped(error.clone());
+                Err(error)
+            }
         }
-        followed
     }
 
     fn follow(&mut self, Applied { at, event }: Applied) -> Result<Vec<MinedRow>, GroupMinerError> {
         match self.last {
-            Some(last) if at <= last => return Err(GroupMinerError::OutOfOrder { at, last }),
+            // Rows are positioned by index alone, so a later term never
+            // excuses an index that does not advance.
+            Some(last) if at.index <= last.index => {
+                return Err(GroupMinerError::OutOfOrder { at, last });
+            }
             _ => self.last = Some(at),
         }
         match event {
@@ -257,7 +298,7 @@ impl GroupMiner {
 
     fn batch(&mut self, frame: Frame) -> Result<Vec<MinedRow>, GroupMinerError> {
         match &mut self.stage {
-            Stage::Unconfigured(pending) => {
+            Stage::Unconfigured { pending, .. } => {
                 pending.push(frame);
                 Ok(Vec::new())
             }
@@ -277,11 +318,16 @@ impl GroupMiner {
                 miner.reconfigure(config.config()).map_err(refused)?;
                 Ok(Vec::new())
             }
-            Stage::Unconfigured(pending) => {
+            Stage::Unconfigured { pending, clock } => {
                 let pending = std::mem::take(pending);
+                let clock = std::mem::replace(clock, Box::new(SystemClock::new()));
+                let audit = Box::new(self.audit.clone());
                 let reserver = Box::new(self.blocks.clone());
-                let mut miner =
-                    Box::new(MinerCluster::new(config.config()).with_id_reserver(reserver));
+                let mut miner = Box::new(
+                    MinerCluster::with_audit_sink(config.config(), audit)
+                        .with_clock(clock)
+                        .with_id_reserver(reserver),
+                );
                 let mut rows = Vec::new();
                 for frame in &pending {
                     rows.extend(frame.mine(&mut miner)?);

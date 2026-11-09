@@ -19,7 +19,7 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 369 |
+| `Apache-2.0` | 370 |
 | `MIT` | 77 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 10 |
@@ -6108,6 +6108,7 @@ Used by:
 - `block-buffer` 0.10.4 — <https://github.com/RustCrypto/utils>
 - `block-buffer` 0.12.1 — <https://github.com/RustCrypto/utils>
 - `chacha20` 0.10.2 — <https://github.com/RustCrypto/stream-ciphers>
+- `const-oid` 0.10.2 — <https://github.com/RustCrypto/formats>
 - `const-oid` 0.9.6 — <https://github.com/RustCrypto/formats/tree/master/const-oid>
 - `cpufeatures` 0.2.17 — <https://github.com/RustCrypto/utils>
 - `cpufeatures` 0.3.0 — <https://github.com/RustCrypto/utils>
@@ -7263,8 +7264,8 @@ Used by:
 - `rand_xorshift` 0.5.0 — <https://github.com/rust-random/rngs>
 - `ref-cast-impl` 1.0.25 — <https://github.com/dtolnay/ref-cast>
 - `ref-cast` 1.0.25 — <https://github.com/dtolnay/ref-cast>
-- `rmcp-macros` 3.7.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
-- `rmcp` 3.7.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
+- `rmcp-macros` 3.9.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
+- `rmcp` 3.9.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
 - `rustls-platform-verifier-android` 0.2.0 — <https://github.com/rustls/rustls-platform-verifier>
 - `rustversion` 1.0.22 — <https://github.com/dtolnay/rustversion>
 - `ryu` 1.0.23 — <https://github.com/dtolnay/ryu>

@@ -1608,7 +1608,7 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   `log_ids.json` nor a block held in a log (§9, Q6).
 - **Snapshot and bundle formats.** The checkpoint bundle (§6.5) and the
   miner snapshots in it carry a format version; the snapshot's
-  `wal_high_water` gains a variant `{ group, seq }` (both below). Once
+  `wal_high_water` gains a variant `{ log, seq }` (both below). Once
   the WAL below a checkpoint is purged, a full replay can no longer
   rebuild the miner and allocator state, so the local backend's rule of
   discarding an unreadable snapshot and replaying does not carry over: a

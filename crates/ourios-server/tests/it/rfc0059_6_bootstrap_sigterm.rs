@@ -61,6 +61,7 @@ fn record() -> MinedRecord {
         body: Some("line".to_owned()),
         confidence: 1.0,
         lossy_flag: true,
+        ingest_position: None,
     }
 }
 

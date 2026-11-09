@@ -80,6 +80,7 @@ fn a_record() -> MinedRecord {
         body: Some("line".to_string()),
         confidence: 0.0,
         lossy_flag: true,
+        ingest_position: None,
     }
 }
 

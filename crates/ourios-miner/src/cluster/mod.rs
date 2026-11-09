@@ -458,6 +458,23 @@ enum FreshLeafZone {
     Lossy { confidence: f32 },
 }
 
+/// The record's `log.record.template` when the upstream-template dial
+/// handles it at all: not under `ignore`, nor with a byte limit of 0.
+fn handled_upstream_template<'r>(
+    record: &'r OtlpLogRecord,
+    config: &MinerConfig,
+) -> Option<&'r str> {
+    match config.upstream_templates {
+        UpstreamTemplates::Ignore => None,
+        UpstreamTemplates::Observe | UpstreamTemplates::Adopt
+            if config.upstream_template_byte_limit == 0 =>
+        {
+            None
+        }
+        UpstreamTemplates::Observe | UpstreamTemplates::Adopt => upstream_template_of(record),
+    }
+}
+
 impl MinerCluster {
     /// Resolve the effective [`MinerConfig`] for `tenant_id`.
     /// Order of preference:
@@ -483,6 +500,28 @@ impl MinerCluster {
             },
             |s| s.config,
         )
+    }
+
+    /// RFC 0050 §3.2 `observe`: `upstream` if it fits the byte cap and
+    /// parses (cap before grammar), else `None` with the rejection
+    /// counted.
+    fn observable_upstream<'a>(
+        &self,
+        line: StringLine<'_>,
+        upstream: &'a str,
+        config: &MinerConfig,
+    ) -> Option<&'a str> {
+        let cause = match upstream {
+            s if s.len() > config.upstream_template_byte_limit as usize => "byte_limit",
+            s if upstream::parse_template(s).is_err() => "grammar",
+            s => return Some(s),
+        };
+        self.metrics.record_upstream_template_processed(
+            &line.record.tenant_id,
+            line.service,
+            Some(cause),
+        );
+        None
     }
 
     /// Apply RFC §6.5's "overflow forces body retention" rule to
@@ -899,41 +938,21 @@ impl MinerCluster {
         // here (cap before grammar, §3.2) and threaded to the
         // attach/create sites, which associate it with the mined
         // leaf; the clustering itself is untouched (RFC0050.9).
-        let upstream_raw = match effective_config.upstream_templates {
-            UpstreamTemplates::Ignore => None,
-            UpstreamTemplates::Observe | UpstreamTemplates::Adopt
-                if effective_config.upstream_template_byte_limit == 0 =>
-            {
-                None
+        let upstream_raw = handled_upstream_template(record, &effective_config);
+        let adopted = match (effective_config.upstream_templates, upstream_raw) {
+            (UpstreamTemplates::Adopt, Some(s)) => {
+                self.try_adopt(line, s, masked_line, &effective_config)
             }
-            UpstreamTemplates::Observe | UpstreamTemplates::Adopt => upstream_template_of(record),
+            _ => None,
         };
-        if effective_config.upstream_templates == UpstreamTemplates::Adopt
-            && let Some(s) = upstream_raw
-            && let Some(id) = self.try_adopt(line, s, masked_line, &effective_config)
-        {
+        if let Some(id) = adopted {
             return id;
         }
-        let observed: Option<&str> = if effective_config.upstream_templates
-            == UpstreamTemplates::Observe
-        {
-            upstream_raw.and_then(|s| {
-                let cause = if s.len() > effective_config.upstream_template_byte_limit as usize {
-                    "byte_limit"
-                } else if upstream::parse_template(s).is_err() {
-                    "grammar"
-                } else {
-                    return Some(s);
-                };
-                self.metrics.record_upstream_template_processed(
-                    &record.tenant_id,
-                    service,
-                    Some(cause),
-                );
-                None
-            })
-        } else {
-            None
+        let observed = match (effective_config.upstream_templates, upstream_raw) {
+            (UpstreamTemplates::Observe, Some(s)) => {
+                self.observable_upstream(line, s, &effective_config)
+            }
+            _ => None,
         };
 
         // Phase 1 — read-only candidate selection. RFC §6.2 step

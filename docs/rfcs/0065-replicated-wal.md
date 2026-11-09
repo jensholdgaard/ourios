@@ -806,13 +806,18 @@ the mass-failover time and vote-log batching as tuning signals.
 >   and resumed before it applies its replacement publishes files whose
 >   repeated positions a query counts once
 > - **And** with the kept audit events driven past the per-group
->   ceiling, or the tail volume full, before the takeover, the replica
->   drops what it kept, counts it and records its gap; taking over, it
->   rebuilds the dropped output from the bundle at its applied cut and
->   publishes the same rows and audit events, byte for byte, as a
->   replica that dropped nothing; once it has applied a checkpoint at or
->   above its gap it rebuilds nothing; and while the store is
->   unreachable it publishes nothing
+>   ceiling, or the tail volume full, the replica drops what it kept,
+>   counts it and records its gap, whether it is a tail replica that
+>   later takes over or the flusher itself during a store outage, with
+>   drops repeated until more than the ceiling's worth of audit events
+>   lies between the cut and the gap; as flusher it publishes nothing it
+>   keeps and proposes no cut until it has replayed from the bundle at
+>   its applied cut, slice by slice, each slice's audit events in the
+>   store before its rows' files and its memory never above one slice
+>   plus the miner's state; it then publishes the same rows and audit
+>   events, byte for byte, as a flusher that dropped nothing; once a
+>   tail replica has applied a checkpoint at or above its gap it replays
+>   nothing; and while the store is unreachable it publishes nothing
 
 > **Scenario RFC0065.24 — a wiped disk rejoins as a new replica (B4, B6, B8)**
 > - **Given** a group of three voters, and a voter restarted under the
@@ -960,13 +965,15 @@ the mass-failover time and vote-log batching as tuning signals.
 > **Scenario RFC0065.32 — the flusher's proposals and reports reach the leader (B11)**
 > - **Given** a group with a flusher, a second tail replica, a former
 >   flusher still running, and one id block in the log the flusher's
->   allocator has not started
+>   allocator has not started, and a flusher that mines on in one block
+>   across several checkpoints that purge its unstarted blocks' entries
 > - **When** the flusher reports its allocator and proposes checkpoint
 >   entries with `Propose`, the leader fails over while a proposal is
 >   in flight, and the former flusher reports and proposes too
-> - **Then** after the flusher's report the leader's log holds three
->   blocks above the flusher's current one, each reserved in the store
->   first, and a repeated report appends none; the flusher's checkpoint
+> - **Then** after each report the flusher's unstarted blocks and the
+>   blocks the leader's log holds after its `mined` add up to three, each
+>   reserved in the store first, a repeated report appends none, and no
+>   checkpoint's purge makes the leader reserve more; the flusher's checkpoint
 >   is appended and answered with its log id once committed; the former
 >   flusher's report and entry are refused `not_flusher` and append
 >   nothing; a proposal whose cut is not above the last checkpoint, not
@@ -976,7 +983,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   `malformed`; a call to a non-leader is refused `not_leader` with the
 >   hint, and the flusher reaches the new leader; a proposal resent
 >   after an uncertain outcome leaves at most one applied checkpoint for
->   its cut
+>   its cut; and a flusher refused `not_flusher` by a leader whose
+>   uncommitted assignment of another replica the next leader
+>   discards reports and proposes again to that next leader, while one
+>   that has applied an assignment of another replica does not
 > - **And** a current flusher whose `checkpoint.json` write finds a
 >   later `seq` a former flusher wrote, or its own earlier write of the
 >   same `seq`, proposes its entry, which every replica applies, so the
@@ -1670,16 +1680,28 @@ never count toward an ack (learners, under §4.3's shape).
     keeping later entries' output. The gap clears when the replica
     applies a checkpoint whose cut is at or above it, since everything
     dropped was then published by the proposer.
-  - **A takeover over a gap.** A replica that becomes the flusher while
-    it has a gap first rebuilds what it dropped: it restores the bundle
-    at the last checkpoint it applied into a second miner, as recovery
-    does (§6.5), mines its log from the cut through the gap, and
-    replaces everything it keeps at or below the gap with that miner's
-    rows and audit events, which are the bytes it dropped (item 5
-    below, RFC0065.20). Its log holds those entries, since its WAL is
-    purged only below an applied checkpoint. Then it publishes as
-    above. With the store unreachable it can restore nothing, and
-    could publish nothing either; it rebuilds once the store returns.
+  - **A flusher with a gap.** Any flusher with a gap, newly assigned or
+    one that dropped output while assigned, during a store outage for
+    instance, publishes nothing it keeps and proposes no cut until it
+    has rebuilt what it dropped. It rebuilds by a **bounded replay**: it
+    restores the bundle at the last checkpoint it applied into a second
+    miner, as recovery does (§6.5), and mines its log from the cut
+    through the gap in slices, each closed by the record sink's size or
+    age trigger as a flush is. For each slice it publishes the slice's
+    audit events, durable in the store, before the files holding the
+    slice's rows, as audit-before-record requires, and then drops the
+    slice, so the replay holds one slice and the second miner's state,
+    never the whole gap, however far apart the drops left the gap and
+    the cut. The replay's output is the bytes it dropped (item 5 below,
+    RFC0065.20); the rows it re-publishes that a former flusher already
+    published are removed by position (§6.6). It discards what it keeps
+    at or below the gap, which the replay published, and a gap that
+    grows while it replays extends the replay. Its log holds every
+    entry the replay mines, since its WAL is purged only below an
+    applied checkpoint. Once the replay reaches the gap, the gap clears,
+    and it publishes what it keeps above the gap and proposes cuts as
+    above. With the store unreachable it can restore nothing, and could
+    publish nothing either; it replays once the store returns.
 - **Where the mined rows come from: a deterministic miner.** Every tail
   replica mines the same committed log from the same snapshot and gets
   the rows the leader gets, so only raw frames are replicated. A spike
@@ -2013,8 +2035,9 @@ never count toward an ack (learners, under §4.3's shape).
     version:         uint32         = 1  // the protocol version (B22)
     group:           uint32         = 2
     proposer:        bytes          = 3  // sender's replica UUID, 16 bytes big-endian
-    current_through: uint64         = 4  // its allocator's current block's `through`, or 0
-    entry:           optional bytes = 5  // a control entry's kind byte and body
+    mined:           WireLogId      = 4  // the last entry its group miner followed; absent before one
+    unstarted:       uint32         = 5  // id blocks it holds and has not started
+    entry:           optional bytes = 6  // a control entry's kind byte and body
   }
   ProposeResponse {
     appended:        WireLogId      = 1  // the entry's committed log id; absent without one
@@ -2049,15 +2072,24 @@ never count toward an ack (learners, under §4.3's shape).
   ignore.
   An accepted request's entry is appended with `client_write`, and the
   answer carries its log id once it commits. Its report, with or
-  without an entry, tops up the group's id blocks: the leader counts
-  the id blocks its log holds, committed or not, whose `after` is at
-  or above `current_through`, and while there are fewer than three, the
-  target RFC 0059's refiller keeps, it reserves one in the store and
-  appends it (§6.5). A checkpoint purge leaves only the latest applied
-  block in the snapshot record, so the count can miss blocks the
-  flusher has not started yet; that reserves at most three blocks
-  more than needed and reuses no id. With the store unreachable it
-  reserves none, and the miners run out at the same position (§6.5).
+  without an entry, tops up the group's id blocks. `unstarted` is the
+  number of applied blocks the flusher's allocator has not started,
+  the bundle's pending blocks (§6.5), and `mined` the last entry its
+  miner followed, blocks included, so `unstarted` covers every block at
+  or below `mined`. The leader adds the id blocks its log holds after
+  `mined`, committed or not, which the flusher has not reached, and
+  while the sum is below three, the target RFC 0059's refiller keeps,
+  it reserves one in the store and appends it (§6.5). A block whose
+  entry a checkpoint purged still counts, through `unstarted`, so a
+  flusher that mines on in one block across many checkpoints is not
+  topped up past three. The only miss is a report whose `mined` is
+  below the leader's purge point, a new flusher still behind its
+  predecessor's cut, which can reserve up to three blocks more than
+  needed and reuses no id. The count needs nothing persisted beyond
+  the bundle's pending blocks; the snapshot record keeps only the
+  latest block, so the leader could not count pending ones itself
+  without a new record field. With the store unreachable it reserves
+  none, and the miners run out at the same position (§6.5).
 - The flusher sends a report when it applies an assignment naming
   itself, when its allocator starts a block, when it sees a new leader,
   and otherwise at least once per flusher patience (10 s, §6.5); it
@@ -2072,7 +2104,11 @@ never count toward an ack (learners, under §4.3's shape).
   refused as `stale` once the first is in the leader's log, and ignored
   by every replica if both commit, and a second report appends nothing
   the first did not. After `not_flusher` it stops proposing and
-  reporting until it applies an assignment naming itself; after
+  reporting to that leader in that term: the assignment the leader
+  refused it by may be uncommitted, and the next leader may discard
+  it. When it sees a new leader or a new term it reports again if the
+  latest assignment it has applied still names it, and it stops for
+  good only when it applies an assignment naming another replica; after
   `stale` it drops the proposal, leaving its bundle in the store
   unnamed by any applied cut; after `malformed`, a defect, it reports
   why and fails the checkpoint as a failed bundle write does. A
@@ -2152,7 +2188,7 @@ signal that tunes it:
 | Election and heartbeat timeouts | 50 ms heartbeat, 150–300 ms election: failover and tail gap about 1.8 × the election maximum, 0.55 s (§4.6) | failover time, spurious leadership changes |
 | Vote log | one per node, group-committed (§4.7): a node failure at 128 groups failed over in 0.5–0.8 s | failover time when a node's groups elect at once, vote-log fsync latency and votes per fsync |
 | Freshness target (B15) | under 1 s | ack-to-queryable latency, a new histogram on the tail path |
-| Audit events kept for a takeover | 16 MiB per group, then dropped and rebuilt on takeover (§6.7) | audit bytes kept and drops per group, takeovers that had to rebuild |
+| Audit events kept for a takeover | 16 MiB per group, then dropped and replayed before the flusher publishes (§6.7) | audit bytes kept and drops per group, replays and their length |
 
 The backlog bytes and age, flush and ingest throughput per group, and
 the ack-to-queryable latency are new names in the same registry as the

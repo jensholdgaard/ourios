@@ -858,6 +858,9 @@ the mass-failover time and vote-log batching as tuning signals.
 >   writes as `ingest_group`; a recording voter killed between the
 >   allocation and its write records a later id on its next attempt and
 >   no id is recorded twice; and a format-`1` record forms nothing
+> - **And** a node whose `wal_root` exists but cannot be read fails
+>   startup and reports why, with no new `replica.id` written and its
+>   vote log and group logs unchanged
 
 > **Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13)**
 > - **Given** a group whose other two voters are lost for good, with
@@ -1035,7 +1038,11 @@ the mass-failover time and vote-log batching as tuning signals.
 >   configuration in force is ignored by every replica and purges
 >   nothing, the leader refuses its proposal as `stale`, and once the
 >   configuration applies every tail replica mines those batches, read
->   back from the group's WAL, into the same rows
+>   back from the group's WAL, into the same rows; and a checkpoint at or
+>   above the configuration that applies while a slow replica is still
+>   reading those batches back restarts that replica's miner from the
+>   cut's bundle, after which it mines the same rows as one that mined
+>   through the cut
 
 > **Scenario RFC0065.32 — the flusher's proposals and reports reach the leader (B11)**
 > - **Given** a group with a flusher, a second tail replica, a former
@@ -1544,7 +1551,12 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     the group's first configuration, which a miner cannot have mined
     and the bundle has no place for; a miner waiting for that first
     configuration reads them back from the group's WAL when it applies,
-    rather than holding them in memory. Applying
+    rather than holding them in memory. A later checkpoint can apply
+    while it reads them back, and its purge can remove entries it has
+    not read, so a replica that applies a checkpoint before its miner
+    has mined through that checkpoint's cut restarts the miner from
+    the cut's bundle, as a bounded replay does (§6.7); the proposer
+    made that bundle durable before proposing. Applying
     it makes it the group's checkpoint and builds a snapshot **at the
     cut**, not at the last applied entry: its last log id is the cut,
     and it holds the group's membership, flusher and highest kind as

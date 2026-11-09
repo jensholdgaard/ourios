@@ -414,6 +414,19 @@ fn rfc0065_24_the_formation_record_carries_the_groups_log_id() {
     );
 }
 
+/// Scenario RFC0065.24 — the unreadable-disk arm (B4, B6). A node whose
+/// `wal_root` exists but cannot be read fails startup and changes nothing
+/// on it. The identity half is `replicated::replica_id::tests::
+/// an_unreadable_identity_fails_naming_the_file`.
+#[test]
+#[ignore = "RFC0065.24 stub — the unreadable-disk arm, implemented with the server wiring"]
+fn rfc0065_24_an_unreadable_wal_root_refuses_to_start() {
+    todo!(
+        "RFC0065.24 — startup fails naming the cause, no new replica.id is written, and \
+         the vote log and group logs are byte-for-byte unchanged"
+    );
+}
+
 /// Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13).
 /// Given the other two voters lost for good with acked records above the
 /// checkpoint, some flushed, when `ourios wal force-leader` runs on the
@@ -770,7 +783,9 @@ fn rfc0065_31_a_cut_before_the_first_configuration_is_ignored() {
     todo!(
         "RFC0065.31 — every replica ignores the checkpoint and purges nothing, the leader \
          refuses the proposal as stale, and once the configuration applies every tail \
-         replica mines the earlier batches, read back from the WAL, into the same rows"
+         replica mines the earlier batches, read back from the WAL, into the same rows; a \
+         checkpoint applied during that read-back restarts a slow replica's miner from \
+         the cut's bundle, after which it mines the same rows"
     );
 }
 

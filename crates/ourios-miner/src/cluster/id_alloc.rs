@@ -85,6 +85,58 @@ impl fmt::Display for IdSpaceExhausted {
 
 impl std::error::Error for IdSpaceExhausted {}
 
+/// Where the allocator stands: the next id it issues and the end
+/// (exclusive) of the reserved range that id comes from. With
+/// `next == end` no reserved id is in hand and the next mint reserves
+/// first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdCursor {
+    next: u64,
+    end: u64,
+}
+
+impl IdCursor {
+    /// The cursor at `next` in a range ending before `end`, or `None`
+    /// unless `1 <= next <= end <= MAX_TEMPLATE_ID + 1`.
+    #[must_use]
+    pub fn new(next: u64, end: u64) -> Option<Self> {
+        ((1..=end).contains(&next) && end <= MAX_TEMPLATE_ID + 1).then_some(Self { next, end })
+    }
+
+    /// The id the next mint takes, if it is in hand.
+    #[must_use]
+    pub fn next(self) -> u64 {
+        self.next
+    }
+
+    /// The end (exclusive) of the reserved range in hand.
+    #[must_use]
+    pub fn end(self) -> u64 {
+        self.end
+    }
+}
+
+/// [`MinerCluster::restore_id_cursor`] was handed a cursor below an id
+/// the cluster already allocated or restored; restoring it would issue
+/// that id twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdCursorBehind {
+    pub cursor: IdCursor,
+    pub highest_allocated: u64,
+}
+
+impl fmt::Display for IdCursorBehind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "id cursor at {} is behind allocated id {}",
+            self.cursor.next, self.highest_allocated
+        )
+    }
+}
+
+impl std::error::Error for IdCursorBehind {}
+
 /// Durably reserves blocks of template ids.
 pub trait IdReserver: Send {
     /// Reserve a block lying wholly above `floor`, the highest id this
@@ -164,6 +216,28 @@ impl IdRange {
         Ok(())
     }
 
+    /// The cursor, with a range already used up shown as an empty one.
+    fn cursor(&self) -> IdCursor {
+        IdCursor {
+            next: self.next,
+            end: self.end.max(self.next),
+        }
+    }
+
+    fn restore(&mut self, cursor: IdCursor) -> Result<(), IdCursorBehind> {
+        match cursor.next {
+            next if next < self.next => Err(IdCursorBehind {
+                cursor,
+                highest_allocated: self.next - 1,
+            }),
+            next => {
+                self.next = next;
+                self.end = cursor.end;
+                Ok(())
+            }
+        }
+    }
+
     /// Never allocate `issued` or any id below it. An id above
     /// [`MAX_TEMPLATE_ID`] was never issued by this domain, so it is
     /// refused rather than seated past.
@@ -207,6 +281,26 @@ impl MinerCluster {
     /// [`IdReservationError`] when the reservation fails.
     pub fn reserve_current_block(&mut self) -> Result<(), IdReservationError> {
         self.ids.ensure()
+    }
+
+    /// Where the allocator stands, for a checkpoint to carry.
+    #[must_use]
+    pub fn id_cursor(&self) -> IdCursor {
+        self.ids.cursor()
+    }
+
+    /// Continue allocating from `cursor`: its range in hand is issued
+    /// without a new reservation, so the caller restores only a cursor
+    /// whose range a reservation made durable. With a cursor taken
+    /// alongside the tenants' snapshots, restoring those tenants before
+    /// or after this seats the allocator alike.
+    ///
+    /// # Errors
+    ///
+    /// [`IdCursorBehind`] when `cursor` would issue an id this cluster
+    /// already allocated or restored; nothing is changed.
+    pub fn restore_id_cursor(&mut self, cursor: IdCursor) -> Result<(), IdCursorBehind> {
+        self.ids.restore(cursor)
     }
 
     /// The highest id this cluster has allocated or restored, or 0.

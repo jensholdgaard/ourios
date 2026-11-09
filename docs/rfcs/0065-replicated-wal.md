@@ -1654,7 +1654,7 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     and, while no per-tenant override is specified, kind and body
     equal the record's configuration in force byte for byte; and each
     `.snap` has its length and CRC, decodes under
-    `load_snapshot`, carries the mark `{group: log, seq}` and holds no
+    `load_snapshot`, carries the mark `{log, seq}` with this log id and holds no
     template id at or above `next`. Any other bundle, or one missing an
     object, fails the restore closed as above. It never lists the
     prefix: the tenants are the ones `bundle.bin` names.

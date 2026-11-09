@@ -15,8 +15,7 @@ use openraft::errors::{
 };
 use openraft::network::{RPCOption, RPCTypes, RaftNetworkFactory, v2::RaftNetworkV2};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, StreamAppendResult, VoteRequest,
-    VoteResponse,
+    AppendEntriesRequest, AppendError, AppendResult, SnapshotResponse, VoteRequest, VoteResponse,
 };
 use openraft::type_config::alias::SnapshotOf;
 use ourios_serving::tls::TlsSettings;
@@ -40,6 +39,7 @@ use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, MAX_MESSAGE_BYTES, Malformed, Pieces, Recipient, Reply,
     SnapshotRequest, StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
+    append_result,
 };
 use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, STREAM_APPEND, VOTE};
 
@@ -378,7 +378,7 @@ fn streaming(e: RpcError) -> StreamingError<RaftTypes> {
     }
 }
 
-type Answer = Result<StreamAppendResult<RaftTypes>, RpcError>;
+type Answer = Result<AppendResult<RaftTypes>, RpcError>;
 
 impl PeerClient {
     /// Open `StreamAppend` with `input` as its messages. The soft TTL
@@ -564,6 +564,7 @@ impl Replies<'_> {
         let answer = match self.reply().await {
             Ok(Some(reply)) => reply
                 .into_raft()
+                .map(|result| result.map_err(AppendError::from))
                 .map_err(|e| Status::internal(e.to_string())),
             Ok(None) => Err(self.unfinished()?),
             Err(status) => Err(status),
@@ -645,17 +646,13 @@ impl RaftNetworkV2<RaftTypes> for PeerClient {
         &mut self,
         rpc: AppendEntriesRequest<RaftTypes>,
         option: RPCOption,
-    ) -> Result<AppendEntriesResponse<RaftTypes>, RpcError> {
+    ) -> Result<AppendResult<RaftTypes>, RpcError> {
         let (request, cut) = AppendRequest::bounded(self.to, &rpc).map_err(|e| network(&e))?;
         let response = self
             .exchange::<_, AppendResponse>(APPEND_RPC, Ok(request), &option)
             .await?;
-        Ok(match (response, cut) {
-            (AppendEntriesResponse::Success, Some(last)) => {
-                AppendEntriesResponse::PartialSuccess(Some(last))
-            }
-            (response, _) => response,
-        })
+        let last = cut.or_else(|| rpc.last_log_id());
+        append_result(&response, rpc.prev_log_id, last).map_err(|e| network(&e))
     }
 
     async fn vote(

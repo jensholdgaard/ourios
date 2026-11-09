@@ -12,7 +12,9 @@ use std::task::{Context, Poll};
 use futures_util::{Stream, StreamExt as _};
 use openraft::Raft;
 use openraft::errors::Fatal;
-use openraft::raft::{AppendEntriesRequest, StreamAppendResult};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, AppendResult, StreamAppendError,
+};
 use openraft::storage::RaftStateMachine;
 use ourios_serving::tls_serve::{ReloadingAcceptor, tls_incoming};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -183,7 +185,7 @@ where
         let raft = self.route(request.header.take())?;
         let rpc = request.into_raft()?;
         let response = raft.append_entries(rpc).await.map_err(|e| stopped(&e))?;
-        Ok(AppendResponse::from(&response))
+        Ok(AppendResponse::from(&AppendEntriesResponse::from(response)))
     }
 
     /// Open a `StreamAppend` stream: its first message routes it, and the
@@ -490,7 +492,7 @@ struct Answers<O> {
 
 impl<O> Answers<O>
 where
-    O: Stream<Item = Result<StreamAppendResult<RaftTypes>, Fatal<RaftTypes>>> + Unpin,
+    O: Stream<Item = Result<AppendResult<RaftTypes>, Fatal<RaftTypes>>> + Unpin,
 {
     async fn next(mut self) -> Option<(Result<StreamAppendResponse, Status>, Option<Self>)> {
         let next = tokio::select! {
@@ -504,6 +506,7 @@ where
         match next {
             Some(Ok(result)) => {
                 self.answered += 1;
+                let result = result.map_err(StreamAppendError::from);
                 let response = Ok(StreamAppendResponse::from(&result));
                 if result.is_ok() {
                     Some((response, Some(self)))

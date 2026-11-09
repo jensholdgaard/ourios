@@ -818,6 +818,12 @@ the mass-failover time and vote-log batching as tuning signals.
 >   events, byte for byte, as a flusher that dropped nothing; once a
 >   tail replica has applied a checkpoint at or above its gap it replays
 >   nothing; and while the store is unreachable it publishes nothing
+> - **And** when a checkpoint proposed before the replay applies while
+>   it runs, a replay from cut 100 toward gap 200 that has reached 120
+>   when the checkpoint at 150 applies and purges restarts from the
+>   bundle at 150 and never reads a purged entry, one whose new cut is
+>   at or above the gap ends with the gap cleared, and a query and a
+>   compaction over the result count every acknowledged record once
 
 > **Scenario RFC0065.24 — a wiped disk rejoins as a new replica (B4, B6, B8)**
 > - **Given** a group of three voters, and a voter restarted under the
@@ -987,6 +993,13 @@ the mass-failover time and vote-log batching as tuning signals.
 >   uncommitted assignment of another replica the next leader
 >   discards reports and proposes again to that next leader, while one
 >   that has applied an assignment of another replica does not
+> - **And** a report-only request delayed in the network, delivered
+>   again after the flusher has mined the blocks the first delivery
+>   appended and a checkpoint above its `mined` has applied and purged
+>   their entries, is refused `stale` and reserves nothing; the
+>   flusher's fresh report, sent when it applies that checkpoint, is
+>   counted, and the group never holds more than three blocks the
+>   flusher has not started
 > - **And** a current flusher whose `checkpoint.json` write finds a
 >   later `seq` a former flusher wrote, or its own earlier write of the
 >   same `seq`, proposes its entry, which every replica applies, so the
@@ -1697,8 +1710,21 @@ never count toward an ack (learners, under §4.3's shape).
     published are removed by position (§6.6). It discards what it keeps
     at or below the gap, which the replay published, and a gap that
     grows while it replays extends the replay. Its log holds every
-    entry the replay mines, since its WAL is purged only below an
-    applied checkpoint. Once the replay reaches the gap, the gap clears,
+    entry the replay has still to mine while no checkpoint applies,
+    since its WAL is purged only below an applied checkpoint. A
+    checkpoint already in flight can still apply during the replay,
+    since RFC 0052 §3.1's barrier holds no lock across publication and
+    checkpointing, and its purge can remove entries the replay has not
+    read. So when the replica applies a checkpoint during a replay, the
+    replay restarts from that cut's bundle, which its proposer made
+    durable before proposing (§6.5); if the cut is at or above the gap,
+    the gap clears and the replay ends. A slice published before the
+    restart holds entries at or below the new cut, which the proposer
+    also published before its bundle, or entries above it, which the
+    restarted replay publishes again; either way a repeat is a row
+    removed by position (§6.6) or an identical audit event (§9, Q9),
+    since the replay's output and the proposer's are the same bytes.
+    Once the replay reaches the gap, the gap clears,
     and it publishes what it keeps above the gap and proposes cuts as
     above. With the store unreachable it can restore nothing, and could
     publish nothing either; it replays once the store returns.
@@ -2056,11 +2082,12 @@ never count toward an ack (learners, under §4.3's shape).
   4. that `proposer` is the flusher named by the latest assignment in
      its log, committed or not, or by its snapshot record when its log
      holds none, else `FAILED_PRECONDITION`, `not_flusher`;
-  5. for a checkpoint, that its cut is the log id of an entry in its
-     log at or below its commit index, above the cut of the last
-     checkpoint it applied and of every checkpoint entry its log holds
-     after that, and that its highest kind is the log's at the cut,
-     else `FAILED_PRECONDITION`, `stale`.
+  5. that `mined` is present and at or above the cut of the last
+     checkpoint it applied, and, for a checkpoint, that its cut is the
+     log id of an entry in its log at or below its commit index, above
+     the cut of the last checkpoint it applied and of every checkpoint
+     entry its log holds after that, and that its highest kind is the
+     log's at the cut, else `FAILED_PRECONDITION`, `stale`.
 
   The peer certificate admits the caller to the protocol, as for every
   peer call; it shows the caller is a cluster member, not which one,
@@ -2082,17 +2109,21 @@ never count toward an ack (learners, under §4.3's shape).
   it reserves one in the store and appends it (§6.5). A block whose
   entry a checkpoint purged still counts, through `unstarted`, so a
   flusher that mines on in one block across many checkpoints is not
-  topped up past three. The only miss is a report whose `mined` is
-  below the leader's purge point, a new flusher still behind its
-  predecessor's cut, which can reserve up to three blocks more than
-  needed and reuses no id. The count needs nothing persisted beyond
+  topped up past three. The leader purges only below the last
+  checkpoint it applied, and check 5 refuses a report whose `mined` is
+  below that cut, so every block after `mined` that the flusher has
+  not counted is still in the leader's log: a report delayed past a
+  checkpoint, whose blocks the flusher has since mined and whose
+  entries the purge removed, is refused rather than counted short, and
+  a repeated report counts the blocks the first appended and appends
+  none. The count needs nothing persisted beyond
   the bundle's pending blocks; the snapshot record keeps only the
   latest block, so the leader could not count pending ones itself
   without a new record field. With the store unreachable it reserves
   none, and the miners run out at the same position (§6.5).
 - The flusher sends a report when it applies an assignment naming
   itself, when its allocator starts a block, when it sees a new leader,
-  and otherwise at least once per flusher patience (10 s, §6.5); it
+  when it applies a checkpoint entry, and otherwise at least once per flusher patience (10 s, §6.5); it
   sends a checkpoint entry once per checkpoint, after `checkpoint.json`
   (§6.5). It sends to the leader its log names and, after `not_leader`,
   `not_hosted` or a connection not made within the connect timeout, to
@@ -2110,7 +2141,9 @@ never count toward an ack (learners, under §4.3's shape).
   latest assignment it has applied still names it, and it stops for
   good only when it applies an assignment naming another replica; after
   `stale` it drops the proposal, leaving its bundle in the store
-  unnamed by any applied cut; after `malformed`, a defect, it reports
+  unnamed by any applied cut, and reports afresh with its current
+  `mined` at its next trigger, which applying the leader's checkpoint
+  is; after `malformed`, a defect, it reports
   why and fails the checkpoint as a failed bundle write does. A
   checkpoint whose entry is not appended has still published its files
   and written its bundle; the next barrier proposes a later cut, and

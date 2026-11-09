@@ -286,7 +286,10 @@ fn rfc0065_23_a_flusher_publishes_what_it_kept_and_replays_a_gap() {
          the bundle (each slice's audit events durable before its rows, memory at most \
          one slice) yields the same bytes as a flusher that dropped nothing; a tail \
          replica past a checkpoint at or above its gap replays nothing; nothing is \
-         published while the store is unreachable"
+         published while the store is unreachable; a checkpoint that applies during the \
+         replay (from 100 toward 200, at 120 when 150 applies) restarts it from the new \
+         cut's bundle without reading a purged entry, ends it when the cut reaches the \
+         gap, and every record is still counted once"
     );
 }
 
@@ -628,7 +631,9 @@ fn rfc0065_32_the_flushers_proposals_and_reports_reach_the_leader() {
          another highest kind gets stale, another kind or length or proposer gets \
          malformed, a non-leader gets not_leader with the hint; a resend leaves one \
          applied checkpoint; a not_flusher refusal from a leader whose assignment is \
-         discarded does not silence the flusher toward the next leader"
+         discarded does not silence the flusher toward the next leader; a report delayed \
+         past a checkpoint that purged the blocks it caused is refused stale and \
+         reserves nothing, and the fresh report keeps at most three unstarted blocks"
     );
 }
 

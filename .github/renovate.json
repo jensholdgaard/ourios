@@ -16,6 +16,13 @@
   "automergeStrategy": "squash",
   "packageRules": [
     {
+      "description": "The kubescape chart is vendored as a pin and re-vendored whole (see bob-capture.yml); one image bumped inside it breaks the chart's wiring.",
+      "matchFileNames": [
+        ".github/workflows/bob-capture/kubescape-operator-*/**"
+      ],
+      "enabled": false
+    },
+    {
       "matchManagers": [
         "github-actions"
       ],

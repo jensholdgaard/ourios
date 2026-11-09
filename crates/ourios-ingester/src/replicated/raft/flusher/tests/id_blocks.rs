@@ -20,7 +20,8 @@ use tokio::sync::{Semaphore, mpsc};
 
 use super::{
     PATIENCE, Pass, admit, counted, counted_as, group, heard_from, log,
-    membership_change_in_flight, pass, placement, reads_up_to, ready_leader, strs,
+    membership_change_in_flight, membership_committed, pass, placement, reads_up_to, ready_leader,
+    strs,
 };
 use crate::replicated::raft::cluster::{Cluster, WAIT, name, seated_store, write};
 use crate::replicated::raft::flusher::Steward;
@@ -338,8 +339,9 @@ async fn a_membership_change_in_flight_holds_back_every_new_kind() {
     for &f in &followers {
         cluster.node(f).gate.open();
     }
-    membership.await.expect("join");
-    let appended = pass(&mut steward, &cluster, leader, &first).await;
+    membership_committed(membership, &cluster, leader).await;
+    let both = [placed[0].as_str(), placed[1].as_str()];
+    let appended = pass(&mut steward, &cluster, leader, &both).await;
     assert_eq!(appended.assigned, Some(cluster.id(order[0])));
     assert!(appended.configured.is_some(), "the configuration held back");
     assert!(

@@ -457,6 +457,27 @@ async fn membership_change_in_flight(
     (membership, followers)
 }
 
+/// Join the change [`membership_change_in_flight`] started, then wait
+/// for the leader's metrics, which the steward reads, to show it
+/// committed: the change resolves first.
+async fn membership_committed(
+    membership: tokio::task::JoinHandle<()>,
+    cluster: &Cluster,
+    leader: usize,
+) {
+    membership.await.expect("join");
+    cluster
+        .node(leader)
+        .raft(0)
+        .wait(WAIT)
+        .metrics(
+            |m| m.membership_config.log_id() == m.committed_membership_config.log_id(),
+            "the membership change committed",
+        )
+        .await
+        .expect("committed");
+}
+
 /// RFC0065.29: with a membership change in flight the leader appends no
 /// new kind, the assignment nor the miner configuration, and counts each
 /// hold; once it commits, both are appended.
@@ -488,19 +509,7 @@ async fn a_membership_change_in_flight_holds_back_each_new_kind() {
     for &f in &followers {
         cluster.node(f).gate.open();
     }
-    membership.await.expect("join");
-    // The change resolves before the leader's metrics, which the steward
-    // reads, show it committed.
-    cluster
-        .node(leader)
-        .raft(0)
-        .wait(WAIT)
-        .metrics(
-            |m| m.membership_config.log_id() == m.committed_membership_config.log_id(),
-            "the membership change committed",
-        )
-        .await
-        .expect("committed");
+    membership_committed(membership, &cluster, leader).await;
     let both = [placed[0].as_str(), placed[1].as_str()];
     let appended = pass(&mut steward, &cluster, leader, &both).await;
     assert_eq!(appended.assigned, Some(cluster.id(order[0])));

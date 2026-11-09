@@ -134,13 +134,32 @@ pub async fn reserve(store: &Store, floor: u64, group: u32) -> Result<IdBlock, R
             return Err(Refusal::Failed(OTHER));
         }
     };
-    report(group, failed.error_type(), &failed);
+    let error_type = failed.error_type();
     match failed {
-        TemplateIdsError::HighWaterDeleted => Err(Refusal::Absent),
-        TemplateIdsError::HighWaterRolledBack { .. } => Err(Refusal::RolledBack),
-        e => Err(Refusal::Failed(e.error_type())),
+        // The local errors' Display names RFC 0059's re-bootstrap, which
+        // cannot recover a replicated group (RFC 0065 §9 Q6).
+        TemplateIdsError::HighWaterDeleted => {
+            let detail = format!("the template-id high-water object was deleted; {NO_REBOOTSTRAP}");
+            report(group, error_type, &detail);
+            Err(Refusal::Absent)
+        }
+        TemplateIdsError::HighWaterRolledBack { seen, found } => {
+            let detail = format!(
+                "the template-id high-water object is at {found}, below the {seen} this \
+                 group's log holds; {NO_REBOOTSTRAP}"
+            );
+            report(group, error_type, &detail);
+            Err(Refusal::RolledBack)
+        }
+        e => {
+            report(group, error_type, &e);
+            Err(Refusal::Failed(error_type))
+        }
     }
 }
+
+const NO_REBOOTSTRAP: &str = "a replicated group cannot be recovered by RFC 0059's \
+     re-bootstrap, so its miner runs out of ids until RFC 0065 §9 Q6 defines a recovery";
 
 /// The `error.type` of a reservation whose task did not finish.
 const OTHER: &str = "_OTHER";

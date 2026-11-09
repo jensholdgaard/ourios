@@ -165,6 +165,26 @@ async fn a_forward_to_the_leader_commits_and_one_to_a_follower_names_it() {
     let log = cluster.node(leader).log(0).await;
     assert!(log.iter().any(|e| e.log_id.index == seq));
 
+    // The commit needs one follower's ack, not this one's, so it may not
+    // yet have heard from the leader it is to name. The name comes from
+    // its membership, which a heartbeat can precede.
+    let leader_id = cluster.id(leader);
+    cluster
+        .node(follower)
+        .raft(0)
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |m| {
+                m.current_leader == Some(leader_id)
+                    && m.membership_config
+                        .membership()
+                        .get_node(&leader_id)
+                        .is_some()
+            },
+            "the follower follows the leader and holds its node",
+        )
+        .await
+        .expect("following");
     let at_follower = peers
         .forward(&name(cluster.id(follower)), request(), commit)
         .await;

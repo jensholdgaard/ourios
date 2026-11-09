@@ -486,7 +486,20 @@ async fn a_membership_change_in_flight_holds_back_each_new_kind() {
         cluster.node(f).gate.open();
     }
     membership.await.expect("join");
-    let appended = pass(&mut steward, &cluster, leader, &first).await;
+    // The change resolves before the leader's metrics, which the steward
+    // reads, show it committed.
+    cluster
+        .node(leader)
+        .raft(0)
+        .wait(WAIT)
+        .metrics(
+            |m| m.membership_config.log_id() == m.committed_membership_config.log_id(),
+            "the membership change committed",
+        )
+        .await
+        .expect("committed");
+    let both = [placed[0].as_str(), placed[1].as_str()];
+    let appended = pass(&mut steward, &cluster, leader, &both).await;
     assert_eq!(appended.assigned, Some(cluster.id(order[0])));
     assert!(appended.configured.is_some(), "the configuration held back");
     cluster.shutdown().await;

@@ -46,6 +46,7 @@ fn empty_record(tenant: &str, ts_unix_nano: u64) -> MinedRecord {
         body: None,
         confidence: 1.0,
         lossy_flag: false,
+        ingest_position: None,
     }
 }
 

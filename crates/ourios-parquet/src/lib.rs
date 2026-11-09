@@ -69,7 +69,9 @@ pub use partition::{
 };
 pub use promoted::{PromotedAttributes, PromotedClass, PromotedKey, SERVICE_NAME_KEY};
 pub use reader::{Reader, ReaderError, ShapeValidation, batch_to_mined_records};
-pub use record_batch::{BatchError, mined_records_to_batch, mined_records_to_batch_with_promoted};
+pub use record_batch::{
+    BatchError, IngestColumns, mined_records_to_batch, mined_records_to_batch_with_promoted,
+};
 pub use store::{
     Caller, DelimitedListing, ListedObject, QueryPhase, S3Config, Store, StoreConfig, StoreError,
     Suffix,
@@ -120,6 +122,15 @@ pub mod columns {
     pub const RESOURCE_SCHEMA_URL: &str = "resource_schema_url";
     /// RFC 0018 §3.1 — `ScopeLogs.schema_url` (OPTIONAL).
     pub const SCOPE_SCHEMA_URL: &str = "scope_schema_url";
+    /// RFC 0065 §6.6 — the ingest position's log id (OPTIONAL; only in
+    /// files of records mined from a replicated log).
+    pub const INGEST_GROUP: &str = "ingest_group";
+    /// RFC 0065 §6.6 — the committed entry's `seq` (OPTIONAL).
+    pub const INGEST_SEQ: &str = "ingest_seq";
+    /// RFC 0065 §6.6 — the record's index in its frame (OPTIONAL).
+    pub const INGEST_INDEX: &str = "ingest_index";
+    /// The three ingest-position columns, in the order they are written.
+    pub const INGEST_POSITION: [&str; 3] = [INGEST_GROUP, INGEST_SEQ, INGEST_INDEX];
 }
 
 /// Audit-event file column-name constants (RFC 0005 §3.7).
@@ -258,6 +269,28 @@ pub fn data_schema_with_promoted(promoted: &PromotedAttributes) -> SchemaRef {
     let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
     fields.extend(promoted.fields());
     Arc::new(ArrowSchema::new(fields))
+}
+
+/// `schema` plus the RFC 0065 §6.6 ingest-position columns when
+/// `ingest` is [`IngestColumns::Written`], appended after every other
+/// column so no existing leaf index moves. [`IngestColumns::Omitted`]
+/// returns `schema` unchanged, which keeps local-backend files exactly
+/// as they were.
+#[must_use]
+pub fn with_ingest_columns(schema: SchemaRef, ingest: IngestColumns) -> SchemaRef {
+    match ingest {
+        IngestColumns::Omitted => schema,
+        IngestColumns::Written => {
+            let mut fields: Vec<Field> =
+                schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+            fields.extend([
+                Field::new(columns::INGEST_GROUP, DataType::UInt32, true),
+                Field::new(columns::INGEST_SEQ, DataType::UInt64, true),
+                Field::new(columns::INGEST_INDEX, DataType::UInt32, true),
+            ]);
+            Arc::new(ArrowSchema::new(fields))
+        }
+    }
 }
 
 /// Build the audit-event file Arrow schema per RFC 0005 §3.7.

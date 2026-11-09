@@ -46,6 +46,7 @@ fn record(body_kind: BodyKind) -> MinedRecord {
         body: None,
         confidence: 0.0,
         lossy_flag: false,
+        ingest_position: None,
     }
 }
 

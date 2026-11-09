@@ -969,7 +969,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   allocated log ids and reserved a block and the object was deleted,
 >   does not re-create it; a bootstrapper killed between the
 >   object and `seeded` finishes on its restart while every other start
->   waits; an unreadable `log_ids.json` fails a start that holds no
+>   waits; with `log_ids.json` deleted after log ids were allocated, a
+>   start finding the object present, or holding a group's Raft state,
+>   fails with `LogIdsDeleted` and re-creates nothing, and no log id is
+>   allocated twice; an unreadable `log_ids.json` fails a start that holds no
 >   group's Raft state, while a replica holding one, restarted with the
 >   store unreachable or the lock unreadable, opens its groups and keeps
 >   taking the log; and with the
@@ -1542,7 +1545,8 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   that does not parse, fails closed the start or step that reads it,
   and no node replaces it.
   - **The lock comes first.** A replicated start that finds
-    `log_ids.json` absent creates it with `put_if_absent`, naming
+    `log_ids.json` absent, no `template_ids.v<k>.json` and no group's
+    Raft state of its own creates it with `put_if_absent`, naming
     itself, `seeded` `false` and `next` `0`. Only the start whose
     create succeeds bootstraps: if no `template_ids.v<k>.json` exists,
     it runs RFC 0059 §3.5 with that section's table, `restored_max = 0`
@@ -1569,6 +1573,14 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     `put_if_absent`, and a `node_id` runs one start at a time (the
     StatefulSet's pod identity), so no paused start outlives its own
     restart.
+  - **A deleted lock is never re-created.** The object is created only
+    under the lock and a group exists only under a log id, so a lock
+    absent beside the object, or from a start that holds a group's Raft
+    state, was deleted: re-creating it at `next` `0` would hand out log
+    ids already in Parquet. The start or step fails closed with
+    `LogIdsDeleted`, reporting why, and no node re-creates it. With
+    both the lock and the object deleted nothing on the store tells a
+    new bucket from an emptied one, which is §9 Q6's recovery.
   - **A formed replica starts without it.** Log ids exist only after
     `seeded`, and a group only under a log id, so a start that holds a
     group's Raft state (a log or §6.1's snapshot record) comes after

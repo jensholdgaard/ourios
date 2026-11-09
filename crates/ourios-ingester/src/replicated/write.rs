@@ -5,14 +5,15 @@
 //! it.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use openraft::async_runtime::WatchReceiver as _;
 use openraft::errors::{ClientWriteError, RaftError};
+use ourios_wal::BatchTime;
 
 use super::layout::VotingLayout;
 use super::raft::host::{GroupHost, GroupRaft};
-use super::raft::types::{RaftTypes, TenantBatchBytes};
+use super::raft::types::{GroupEntry, RaftTypes, TenantBatchBytes};
 use crate::metrics::{
     ERROR_TYPE_GROUP_UNAVAILABLE, ERROR_TYPE_NOT_ENOUGH_REPLICAS, ERROR_TYPE_REQUEST_TOO_LARGE,
 };
@@ -214,7 +215,8 @@ impl GroupWriter {
     }
 
     /// Commit `batch`, `tenant`'s `TenantOtlpBatch` payload, to the
-    /// tenant's group.
+    /// tenant's group, stamped with this node's wall clock as it submits
+    /// the entry (RFC 0065 §6.5).
     ///
     /// # Errors
     ///
@@ -230,7 +232,8 @@ impl GroupWriter {
             .groups
             .get(&group)
             .ok_or(WriteError::NotHosted { group })?;
-        match tokio::time::timeout(self.timeout, raft.client_write(batch.into())).await {
+        let entry = GroupEntry::batch(BatchTime::from_system_time(SystemTime::now()), batch);
+        match tokio::time::timeout(self.timeout, raft.client_write(entry)).await {
             Ok(Ok(response)) => Ok(GroupPosition {
                 group,
                 seq: response.log_id.index,

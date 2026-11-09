@@ -7,14 +7,13 @@ use openraft::vote::leader_id_std::CommittedLeaderId;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use ourios_core::audit::{AuditPayload, TemplateChange};
-use ourios_core::clock::TestClock;
 use ourios_wal::{Control, MinerConfigV1, UpstreamTemplates};
 use proptest::prelude::*;
 use tokio::sync::mpsc;
 
 use super::super::snapshot_record::GroupState;
 use super::super::state_machine::GroupSm;
-use super::super::types::{Entry, GroupEntry};
+use super::super::types::{Entry, GroupEntry, TenantBatchBytes};
 use super::*;
 
 const CORPUS: [&str; 2] = [
@@ -73,12 +72,20 @@ fn export(lines: &[&str]) -> Vec<u8> {
 }
 
 fn framed(tenant: &str, protobuf: &[u8]) -> GroupEntry {
+    framed_at(BatchTime::default(), tenant, protobuf)
+}
+
+fn framed_at(time: BatchTime, tenant: &str, protobuf: &[u8]) -> GroupEntry {
     let payload = TenantBatch::encode(tenant, protobuf).expect("tenant");
-    GroupEntry::Batch(TenantBatchBytes::new(payload).expect("prefix"))
+    GroupEntry::batch(time, TenantBatchBytes::new(payload).expect("prefix"))
 }
 
 fn batch(tenant: &str, lines: &[&str]) -> GroupEntry {
     framed(tenant, &export(lines))
+}
+
+fn batch_at(time: BatchTime, tenant: &str, lines: &[&str]) -> GroupEntry {
+    framed_at(time, tenant, &export(lines))
 }
 
 fn block(after: u64, through: u64) -> GroupEntry {
@@ -529,6 +536,8 @@ fn template_events_come_with_the_rows_that_need_them() {
 /// Two replicas emit the same audit events in the same order, apart from
 /// the wall-clock timestamps; an injected clock stamps them all.
 #[test]
+#[ignore = "superseded: audit events carry the batch's time, the miner has no clock \
+            (RFC 0065 §6.5, #1244); see two_replicas_stamp_every_audit_event_with_its_batchs_time"]
 fn two_replicas_emit_the_same_audit_events_apart_from_timestamps() {
     let mut entries = vec![configured(0.7), block(0, 10_000)];
     entries.extend(corpus().chunks(5).map(|lines| batch("acme", lines)));
@@ -550,9 +559,61 @@ fn two_replicas_emit_the_same_audit_events_apart_from_timestamps() {
     let replica = audit(GroupMiner::new());
     assert!(replica.iter().filter_map(change_of).count() >= 2);
     assert_eq!(untimed(replica.clone()), untimed(audit(GroupMiner::new())));
+}
 
-    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let stamped = audit(GroupMiner::with_clock(Box::new(TestClock::new(at))));
-    assert!(stamped.iter().all(|event| event.timestamp == at));
-    assert_eq!(untimed(stamped), untimed(replica));
+fn time(nanos: u64) -> BatchTime {
+    BatchTime::from_nanos(nanos).expect("in range")
+}
+
+fn stamps(mined: &Mined) -> Vec<SystemTime> {
+    mined.audit.iter().map(|event| event.timestamp).collect()
+}
+
+/// Two replicas mining the same log, at different moments on their own
+/// clocks, stamp every audit event alike: with the time the leader wrote
+/// into the batch it mined, never the replica's clock (RFC 0065 §6.5).
+#[test]
+fn two_replicas_stamp_every_audit_event_with_its_batchs_time() {
+    let base = 1_000_000_000_000_000_000;
+    let mut entries = vec![configured(0.7), block(0, 10_000)];
+    let mut times = vec![None, None];
+    for (n, lines) in (1..).zip(corpus().chunks(5)) {
+        let at = time(base + n);
+        entries.push(batch_at(at, "acme", lines));
+        times.push(Some(at.system_time()));
+    }
+    let replica = mined_each(GroupMiner::new(), events_of(&entries, 64));
+    std::thread::sleep(Duration::from_millis(2));
+    let other = mined_each(GroupMiner::new(), events_of(&entries, 1));
+    assert_eq!(replica, other);
+
+    let audited = replica.iter().filter(|m| !m.audit.is_empty()).count();
+    assert!(audited >= 2, "{audited} batches emitted audit events");
+    for (mined, at) in replica.iter().zip(&times) {
+        let expected: Vec<SystemTime> = at
+            .iter()
+            .flat_map(|at| mined.audit.iter().map(|_| *at))
+            .collect();
+        assert_eq!(stamps(mined), expected);
+    }
+}
+
+/// Batches that wait for the first configuration are each stamped with
+/// their own time when it mines them.
+#[test]
+fn batches_mined_under_the_first_configuration_keep_their_own_times() {
+    let (early, later, last) = (time(10), time(20), time(30));
+    let entries = vec![
+        batch_at(early, "acme", &["a b c d e"]),
+        block(0, 100),
+        batch_at(later, "acme", &["v w x y z"]),
+        configured(0.7),
+        batch_at(last, "acme", &["a b c d q"]),
+    ];
+    let mined = mined_each(GroupMiner::new(), events_of(&entries, 8));
+    let at = |t: BatchTime| t.system_time();
+    assert!(mined[..3].iter().all(|m| m.audit.is_empty()));
+    assert_eq!(stamps(&mined[3]), [at(early), at(later)]);
+    assert!(!mined[4].audit.is_empty(), "widened");
+    assert!(stamps(&mined[4]).iter().all(|&t| t == at(last)));
 }

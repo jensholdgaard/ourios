@@ -7,20 +7,23 @@
 //! ```text
 //! | tag: u8 | body                                                          |
 //! | 0x01 Blank          | term: u64_le | index: u64_le                      |
-//! | 0x02 Normal         | term | index | TenantOtlpBatch payload (RFC 0046) |
 //! | 0x03 Membership     | term | index | membership bytes                   |
 //! | 0x04 Control        | term | index | kind: u8 | kind's body             |
+//! | 0x05 Batch          | term | index | time: u64_le |                     |
+//! |                     | TenantOtlpBatch payload (RFC 0046)                |
 //! | 0x10 TruncateAfter  | term | index   (replay drops entries above index) |
 //! | 0x11 TruncateAll    | (empty)        (replay drops every entry)         |
 //! | 0x12 Purge          | term | index   (replay drops entries at or below) |
 //! | 0x13 Committed      | term | index                                      |
 //! ```
 //!
-//! Tags `0x01..=0x04` are log entries; `0x10..=0x13` are the markers
-//! that replay honours in WAL order, so conflict truncation and purge
-//! need no tail-truncate primitive. A `Normal` entry carries the tenant
-//! exactly as a `TenantOtlpBatch` frame does, so RFC 0052's ledger keys
-//! on it. The membership bytes are the consensus layer's own encoding;
+//! Tags `0x01` and `0x03..=0x05` are log entries; `0x10..=0x13` are the
+//! markers that replay honours in WAL order, so conflict truncation and
+//! purge need no tail-truncate primitive. A `Batch` entry's `time` is the
+//! leader's wall clock in Unix nanoseconds, at most `2^63 - 1`, and its
+//! payload carries the tenant exactly as a `TenantOtlpBatch` frame does,
+//! so RFC 0052's ledger keys on it. Tag `0x02`, the untimed batch, is no
+//! longer read (RFC 0065 §6.5). The membership bytes are the consensus layer's own encoding;
 //! this codec only bounds them. A `Control` entry is one the leader
 //! appends beside the batches (RFC 0065 §6.5), a kind byte and its body:
 //!
@@ -42,18 +45,21 @@
 //! through]`, with `after < through <= 2^63 - 1`, and `upstream_templates`
 //! is `0` ignore, `1` observe or `2` adopt. Any other tag, an unknown
 //! control kind, a fixed-size body of the wrong length, an id block
-//! outside that range, another `upstream_templates` value, or a `Normal`
-//! body whose tenant prefix is malformed is a [`ReplicatedRecordError`], so
+//! outside that range, another `upstream_templates` value, a `Batch` whose
+//! time is above `2^63 - 1` or whose tenant prefix is malformed is a [`ReplicatedRecordError`], so
 //! a replay refuses the log rather than skip an entry it cannot apply.
 //! The miner configuration's other bounds are `MinerConfig`'s, checked by
 //! the reader that applies it.
 
+use std::time::{Duration, SystemTime};
+
 use crate::{FrameKind, TenantBatch, TenantBatchError};
 
 const TAG_BLANK: u8 = 0x01;
-const TAG_NORMAL: u8 = 0x02;
 const TAG_MEMBERSHIP: u8 = 0x03;
 const TAG_CONTROL: u8 = 0x04;
+const TAG_BATCH: u8 = 0x05;
+const TIME_LEN: usize = 8;
 const KIND_FLUSHER_ASSIGNMENT: u8 = 0x01;
 const KIND_CHECKPOINT: u8 = 0x02;
 const KIND_ID_BLOCK: u8 = 0x03;
@@ -72,6 +78,8 @@ const TAG_COMMITTED: u8 = 0x13;
 const LOG_ID_LEN: usize = 16;
 /// Bytes before an entry's own payload: the tag and the log id.
 const ENTRY_PREFIX_LEN: usize = 1 + LOG_ID_LEN;
+/// Bytes before a batch entry's `TenantOtlpBatch` payload.
+const BATCH_PREFIX_LEN: usize = ENTRY_PREFIX_LEN + TIME_LEN;
 
 /// A Raft log id under a single-leader-per-term election: `(term, index)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -100,13 +108,55 @@ fn u64_pair(bytes: [u8; 16]) -> (u64, u64) {
     (u64::from_le_bytes(first), u64::from_le_bytes(second))
 }
 
+/// A batch's time: Unix nanoseconds, at most `2^63 - 1`, the largest the
+/// audit stream's `TIMESTAMP(NANOS)` column holds (RFC 0065 §6.5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BatchTime(u64);
+
+impl BatchTime {
+    /// The latest time a batch carries.
+    pub const MAX: Self = Self(i64::MAX.unsigned_abs());
+
+    /// `nanos` after the epoch, unless above [`Self::MAX`].
+    #[must_use]
+    pub const fn from_nanos(nanos: u64) -> Option<Self> {
+        match nanos {
+            n if n <= Self::MAX.0 => Some(Self(n)),
+            _ => None,
+        }
+    }
+
+    /// `time`, `0` before the epoch and [`Self::MAX`] past it.
+    #[must_use]
+    pub fn from_system_time(time: SystemTime) -> Self {
+        match time.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(since) => u64::try_from(since.as_nanos())
+                .ok()
+                .and_then(Self::from_nanos)
+                .unwrap_or(Self::MAX),
+            Err(_) => Self(0),
+        }
+    }
+
+    #[must_use]
+    pub const fn nanos(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub fn system_time(self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_nanos(self.0)
+    }
+}
+
 /// What a log entry carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryBody<'a> {
     /// The empty entry a new leader commits.
     Blank,
-    /// A `TenantOtlpBatch` payload, tenant prefix included.
-    Normal(&'a [u8]),
+    /// A tenant's batch: the leader's time and the `TenantOtlpBatch`
+    /// payload, tenant prefix included.
+    Batch { time: BatchTime, batch: &'a [u8] },
     /// A membership change, in the consensus layer's encoding.
     Membership(&'a [u8]),
     /// An entry the leader appends beside the batches (RFC 0065 §6.5).
@@ -358,15 +408,16 @@ pub enum ReplicatedRecord<'a> {
 }
 
 impl<'a> ReplicatedRecord<'a> {
-    /// The largest payload a log entry can carry: its frame, prefix
-    /// included, must fit [`MAX_FRAME_BYTES`](crate::MAX_FRAME_BYTES).
-    pub const MAX_ENTRY_PAYLOAD_BYTES: usize = crate::MAX_FRAME_BYTES - ENTRY_PREFIX_LEN;
+    /// The largest `TenantOtlpBatch` payload a batch entry can carry: its
+    /// frame, prefix and time included, must fit
+    /// [`MAX_FRAME_BYTES`](crate::MAX_FRAME_BYTES).
+    pub const MAX_ENTRY_PAYLOAD_BYTES: usize = crate::MAX_FRAME_BYTES - BATCH_PREFIX_LEN;
 
     /// The frame payload for this record.
     ///
     /// # Errors
     ///
-    /// [`ReplicatedRecordError::TenantBatch`] when a `Normal` body is not
+    /// [`ReplicatedRecordError::TenantBatch`] when a `Batch` payload is not
     /// a well-formed `TenantOtlpBatch` payload, and
     /// [`ReplicatedRecordError::InvalidIdBlock`] for an id block outside
     /// the id domain, so no record is written that [`Self::decode`] would
@@ -377,9 +428,13 @@ impl<'a> ReplicatedRecord<'a> {
             Self::Entry { log_id, body } => {
                 let (tag, bytes) = match body {
                     EntryBody::Blank => (TAG_BLANK, &[][..]),
-                    EntryBody::Normal(bytes) => {
-                        TenantBatch::decode(bytes).map_err(ReplicatedRecordError::TenantBatch)?;
-                        (TAG_NORMAL, bytes)
+                    EntryBody::Batch { time, batch } => {
+                        TenantBatch::decode(batch).map_err(ReplicatedRecordError::TenantBatch)?;
+                        out.push(TAG_BATCH);
+                        log_id.write(&mut out);
+                        out.extend_from_slice(&time.nanos().to_le_bytes());
+                        out.extend_from_slice(batch);
+                        return Ok(out);
                     }
                     EntryBody::Membership(bytes) => (TAG_MEMBERSHIP, bytes),
                     EntryBody::Control(control) => {
@@ -405,7 +460,11 @@ impl<'a> ReplicatedRecord<'a> {
     fn body_len(&self) -> usize {
         match self {
             Self::Entry {
-                body: EntryBody::Normal(bytes) | EntryBody::Membership(bytes),
+                body: EntryBody::Batch { batch, .. },
+                ..
+            } => TIME_LEN + batch.len(),
+            Self::Entry {
+                body: EntryBody::Membership(bytes),
                 ..
             } => bytes.len(),
             Self::Entry {
@@ -426,7 +485,7 @@ impl<'a> ReplicatedRecord<'a> {
             return Err(ReplicatedRecordError::Empty);
         };
         match tag {
-            TAG_BLANK | TAG_NORMAL | TAG_MEMBERSHIP | TAG_CONTROL => decode_entry(tag, body),
+            TAG_BLANK | TAG_MEMBERSHIP | TAG_CONTROL | TAG_BATCH => decode_entry(tag, body),
             TAG_TRUNCATE_ALL if body.is_empty() => Ok(Self::TruncateAfter(None)),
             TAG_TRUNCATE_ALL => Err(wrong_length(tag, 0, body.len())),
             TAG_TRUNCATE_AFTER => exact_log_id(tag, body).map(|id| Self::TruncateAfter(Some(id))),
@@ -464,9 +523,15 @@ fn decode_entry(tag: u8, body: &[u8]) -> Result<ReplicatedRecord<'_>, Replicated
     let body = match tag {
         TAG_BLANK if rest.is_empty() => EntryBody::Blank,
         TAG_BLANK => return Err(wrong_length(tag, LOG_ID_LEN, body.len())),
-        TAG_NORMAL => {
-            TenantBatch::decode(rest).map_err(ReplicatedRecordError::TenantBatch)?;
-            EntryBody::Normal(rest)
+        TAG_BATCH => {
+            let Some((time, batch)) = rest.split_first_chunk::<TIME_LEN>() else {
+                return Err(wrong_length(tag, LOG_ID_LEN + TIME_LEN, body.len()));
+            };
+            let nanos = u64::from_le_bytes(*time);
+            let time = BatchTime::from_nanos(nanos)
+                .ok_or(ReplicatedRecordError::InvalidBatchTime { found: nanos })?;
+            TenantBatch::decode(batch).map_err(ReplicatedRecordError::TenantBatch)?;
+            EntryBody::Batch { time, batch }
         }
         TAG_CONTROL => EntryBody::Control(Control::read(rest)?),
         _ => EntryBody::Membership(rest),
@@ -475,14 +540,14 @@ fn decode_entry(tag: u8, body: &[u8]) -> Result<ReplicatedRecord<'_>, Replicated
 }
 
 /// The `TenantOtlpBatch` payload a frame carries, if any: the whole
-/// payload of a `0x03` frame, or the body of a `0x04` `Normal` entry.
+/// payload of a `0x03` frame, or the batch of a `0x04` `Batch` entry.
 /// The ledger reads tenant membership through this, on append and on
 /// rebuild alike, so the two cannot disagree.
 pub(crate) fn tenant_batch_payload(kind: FrameKind, payload: &[u8]) -> Option<&[u8]> {
     match kind {
         FrameKind::TenantOtlpBatch => Some(payload),
-        FrameKind::ReplicatedEntry if payload.first() == Some(&TAG_NORMAL) => {
-            payload.get(ENTRY_PREFIX_LEN..)
+        FrameKind::ReplicatedEntry if payload.first() == Some(&TAG_BATCH) => {
+            payload.get(BATCH_PREFIX_LEN..)
         }
         FrameKind::ReplicatedEntry | FrameKind::OtlpBatch | FrameKind::AuditEvent => None,
     }
@@ -503,8 +568,10 @@ pub enum ReplicatedRecordError {
         expected: usize,
         found: usize,
     },
-    /// A `Normal` body whose tenant prefix is malformed.
+    /// A `Batch` payload whose tenant prefix is malformed.
     TenantBatch(TenantBatchError),
+    /// A `Batch` whose time is above `2^63 - 1`.
+    InvalidBatchTime { found: u64 },
     /// A control entry of a kind this build does not read.
     UnknownControlKind { found: u8 },
     /// An id block that is not `after < through <= 2^63 - 1`.
@@ -529,7 +596,10 @@ impl std::fmt::Display for ReplicatedRecordError {
                 f,
                 "ReplicatedEntry tag 0x{tag:02x} body is {found} byte(s); expected {expected}"
             ),
-            Self::TenantBatch(e) => write!(f, "ReplicatedEntry Normal body: {e}"),
+            Self::TenantBatch(e) => write!(f, "ReplicatedEntry Batch payload: {e}"),
+            Self::InvalidBatchTime { found } => {
+                write!(f, "ReplicatedEntry Batch time {found} is above 2^63 - 1")
+            }
             Self::UnknownControlKind { found } => {
                 write!(f, "unknown ReplicatedEntry control kind 0x{found:02x}")
             }
@@ -582,6 +652,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded: a batch is tag 0x05 with the leader's time and 0x02 is refused \
+                (RFC 0065 §6.5, #1244); see entries_encode_to_the_documented_bytes_with_a_timed_batch"]
     fn entries_encode_to_the_documented_bytes() {
         let batch = TenantBatch::encode("acme", b"proto").expect("batch");
         let blank = ReplicatedRecord::Entry {
@@ -591,7 +663,10 @@ mod tests {
         round_trip(blank, &golden(0x01, &[]));
         let normal = ReplicatedRecord::Entry {
             log_id: ID,
-            body: EntryBody::Normal(&batch),
+            body: EntryBody::Batch {
+                time: BatchTime::default(),
+                batch: &batch,
+            },
         };
         round_trip(normal, &golden(0x02, b"\x04\x00acmeproto"));
         let membership = ReplicatedRecord::Entry {
@@ -599,6 +674,115 @@ mod tests {
             body: EntryBody::Membership(b"m"),
         };
         round_trip(membership, &golden(0x03, b"m"));
+    }
+
+    /// A batch is tag `0x05`, the log id, the time and the
+    /// `TenantOtlpBatch` payload (RFC 0065 §6.5).
+    #[test]
+    fn entries_encode_to_the_documented_bytes_with_a_timed_batch() {
+        let batch = TenantBatch::encode("acme", b"proto").expect("batch");
+        let blank = ReplicatedRecord::Entry {
+            log_id: ID,
+            body: EntryBody::Blank,
+        };
+        round_trip(blank, &golden(0x01, &[]));
+        let time = BatchTime::from_nanos(0x2122_2324_2526_2728).expect("in range");
+        let timed = ReplicatedRecord::Entry {
+            log_id: ID,
+            body: EntryBody::Batch {
+                time,
+                batch: &batch,
+            },
+        };
+        let mut tail = vec![0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21];
+        tail.extend_from_slice(b"\x04\x00acmeproto");
+        round_trip(timed, &golden(0x05, &tail));
+        let membership = ReplicatedRecord::Entry {
+            log_id: ID,
+            body: EntryBody::Membership(b"m"),
+        };
+        round_trip(membership, &golden(0x03, b"m"));
+    }
+
+    fn batch_payload(time: u64, batch: &[u8]) -> Vec<u8> {
+        let mut tail = time.to_le_bytes().to_vec();
+        tail.extend_from_slice(batch);
+        golden(0x05, &tail)
+    }
+
+    /// A batch's time is at most `2^63 - 1`: the largest round-trips, one
+    /// above it is refused, and so is a batch too short to hold a time.
+    #[test]
+    fn a_batch_time_above_the_largest_is_refused() {
+        let batch = TenantBatch::encode("acme", b"p").expect("batch");
+        let max = i64::MAX.unsigned_abs();
+        assert_eq!(BatchTime::MAX.nanos(), max);
+        for nanos in [0, 1, max] {
+            let time = BatchTime::from_nanos(nanos).expect("in range");
+            let record = ReplicatedRecord::Entry {
+                log_id: ID,
+                body: EntryBody::Batch {
+                    time,
+                    batch: &batch,
+                },
+            };
+            round_trip(record, &batch_payload(nanos, &batch));
+        }
+        for nanos in [max + 1, u64::MAX] {
+            assert_eq!(BatchTime::from_nanos(nanos), None);
+            let decoded = ReplicatedRecord::decode(&batch_payload(nanos, &batch)).map(|_| ());
+            let invalid = ReplicatedRecordError::InvalidBatchTime { found: nanos };
+            assert_eq!(decoded, Err(invalid), "{nanos}");
+        }
+        let short = golden(0x05, &[0; 7]);
+        let decoded = ReplicatedRecord::decode(&short).map(|_| ());
+        assert_eq!(decoded, Err(wrong_length(0x05, 24, 23)));
+    }
+
+    /// The untimed batch, tag `0x02`, is no longer read: it is refused as
+    /// an unknown tag is, whatever it holds (RFC 0065 §6.5).
+    #[test]
+    fn an_untimed_batch_is_refused() {
+        let batch = TenantBatch::encode("acme", b"proto").expect("batch");
+        for payload in [golden(0x02, &batch), golden(0x02, &[0, 0]), vec![0x02]] {
+            let decoded = ReplicatedRecord::decode(&payload).map(|_| ());
+            let unknown = ReplicatedRecordError::UnknownTag { found: 0x02 };
+            assert_eq!(decoded, Err(unknown), "{payload:02x?}");
+        }
+        let kind = FrameKind::ReplicatedEntry;
+        assert_eq!(tenant_batch_payload(kind, &golden(0x02, &batch)), None);
+    }
+
+    /// A time before the epoch is `0`, one past the largest is the
+    /// largest, and any other is its nanoseconds.
+    #[test]
+    fn a_batch_time_from_the_wall_clock_is_clamped() {
+        let epoch = SystemTime::UNIX_EPOCH;
+        let before = epoch.checked_sub(Duration::from_secs(1)).expect("before");
+        assert_eq!(BatchTime::from_system_time(before).nanos(), 0);
+        let at = epoch + Duration::from_nanos(1_700_000_000_123_456_789);
+        let time = BatchTime::from_system_time(at);
+        assert_eq!(time.nanos(), 1_700_000_000_123_456_789);
+        assert_eq!(time.system_time(), at);
+        let past = epoch + Duration::from_nanos(u64::MAX);
+        assert_eq!(BatchTime::from_system_time(past), BatchTime::MAX);
+    }
+
+    /// The largest batch payload makes a frame of exactly the frame cap.
+    #[test]
+    fn the_largest_batch_fills_one_frame() {
+        let protobuf = vec![0; ReplicatedRecord::MAX_ENTRY_PAYLOAD_BYTES - 6];
+        let batch = TenantBatch::encode("acme", &protobuf).expect("batch");
+        assert_eq!(batch.len(), ReplicatedRecord::MAX_ENTRY_PAYLOAD_BYTES);
+        let record = ReplicatedRecord::Entry {
+            log_id: ID,
+            body: EntryBody::Batch {
+                time: BatchTime::MAX,
+                batch: &batch,
+            },
+        };
+        let encoded = record.encode().expect("encode");
+        assert_eq!(encoded.len(), crate::MAX_FRAME_BYTES);
     }
 
     #[test]
@@ -673,6 +857,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded: tag 0x05 is the timed batch and 0x02 is refused (RFC 0065 §6.5, \
+                #1244); see malformed_payloads_and_untimed_batches_are_refused"]
     fn malformed_payloads_and_control_kinds_above_the_highest_are_refused() {
         let unknown = Control::HIGHEST_KIND + 1;
         let mut short_checkpoint = vec![0x02];
@@ -692,6 +878,50 @@ mod tests {
             (golden(0x01, &[0]), wrong_length(0x01, 16, 17)),
             (
                 golden(0x02, &[0, 0]),
+                ReplicatedRecordError::TenantBatch(TenantBatchError::EmptyTenant),
+            ),
+            (vec![0x04], wrong_length(0x04, 16, 0)),
+            (golden(0x04, &[]), wrong_length(0x04, 17, 16)),
+            (
+                golden(0x04, &[unknown]),
+                ReplicatedRecordError::UnknownControlKind { found: unknown },
+            ),
+            (golden(0x04, &[0x01; 16]), wrong_length(0x04, 33, 32)),
+            (golden(0x04, &[0x01; 18]), wrong_length(0x04, 33, 34)),
+            (golden(0x04, &short_checkpoint), wrong_length(0x04, 50, 49)),
+            (golden(0x04, &long_checkpoint), wrong_length(0x04, 50, 51)),
+        ];
+        for (payload, error) in refused {
+            let decoded = ReplicatedRecord::decode(&payload).map(|_| ());
+            assert_eq!(decoded, Err(error), "{payload:02x?}");
+        }
+    }
+
+    #[test]
+    fn malformed_payloads_and_untimed_batches_are_refused() {
+        let unknown = Control::HIGHEST_KIND + 1;
+        let mut short_checkpoint = vec![0x02];
+        short_checkpoint.extend_from_slice(&[0; 32]);
+        let mut long_checkpoint = short_checkpoint.clone();
+        long_checkpoint.extend_from_slice(&[0; 2]);
+        let refused = [
+            (vec![], ReplicatedRecordError::Empty),
+            (
+                vec![0x06],
+                ReplicatedRecordError::UnknownTag { found: 0x06 },
+            ),
+            (
+                golden(0x02, &[0, 0]),
+                ReplicatedRecordError::UnknownTag { found: 0x02 },
+            ),
+            (vec![0x11, 0], wrong_length(0x11, 0, 1)),
+            (vec![0x12, 0, 0], wrong_length(0x12, 16, 2)),
+            (golden(0x13, &[0]), wrong_length(0x13, 16, 17)),
+            (vec![0x01; 9], wrong_length(0x01, 16, 8)),
+            (golden(0x01, &[0]), wrong_length(0x01, 16, 17)),
+            (vec![0x05], wrong_length(0x05, 16, 0)),
+            (
+                golden(0x05, &[0; 10]),
                 ReplicatedRecordError::TenantBatch(TenantBatchError::EmptyTenant),
             ),
             (vec![0x04], wrong_length(0x04, 16, 0)),
@@ -961,7 +1191,10 @@ mod tests {
     fn a_malformed_normal_body_is_never_encoded() {
         let record = ReplicatedRecord::Entry {
             log_id: ID,
-            body: EntryBody::Normal(&[1]),
+            body: EntryBody::Batch {
+                time: BatchTime::default(),
+                batch: &[1],
+            },
         };
         assert!(matches!(
             record.encode(),
@@ -974,7 +1207,10 @@ mod tests {
         let batch = TenantBatch::encode("acme", b"p").expect("batch");
         let normal = ReplicatedRecord::Entry {
             log_id: ID,
-            body: EntryBody::Normal(&batch),
+            body: EntryBody::Batch {
+                time: BatchTime::MAX,
+                batch: &batch,
+            },
         }
         .encode()
         .expect("encode");
@@ -1005,7 +1241,10 @@ mod tests {
             let batch = TenantBatch::encode("t", &bytes).expect("batch");
             let record = match pick {
                 0 => ReplicatedRecord::Entry { log_id, body: EntryBody::Blank },
-                1 => ReplicatedRecord::Entry { log_id, body: EntryBody::Normal(&batch) },
+                1 => {
+                    let time = BatchTime::from_nanos(term >> 1).expect("below 2^63");
+                    ReplicatedRecord::Entry { log_id, body: EntryBody::Batch { time, batch: &batch } }
+                }
                 2 => ReplicatedRecord::Entry { log_id, body: EntryBody::Membership(&bytes) },
                 3 => ReplicatedRecord::TruncateAfter(Some(log_id)),
                 4 => ReplicatedRecord::TruncateAfter(None),

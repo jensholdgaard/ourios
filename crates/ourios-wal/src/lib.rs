@@ -65,8 +65,8 @@ pub use reclaim::{
     MAX_UNLINKS_PER_PASS_CEILING,
 };
 pub use replicated::{
-    Control, EntryBody, MinerConfigV1, RaftLogId, ReplicatedRecord, ReplicatedRecordError,
-    UpstreamTemplates,
+    BatchTime, Control, EntryBody, MinerConfigV1, RaftLogId, ReplicatedRecord,
+    ReplicatedRecordError, UpstreamTemplates,
 };
 pub use retain::{RetainFloor, SnapshotHorizons, TenantHorizon};
 use rotation::DirFsync;

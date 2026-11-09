@@ -94,7 +94,8 @@ fn export(marker: &str, credential: Option<&str>) -> Forwarded {
 /// How many of `log`'s entries carry `marker`.
 fn copies(log: &[Entry], marker: &str) -> usize {
     let carries = |e: &&Entry| match &e.payload {
-        openraft::EntryPayload::Normal(GroupEntry::Batch(batch)) => batch
+        openraft::EntryPayload::Normal(GroupEntry::Batch(timed)) => timed
+            .batch
             .as_bytes()
             .windows(marker.len())
             .any(|w| w == marker.as_bytes()),

@@ -1,12 +1,25 @@
 //! RFC 0065 — replicated WAL and a queryable tail, the config,
 //! served-binary and chart arms. See `docs/rfcs/0065-replicated-wal.md`
 //! §5 and §8. The in-process cluster arms are in `ourios-ingester`'s
-//! `tests/it/rfc0065_replicated_wal.rs`.
+//! `tests/it/rfc0065_replicated_wal/`.
 //!
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC is
 //! red; each names the slice that discharges it. RFC0065.1's layout arm is
 //! a unit test in `src/main.rs`: the replicated backend needs a store with
 //! conditional updates, and the local store these tests serve on has none.
+
+/// Scenario RFC0065.1 — the start arm. With `receiver.wal.backend:
+/// replicated` and every field set, the server starts; today
+/// `check_wal_backend` refuses it, as `only_the_local_wal_backend_starts`
+/// pins until the backend is wired.
+#[test]
+#[ignore = "RFC0065.1 stub — the start arm, implemented with the server wiring"]
+fn rfc0065_1_a_valid_replicated_config_starts() {
+    todo!(
+        "RFC0065.1 — a server configured with the replicated backend and every field set \
+         starts and serves its groups"
+    );
+}
 
 /// Scenario RFC0065.3 — crash recovery on the replicated backend (B2, B7).
 /// Given a three-node cluster ingesting steadily, when the acknowledging

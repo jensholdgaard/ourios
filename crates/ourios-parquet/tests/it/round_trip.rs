@@ -66,6 +66,7 @@ fn populated_record(ts_ns: u64, template_id: u64) -> MinedRecord {
         body: None,
         confidence: 0.875,
         lossy_flag: false,
+        ingest_position: None,
     }
 }
 
@@ -135,6 +136,7 @@ fn rfc0005_1_body_raw_bytes_round_trip() {
         body: Some("user 42 logged in from 10.0.0.1".to_string()),
         confidence: 0.0,
         lossy_flag: true,
+        ingest_position: None,
     };
 
     let partition = PartitionKey::derive(&rec).expect("derive");

@@ -68,6 +68,19 @@ pub struct Param {
     pub value: String,
 }
 
+/// Where a record sits in a replicated log (RFC 0065 §6.6): the log id
+/// of its group, the committed entry's `seq`, and the record's index in
+/// that entry's frame. A committed `seq` is never reused, so a position
+/// names one acknowledged record and is the dedup key across files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IngestPosition {
+    /// The log id allocated once per log incarnation, not the raw group
+    /// index.
+    pub group: u32,
+    pub seq: u64,
+    pub index: u32,
+}
+
 /// One row the miner emits per ingested line — RFC 0001 §6.1
 /// record schema.
 ///
@@ -182,6 +195,9 @@ pub struct MinedRecord {
     /// (next PR). The §6.3 lossy *zone* keeps this `false` even
     /// though body is retained.
     pub lossy_flag: bool,
+    /// Set only for records mined from a replicated log; `None` on the
+    /// local backend and in files written before RFC 0065.
+    pub ingest_position: Option<IngestPosition>,
 }
 
 /// Sink for mined records.
@@ -347,6 +363,7 @@ mod tests {
             body: None,
             confidence: 1.0,
             lossy_flag: false,
+            ingest_position: None,
         }
     }
 
@@ -377,6 +394,7 @@ mod tests {
             body: Some("malformed line".to_string()),
             confidence: 0.0,
             lossy_flag: true,
+            ingest_position: None,
         }
     }
 

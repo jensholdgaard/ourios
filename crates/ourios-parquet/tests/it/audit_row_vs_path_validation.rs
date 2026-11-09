@@ -69,6 +69,7 @@ fn partition_for(event: &AuditEvent) -> PartitionKey {
         body: None,
         confidence: 0.0,
         lossy_flag: false,
+        ingest_position: None,
     };
     PartitionKey::derive(&proxy).expect("derive")
 }

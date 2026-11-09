@@ -73,6 +73,7 @@ fn body_record(seed: usize) -> MinedRecord {
         body: Some(high_entropy_body(seed)),
         confidence: 0.5,
         lossy_flag: true, // body retained per §6.3 lossy-zone
+        ingest_position: None,
     }
 }
 
@@ -188,6 +189,7 @@ fn rfc0005_8_params_list_leaves_have_no_dictionary_encoding() {
             body: None,
             confidence: 1.0,
             lossy_flag: false,
+            ingest_position: None,
         })
         .collect();
 

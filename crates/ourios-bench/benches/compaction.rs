@@ -125,6 +125,7 @@ fn rec_sized(i: u64, body_bytes: usize) -> MinedRecord {
         body: (body_bytes > 0).then(|| high_entropy_body(i, body_bytes)),
         confidence: 1.0,
         lossy_flag: false,
+        ingest_position: None,
     }
 }
 

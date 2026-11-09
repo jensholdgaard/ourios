@@ -31,7 +31,7 @@ use arrow_array::builder::{
     GenericListBuilder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
     TimestampNanosecondBuilder, UInt8Builder, UInt32Builder, UInt64Builder,
 };
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{ArrowError, DataType, Field};
 use ourios_core::audit::ParamType;
 use ourios_core::otlp::KeyValue;
@@ -39,7 +39,7 @@ use ourios_core::record::{BodyKind, MinedRecord};
 
 use crate::partition::{TimestampOverflowError, effective_time_unix_nano};
 use crate::promoted::{self, PromotedAttributes};
-use crate::{columns, data_schema, data_schema_with_promoted};
+use crate::{columns, data_schema, data_schema_with_promoted, with_ingest_columns};
 
 /// Build an Arrow `RecordBatch` matching `data_schema()` from a
 /// slice of [`MinedRecord`]s.
@@ -54,12 +54,11 @@ use crate::{columns, data_schema, data_schema_with_promoted};
 ///   internal-bug-not-user-input signal, since the builders are
 ///   constructed against `data_schema()` directly).
 pub fn mined_records_to_batch(records: &[MinedRecord]) -> Result<RecordBatch, BatchError> {
-    let mut b = Builders::with_capacity(records.len());
-    for r in records {
-        b.append(r)?;
-    }
-    let arrays = b.finish();
-    RecordBatch::try_new(data_schema(), arrays).map_err(BatchError::Arrow)
+    let ingest = IngestColumns::of(records)?;
+    let mut arrays = base_columns(records)?;
+    arrays.extend(ingest_position_columns(records, ingest));
+    RecordBatch::try_new(with_ingest_columns(data_schema(), ingest), arrays)
+        .map_err(BatchError::Arrow)
 }
 
 /// [`mined_records_to_batch`] plus the RFC 0022 promoted attribute
@@ -77,11 +76,8 @@ pub fn mined_records_to_batch_with_promoted(
     records: &[MinedRecord],
     promoted: &PromotedAttributes,
 ) -> Result<RecordBatch, BatchError> {
-    let mut b = Builders::with_capacity(records.len());
-    for r in records {
-        b.append(r)?;
-    }
-    let mut arrays = b.finish();
+    let ingest = IngestColumns::of(records)?;
+    let mut arrays = base_columns(records)?;
     arrays.extend(project_promoted_columns(
         records,
         promoted.resource_keys(),
@@ -92,7 +88,79 @@ pub fn mined_records_to_batch_with_promoted(
         promoted.log_keys(),
         |r| r.attributes.as_slice(),
     ));
-    RecordBatch::try_new(data_schema_with_promoted(promoted), arrays).map_err(BatchError::Arrow)
+    arrays.extend(ingest_position_columns(records, ingest));
+    RecordBatch::try_new(
+        with_ingest_columns(data_schema_with_promoted(promoted), ingest),
+        arrays,
+    )
+    .map_err(BatchError::Arrow)
+}
+
+fn base_columns(records: &[MinedRecord]) -> Result<Vec<ArrayRef>, BatchError> {
+    let mut b = Builders::with_capacity(records.len());
+    for r in records {
+        b.append(r)?;
+    }
+    Ok(b.finish())
+}
+
+/// Whether a file carries the RFC 0065 §6.6 ingest-position columns.
+/// Records mined from a replicated log all carry a position; records on
+/// the local backend carry none, and their files have no such columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestColumns {
+    /// No `ingest_*` columns: the local backend and every file written
+    /// before RFC 0065.
+    Omitted,
+    /// `ingest_group`, `ingest_seq` and `ingest_index`, one value each
+    /// per row.
+    Written,
+}
+
+impl IngestColumns {
+    /// The layout `record` needs.
+    #[must_use]
+    pub fn for_record(record: &MinedRecord) -> Self {
+        match record.ingest_position {
+            Some(_) => Self::Written,
+            None => Self::Omitted,
+        }
+    }
+
+    /// The layout every record in `records` needs; an empty slice needs
+    /// no columns.
+    ///
+    /// # Errors
+    ///
+    /// [`BatchError::MixedIngestPositions`] when some records carry a
+    /// position and others do not. Writing that batch would leave the
+    /// unpositioned rows with `NULL` positions that compaction and the
+    /// tail merge could not deduplicate.
+    pub fn of(records: &[MinedRecord]) -> Result<Self, BatchError> {
+        let Some(first) = records.first() else {
+            return Ok(Self::Omitted);
+        };
+        let layout = Self::for_record(first);
+        match records.iter().position(|r| Self::for_record(r) != layout) {
+            Some(row_index) => Err(BatchError::MixedIngestPositions { row_index }),
+            None => Ok(layout),
+        }
+    }
+}
+
+/// The three ingest-position arrays for `records` under `ingest`, in
+/// [`crate::columns::INGEST_POSITION`] order; none when omitted.
+fn ingest_position_columns(records: &[MinedRecord], ingest: IngestColumns) -> Vec<ArrayRef> {
+    match ingest {
+        IngestColumns::Omitted => Vec::new(),
+        IngestColumns::Written => {
+            let positions = || records.iter().map(|r| r.ingest_position);
+            let group: UInt32Array = positions().map(|p| p.map(|p| p.group)).collect();
+            let seq: UInt64Array = positions().map(|p| p.map(|p| p.seq)).collect();
+            let index: UInt32Array = positions().map(|p| p.map(|p| p.index)).collect();
+            vec![Arc::new(group), Arc::new(seq), Arc::new(index)]
+        }
+    }
 }
 
 /// One promoted column under construction, dispatched by its key's
@@ -234,6 +302,11 @@ pub enum BatchError {
     /// at write time so the file never contains a row that
     /// would surface this corruption on read.
     MissingBodyForLossyString,
+    /// The batch mixes records with and without an RFC 0065 §6.6 ingest
+    /// position; `row_index` is the first record that disagrees with
+    /// record 0. A file either carries the position columns for every
+    /// row or has none.
+    MixedIngestPositions { row_index: usize },
     /// Arrow rejected the constructed `RecordBatch` (schema
     /// mismatch, column-length mismatch, etc.). Internal bug if
     /// it ever fires — the array builders are constructed against
@@ -282,6 +355,12 @@ impl fmt::Display for BatchError {
                  Absent on-disk contract as a NULL body cell — a producer bug, rejected \
                  rather than written",
             ),
+            Self::MixedIngestPositions { row_index } => write!(
+                f,
+                "record at index {row_index} disagrees with record 0 on carrying an ingest \
+                 position (RFC 0065 §6.6): a file has the position columns for every row or \
+                 none",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -300,6 +379,7 @@ impl BatchError {
             Self::NonNullBodyForAbsent => "non_null_body_for_absent",
             Self::InvalidSeparatorsForString { .. } => "invalid_separators_for_string",
             Self::MissingBodyForLossyString => "missing_body_for_lossy_string",
+            Self::MixedIngestPositions { .. } => "mixed_ingest_positions",
             Self::Arrow(_) => "arrow",
         }
     }
@@ -311,7 +391,8 @@ impl std::error::Error for BatchError {
             Self::TimestampOverflow { .. }
             | Self::InvalidSeparatorsForString { .. }
             | Self::MissingBodyForLossyString
-            | Self::NonNullBodyForAbsent => None,
+            | Self::NonNullBodyForAbsent
+            | Self::MixedIngestPositions { .. } => None,
             Self::AttributeEncode { source, .. } => Some(source),
             Self::Arrow(e) => Some(e),
         }
@@ -735,6 +816,7 @@ mod tests {
             body: None,
             confidence: 0.0,
             lossy_flag: false,
+            ingest_position: None,
         }
     }
 

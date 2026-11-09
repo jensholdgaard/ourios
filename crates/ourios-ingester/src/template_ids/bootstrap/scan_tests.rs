@@ -185,6 +185,7 @@ fn record(template_id: u64) -> MinedRecord {
         body: Some(format!("line {template_id}")),
         confidence: 1.0,
         lossy_flag: true,
+        ingest_position: None,
     }
 }
 

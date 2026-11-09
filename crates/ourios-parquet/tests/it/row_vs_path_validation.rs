@@ -41,6 +41,7 @@ fn lossy_record(tenant: &str, time_ns: u64, observed: Option<u64>) -> MinedRecor
         body: Some("placeholder".to_string()),
         confidence: 0.0,
         lossy_flag: true,
+        ingest_position: None,
     }
 }
 

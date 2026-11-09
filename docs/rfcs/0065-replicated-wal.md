@@ -34,7 +34,8 @@ superseded-by: —
 > `require_complete` request field (§6.7), adds a group variant to the miner snapshot's
 > high-water mark (RFC 0001 §6.9, `accepted`), and **amends RFC 0059
 > §3.5** (`green`): a start of any backend creates the template-id
-> high-water object only while `wal/log_ids.json` is absent (§6.5). It reuses RFC 0052's barrier and
+> high-water object only while holding `wal/log_ids.json`, which it
+> creates first (§6.5). It reuses RFC 0052's barrier and
 > checkpoint (`green`), RFC 0053's retryable rejection (`drafted`) and
 > RFC 0059's template-id allocation (`green`), whose reservations §6.7
 > moves into the log and scopes per group (coordinate with RFC 0059).
@@ -735,8 +736,10 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Given** `backend: local`
 > - **When** the RFC 0008, RFC 0014 and RFC 0052 suites run
 > - **Then** they pass unchanged, and written Parquet files have no
->   `ingest_*` columns; on a store without `wal/log_ids.json`, RFC
->   0059's bootstrap runs exactly as before
+>   `ingest_*` columns; the only new store object is `wal/log_ids.json`,
+>   written once, by the bootstrapping start or by the first seated
+>   start after the upgrade, and a seated local root whose create of it
+>   fails keeps running
 
 > **Scenario RFC0065.17 — the chart renders the replicated shape (B20, B21)**
 > - **Given** `receiver.wal.backend: replicated` and `receiver.replicas: 3`
@@ -978,10 +981,15 @@ the mass-failover time and vote-log batching as tuning signals.
 >   B has applied no block, neither A's leader nor B's bootstraps or
 >   appends a block, and no id A holds is reserved again; nor does a
 >   leader while the object's `reserved_through` is below its group's
->   latest block's `through`; and with that object deleted, a fresh
+>   latest block's `through`; with that object deleted, a fresh
 >   local-backend root starting on the same store finds `log_ids.json`
 >   present, does not re-create the object, and fails closed with
->   `HighWaterDeleted`
+>   `HighWaterDeleted`; a markerless local start that finished its
+>   empty-store scan and paused before creating the object, while a
+>   replicated start created `log_ids.json`, seeded, and a group applied
+>   `(0, 1000]`, and the object was then deleted, resumes without the
+>   lock and never re-creates it; and on a store seated before this
+>   amendment, the first start creates `log_ids.json` as seeded
 
 ## 6. Proposed design
 
@@ -1520,56 +1528,73 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   before the next block entry does so at the same log position on every
   replica, so the outcome (no id, body kept, as `id_reservation_failed`
   today) is still identical everywhere.
-- **The high-water object's bootstrap.** On this backend RFC 0059's
-  `miner/template_ids.v1.json` is created once per store, by one start,
-  before any log id exists, and its absence afterwards always means it
-  was deleted. `<bucket>/wal/log_ids.json` (§6.6) decides which start
-  that is. It is UTF-8 JSON:
+- **The high-water object's bootstrap.** RFC 0059's
+  `miner/template_ids.v1.json` is created once per store, by one start
+  of whichever backend, and its absence afterwards always means it was
+  deleted. `<bucket>/wal/log_ids.json` (§6.6) is the lock that decides
+  which start that is, and it comes before the object. It is UTF-8
+  JSON:
 
   ```json
   {"format": 1, "bootstrapper": "ourios-receiver-0", "seeded": false, "next": 0}
   ```
 
   `format` is `1`; `bootstrapper` is the `node_id` of the start that
-  created the object; `seeded` says whether the high-water object has
-  been made sure of; `next` is the next log id to allocate, a JSON
-  integer read as a `u32`. A reader takes it only with exactly these
-  fields and `format` `1`; any other object, or one that does not
-  parse, fails the start closed, and no node replaces it.
-  - A start that finds `log_ids.json` absent creates it with
-    `put_if_absent`, naming itself, `seeded` `false` and `next` `0`.
-    Only the start whose create succeeds bootstraps: if no
-    `template_ids.v<k>.json` exists, it runs RFC 0059 §3.5's bootstrap,
-    with that section's table, `restored_max = 0` and its own node's
-    `receiver.template_ids_allow_bootstrap`, and creates the object
-    with `put_if_absent`, going on with the object it finds if one is
-    present. It then sets `seeded` to `true` by `put_if_match`, and only
-    then are log ids allocated, by `put_if_match` on `next`.
-  - A start that loses the create, or finds `seeded` `false` under
-    another `node_id`, never bootstraps: it waits, reporting why, until
-    `seeded` is `true`. One that finds `seeded` `false` under its own
-    `node_id`, a bootstrapper that crashed between the two steps,
-    repeats them; that is safe because no log id, and so no group and
-    no reserved block, exists before `seeded`, and the object's create
-    is `put_if_absent`. A `node_id` runs one start at a time (the
-    StatefulSet's pod identity), so no paused start outlives its own
-    restart.
-  - A node that finds `log_ids.json` present never creates the object.
-    So a start that paused while the file was absent either created it,
-    and so bootstraps before any block exists, or lost the create and
-    never bootstraps, and a group whose leader finds the object absent
-    cannot have it re-created from a floor below ids another group
-    holds, whether or not its own group has applied a block.
-  - **Amends RFC 0059 §3.5 for every backend sharing the object.**
-    Every start that would run that section's bootstrap, a local
-    backend's included, first reads `log_ids.json`. If it is present,
-    readable or not, the start never creates the object: an absent
-    object is then the deletion of §9 Q6, and the start fails closed
-    with `HighWaterDeleted`, as a replicated start does. If it is
-    absent, RFC 0059 §3.5 runs unchanged, so a store no replicated node
-    has started on behaves exactly as before (RFC0065.16). Without
-    this, a fresh local root could re-create a deleted object at `0`
-    and reserve ids a replicated group holds unpublished.
+  created the file; `seeded` says whether the high-water object exists
+  under it; `next` is the next log id to allocate, a JSON integer read
+  as a `u32`, `0` on a store where none ever is. A reader takes it only
+  with exactly these fields and `format` `1`; any other object, or one
+  that does not parse, fails the start closed, and no node replaces it.
+  **This amends RFC 0059 §3.5 for every backend sharing the object**,
+  the local one included:
+  - **The lock comes first.** A start of any backend that would run RFC
+    0059 §3.5's bootstrap, the object being absent, first creates
+    `log_ids.json` with `put_if_absent`, naming itself, `seeded`
+    `false` and `next` `0`. Only the start whose create succeeds
+    bootstraps: it runs RFC 0059 §3.5 with that section's table and its
+    own node's `receiver.template_ids_allow_bootstrap`
+    (`restored_max = 0` on the replicated backend, whose groups hold no
+    id before a log id exists), creates the object with
+    `put_if_absent`, and then sets `seeded` to `true` by
+    `put_if_match`. Log ids are allocated, by `put_if_match` on `next`,
+    only once `seeded` is `true`. If the object turns out present at
+    its create, a replicated bootstrapper goes on with it and a local
+    one fails with `BootstrapRaceLost`, as RFC 0059 §3.4 case 4 does.
+  - **A present lock is never bootstrapped past.** A start of any
+    backend that finds `log_ids.json` present never creates the object.
+    With `seeded` `false` under another `node_id` it waits, reporting
+    why, until `seeded` is `true`; with `seeded` `true` and the object
+    absent, the object was deleted (§9 Q6), and it fails closed with
+    `HighWaterDeleted`. A start that paused anywhere before the object
+    exists either holds the lock, so it bootstraps before any log id or
+    block exists, or does not, so it never bootstraps: no start re-creates
+    a deleted object from a floor below ids a group holds, whether or
+    not that group has applied a block, and whether the paused start is
+    local or replicated.
+  - **A crash between the two steps.** A start that finds `seeded`
+    `false` under its own `node_id` is a bootstrapper that crashed
+    between the object and `seeded`. It repeats them, taking RFC 0059
+    §3.4's path for an object it finds present, and sets `seeded`. That
+    is safe because no log id, and so no group and no reserved block,
+    exists before `seeded`, and a `node_id` runs one start at a time
+    (the StatefulSet's pod identity), so no paused start outlives its
+    own restart.
+  - **A store seated before this amendment.** A start that finds the
+    object present and `log_ids.json` absent bootstraps nothing; it
+    creates `log_ids.json` with `put_if_absent`, naming itself, with
+    `seeded` `true`, since the object exists, and `next` `0`, and goes
+    on as RFC 0059 §3.4 says whether that create succeeds, loses to
+    another start's, or fails, which it reports and retries at its next
+    start. A seated local root therefore never needs the file to keep
+    running.
+  - **RFC 0059 §3.1's re-bootstrap.** On a store whose `log_ids.json`
+    has `next` `0`, no log id and so no replicated group exists, and
+    the quiesced re-bootstrap's step 2 removes that file with the
+    object and the markers, so a local-only store recovers exactly as
+    RFC 0059 describes. With `next` above `0` it does not (§9 Q6).
+
+  So a local-only store gains one small object, written once; its
+  mining, ids, snapshots and Parquet files are unchanged (RFC0065.16).
 
   Thereafter only the leader writes the object, reserving blocks (RFC
   0059 §3.2), and a group's latest applied id block (§6.1's record,
@@ -2253,10 +2278,11 @@ from rows.
   cluster on the in-memory store, with a failpoint between each pair of
   bundle puts and the store made unreachable across a tail replica's
   restart.
-- RFC0065.16: the existing suites, unchanged; RFC 0059's bootstrap
-  tests run on a store without `log_ids.json`, and one more case puts
-  the file on the store and checks a local start that finds the object
-  absent fails closed (RFC0065.31's cross-backend arm).
+- RFC0065.16: the existing suites, unchanged, with RFC 0059's
+  bootstrap tests also asserting the `log_ids.json` it writes first;
+  RFC0065.31's lock arms (a paused local start, a crashed
+  bootstrapper, a store seated before the amendment) on the in-memory
+  store with failpoints between the lock, the object and `seeded`.
 - RFC0065.17: `deploy/helm/render-tests.sh`.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process
   cluster (ack latency with and without tail load; tail throughput with
@@ -2298,13 +2324,15 @@ Q1 and Q2 are RFC 0064's (§7 there).
 
 - [ ] **Q6. How does a replicated group recover from a deleted or
   rolled-back high-water object?** RFC 0059 §3.1's quiesced
-  re-bootstrap removes every root's seated marker. On this backend the
-  object is created only before `log_ids.json` is seeded, and the
-  rollback check reads each group's latest applied id block, in its
-  log and snapshot record; no operator step removes either, so after a
-  deletion every group, and after a rollback every group with a block
-  above the object, appends no id block (§6.5) and its miner runs out
-  of ids until a recovery is defined. That recovery must floor the new
+  re-bootstrap removes every root's seated marker, and on a store
+  whose `log_ids.json` has `next` `0` also that file (§6.5). Once a log
+  id exists the file stays, so after a deletion no start of any backend
+  re-creates the object and each fails closed, and the rollback check
+  reads each group's latest applied id block, in its log and snapshot
+  record, which no operator step removes. So after a deletion every
+  group, and after a rollback every group with a block above the
+  object, appends no id block (§6.5) and its miner runs out of ids
+  until a recovery is defined. That recovery must floor the new
   object above every block any group's log or bundle holds, not only
   above the published ids.
 

@@ -5,12 +5,13 @@
 //! election, so frame kind `0x04` carries no node id. The node id is the
 //! replica's `UUIDv7` identity and the node data its `node_id`, so the
 //! group's membership pairs the two. The application data is a raw
-//! `TenantOtlpBatch` payload (§6.7) or a control entry (§6.5).
+//! `TenantOtlpBatch` payload with the leader's time (§6.5, §6.7) or a
+//! control entry (§6.5).
 
 use std::fmt;
 
 use ourios_wal::{
-    Control, MinerConfigV1, RaftLogId, TenantBatch, TenantBatchError, UpstreamTemplates,
+    BatchTime, Control, MinerConfigV1, RaftLogId, TenantBatch, TenantBatchError, UpstreamTemplates,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -87,11 +88,36 @@ impl fmt::Display for TenantBatchBytes {
     }
 }
 
+/// A tenant's batch and the leader's wall clock when it submitted it,
+/// which stamps every audit event mining the batch emits (RFC 0065 §6.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimedBatch {
+    #[serde(with = "batch_time")]
+    pub time: BatchTime,
+    pub batch: TenantBatchBytes,
+}
+
+mod batch_time {
+    use ourios_wal::BatchTime;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde's `with` passes a reference
+    pub fn serialize<S: Serializer>(time: &BatchTime, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(time.nanos())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BatchTime, D::Error> {
+        let nanos = u64::deserialize(deserializer)?;
+        BatchTime::from_nanos(nanos)
+            .ok_or_else(|| D::Error::custom(format!("batch time {nanos} is above 2^63 - 1")))
+    }
+}
+
 /// What a group's log entry applies: a tenant's batch, or a control entry
 /// the leader appends beside the batches (RFC 0065 §6.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupEntry {
-    Batch(TenantBatchBytes),
+    Batch(TimedBatch),
     Control(#[serde(with = "ControlDef")] Control),
 }
 
@@ -145,16 +171,26 @@ struct RaftLogIdDef {
     index: u64,
 }
 
+impl GroupEntry {
+    /// `batch`, stamped with `time`.
+    #[must_use]
+    pub fn batch(time: BatchTime, batch: TenantBatchBytes) -> Self {
+        Self::Batch(TimedBatch { time, batch })
+    }
+}
+
+/// A batch at the epoch, for tests that do not look at its time.
+#[cfg(test)]
 impl From<TenantBatchBytes> for GroupEntry {
     fn from(batch: TenantBatchBytes) -> Self {
-        Self::Batch(batch)
+        Self::batch(BatchTime::default(), batch)
     }
 }
 
 impl fmt::Display for GroupEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Batch(batch) => batch.fmt(f),
+            Self::Batch(timed) => timed.batch.fmt(f),
             Self::Control(Control::FlusherAssignment(replica)) => {
                 write!(f, "FlusherAssignment({})", Uuid::from_bytes(*replica))
             }
@@ -210,6 +246,25 @@ mod tests {
             Err(TenantBatchError::EmptyTenant)
         );
         assert!(serde_json::from_str::<TenantBatchBytes>("[0,0]").is_err());
+    }
+
+    /// A batch's time survives `serde`, and one above `2^63 - 1` does not
+    /// deserialise.
+    #[test]
+    fn a_timed_batch_round_trips_and_refuses_a_time_out_of_range() {
+        let batch = TenantBatchBytes::new(TenantBatch::encode("acme", b"p").expect("encode"))
+            .expect("valid");
+        let entry = GroupEntry::batch(BatchTime::MAX, batch);
+        let json = serde_json::to_string(&entry).expect("serialise");
+        assert_eq!(serde_json::from_str::<GroupEntry>(&json).ok(), Some(entry));
+        let above = json.replace(
+            &BatchTime::MAX.nanos().to_string(),
+            &(BatchTime::MAX.nanos() + 1).to_string(),
+        );
+        assert!(
+            serde_json::from_str::<GroupEntry>(&above).is_err(),
+            "{above}"
+        );
     }
 
     #[test]

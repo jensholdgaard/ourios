@@ -51,15 +51,15 @@ use super::gate::SyncGate;
 use super::snapshot_record::{
     self, GroupMinerConfig, GroupSnapshot, GroupState, IdBlock, SnapshotMeta,
 };
-use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes, TenantBatchBytes};
+use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes, TimedBatch};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
 
 /// What applying one entry changed for the group's miner.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppliedEvent {
-    /// A tenant's batch, owned.
-    Batch(TenantBatchBytes),
+    /// A tenant's batch and its time, owned.
+    Batch(TimedBatch),
     /// An id block the group applied; an ignored block emits nothing.
     IdBlock(IdBlock),
     /// The miner configuration in force from this entry.
@@ -526,7 +526,7 @@ mod tests {
     fn batch(index: u64) -> EntryResponder<RaftTypes> {
         let payload = ourios_wal::TenantBatch::encode("acme", b"p").expect("batch");
         let batch = super::super::types::TenantBatchBytes::new(payload).expect("valid");
-        entry(index, EntryPayload::Normal(GroupEntry::Batch(batch)))
+        entry(index, EntryPayload::Normal(GroupEntry::from(batch)))
     }
 
     async fn apply(sm: &mut GroupSm, entries: Vec<EntryResponder<RaftTypes>>) {
@@ -921,9 +921,12 @@ mod tests {
             .collect()
     }
 
-    fn batch_bytes() -> TenantBatchBytes {
+    fn batch_bytes() -> TimedBatch {
         let payload = ourios_wal::TenantBatch::encode("acme", b"p").expect("batch");
-        TenantBatchBytes::new(payload).expect("valid")
+        TimedBatch {
+            time: ourios_wal::BatchTime::default(),
+            batch: super::super::types::TenantBatchBytes::new(payload).expect("valid"),
+        }
     }
 
     /// A mining replica receives, in log order, each batch, flusher

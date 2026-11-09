@@ -17,7 +17,8 @@ superseded-by: —
 > config, served-binary and chart arms (RFC0065.1, .3, .11's latency
 > arm, .14's `require_complete` arms, .17) in `ourios-server`
 > (`tests/it/rfc0065_replicated_wal.rs`).
-> Specified 2026-11-02 (#1146). Tracks #1141 (option 2). It depends on
+> Specified 2026-11-02 (#1146) as #1141's option 2, and tracked by
+> #1254. It depends on
 > **RFC 0064** (`meta:`, `accepted` 2026-11-02, enacted 2026-11-03),
 > which states in `AGENTS.md` §3.4 what a replicated WAL must
 > guarantee. §3 states the required behaviour without
@@ -36,7 +37,7 @@ superseded-by: —
 > checkpoint (`green`), RFC 0053's retryable rejection (`drafted`) and
 > RFC 0059's template-id allocation (`green`), whose reservations §6.7
 > moves into the log and scopes per group (coordinate with RFC 0059).
-> It coordinates with RFC 0061 (`drafted`, PR #1135), whose request-size
+> It coordinates with RFC 0061 (`green`), whose request-size
 > limit bounds what `Forward` carries. RFC 0066 (the Kafka backend) is a
 > second backend that must meet the same §3.
 
@@ -852,6 +853,11 @@ the mass-failover time and vote-log batching as tuning signals.
 >   and a `formed.json` that does not parse, is truncated, has another
 >   `format` or `group`, or whose `node_id`s are not the group's voters,
 >   forms nothing
+> - **And** the recorded `formed.json` is format `2` and carries a log
+>   id allocated from `log_ids.json`, which every replica of the group
+>   writes as `ingest_group`; a recording voter killed between the
+>   allocation and its write records a later id on its next attempt and
+>   no id is recorded twice; and a format-`1` record forms nothing
 
 > **Scenario RFC0065.25 — a forced takeover reports its loss and reuses no position (B8, B13)**
 > - **Given** a group whose other two voters are lost for good, with
@@ -1024,6 +1030,12 @@ the mass-failover time and vote-log batching as tuning signals.
 >   appends a block, and no id A holds is reserved again; nor does a
 >   leader while the object's `reserved_through` is below its group's
 >   latest block's `through`
+> - **And** with batches applied before the group's first miner
+>   configuration, a checkpoint entry from the flusher whose cut has no
+>   configuration in force is ignored by every replica and purges
+>   nothing, the leader refuses its proposal as `stale`, and once the
+>   configuration applies every tail replica mines those batches, read
+>   back from the group's WAL, into the same rows
 
 > **Scenario RFC0065.32 — the flusher's proposals and reports reach the leader (B11)**
 > - **Given** a group with a flusher, a second tail replica, a former
@@ -1102,11 +1114,14 @@ the mass-failover time and vote-log batching as tuning signals.
   leader first commits a flusher-assignment entry naming a remaining
   tail replica that has mined through the commit point, and only then
   removes it, so a group is never without a flusher. A tail node that
-  restarts on an empty or unreadable `wal_root` answers `Identify` under
+  restarts on an empty `wal_root` answers `Identify` under
   a new UUID with an unchanged `node_id`: the leader adds the new UUID as
   a learner and removes the learner under the old one, which no node
   answers for any more, by the same rule, so a membership never holds
-  two learners with one `node_id` for longer than the handoff.
+  two learners with one `node_id` for longer than the handoff. A node
+  whose `wal_root` is unreadable, as opposed to empty, refuses to start
+  and reports why, so a disk fault never discards a replica's vote or
+  log; an operator who empties it makes it a new replica.
 - **A tenant belongs to one group**:
   `group = xxh3_64(tenant_bytes) mod groups`, where `xxh3_64` is
   XXH3's 64-bit variant with seed 0 and `tenant_bytes` are the tenant
@@ -1128,7 +1143,7 @@ the mass-failover time and vote-log batching as tuning signals.
   the group's Raft membership itself: each member's node data is its
   `node_id`, so membership pairs every UUID with the `node_id` it runs
   under, and it is replicated and persisted like any log entry. A node
-  whose `wal_root` is empty or unreadable joins as a new replica: it
+  whose `wal_root` is empty joins as a new replica: it
   answers the leader's `Identify` call with its new UUID under its
   `node_id` (§6.8); the leader, seeing a voter's `node_id` under a UUID
   the membership does not hold, adds it as a learner, waits until its
@@ -1145,10 +1160,13 @@ the mass-failover time and vote-log batching as tuning signals.
   is recorded in the bucket, so a group forms once. Only the group's
   first-ranked voter records it, and only while no record exists: it
   calls `Identify` on each of the group's other voters at its configured
-  address (§6.8) and, once every one has answered, writes
-  `<bucket>/wal/replicated/groups/<group>/formed.json`, the membership
-  as each voter's UUID paired with its `node_id`, with
-  `put_if_absent`. Every voter whose log for the group is empty reads
+  address (§6.8) and, once every one has answered, allocates the
+  group's log id (§6.6) and writes
+  `<bucket>/wal/replicated/groups/<group>/formed.json`, the log id and
+  the membership as each voter's UUID paired with its `node_id`, with
+  `put_if_absent`. A recording voter that fails between the allocation
+  and the write allocates again on its next attempt; the id it never
+  recorded is spent, never handed out again. Every voter whose log for the group is empty reads
   that object, at start and then until it exists, and initializes the
   group with exactly the membership it holds, if its own UUID is in it.
   They all initialize with one membership, so any original majority
@@ -1162,20 +1180,25 @@ the mass-failover time and vote-log batching as tuning signals.
   leader. The object is UTF-8 JSON:
 
   ```json
-  {"format": 1, "group": 3, "members": [
+  {"format": 2, "group": 3, "log": 7, "members": [
     {"node_id": "ourios-receiver-0", "replica": "0190d2a8-7c1e-7b3a-9f00-5e1c2d3a4b5c"},
     {"node_id": "ourios-receiver-2", "replica": "0190d2a8-91f4-7c02-8a11-0c9d8e7f6a5b"},
     {"node_id": "ourios-receiver-4", "replica": "0190d2a8-a3b7-7d4e-b622-1f2e3d4c5b6a"}]}
   ```
 
-  `format` is `1`; `group` is the group number; `members` holds one
+  `format` is `2`; `group` is the group number; `log` is the group's
+  log id, a JSON integer read as a `u32`; `members` holds one
   entry per voter of the group, sorted by `node_id` bytewise, each
   `replica` the lowercase hyphenated UUID that voter answered with. A
-  voter initializes from the object only if `format` is `1`, `group` is
+  voter initializes from the object only if `format` is `2`, `group` is
   the group it read it for, and the `node_id`s are exactly the group's
   voters under the recorded layout; any other object, or one that does
   not parse, it treats as unreadable: it does not initialize, and
   reports why, so a group never forms from a record it cannot trust.
+  Format `1`, which the first slice wrote without `log`, is refused
+  like any other: no deployment runs this backend. Every replica that
+  needs the group's log id, to write `ingest_group` or a bundle's key,
+  reads it from this object.
 - **Each replica keeps one RFC 0008 WAL per group** under
   `wal_root/groups/<group>/`, with RFC 0008's segments, fsync policy
   and CRCs unchanged, and its RFC 0052 reclaim sidecar sized for the
@@ -1514,8 +1537,14 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     flusher in force at the entry's own position and the cut is above
     the last applied checkpoint's, below the entry, the log id of an
     entry in its log, with the log's highest kind at the cut equal to
-    the body's; otherwise every replica ignores it alike, purging
-    nothing, as the leader's own check (above) already should. Applying
+    the body's, and a miner configuration in force at the cut;
+    otherwise every replica ignores it alike, purging
+    nothing, as the leader's own check (above) already should. The
+    configuration rule keeps a cut from passing batches applied before
+    the group's first configuration, which a miner cannot have mined
+    and the bundle has no place for; a miner waiting for that first
+    configuration reads them back from the group's WAL when it applies,
+    rather than holding them in memory. Applying
     it makes it the group's checkpoint and builds a snapshot **at the
     cut**, not at the last applied entry: its last log id is the cut,
     and it holds the group's membership, flusher and highest kind as
@@ -1867,10 +1896,12 @@ record.
   columns, and readers treat them as absent (RFC 0005 §3.9), so
   `AGENTS.md` §3.5 needs no migration.
 - **A log namespace in the group number.** `ingest_group` is not the raw
-  group index but a **log id** allocated once per log incarnation: the
-  first start of a cluster allocates one id per group from a counter in
-  `<bucket>/wal/log_ids.json` by compare-and-swap, and records the
-  mapping in `cluster.json`. RFC 0066 allocates one per (topic id,
+  group index but a **log id** allocated once per log incarnation: a
+  group's first-ranked voter allocates it from the counter in
+  `<bucket>/wal/log_ids.json` by compare-and-swap when it records the
+  group's first membership, and records it in the group's `formed.json`
+  (§6.1). `cluster.json` is written once per cluster and holds no
+  per-group state. RFC 0066 allocates one per (topic id,
   partition), using the broker's topic UUID, so a recreated topic gets
   new ids. Positions from different logs, backends or topic incarnations
   therefore never compare equal, and switching a tenant's backend or
@@ -1886,8 +1917,11 @@ record.
   rows above the checkpoint, so a sealed partition can still receive a
   duplicate, and only the columns let the next compaction remove it.
   The erasure rewrite (RFC 0009) carries them through.
-- **Never read by queries.** Selective scans prune without them, and
-  materialization projects them out; the spike found the record
+- **Never returned to users.** Selective scans prune without them, and
+  materialization projects them out. A query reads them only for
+  §6.7's dedup step: footer statistics to find the files whose
+  positions overlap, and the columns themselves in those files and the
+  tail rows they overlap. The spike found the record
   materializer reading the whole union schema, which the implementation
   must narrow.
 - **Compaction** (RFC 0009) keeps the first row of each
@@ -2360,8 +2394,9 @@ never count toward an ack (learners, under §4.3's shape).
      checkpoint it applied, and, for a checkpoint, that its cut is the
      log id of an entry in its log at or below its commit index, above
      the cut of the last checkpoint it applied and of every checkpoint
-     entry its log holds after that, and that its highest kind is the
-     log's at the cut, else `FAILED_PRECONDITION`, `stale`.
+     entry its log holds after that, that its highest kind is the
+     log's at the cut, and that a miner configuration is in force at
+     the cut, else `FAILED_PRECONDITION`, `stale`.
 
   The peer certificate admits the caller to the protocol, as for every
   peer call; it shows the caller is a cluster member, not which one,
@@ -2465,7 +2500,8 @@ never count toward an ack (learners, under §4.3's shape).
   checked against the OTel conventions first: per group, follower lag
   in entries, leadership changes, and the term (the fallback's epoch);
   with the fallback, also the in-sync set size and compare-and-swap
-  conflicts on the group record; forwarded exports;
+  conflicts on the group record; forwarded exports; flusher
+  assignments and control-kind holds, each by reason;
   tail calls, their latency and `tail_unavailable` responses; and H8's
   two detection signals, the dedup hit count and
   `bytes_stored / bytes_received` per tenant.
@@ -2526,13 +2562,18 @@ rest of this section.
 
 ### 6.11 Invariants and hazards
 
-- **§3.1–§3.3 (miner):** unchanged. Frames reach the miner whole and in
-  per-tenant order, on one node at a time.
+- **§3.1–§3.3 (miner):** the rules are unchanged. Frames reach each
+  tail replica's miner whole and in per-tenant order, and every tail
+  replica mines the same log under the configuration, id blocks and
+  audit time the log carries (§6.5), so they all produce the same rows
+  and audit events; only the flusher publishes them.
 - **§3.4 WAL-before-ack:** per RFC 0064 §3.1. Every replica's copy is an
-  RFC 0008 WAL with its fsync rules; the ack waits for the fsync on
-  every in-sync member; the floor is never breached; a replaced leader
-  is fenced.
-- **§3.5 schema:** one optional column; old files read unchanged.
+  RFC 0008 WAL with its fsync rules; the ack waits for the fsync on a
+  write quorum of the group's voters (B1: 2 of 3, 3 of 5), so on at
+  least two replicas; the quorum never degrades; a replaced leader is
+  fenced.
+- **§3.5 schema:** three optional columns (§6.6); old files read
+  unchanged.
 - **§3.6 object storage as truth:** group records, checkpoints,
   snapshots and the cluster layout live in the store. Local disk holds
   only the WAL above the checkpoint and caches derived from it (the
@@ -2541,7 +2582,8 @@ rest of this section.
 - **§3.7 tenancy:** the tenant is in every frame and every tail row.
 - **H3:** the batch window stays the knob; RFC0065.3 is this backend's
   crash test.
-- **H4:** unchanged; the leader flushes as a receiver does today.
+- **H4:** unchanged; the group's flusher writes files as a receiver
+  does today, with the same size and age triggers.
 - **H6:** the DSL is unchanged; the tail is a table under the same plan.
 - **H8:** live on this backend, met by §6.6.
 

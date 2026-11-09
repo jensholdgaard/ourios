@@ -210,7 +210,7 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "cr
 # The RFC0026.2 served-stack arm: serve `LogsServiceServer::with_interceptor`
 # over a local socket and drive it with a real tonic client, so the
 # metadata → interceptor → extension → handler handoff is covered end to end.
-tonic = { version = "=0.14.6", default-features = false, features = ["transport", "router", "channel", "tls-ring", "tls-connect-info"] }
+tonic = { version = "=0.14.9", default-features = false, features = ["transport", "router", "channel", "tls-ring", "tls-connect-info"] }
 tempfile = "=3.27.0"
 # RFC0059.7 (`tests/rfc0059_7_bootstrap_heap.rs`): testing-mode heap profiler
 # as the global allocator, so the bootstrap scan's peak heap is asserted in

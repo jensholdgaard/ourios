@@ -165,6 +165,15 @@ async fn a_forward_to_the_leader_commits_and_one_to_a_follower_names_it() {
     let log = cluster.node(leader).log(0).await;
     assert!(log.iter().any(|e| e.log_id.index == seq));
 
+    // The commit needs one follower's ack, not this one's, so it may not
+    // yet have heard from the leader it is to name.
+    cluster
+        .node(follower)
+        .raft(0)
+        .wait(Some(Duration::from_secs(10)))
+        .current_leader(cluster.id(leader), "the follower follows the leader")
+        .await
+        .expect("following");
     let at_follower = peers
         .forward(&name(cluster.id(follower)), request(), commit)
         .await;

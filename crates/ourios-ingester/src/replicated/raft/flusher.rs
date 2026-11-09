@@ -18,8 +18,15 @@
 //! The assignment is control kind `0x01`. While the log has never held it,
 //! the leader appends it only with no membership change in flight and once
 //! every member of its latest membership has answered `Identify` reading
-//! it (§6.8). [`Steward::pass`] runs the learner reconcile and this step in
-//! turn, so a membership change and a new kind are never proposed at once.
+//! it (§6.8). [`Steward::pass`] runs the learner reconcile, this step and
+//! the miner configuration's in turn, so a membership change and a new
+//! kind are never proposed at once.
+//!
+//! The leader appends a miner configuration entry, kind `0x04`, when
+//! neither its log after the snapshot nor the snapshot holds one, or when
+//! its own effective configuration differs from the one in force in a
+//! field other than the tree's shape (`miner_config::plan`), under the
+//! same kind gate.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -27,10 +34,12 @@ use std::time::{Duration, Instant};
 use openraft::Instant as _;
 use openraft::RaftMetrics;
 use openraft::async_runtime::WatchReceiver as _;
-use ourios_wal::Control;
+use ourios_config::MinerConfig;
+use ourios_wal::{Control, MinerConfigV1};
 
 use super::host::GroupRaft;
 use super::learners::{self, Changes, Group, Tail};
+use super::miner_config;
 use super::telemetry::{FlusherCounts, Meters};
 use super::types::{GroupEntry, NodeId, RaftTypes};
 
@@ -166,19 +175,33 @@ enum Gate {
     Deposed,
 }
 
+/// A control the leader plans to append.
+struct Planned<F> {
+    control: Control,
+    /// The highest kind the log held when the control was planned.
+    highest_kind: u8,
+    /// Plans the control again, after a kind gate round.
+    replan: F,
+}
+
 /// What one pass changed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Pass {
     pub learners: Changes,
     /// The replica a committed assignment now names.
     pub assigned: Option<NodeId>,
+    /// The miner configuration a committed entry now puts in force.
+    pub configured: Option<MinerConfigV1>,
 }
 
-/// A group's leader-side pass on this node: the learner reconcile, then
-/// the flusher.
+/// A group's leader-side pass on this node: the learner reconcile, the
+/// flusher, then the miner configuration.
 #[derive(Debug)]
 pub struct Steward {
     patience: Duration,
+    /// This node's own effective miner configuration, which it puts in
+    /// force while it leads (§6.5).
+    miner: MinerConfig,
     /// The term this node leads in, and when this node first saw itself
     /// leading it.
     led: Option<(u64, Instant)>,
@@ -187,11 +210,25 @@ pub struct Steward {
 
 impl Default for Steward {
     fn default() -> Self {
-        Self::with_patience(PATIENCE)
+        Self::new(MinerConfig::default())
     }
 }
 
 impl Steward {
+    /// A steward whose node's own effective miner configuration is
+    /// `miner`.
+    #[must_use]
+    pub fn new(miner: MinerConfig) -> Self {
+        Self::with_patience(PATIENCE).configured(miner)
+    }
+
+    /// This steward, with `miner` as its node's own effective miner
+    /// configuration.
+    #[must_use]
+    pub(crate) fn configured(self, miner: MinerConfig) -> Self {
+        Self { miner, ..self }
+    }
+
     /// A steward whose flusher patience is `patience`: [`PATIENCE`] but in
     /// tests.
     #[must_use]
@@ -204,70 +241,123 @@ impl Steward {
     pub(crate) fn counting(patience: Duration, counts: FlusherCounts) -> Self {
         Self {
             patience,
+            miner: MinerConfig::default(),
             led: None,
             counts,
         }
     }
 
     /// Reconcile `tail` as the group's learners ([`learners::reconcile`]),
-    /// then append a flusher assignment if [`plan`] gives one. Each step
+    /// append a flusher assignment if [`plan`] gives one, then a miner
+    /// configuration entry if `miner_config::plan` gives one. Each step
     /// changes nothing on a node that does not lead the group.
     ///
     /// # Errors
     ///
-    /// The membership change or the assignment the leader could not
-    /// commit; the next pass plans again from the log.
+    /// The membership change or the entry the leader could not commit;
+    /// the next pass plans again from the log.
     pub async fn pass(&mut self, group: Group<'_>, tail: Tail<'_>) -> Result<Pass, String> {
         let learners = learners::reconcile(group, tail).await?;
         let assigned = self.assign(group, tail).await?;
-        Ok(Pass { learners, assigned })
+        let configured = self.configure(group, tail).await?;
+        Ok(Pass {
+            learners,
+            assigned,
+            configured,
+        })
     }
 
     /// Append the assignment [`plan`] gives, held back while the log has
     /// never held its kind and not every member reads it.
     async fn assign(&mut self, group: Group<'_>, tail: Tail<'_>) -> Result<Option<NodeId>, String> {
-        let Some(chosen) = self.choose(group, tail) else {
+        let Some((chosen, highest_kind)) = self.choose(group, tail) else {
             return Ok(None);
         };
-        let Some(next) = self.admit(group, tail, chosen).await else {
-            return Ok(None);
+        let planned = Planned {
+            control: chosen.control(),
+            highest_kind,
+            // The round can outlast the patience, so the replica may no
+            // longer be healthy, or no longer the one to choose.
+            replan: |steward: &mut Self| {
+                let (again, _) = steward.choose(group, tail)?;
+                Some(again.control())
+            },
         };
-        group
-            .raft
-            .client_write(GroupEntry::Control(next.control()))
-            .await
-            .map_err(|e| e.to_string())?;
-        self.counts.assigned(group.log.group(), next.reason);
-        Ok(Some(next.replica))
+        if !self.admit(group, tail, planned).await {
+            return Ok(None);
+        }
+        propose(group, chosen.control()).await?;
+        self.counts.assigned(group.log.group(), chosen.reason);
+        Ok(Some(chosen.replica))
     }
 
-    /// `planned`, unless its kind is above `highest_kind`, the highest the
-    /// log holds: then only once every member reads it and the leader still
-    /// chooses its replica.
+    /// Append the miner configuration entry `miner_config::plan` gives,
+    /// held back as [`Self::assign`]'s assignment is. An entry appended and
+    /// not yet committed is the one in force to the next pass, so a pass
+    /// after this one appends none until the configuration changes.
+    async fn configure(
+        &mut self,
+        group: Group<'_>,
+        tail: Tail<'_>,
+    ) -> Result<Option<MinerConfigV1>, String> {
+        let Some((body, highest_kind)) = self.plan_config(group) else {
+            return Ok(None);
+        };
+        let planned = Planned {
+            control: Control::MinerConfig(body),
+            highest_kind,
+            // An entry appended during the round may have put another in
+            // force.
+            replan: |steward: &mut Self| {
+                let (again, _) = steward.plan_config(group)?;
+                Some(Control::MinerConfig(again))
+            },
+        };
+        if !self.admit(group, tail, planned).await {
+            return Ok(None);
+        }
+        propose(group, Control::MinerConfig(body)).await?;
+        Ok(Some(body))
+    }
+
+    /// Whether the leader may append `planned`'s control: at once when its
+    /// kind is at or below the highest the log holds, otherwise once every
+    /// member reads the kind and the leader still plans the control.
     async fn admit(
         &mut self,
         group: Group<'_>,
         tail: Tail<'_>,
-        (planned, highest_kind): (Assignment, u8),
-    ) -> Option<Assignment> {
-        let kind = planned.control().kind();
+        planned: Planned<impl FnOnce(&mut Self) -> Option<Control>>,
+    ) -> bool {
+        let Planned {
+            control,
+            highest_kind,
+            replan,
+        } = planned;
+        let kind = control.kind();
         if kind <= highest_kind {
-            return Some(planned);
+            return true;
         }
         let metrics = group.raft.metrics().borrow_watched().clone();
         match gate(group.raft, &metrics, tail, kind).await {
-            Gate::Reads => {}
+            Gate::Reads => replan(self) == Some(control),
             Gate::Held(hold) => {
                 self.counts.held(group.log.group(), hold);
-                return None;
+                false
             }
-            Gate::Deposed => return None,
+            Gate::Deposed => false,
         }
-        // The round can outlast the patience, so the replica may no longer
-        // be healthy, or no longer the one to choose.
-        self.choose(group, tail)
-            .map(|(chosen, _)| chosen)
-            .filter(|chosen| chosen.replica == planned.replica)
+    }
+
+    /// The miner configuration entry `miner_config::plan` gives over the
+    /// one in force, with the highest kind the log holds, if this node
+    /// leads the group.
+    fn plan_config(&mut self, group: Group<'_>) -> Option<(MinerConfigV1, u8)> {
+        let metrics = group.raft.metrics().borrow_watched().clone();
+        self.led_for(&metrics)?;
+        let controls = group.controls();
+        miner_config::plan(&self.miner, controls.miner_config.as_ref())
+            .map(|body| (body, controls.highest_kind))
     }
 
     /// The assignment [`plan`] gives from what the leader sees now, with the
@@ -297,6 +387,16 @@ impl Steward {
         };
         Some(since.elapsed())
     }
+}
+
+/// Append `control` to the group's log and wait for it to commit.
+async fn propose(group: Group<'_>, control: Control) -> Result<(), String> {
+    group
+        .raft
+        .client_write(GroupEntry::Control(control))
+        .await
+        .map(drop)
+        .map_err(|e| e.to_string())
 }
 
 /// The committed membership's learners, placed ones first in `placed`

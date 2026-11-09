@@ -653,6 +653,7 @@ impl MinerCluster {
             body: None,
             confidence: 0.0,
             lossy_flag: false,
+            ingest_position: None,
         }
     }
 

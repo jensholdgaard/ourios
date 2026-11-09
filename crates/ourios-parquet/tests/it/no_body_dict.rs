@@ -73,6 +73,7 @@ fn body_record(seed: usize) -> MinedRecord {
         body: Some(high_entropy_body(seed)),
         confidence: 0.5,
         lossy_flag: true, // body retained per §6.3 lossy-zone
+        ingest_position: None,
     }
 }
 
@@ -160,26 +161,6 @@ fn rfc0005_8_params_list_leaves_have_no_dictionary_encoding() {
     // grow the dictionary linearly.
     let records: Vec<MinedRecord> = (0..50)
         .map(|i| MinedRecord {
-            tenant_id: TenantId::new("tenant-x"),
-            template_id: 1,
-            template_version: 1,
-            severity_number: 9,
-            severity_text: None,
-            scope_name: None,
-            scope_version: None,
-            scope_attributes: Vec::new(),
-            resource_schema_url: None,
-            scope_schema_url: None,
-            time_unix_nano: 1_775_127_480_000_000_000,
-            observed_time_unix_nano: None,
-            attributes: Vec::new(),
-            dropped_attributes_count: 0,
-            resource_attributes: Vec::new(),
-            trace_id: None,
-            span_id: None,
-            flags: 0,
-            event_name: None,
-            body_kind: BodyKind::String,
             params: vec![Param {
                 type_tag: ParamType::Num,
                 value: format!("unique-param-value-{i}-padded-with-noise-{i:08}"),
@@ -188,6 +169,7 @@ fn rfc0005_8_params_list_leaves_have_no_dictionary_encoding() {
             body: None,
             confidence: 1.0,
             lossy_flag: false,
+            ..body_record(i)
         })
         .collect();
 

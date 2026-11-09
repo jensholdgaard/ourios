@@ -40,24 +40,25 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use arrow_schema::SchemaRef;
 use ourios_core::record::MinedRecord;
 use parquet::arrow::{ArrowSchemaConverter, ArrowWriter};
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::SortingColumn;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
 use uuid::Uuid;
 
-use crate::data_schema_with_promoted;
 use crate::parquet_io::{
     BufferedParquetWriter, ChunkError, ChunkSizing, WriteError, object_key, open_local_store,
     write_chunked,
 };
 use crate::partition::PartitionKey;
 use crate::promoted::PromotedAttributes;
-use crate::record_batch::{BatchError, mined_records_to_batch_with_promoted};
+use crate::record_batch::{BatchError, IngestColumns, mined_records_to_batch_with_promoted};
 use crate::store::Store;
+use crate::{data_schema_with_promoted, with_ingest_columns};
 
 /// RFC 0005 §3.5 — row-group rotation threshold for ingest-side files.
 /// The writer rotates a row group when `ArrowWriter::in_progress_size`
@@ -255,9 +256,30 @@ pub struct Writer {
     core: BufferedParquetWriter,
     partition: PartitionKey,
     flush_uuid: Uuid,
-    /// RFC 0022 promoted attribute set this writer projects; fixed at
-    /// open time (the declared schema embeds its columns).
+    /// The promoted set and ingest-position layout this writer declares;
+    /// fixed at open time (the declared schema embeds their columns).
+    columns: FileColumns,
+}
+
+/// The columns a data file declares beyond the RFC 0005 §3.2 base: the
+/// RFC 0022 promoted set and, for records mined from a replicated log,
+/// the RFC 0065 §6.6 ingest position.
+struct FileColumns {
     promoted: PromotedAttributes,
+    ingest: IngestColumns,
+}
+
+impl FileColumns {
+    fn local(promoted: PromotedAttributes) -> Self {
+        Self {
+            promoted,
+            ingest: IngestColumns::Omitted,
+        }
+    }
+
+    fn schema(&self) -> SchemaRef {
+        with_ingest_columns(data_schema_with_promoted(&self.promoted), self.ingest)
+    }
 }
 
 impl Writer {
@@ -362,7 +384,34 @@ impl Writer {
         zstd_level: i32,
         promoted: PromotedAttributes,
     ) -> Result<Self, WriterError> {
-        Self::open_in_inner(store, partition, zstd_level, promoted, None)
+        Self::open_in_inner(
+            store,
+            partition,
+            zstd_level,
+            FileColumns::local(promoted),
+            None,
+        )
+    }
+
+    /// Like [`Writer::open_in_with_promoted`] for records mined from a
+    /// replicated log: the file also declares the RFC 0065 §6.6
+    /// `ingest_group`, `ingest_seq` and `ingest_index` columns, and every
+    /// appended record must carry an ingest position.
+    ///
+    /// # Errors
+    ///
+    /// See [`Writer::open_in_with_zstd_level`].
+    pub fn open_in_with_ingest_positions(
+        store: &Store,
+        partition: PartitionKey,
+        zstd_level: i32,
+        promoted: PromotedAttributes,
+    ) -> Result<Self, WriterError> {
+        let columns = FileColumns {
+            promoted,
+            ingest: IngestColumns::Written,
+        };
+        Self::open_in_inner(store, partition, zstd_level, columns, None)
     }
 
     /// Open a **compacted-output** writer for `partition` (RFC 0036):
@@ -387,7 +436,13 @@ impl Writer {
         promoted: PromotedAttributes,
         output: CompactedOutput,
     ) -> Result<Self, WriterError> {
-        Self::open_in_inner(store, partition, DEFAULT_ZSTD_LEVEL, promoted, Some(output))
+        Self::open_in_inner(
+            store,
+            partition,
+            DEFAULT_ZSTD_LEVEL,
+            FileColumns::local(promoted),
+            Some(output),
+        )
     }
 
     /// Shared body of [`Writer::open_in_with_promoted`] (ingest layout,
@@ -397,7 +452,7 @@ impl Writer {
         store: &Store,
         partition: PartitionKey,
         zstd_level: i32,
-        promoted: PromotedAttributes,
+        columns: FileColumns,
         compacted: Option<CompactedOutput>,
     ) -> Result<Self, WriterError> {
         // Validate the codec level up front so invalid input fails fast. The
@@ -421,7 +476,7 @@ impl Writer {
 
         let (sorting, flush_bytes) = match compacted {
             Some(output) => (
-                Some(sorting_columns(output.keys, &promoted)?),
+                Some(sorting_columns(output.keys, &columns.promoted)?),
                 // Precedence (§3.3): explicit override > env override >
                 // adaptive. The positivity filter guards a 0 override, which
                 // would make `in_progress_size() >= flush_bytes` always true
@@ -436,11 +491,11 @@ impl Writer {
             ),
             None => (None, ROW_GROUP_FLUSH_BYTES),
         };
-        let props = writer_properties(zstd, &promoted, sorting);
+        let props = writer_properties(zstd, &columns.promoted, sorting);
         let core = BufferedParquetWriter::open::<WriterError>(
             store,
             key,
-            data_schema_with_promoted(&promoted),
+            columns.schema(),
             props,
             flush_bytes,
         )?;
@@ -449,7 +504,7 @@ impl Writer {
             core,
             partition,
             flush_uuid,
-            promoted,
+            columns,
         })
     }
 
@@ -500,6 +555,10 @@ impl Writer {
     ///   partition (per §3.4's time-fallback algorithm) disagrees
     ///   with the writer's `partition`. Pre-checked across the
     ///   whole slice before any `inner.write`. **Non-poisoning**.
+    /// - [`WriterError::IngestColumnsMismatch`] when a record's ingest
+    ///   position disagrees with the layout the writer was opened with
+    ///   (RFC 0065 §6.6). Pre-checked like `PartitionMismatch`.
+    ///   **Non-poisoning**.
     /// - [`WriterError::Batch`] when `RecordBatch` construction
     ///   fails (timestamp overflow per RFC 0005 §3.2, or Arrow
     ///   internal error). **Non-poisoning**, but earlier chunks
@@ -545,6 +604,16 @@ impl Writer {
                 });
             }
         }
+        let declared = self.columns.ingest;
+        if let Some(row_index) = records
+            .iter()
+            .position(|r| IngestColumns::for_record(r) != declared)
+        {
+            return Err(WriterError::IngestColumnsMismatch {
+                row_index,
+                declared,
+            });
+        }
         // The core poisons itself on Parquet errors only — `Batch`
         // errors come from `mined_records_to_batch`, which runs on a
         // single chunk and doesn't touch the buffer itself; the
@@ -553,7 +622,7 @@ impl Writer {
         // already-written rows from this same call). Either way a
         // follow-up `append_records` is safe — the contract is
         // "writer remains usable", not "no rows persisted".
-        let promoted = &self.promoted;
+        let promoted = &self.columns.promoted;
         self.core.append_observed(
             records,
             SUB_BATCH_ROWS,
@@ -693,6 +762,15 @@ pub enum WriterError {
         /// The partition derived from the offending record.
         actual: PartitionKey,
     },
+    /// A record carries an RFC 0065 §6.6 ingest position and the writer
+    /// was opened without the position columns, or the reverse. The
+    /// declared schema is fixed at open, so the row cannot be written.
+    IngestColumnsMismatch {
+        /// Zero-based index into the batch slice.
+        row_index: usize,
+        /// The layout the writer was opened with.
+        declared: IngestColumns,
+    },
     /// A prior [`Writer::append_records`] returned a `Parquet`
     /// error, leaving the underlying writer's buffer in an
     /// undefined state. [`Writer::close`] refuses to publish to
@@ -731,6 +809,14 @@ impl fmt::Display for WriterError {
                 expected.day,
                 expected.hour,
             ),
+            Self::IngestColumnsMismatch {
+                row_index,
+                declared,
+            } => write!(
+                f,
+                "record at index {row_index} does not match the writer's ingest-position \
+                 layout {declared:?} (RFC 0065 §6.6)",
+            ),
             Self::Poisoned => write!(
                 f,
                 "Writer is poisoned — a prior append_records failed with a Parquet error, \
@@ -748,7 +834,9 @@ impl std::error::Error for WriterError {
             Self::Io { source, .. } => Some(source),
             Self::Parquet(e) => Some(e),
             Self::Batch(e) => Some(e),
-            Self::PartitionMismatch { .. } | Self::Poisoned => None,
+            Self::PartitionMismatch { .. }
+            | Self::IngestColumnsMismatch { .. }
+            | Self::Poisoned => None,
         }
     }
 }
@@ -845,9 +933,10 @@ pub fn encode_records_to_parquet_with_promoted(
 ) -> Result<Vec<u8>, WriterError> {
     let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
     let props = writer_properties(zstd, promoted, None);
+    let ingest = IngestColumns::of(records).map_err(WriterError::Batch)?;
+    let schema = with_ingest_columns(data_schema_with_promoted(promoted), ingest);
     let mut writer =
-        ArrowWriter::try_new(Vec::new(), data_schema_with_promoted(promoted), Some(props))
-            .map_err(WriterError::Parquet)?;
+        ArrowWriter::try_new(Vec::new(), schema, Some(props)).map_err(WriterError::Parquet)?;
     // §3.5 row-group sizing rides the shared chunk loop (the same
     // guard as `Writer::append_records`); the row count is unused —
     // the one-shot API reports bytes, not rows.
@@ -1018,7 +1107,23 @@ fn writer_properties(
         builder = builder.set_column_bloom_filter_enabled(path, true);
     }
 
-    builder.build()
+    ingest_position_properties(builder).build()
+}
+
+/// RFC 0065 §6.6: the ingest-position columns are written with
+/// dictionary encoding off and `DELTA_BINARY_PACKED` (every position is
+/// unique, so a dictionary only grows the file). They keep the global
+/// statistics, whose per-row-group `ingest_seq` min/max is what the
+/// querier's overlap test and compaction read. A file without the
+/// columns ignores these settings.
+fn ingest_position_properties(mut builder: WriterPropertiesBuilder) -> WriterPropertiesBuilder {
+    for column in crate::columns::INGEST_POSITION {
+        let path = ColumnPath::new(vec![column.to_string()]);
+        builder = builder
+            .set_column_dictionary_enabled(path.clone(), false)
+            .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
+    }
+    builder
 }
 
 #[cfg(test)]
@@ -1062,6 +1167,7 @@ mod tests {
             body: None,
             confidence: 1.0,
             lossy_flag: false,
+            ingest_position: None,
         }
     }
 

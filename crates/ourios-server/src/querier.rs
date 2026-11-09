@@ -1642,6 +1642,7 @@ mod tests {
             body: Some(String::new()),
             confidence: 0.0,
             lossy_flag: true,
+            ingest_position: None,
         }
     }
 

@@ -45,6 +45,7 @@ fn rec(trace_id: Option<[u8; 16]>, span_id: Option<[u8; 8]>) -> MinedRecord {
         body: None,
         confidence: 1.0,
         lossy_flag: false,
+        ingest_position: None,
     }
 }
 

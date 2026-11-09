@@ -498,7 +498,8 @@ async fn a_membership_change_in_flight_holds_back_each_new_kind() {
         )
         .await
         .expect("committed");
-    let appended = pass(&mut steward, &cluster, leader, &first).await;
+    let both = [placed[0].as_str(), placed[1].as_str()];
+    let appended = pass(&mut steward, &cluster, leader, &both).await;
     assert_eq!(appended.assigned, Some(cluster.id(order[0])));
     assert!(appended.configured.is_some(), "the configuration held back");
     cluster.shutdown().await;

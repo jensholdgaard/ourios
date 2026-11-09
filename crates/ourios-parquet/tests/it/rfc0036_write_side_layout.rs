@@ -74,6 +74,7 @@ fn rec(service: &str, ts_ns: u64, id: u64, payload: String) -> MinedRecord {
         body: Some(payload),
         confidence: 1.0,
         lossy_flag: false,
+        ingest_position: None,
     }
 }
 

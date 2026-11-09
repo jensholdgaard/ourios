@@ -311,6 +311,7 @@ mod tests {
             body: None,
             confidence: 1.0,
             lossy_flag: false,
+            ingest_position: None,
         }
     }
 

@@ -47,8 +47,8 @@ fn fixture_path() -> std::path::PathBuf {
 /// attributes), a structured body carrying Ourios-canonical JSON with a
 /// proto3 non-finite double string form (RFC 0018 §3.4), a parse-failure
 /// row (retained body, no template), and a minimal row (absent optionals).
-fn fixture_records() -> Vec<MinedRecord> {
-    let kv = |k: &str, v: &str| ourios_core::otlp::KeyValue {
+fn kv(k: &str, v: &str) -> ourios_core::otlp::KeyValue {
+    ourios_core::otlp::KeyValue {
         key: k.to_owned(),
         value: Some(ourios_core::otlp::AnyValue {
             value: Some(ourios_core::otlp::any_value::Value::StringValue(
@@ -56,7 +56,10 @@ fn fixture_records() -> Vec<MinedRecord> {
             )),
         }),
         ..Default::default()
-    };
+    }
+}
+
+fn fixture_records() -> Vec<MinedRecord> {
     let base = MinedRecord {
         tenant_id: TenantId::new("rfc0021"),
         template_id: 7,
@@ -86,6 +89,7 @@ fn fixture_records() -> Vec<MinedRecord> {
         body: None,
         confidence: 1.0,
         lossy_flag: false,
+        ingest_position: None,
     };
 
     let structured = MinedRecord {

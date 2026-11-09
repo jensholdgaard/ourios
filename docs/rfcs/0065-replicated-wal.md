@@ -2390,11 +2390,13 @@ never count toward an ack (learners, under §4.3's shape).
   checkpoint, whose blocks the flusher has since mined and whose
   entries the purge removed, is refused rather than counted short, and
   a repeated report counts the blocks the first appended and appends
-  none. The leader handles one report per group at a time: it counts,
-  reserves and appends under the group's refill lock, and the next
-  report waits until that append is in its log, so two reports that
-  overlap, a retry after a timeout among them, each count the other's
-  block. The count needs nothing persisted beyond
+  none. The leader handles one report per group at a time: under the
+  group's refill lock it runs check 5, counts, reserves and appends,
+  and the next report waits until that append is in its log, so two
+  reports that overlap, a retry after a timeout among them, each count
+  the other's block. A purge of the group's log takes the same lock,
+  so check 5 and the count see one log and no checkpoint removes a
+  block between them. The count needs nothing persisted beyond
   the bundle's pending blocks; the snapshot record keeps only the
   latest block, so the leader could not count pending ones itself
   without a new record field. With the store unreachable it reserves

@@ -113,6 +113,16 @@
     },
     {
       "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "rsa"
+      ],
+      "allowedVersions": "<0.10.0",
+      "description": "Hold rsa at 0.9.x. The dev-dependency in ourios-core and ourios-serving mints the RSA test fixture key and is pinned to the rsa jsonwebtoken 10's rust_crypto backend already pulls in (0.9). rsa 0.10 drops the pem feature those pins enable, so the bump fails resolution (Renovate PR #1229's plan failure), and it moves to the rand_core 0.10-era RustCrypto stack the rand 0.8 hold above cannot feed. Lift together with the p256 and rand holds when jsonwebtoken moves to that stack; run cargo tree -i rsa first."
+    },
+    {
+      "matchManagers": [
         "helm-values"
       ],
       "pinDigests": false,

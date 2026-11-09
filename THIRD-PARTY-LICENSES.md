@@ -19,10 +19,10 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 370 |
-| `MIT` | 77 |
+| `Apache-2.0` | 371 |
+| `MIT` | 76 |
 | `Unicode-3.0` | 19 |
-| `BSD-3-Clause` | 10 |
+| `BSD-3-Clause` | 12 |
 | `ISC` | 4 |
 | `Zlib` | 3 |
 | `CDLA-Permissive-2.0` | 2 |
@@ -474,6 +474,7 @@ Used by:
 - `arrow-row` 59.2.0 — <https://github.com/apache/arrow-rs>
 - `arrow-string` 59.2.0 — <https://github.com/apache/arrow-rs>
 - `arrow` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `crc32c` 0.6.9 — <https://github.com/zowens/crc32c>
 - `encoding_rs` 0.8.42 — <https://github.com/hsivonen/encoding_rs>
 - `multiversion_no_op` 1.0.0 — <https://github.com/hsivonen/multiversion_no_op>
 - `sse-stream` 0.2.6 — <https://github.com/4t145/sse-stream/>
@@ -1410,6 +1411,7 @@ Used by:
 - `windows-result` 0.4.1 — <https://github.com/microsoft/windows-rs>
 - `windows-strings` 0.5.1 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.52.0 — <https://github.com/microsoft/windows-rs>
+- `windows-sys` 0.59.0 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.61.2 — <https://github.com/microsoft/windows-rs>
 - `windows-targets` 0.52.6 — <https://github.com/microsoft/windows-rs>
 - `windows_aarch64_gnullvm` 0.52.6 — <https://github.com/microsoft/windows-rs>
@@ -5154,7 +5156,7 @@ Used by:
 - `fastrand` 2.4.1 — <https://github.com/smol-rs/fastrand>
 - `find-msvc-tools` 0.1.9 — <https://github.com/rust-lang/cc-rs>
 - `fixedbitset` 0.5.7 — <https://github.com/petgraph/fixedbitset>
-- `flate2` 1.1.10 — <https://github.com/rust-lang/flate2-rs>
+- `flate2` 1.1.11 — <https://github.com/rust-lang/flate2-rs>
 - `fnv` 1.0.7 — <https://github.com/servo/rust-fnv>
 - `form_urlencoded` 1.2.2 — <https://github.com/servo/rust-url>
 - `glob` 0.3.3 — <https://github.com/rust-lang/glob>
@@ -5169,6 +5171,7 @@ Used by:
 - `idna` 1.1.0 — <https://github.com/servo/rust-url/>
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
+- `itertools` 0.13.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.15.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
@@ -5202,7 +5205,7 @@ Used by:
 - `regex` 1.13.1 — <https://github.com/rust-lang/regex>
 - `ring` 0.17.14 — <https://github.com/briansmith/ring>
 - `rustc_version` 0.4.1 — <https://github.com/djc/rustc-version-rs>
-- `rustix` 1.1.5 — <https://github.com/bytecodealliance/rustix>
+- `rustix` 1.1.6 — <https://github.com/bytecodealliance/rustix>
 - `rustls-native-certs` 0.8.4 — <https://github.com/rustls/rustls-native-certs>
 - `rustls` 0.23.46 — <https://github.com/rustls/rustls>
 - `rusty-fork` 0.3.1 — <https://github.com/altsysrq/rusty-fork>
@@ -5220,7 +5223,7 @@ Used by:
 - `unicode-width` 0.2.2 — <https://github.com/unicode-rs/unicode-width>
 - `unicode-xid` 0.2.6 — <https://github.com/unicode-rs/unicode-xid>
 - `url` 2.5.8 — <https://github.com/servo/rust-url>
-- `uuid` 1.28.0 — <https://github.com/uuid-rs/uuid>
+- `uuid` 1.29.2 — <https://github.com/uuid-rs/uuid>
 - `validit` 0.2.6 — <https://github.com/drmingdrmer/validit>
 - `version_check` 0.9.5 — <https://github.com/SergioBenitez/version_check>
 - `wait-timeout` 0.2.1 — <https://github.com/alexcrichton/wait-timeout>
@@ -6130,7 +6133,7 @@ Used by:
 - `primeorder` 0.13.6 — <https://github.com/RustCrypto/elliptic-curves/tree/master/primeorder>
 - `sec1` 0.7.3 — <https://github.com/RustCrypto/formats/tree/master/sec1>
 - `sha2` 0.10.9 — <https://github.com/RustCrypto/hashes>
-- `sha2` 0.11.0 — <https://github.com/RustCrypto/hashes>
+- `sha2` 0.11.1 — <https://github.com/RustCrypto/hashes>
 - `signature` 2.2.0 — <https://github.com/RustCrypto/traits/tree/master/signature>
 - `spki` 0.7.3 — <https://github.com/RustCrypto/formats/tree/master/spki>
 
@@ -7229,7 +7232,6 @@ Used by:
 - `blake3` 1.8.7 — <https://github.com/BLAKE3-team/BLAKE3>
 - `const-hex` 1.19.1 — <https://github.com/danipopes/const-hex>
 - `constant_time_eq` 0.4.2 — <https://github.com/cesarb/constant_time_eq>
-- `crc32c` 0.6.8 — <https://github.com/zowens/crc32c>
 - `dyn-clone` 1.0.20 — <https://github.com/dtolnay/dyn-clone>
 - `fiat-crypto` 0.2.9 — <https://github.com/mit-plv/fiat-crypto>
 - `flatbuffers` 25.12.19 — <https://github.com/google/flatbuffers>
@@ -7240,7 +7242,7 @@ Used by:
 - `jni-macros` 0.22.4 — <https://github.com/jni-rs/jni-rs>
 - `jni-sys-macros` 0.4.1 — <https://github.com/jni-rs/jni-sys>
 - `jni` 0.22.4 — <https://github.com/jni-rs/jni-rs>
-- `libc` 0.2.190 — <https://github.com/rust-lang/libc>
+- `libc` 0.2.191 — <https://github.com/rust-lang/libc>
 - `miniz_oxide` 0.9.1 — <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide>
 - `num-conv` 0.2.2 — <https://github.com/jhpratt/num-conv>
 - `opentelemetry-appender-tracing` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-appender-tracing>
@@ -7292,7 +7294,6 @@ Used by:
 - `unicode-ident` 1.0.24 — <https://github.com/dtolnay/unicode-ident>
 - `utf8parse` 0.2.2 — <https://github.com/alacritty/vte>
 - `wasm-streams` 0.4.2 — <https://github.com/MattiasBuelens/wasm-streams/>
-- `zstd-safe` 7.2.4 — <https://github.com/gyscos/zstd-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -8165,7 +8166,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
+- `zstd-safe` 7.4.0 — <https://github.com/gyscos/zstd-rs>
 - `zstd-sys` 2.1.2+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
+- `zstd` 0.13.4 — <https://github.com/gyscos/zstd-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -8764,6 +8767,76 @@ third-party/chromium/LICENSE.
 
 Used by:
 
+- `tonic-prost` 0.14.9 — <https://github.com/grpc/grpc-rust>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
+//! Prost codec implementation for tonic.
+//!
+//! This crate provides the [`ProstCodec`] for encoding and decoding protobuf
+//! messages using the [`prost`] library.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use tonic_prost::ProstCodec;
+//!
+//! let codec = ProstCodec::<Message, Message>::default();
+//! ```
+
+#![warn(
+    missing_docs,
+    missing_debug_implementations,
+    rust_2018_idioms,
+    unreachable_pub
+)]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/tokio-rs/website/master/public/img/icons/tonic.svg"
+)]
+#![doc(html_root_url = "https://docs.rs/tonic-prost/0.13.1")]
+#![doc(issue_tracker_base_url = "https://github.com/grpc/grpc-rust/issues/")]
+
+mod codec;
+
+pub use codec::{ProstCodec, ProstDecoder, ProstEncoder};
+
+// Re-export prost types that users might need
+pub use prost;
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
 - `brotli` 8.0.4 — <https://github.com/dropbox/rust-brotli>
 
 <details>
@@ -9350,13 +9423,13 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `http-body` 1.0.1 — <https://github.com/hyperium/http-body>
+- `http-body-util` 0.1.3 — <https://github.com/hyperium/http-body>
 
 <details>
 <summary>Full license text</summary>
 
 ```text
-Copyright (c) 2019-2024 Sean McArthur & Hyper Contributors
+Copyright (c) 2019-2025 Sean McArthur & Hyper Contributors
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -9390,13 +9463,13 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `http-body-util` 0.1.3 — <https://github.com/hyperium/http-body>
+- `http-body` 1.1.0 — <https://github.com/hyperium/http-body>
 
 <details>
 <summary>Full license text</summary>
 
 ```text
-Copyright (c) 2019-2025 Sean McArthur & Hyper Contributors
+Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -9464,14 +9537,36 @@ THE SOFTWARE.
 
 Used by:
 
-- `tonic-types` 0.14.6 — <https://github.com/hyperium/tonic>
-- `tonic` 0.14.6 — <https://github.com/hyperium/tonic>
+- `synstructure` 0.13.2 — <https://github.com/mystor/synstructure>
 
 <details>
 <summary>Full license text</summary>
 
 ```text
-Copyright (c) 2025 Lucio Franco
+Copyright 2016 Nika Layzell
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
+- `tonic-types` 0.14.9 — <https://github.com/grpc/grpc-rust>
+- `tonic` 0.14.9 — <https://github.com/grpc/grpc-rust>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+Copyright 2019 gRPC authors.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9490,28 +9585,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
-```
-
-</details>
-
-### MIT License (`MIT`)
-
-Used by:
-
-- `synstructure` 0.13.2 — <https://github.com/mystor/synstructure>
-
-<details>
-<summary>Full license text</summary>
-
-```text
-Copyright 2016 Nika Layzell
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -9667,8 +9740,8 @@ SOFTWARE.
 
 Used by:
 
-- `schemars` 1.2.2 — <https://github.com/GREsau/schemars>
-- `schemars_derive` 1.2.2 — <https://github.com/GREsau/schemars>
+- `schemars` 1.2.3 — <https://github.com/GREsau/schemars>
+- `schemars_derive` 1.2.3 — <https://github.com/GREsau/schemars>
 
 <details>
 <summary>Full license text</summary>
@@ -9928,7 +10001,6 @@ Used by:
 - `brotli-decompressor` 5.0.3 — <https://github.com/dropbox/rust-brotli-decompressor>
 - `libm` 0.2.16 — <https://github.com/rust-lang/compiler-builtins>
 - `parse-zoneinfo` 0.3.1 — <https://github.com/chronotope/chrono-tz>
-- `tonic-prost` 0.14.6 — <https://github.com/hyperium/tonic>
 
 <details>
 <summary>Full license text</summary>
@@ -10226,7 +10298,7 @@ SOFTWARE.
 
 Used by:
 
-- `twox-hash` 2.1.2 — <https://github.com/shepmaster/twox-hash>
+- `twox-hash` 2.1.5 — <https://github.com/shepmaster/twox-hash>
 
 <details>
 <summary>Full license text</summary>
@@ -10516,29 +10588,6 @@ SOFTWARE.
 
 Used by:
 
-- `zstd` 0.13.3 — <https://github.com/gyscos/zstd-rs>
-
-<details>
-<summary>Full license text</summary>
-
-```text
-The MIT License (MIT)
-Copyright (c) 2016 Alexandre Bury
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-</details>
-
-### MIT License (`MIT`)
-
-Used by:
-
 - `generic-array` 0.14.7 — <https://github.com/fizyk20/generic-array.git>
 
 <details>
@@ -10744,7 +10793,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 Used by:
 
-- `zlib-rs` 0.6.5 — <https://github.com/trifectatechfoundation/zlib-rs>
+- `zlib-rs` 0.6.8 — <https://github.com/trifectatechfoundation/zlib-rs>
 
 <details>
 <summary>Full license text</summary>

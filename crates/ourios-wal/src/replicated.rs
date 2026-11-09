@@ -860,52 +860,24 @@ mod tests {
     #[ignore = "superseded: tag 0x05 is the timed batch and 0x02 is refused (RFC 0065 §6.5, \
                 #1244); see malformed_payloads_and_untimed_batches_are_refused"]
     fn malformed_payloads_and_control_kinds_above_the_highest_are_refused() {
-        let unknown = Control::HIGHEST_KIND + 1;
-        let mut short_checkpoint = vec![0x02];
-        short_checkpoint.extend_from_slice(&[0; 32]);
-        let mut long_checkpoint = short_checkpoint.clone();
-        long_checkpoint.extend_from_slice(&[0; 2]);
-        let refused = [
-            (vec![], ReplicatedRecordError::Empty),
+        let mut refused = refusals_of_every_version();
+        refused.extend([
             (
                 vec![0x05],
                 ReplicatedRecordError::UnknownTag { found: 0x05 },
             ),
-            (vec![0x11, 0], wrong_length(0x11, 0, 1)),
-            (vec![0x12, 0, 0], wrong_length(0x12, 16, 2)),
-            (golden(0x13, &[0]), wrong_length(0x13, 16, 17)),
-            (vec![0x01; 9], wrong_length(0x01, 16, 8)),
-            (golden(0x01, &[0]), wrong_length(0x01, 16, 17)),
             (
                 golden(0x02, &[0, 0]),
                 ReplicatedRecordError::TenantBatch(TenantBatchError::EmptyTenant),
             ),
-            (vec![0x04], wrong_length(0x04, 16, 0)),
-            (golden(0x04, &[]), wrong_length(0x04, 17, 16)),
-            (
-                golden(0x04, &[unknown]),
-                ReplicatedRecordError::UnknownControlKind { found: unknown },
-            ),
-            (golden(0x04, &[0x01; 16]), wrong_length(0x04, 33, 32)),
-            (golden(0x04, &[0x01; 18]), wrong_length(0x04, 33, 34)),
-            (golden(0x04, &short_checkpoint), wrong_length(0x04, 50, 49)),
-            (golden(0x04, &long_checkpoint), wrong_length(0x04, 50, 51)),
-        ];
-        for (payload, error) in refused {
-            let decoded = ReplicatedRecord::decode(&payload).map(|_| ());
-            assert_eq!(decoded, Err(error), "{payload:02x?}");
-        }
+        ]);
+        assert_refused(refused);
     }
 
     #[test]
     fn malformed_payloads_and_untimed_batches_are_refused() {
-        let unknown = Control::HIGHEST_KIND + 1;
-        let mut short_checkpoint = vec![0x02];
-        short_checkpoint.extend_from_slice(&[0; 32]);
-        let mut long_checkpoint = short_checkpoint.clone();
-        long_checkpoint.extend_from_slice(&[0; 2]);
-        let refused = [
-            (vec![], ReplicatedRecordError::Empty),
+        let mut refused = refusals_of_every_version();
+        refused.extend([
             (
                 vec![0x06],
                 ReplicatedRecordError::UnknownTag { found: 0x06 },
@@ -914,16 +886,30 @@ mod tests {
                 golden(0x02, &[0, 0]),
                 ReplicatedRecordError::UnknownTag { found: 0x02 },
             ),
-            (vec![0x11, 0], wrong_length(0x11, 0, 1)),
-            (vec![0x12, 0, 0], wrong_length(0x12, 16, 2)),
-            (golden(0x13, &[0]), wrong_length(0x13, 16, 17)),
-            (vec![0x01; 9], wrong_length(0x01, 16, 8)),
-            (golden(0x01, &[0]), wrong_length(0x01, 16, 17)),
             (vec![0x05], wrong_length(0x05, 16, 0)),
             (
                 golden(0x05, &[0; 10]),
                 ReplicatedRecordError::TenantBatch(TenantBatchError::EmptyTenant),
             ),
+        ]);
+        assert_refused(refused);
+    }
+
+    /// The refusals that hold whatever the batch tag: empty and mis-sized
+    /// records, markers and control entries, and a kind above the highest.
+    fn refusals_of_every_version() -> Vec<(Vec<u8>, ReplicatedRecordError)> {
+        let unknown = Control::HIGHEST_KIND + 1;
+        let mut short_checkpoint = vec![0x02];
+        short_checkpoint.extend_from_slice(&[0; 32]);
+        let mut long_checkpoint = short_checkpoint.clone();
+        long_checkpoint.extend_from_slice(&[0; 2]);
+        vec![
+            (vec![], ReplicatedRecordError::Empty),
+            (vec![0x11, 0], wrong_length(0x11, 0, 1)),
+            (vec![0x12, 0, 0], wrong_length(0x12, 16, 2)),
+            (golden(0x13, &[0]), wrong_length(0x13, 16, 17)),
+            (vec![0x01; 9], wrong_length(0x01, 16, 8)),
+            (golden(0x01, &[0]), wrong_length(0x01, 16, 17)),
             (vec![0x04], wrong_length(0x04, 16, 0)),
             (golden(0x04, &[]), wrong_length(0x04, 17, 16)),
             (
@@ -934,7 +920,10 @@ mod tests {
             (golden(0x04, &[0x01; 18]), wrong_length(0x04, 33, 34)),
             (golden(0x04, &short_checkpoint), wrong_length(0x04, 50, 49)),
             (golden(0x04, &long_checkpoint), wrong_length(0x04, 50, 51)),
-        ];
+        ]
+    }
+
+    fn assert_refused(refused: Vec<(Vec<u8>, ReplicatedRecordError)>) {
         for (payload, error) in refused {
             let decoded = ReplicatedRecord::decode(&payload).map(|_| ());
             assert_eq!(decoded, Err(error), "{payload:02x?}");
@@ -1005,12 +994,9 @@ mod tests {
         }
     }
 
-    /// The flusher assignment, the checkpoint and the id block, kind `0x03`:
-    /// `after` and `through`, each a `u64` little-endian (RFC 0065 §6.5).
-    #[test]
-    #[ignore = "superseded: the highest kind is 0x04, the miner configuration (RFC 0065 §6.5); \
-                see every_control_kind_encodes_to_the_documented_bytes"]
-    fn the_control_entries_encode_to_the_documented_bytes() {
+    /// The flusher assignment, the checkpoint (with `highest_kind`) and the
+    /// id block, each round-tripped through its documented bytes.
+    fn first_three_kinds(highest_kind: u8) -> [Control; 3] {
         let replica: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).expect("small"));
         let mut tail = vec![0x01];
         tail.extend_from_slice(&replica);
@@ -1023,13 +1009,13 @@ mod tests {
                 term: 0x21,
                 index: 0x0302,
             },
-            highest_kind: 0x03,
+            highest_kind,
         };
         let mut tail = vec![0x02];
         tail.extend_from_slice(&replica);
         tail.extend_from_slice(&[0x21, 0, 0, 0, 0, 0, 0, 0]);
         tail.extend_from_slice(&[0x02, 0x03, 0, 0, 0, 0, 0, 0]);
-        tail.push(0x03);
+        tail.push(highest_kind);
         round_trip(control(checkpoint), &golden(0x04, &tail));
 
         let block = Control::IdBlock {
@@ -1039,6 +1025,16 @@ mod tests {
         let mut tail = vec![0x03, 0x01, 0x02, 0, 0, 0, 0, 0, 0];
         tail.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
         round_trip(control(block), &golden(0x04, &tail));
+        [assignment, checkpoint, block]
+    }
+
+    /// The flusher assignment, the checkpoint and the id block, kind `0x03`:
+    /// `after` and `through`, each a `u64` little-endian (RFC 0065 §6.5).
+    #[test]
+    #[ignore = "superseded: the highest kind is 0x04, the miner configuration (RFC 0065 §6.5); \
+                see every_control_kind_encodes_to_the_documented_bytes"]
+    fn the_control_entries_encode_to_the_documented_bytes() {
+        let [assignment, checkpoint, block] = first_three_kinds(0x03);
 
         assert_eq!(Control::HIGHEST_KIND, 0x03);
         let kinds = [assignment, checkpoint, block].map(Control::kind);
@@ -1065,34 +1061,7 @@ mod tests {
     /// `upstream_templates` `1` for observe (RFC 0065 §6.5).
     #[test]
     fn every_control_kind_encodes_to_the_documented_bytes() {
-        let replica: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).expect("small"));
-        let mut tail = vec![0x01];
-        tail.extend_from_slice(&replica);
-        let assignment = Control::FlusherAssignment(replica);
-        round_trip(control(assignment), &golden(0x04, &tail));
-
-        let checkpoint = Control::Checkpoint {
-            proposer: replica,
-            cut: RaftLogId {
-                term: 0x21,
-                index: 0x0302,
-            },
-            highest_kind: 0x04,
-        };
-        let mut tail = vec![0x02];
-        tail.extend_from_slice(&replica);
-        tail.extend_from_slice(&[0x21, 0, 0, 0, 0, 0, 0, 0]);
-        tail.extend_from_slice(&[0x02, 0x03, 0, 0, 0, 0, 0, 0]);
-        tail.push(0x04);
-        round_trip(control(checkpoint), &golden(0x04, &tail));
-
-        let block = Control::IdBlock {
-            after: 0x0201,
-            through: 0x7fff_ffff_ffff_ffff,
-        };
-        let mut tail = vec![0x03, 0x01, 0x02, 0, 0, 0, 0, 0, 0];
-        tail.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
-        round_trip(control(block), &golden(0x04, &tail));
+        let [assignment, checkpoint, block] = first_three_kinds(0x04);
 
         let config = Control::MinerConfig(miner_config());
         let tail = [

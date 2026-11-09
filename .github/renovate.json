@@ -16,6 +16,13 @@
   "automergeStrategy": "squash",
   "packageRules": [
     {
+      "description": "The kubescape chart is vendored as a pin and re-vendored whole (see bob-capture.yml); one image bumped inside it breaks the chart's wiring.",
+      "matchFileNames": [
+        ".github/workflows/bob-capture/kubescape-operator-*/**"
+      ],
+      "enabled": false
+    },
+    {
       "matchManagers": [
         "github-actions"
       ],
@@ -110,6 +117,16 @@
       ],
       "allowedVersions": "<0.9.0",
       "description": "Hold rand at 0.8.x. The test ES256 key minting feeds p256 0.13's rand_core 0.6 traits, and rand 0.9+ removes rand::rngs::OsRng (the exact break in Renovate PR #505's third regeneration). Lifts together with the p256 hold above when jsonwebtoken moves to the RustCrypto 0.14-era stack."
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "rsa"
+      ],
+      "allowedVersions": "<0.10.0",
+      "description": "Hold rsa at 0.9.x. The dev-dependency in ourios-core and ourios-serving mints the RSA test fixture key and is pinned to the rsa jsonwebtoken 10's rust_crypto backend already pulls in (0.9). rsa 0.10 drops the pem feature those pins enable, so the bump fails resolution (Renovate PR #1229's plan failure), and it moves to the rand_core 0.10-era RustCrypto stack the rand 0.8 hold above cannot feed. Lift together with the p256 and rand holds when jsonwebtoken moves to that stack; run cargo tree -i rsa first."
     },
     {
       "matchManagers": [

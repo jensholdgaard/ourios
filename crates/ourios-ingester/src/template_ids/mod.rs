@@ -37,10 +37,13 @@ pub(crate) mod names {
     /// seated (RFC 0059 §3.5); registered in ourios-semconv#8.
     pub(crate) const PREDATES_HIGH_WATER: &str = "predates_high_water";
 
+    /// A reservation failed; the replicated leader's id-block top-up
+    /// reports under it too (RFC 0065 §6.5).
+    pub(crate) use ourios_semconv::EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_FAILED as REFILL_FAILED;
+
     pub(super) use ourios_semconv::{
         EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAP_PROGRESS as BOOTSTRAP_PROGRESS,
         EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAPPED as BOOTSTRAPPED,
-        EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_FAILED as REFILL_FAILED,
         EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_STOPPED as REFILL_STOPPED,
         OURIOS_RECEIVER_TEMPLATE_IDS_AUDIT_MAX as AUDIT_MAX,
         OURIOS_RECEIVER_TEMPLATE_IDS_DATA_MAX as DATA_MAX,
@@ -347,7 +350,7 @@ fn refuse_later_version(store: &Store) -> Result<(), TemplateIdsError> {
     }
 }
 
-fn encode(reserved_through: u64) -> Vec<u8> {
+pub(crate) fn encode(reserved_through: u64) -> Vec<u8> {
     serde_json::json!({ FIELD: reserved_through })
         .to_string()
         .into_bytes()

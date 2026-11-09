@@ -27,6 +27,10 @@
 //! its own effective configuration differs from the one in force in a
 //! field other than the tree's shape (`miner_config::plan`), under the
 //! same kind gate.
+//!
+//! Last, while the group holds fewer than [`id_blocks::AHEAD`] id blocks,
+//! the leader reserves one in the store and appends it, kind `0x03`, under
+//! the same kind gate, one block a pass (`id_blocks`).
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -35,9 +39,11 @@ use openraft::Instant as _;
 use openraft::RaftMetrics;
 use openraft::async_runtime::WatchReceiver as _;
 use ourios_config::MinerConfig;
+use ourios_parquet::Store;
 use ourios_wal::{Control, MinerConfigV1};
 
 use super::host::GroupRaft;
+use super::id_blocks::{self, Ahead, TopUp};
 use super::learners::{self, Changes, Group, Tail};
 use super::miner_config;
 use super::telemetry::{FlusherCounts, Meters};
@@ -177,11 +183,12 @@ enum Gate {
 
 /// A control the leader plans to append.
 struct Planned<F> {
-    control: Control,
+    kind: u8,
     /// The highest kind the log held when the control was planned.
     highest_kind: u8,
-    /// Plans the control again, after a kind gate round.
-    replan: F,
+    /// Whether the leader still plans the control, after a kind gate
+    /// round.
+    still: F,
 }
 
 /// What one pass changed.
@@ -192,65 +199,82 @@ pub struct Pass {
     pub assigned: Option<NodeId>,
     /// The miner configuration a committed entry now puts in force.
     pub configured: Option<MinerConfigV1>,
+    /// What the leader did for a group short of id blocks.
+    pub id_block: Option<TopUp>,
 }
 
 /// A group's leader-side pass on this node: the learner reconcile, the
-/// flusher, then the miner configuration.
+/// flusher, the miner configuration, then the id blocks.
 #[derive(Debug)]
 pub struct Steward {
     patience: Duration,
     /// This node's own effective miner configuration, which it puts in
     /// force while it leads (§6.5).
     miner: MinerConfig,
+    /// The store holding RFC 0059's template-id high-water.
+    ids: Store,
     /// The term this node leads in, and when this node first saw itself
     /// leading it.
     led: Option<(u64, Instant)>,
     counts: FlusherCounts,
 }
 
-impl Default for Steward {
-    fn default() -> Self {
-        Self::new(MinerConfig::default())
-    }
-}
-
 impl Steward {
     /// A steward whose node's own effective miner configuration is
-    /// `miner`.
+    /// `miner`, reserving id blocks in `ids`.
     #[must_use]
-    pub fn new(miner: MinerConfig) -> Self {
-        Self::with_patience(PATIENCE).configured(miner)
+    pub fn new(miner: MinerConfig, ids: Store) -> Self {
+        Self {
+            patience: PATIENCE,
+            miner,
+            ids,
+            led: None,
+            counts: Meters::global().flusher(),
+        }
     }
 
     /// This steward, with `miner` as its node's own effective miner
     /// configuration.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn configured(self, miner: MinerConfig) -> Self {
         Self { miner, ..self }
     }
 
-    /// A steward whose flusher patience is `patience`: [`PATIENCE`] but in
-    /// tests.
+    /// This steward, reserving id blocks in `ids`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn reserving(self, ids: Store) -> Self {
+        Self { ids, ..self }
+    }
+
+    /// A steward whose flusher patience is `patience`, over an empty
+    /// in-memory store.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_patience(patience: Duration) -> Self {
         Self::counting(patience, Meters::global().flusher())
     }
 
-    /// A steward with patience `patience` that counts to `counts`.
+    /// A steward with patience `patience` that counts to `counts`, over an
+    /// empty in-memory store.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn counting(patience: Duration, counts: FlusherCounts) -> Self {
         Self {
             patience,
             miner: MinerConfig::default(),
+            ids: Store::in_memory(),
             led: None,
             counts,
         }
     }
 
     /// Reconcile `tail` as the group's learners ([`learners::reconcile`]),
-    /// append a flusher assignment if [`plan`] gives one, then a miner
-    /// configuration entry if `miner_config::plan` gives one. Each step
-    /// changes nothing on a node that does not lead the group.
+    /// append a flusher assignment if [`plan`] gives one, a miner
+    /// configuration entry if `miner_config::plan` gives one, then an id
+    /// block if the group is short of them. Each step changes nothing on a
+    /// node that does not lead the group.
     ///
     /// # Errors
     ///
@@ -260,10 +284,12 @@ impl Steward {
         let learners = learners::reconcile(group, tail).await?;
         let assigned = self.assign(group, tail).await?;
         let configured = self.configure(group, tail).await?;
+        let id_block = self.top_up(group, tail).await?;
         Ok(Pass {
             learners,
             assigned,
             configured,
+            id_block,
         })
     }
 
@@ -273,14 +299,16 @@ impl Steward {
         let Some((chosen, highest_kind)) = self.choose(group, tail) else {
             return Ok(None);
         };
+        let control = chosen.control();
         let planned = Planned {
-            control: chosen.control(),
+            kind: control.kind(),
             highest_kind,
             // The round can outlast the patience, so the replica may no
             // longer be healthy, or no longer the one to choose.
-            replan: |steward: &mut Self| {
-                let (again, _) = steward.choose(group, tail)?;
-                Some(again.control())
+            still: |steward: &mut Self| {
+                steward
+                    .choose(group, tail)
+                    .is_some_and(|(again, _)| again.control() == control)
             },
         };
         if !self.admit(group, tail, planned).await {
@@ -304,13 +332,14 @@ impl Steward {
             return Ok(None);
         };
         let planned = Planned {
-            control: Control::MinerConfig(body),
+            kind: Control::MinerConfig(body).kind(),
             highest_kind,
             // An entry appended during the round may have put another in
             // force.
-            replan: |steward: &mut Self| {
-                let (again, _) = steward.plan_config(group)?;
-                Some(Control::MinerConfig(again))
+            still: |steward: &mut Self| {
+                steward
+                    .plan_config(group)
+                    .is_some_and(|(again, _)| again == body)
             },
         };
         if !self.admit(group, tail, planned).await {
@@ -320,6 +349,37 @@ impl Steward {
         Ok(Some(body))
     }
 
+    /// Reserve an id block in the store and append it while the group is
+    /// short of them, held back as [`Self::assign`]'s assignment is. The
+    /// block is reserved only once the kind gate admits it, and appended
+    /// only once its reservation is durable; a failed reservation appends
+    /// nothing. A block appended and not yet committed counts to the next
+    /// pass, so no pass appends one beside it.
+    async fn top_up(&mut self, group: Group<'_>, tail: Tail<'_>) -> Result<Option<TopUp>, String> {
+        let Some((floor, highest_kind)) = self.plan_block(group) else {
+            return Ok(None);
+        };
+        let planned = Planned {
+            kind: id_blocks::KIND,
+            highest_kind,
+            still: |steward: &mut Self| steward.plan_block(group).is_some(),
+        };
+        if !self.admit(group, tail, planned).await {
+            return Ok(None);
+        }
+        let block = match id_blocks::reserve(&self.ids, floor, group.log.group()).await {
+            Ok(block) => block,
+            Err(refusal) => return Ok(Some(TopUp::Refused(refusal))),
+        };
+        // Deposed, or topped up by another leader, during the reservation:
+        // the block's ids are skipped, never appended later.
+        if self.plan_block(group).is_none() {
+            return Ok(None);
+        }
+        propose(group, id_blocks::control(block)).await?;
+        Ok(Some(TopUp::Appended(block)))
+    }
+
     /// Whether the leader may append `planned`'s control: at once when its
     /// kind is at or below the highest the log holds, otherwise once every
     /// member reads the kind and the leader still plans the control.
@@ -327,20 +387,19 @@ impl Steward {
         &mut self,
         group: Group<'_>,
         tail: Tail<'_>,
-        planned: Planned<impl FnOnce(&mut Self) -> Option<Control>>,
+        planned: Planned<impl FnOnce(&mut Self) -> bool>,
     ) -> bool {
         let Planned {
-            control,
+            kind,
             highest_kind,
-            replan,
+            still,
         } = planned;
-        let kind = control.kind();
         if kind <= highest_kind {
             return true;
         }
         let metrics = group.raft.metrics().borrow_watched().clone();
         match gate(group.raft, &metrics, tail, kind).await {
-            Gate::Reads => replan(self) == Some(control),
+            Gate::Reads => still(self),
             Gate::Held(hold) => {
                 self.counts.held(group.log.group(), hold);
                 false
@@ -358,6 +417,16 @@ impl Steward {
         let controls = group.controls();
         miner_config::plan(&self.miner, controls.miner_config.as_ref())
             .map(|body| (body, controls.highest_kind))
+    }
+
+    /// The floor of the id block to reserve while the group is short of
+    /// them, with the highest kind the log holds, if this node leads the
+    /// group.
+    fn plan_block(&mut self, group: Group<'_>) -> Option<(u64, u8)> {
+        let metrics = group.raft.metrics().borrow_watched().clone();
+        self.led_for(&metrics)?;
+        let floor = Ahead::of(group).short()?;
+        Some((floor, group.controls().highest_kind))
     }
 
     /// The assignment [`plan`] gives from what the leader sees now, with the

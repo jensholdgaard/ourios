@@ -12,6 +12,7 @@ mod controls;
 pub mod flusher;
 pub mod formation;
 pub mod host;
+pub mod id_blocks;
 pub mod learners;
 pub mod log_store;
 mod miner_config;

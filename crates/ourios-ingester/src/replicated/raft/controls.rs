@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use ourios_wal::{Control, MinerConfigV1};
 use uuid::Uuid;
 
-use super::snapshot_record::{GroupMinerConfig, GroupSnapshot};
+use super::id_blocks::Ahead;
+use super::snapshot_record::{GroupMinerConfig, GroupSnapshot, IdBlock};
 use super::types::NodeId;
 
 /// The control entries a log held at one read, and the highest kind it
@@ -42,9 +43,7 @@ impl HeldControls {
             .iter()
             .find(|(_, c)| c.kind() == highest_kind && highest_kind > committed_kind)
             .map(|(&index, _)| index);
-        let after = snapshot
-            .and_then(|s| s.meta.last_log_id)
-            .map_or(0, |last| last.index + 1);
+        let after = first_after(snapshot);
         let after_snapshot = || self.controls.range(after..).rev().map(|(_, c)| *c);
         let flusher = after_snapshot().find_map(|c| match c {
             Control::FlusherAssignment(replica) => Some(NodeId::from(Uuid::from_bytes(replica))),
@@ -65,6 +64,27 @@ impl HeldControls {
             }),
         }
     }
+
+    /// The id blocks of [`Ahead::of`]: `snapshot`'s latest block and every
+    /// one after it in the log that a replica would apply.
+    pub(super) fn blocks_over(&self, snapshot: Option<&GroupSnapshot>) -> Ahead {
+        let start = Ahead::starting(snapshot.and_then(|s| s.state.id_block));
+        self.controls
+            .range(first_after(snapshot)..)
+            .fold(start, |ahead, (_, control)| match *control {
+                Control::IdBlock { after, through } => ahead.then(IdBlock::new(after, through)),
+                Control::FlusherAssignment(_)
+                | Control::Checkpoint { .. }
+                | Control::MinerConfig(_) => ahead,
+            })
+    }
+}
+
+/// The index of the first entry after `snapshot`.
+fn first_after(snapshot: Option<&GroupSnapshot>) -> u64 {
+    snapshot
+        .and_then(|s| s.meta.last_log_id)
+        .map_or(0, |last| last.index + 1)
 }
 
 /// What the control entries of a log, committed or not, say (§6.5).

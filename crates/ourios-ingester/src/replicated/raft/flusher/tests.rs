@@ -20,6 +20,7 @@ use crate::replicated::raft::types::{GroupEntry, LogId, NodeId};
 use ourios_semconv as semconv;
 
 mod config;
+mod id_blocks;
 
 const P: Duration = Duration::from_secs(10);
 
@@ -460,6 +461,8 @@ async fn membership_change_in_flight(
 /// new kind, the assignment nor the miner configuration, and counts each
 /// hold; once it commits, both are appended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: a pass also gates the id block, kind 0x03, which counts its own hold; \
+            see id_blocks::a_membership_change_in_flight_holds_back_every_new_kind"]
 async fn a_membership_change_in_flight_holds_back_each_new_kind() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -682,6 +685,8 @@ async fn held_kinds_and_committed_assignments_are_counted() {
 /// configuration's, and the assignment once it commits, each by group and
 /// reason; a pass that holds back nothing counts nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: each pass also gates the id block, kind 0x03, which counts its own \
+            holds; see id_blocks::every_held_kind_and_committed_assignment_is_counted"]
 async fn each_held_kind_and_committed_assignment_is_counted() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
     let leader = ready_leader(&cluster).await;

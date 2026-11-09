@@ -140,10 +140,11 @@ headline requirements are durability (§3.1–§3.3), a queryable tail
   affected tenants' exports get the retryable rejection.
 - **B8.** If no replica can meet B6, the tenants stay unavailable rather
   than lose acknowledged data. Overriding that is an explicit, offline
-  operator action, `ourios wal force-leader`, which starts above every
-  position the group has ever published, not only above its checkpoint,
-  so no position is reused (B13), and reports the range of acknowledged
-  records that may be lost before it acts (§4.5, §6.5).
+  operator action, `ourios wal force-leader`, which starts a new log
+  under a fresh log id (§6.6), so no position the group has ever
+  published, above its checkpoint or not, is reused (B13), and reports
+  the range of acknowledged records that may be lost before it acts
+  (§4.5, §6.5).
 - **B9.** A client never has to know which replica holds a tenant: an
   export sent to any receiver reaches the right one.
 - **B10.** An outage of the object store must not stop acknowledgements
@@ -827,27 +828,30 @@ the mass-failover time and vote-log batching as tuning signals.
 >   held, some of them already flushed to Parquet by the flusher
 > - **When** an operator runs `ourios wal force-leader` on the survivor
 > - **Then** it prints the possibly-lost range before acting, the
->   survivor leads alone, and its first new entry's position is above
->   every position in any published file, so no new row collides with
->   an old one; every template id it mints is above the store's id
+>   survivor leads alone, its new log's rows carry a fresh log id
+>   recorded in `cluster.json`, so no new row collides with an old one,
+>   also with files the lost flusher published after the last
+>   checkpoint; every template id it mints is above the store's id
 >   high-water when it acted, so no id in a published file names a
 >   different template; and a restored template the lost suffix had
 >   already widened, widened again by the survivor, gets a version
->   above every published one for its id; its first new position is
->   also above a file the lost flusher published after the last
->   checkpoint; and when the lost voters had
->   written `checkpoint.json` for a cut above the survivor's log end, the
->   survivor's first checkpoint is above that `seq`, under the same log
->   id
-> - **And** with a tail flusher of the old log still running, holding
->   committed entry 300 unpublished while `checkpoint.json`'s
->   `published_high` is 200: when the flusher raises before the
->   takeover writes, the takeover's start bound is above 300; when the
->   takeover writes first, the flusher's raise fails and it publishes
->   no file above 200, nor claims or checkpoints, so no position of the
->   new log appears in two files with different rows; and that flusher,
->   rejoining the new log as a learner or later made its flusher,
->   publishes no row mined from the old log above the bound
+>   above every published one for its id
+> - **And** with old-log flusher assignments `X` then `A`, and `A`
+>   paused before its first store write while holding committed entry
+>   300 unpublished: after the takeover, and after `X` has become the
+>   new log's flusher and checkpointed, `A` resumes and publishes 300
+>   and checkpoints under the old log id only; the new log's
+>   `checkpoint.json` and bundles are unchanged, no position appears in
+>   two files with different rows, and a row `A` publishes at a
+>   position the survivor also published is the same row
+> - **And** a replica restored from a bundle with `next` `101` in
+>   `(0, 1000]`, whose lost suffix published id `101`, rejoins the new
+>   log: it mines the kept old entries into the same ids as the
+>   survivor, issues no id from `(0, 1000]` after the incarnation entry,
+>   and mints the new log's lines into the same template ids as the
+>   survivor, from the fresh block; and a replica whose log is purged
+>   below that incarnation entry installs a snapshot carrying the new
+>   log id and stamps its rows with it
 
 > **Scenario RFC0065.26 — a delayed former flusher cannot move a checkpoint back**
 > - **Given** a group whose new flusher has checkpointed `seq` 200 and
@@ -864,12 +868,8 @@ the mass-failover time and vote-log batching as tuning signals.
 >   `format`, a missing or unknown field, or a `bundle` that is not its
 >   `seq`'s prefix, is never replaced, and that checkpoint fails with
 >   nothing purged; a retried put of identical bytes completes the
->   checkpoint; a flusher claims `checkpoint.json` before its first write
->   only from a flusher in force before it in its log, and a former
->   flusher, once the next has claimed, writes nothing more;
->   `published_high` never falls, and no file is published
->   with an `ingest_seq` above the stored `published_high`, also before
->   the group's first checkpoint; and a new log incarnation
+>   checkpoint; a checkpoint entry whose cut is at or below the latest
+>   incarnation entry is ignored; and a new log incarnation
 >   over a bucket holding an old one's objects checkpoints under its
 >   own log id from its first cut
 
@@ -956,7 +956,8 @@ the mass-failover time and vote-log batching as tuning signals.
 >   does, and a leader whose own `prefix_depth` differs appends the
 >   log's, also when elected after a checkpoint purged every
 >   configuration entry; and an
->   otherwise valid version-1 snapshot record fails the group's open
+>   otherwise valid version-1 or version-2 snapshot record fails the
+>   group's open
 > - **And** the bundle at the cut holds, for each tenant of the group, a
 >   version-3 miner snapshot marked `{group, seq}` with the log id and
 >   the cut, and the allocator's range, its unused blocks and each
@@ -1128,14 +1129,17 @@ the mass-failover time and vote-log batching as tuning signals.
   configuration in force (`kind: u8`, `0` when none has committed,
   then that kind's body) and the latest id block (`after: u64 |
   through: u64`, the latest applied, both `0` when none has been).
-  The data
+  Format version 3 adds, after the latest id block, the log id in
+  force at the snapshot's last log id (`log: u32`, §6.5's incarnation
+  entry), so a replica whose log is purged below the group's latest
+  incarnation entry still knows which log id its rows carry. The data
   `InstallSnapshot` sends is those same bytes, so an installing
   replica gets them with the metadata. Snapshots are built only at a
   checkpoint's cut (the snapshot policy is `Never`; applying a
   checkpoint entry triggers the build), so a snapshot's last log id is
   a cut, and its index the `seq` of the bundle that holds the miner
-  state. No deployment runs this backend yet, so version 1 is not
-  read: a version-1 record fails the open like an unknown version.
+  state. No deployment runs this backend yet, so versions 1 and 2 are
+  not read: such a record fails the open like an unknown version.
 - **No storage operation blocks the Raft runtime's workers.** Vote
   writes, `sync`, truncation and purge markers run on the WAL's own
   threads. An append completes through `openraft`'s `IOFlushed`
@@ -1354,23 +1358,31 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   §3.1 on the local backend, a failed snapshot write here **fails the
   checkpoint**: the barrier retries, and nothing is purged until a
   bundle is complete.
-- **Highest published position.** The flusher also records, per group,
-  the highest ingest position in any file it has published
-  (`published_high` in `checkpoint.json`, raised before any file that
-  would pass it is published, below, and in the footer statistics of
-  every file). `ourios wal force-leader` (B8) starts its new log
-  above the largest of that, `checkpoint.json`'s `seq` and the
-  survivor's log end, written to `checkpoint.json` with its fence
-  before the new log is (below), so its checkpoints are not refused
-  and a position that a lost replica flushed but never checkpointed is
-  never issued again (§4.5). For the same reason it abandons every unused id block
-  the survivor holds, from its log and from the checkpoint snapshot:
-  the lost suffix may already have minted ids from them, and published
-  rows with them. Before mining any new entry the survivor reserves
-  fresh blocks from the store, whose compare-and-swap high-water is
-  above every block ever reserved, so no template id is minted twice
-  for different templates. Ids are not the only identity at risk: a
-  widen raises `template_version` without a new id, so the lost suffix
+- **A forced takeover starts a new log incarnation.** `ourios wal
+  force-leader` (B8) allocates a fresh log id from `log_ids.json` by
+  compare-and-swap and appends it to the group's ids in `cluster.json`
+  (§6.6), then writes the survivor's new log: the membership entry
+  naming only itself, then an incarnation entry (below) naming the new
+  id. Every row of an entry after that entry carries the new id, so no
+  new row shares a position with any row the lost replicas flushed,
+  checkpointed or not (§4.5), and the new log needs no position bound
+  of its own. The entries up to the survivor's log end keep the old id:
+  they are the old log's entries, identical on every replica that holds
+  them, so a row the survivor or the lost flusher publishes from one is
+  the same row at the same position and compaction deduplicates it
+  (§6.6). A former flusher still running publishes only old-id rows:
+  duplicates of those, or rows of the lost suffix, acknowledged records
+  that no new row collides with, so publishing them late is safe and
+  recovers some of the reported loss. The new id has its own
+  `checkpoint.json`, so nothing an old flusher writes reaches the new
+  log. The ids the lost suffix may have minted lie in the blocks
+  reserved before the takeover, so at the incarnation entry every tail
+  replica abandons its current range and pending blocks (below), and
+  the leader's first block of the new log is reserved fresh from the
+  store, whose compare-and-swap high-water is above every block ever
+  reserved, so no template id is minted twice for different templates.
+  Ids are not the only identity at risk: a widen raises
+  `template_version` without a new id, so the lost suffix
   may have published `(7, 2)` while the survivor's snapshot still holds
   `(7, 1)`. Every published version has its audit event in the store
   first (audit-before-record, `ourios-ingester/src/publish.rs`), so
@@ -1378,8 +1390,8 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   version the tenant's audit trail holds, and its next widen of that
   template takes the version above it, so no `(template_id,
   template_version)` key ever names two token sequences.
-- **Control entries.** The flusher assignment, the checkpoint, id-block
-  and miner-configuration entries below, and §6.7's published and
+- **Control entries.** The flusher assignment, the checkpoint, id-block,
+  miner-configuration and incarnation entries below, and §6.7's published and
   erasure entries are log entries the leader appends beside the tenant
   batches, so every replica applies them at the same position. In the
   group WAL each is a `ReplicatedEntry` record with its own tag, `0x04`,
@@ -1392,10 +1404,11 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   | `0x02` | Checkpoint | 33 bytes, below |
   | `0x03` | Id-block reservation | 16 bytes, below |
   | `0x04` | Miner configuration, algorithm 1 | 28 bytes, below |
-  | `0x05` | Published (§6.7) | reserved |
-  | `0x06` | Erasure (§6.7) | reserved |
+  | `0x05` | Incarnation | 4 bytes, below |
+  | `0x06` | Published (§6.7) | reserved |
+  | `0x07` | Erasure (§6.7) | reserved |
 
-  The bodies of kinds `0x02` to `0x04`, every integer little-endian and
+  The bodies of kinds `0x02` to `0x05`, every integer little-endian and
   every UUID 16 bytes big-endian, as in `0x01`:
 
   ```text
@@ -1405,6 +1418,7 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
                      | param_byte_limit: u32 | prefix_depth: u8 | max_node_children: u16 |
                      | max_templates: u32 | max_line_tokens: u16 | upstream_templates: u8 |
                      | upstream_template_byte_limit: u32 | upstream_association_limit: u16 |
+  0x05 incarnation   | log: u32 |
   ```
 
   - **Checkpoint.** `proposer` is the replica that proposed it, the cut
@@ -1487,6 +1501,35 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     algorithm applies only once every member reads it. DynSRV updates
     one monitor at the step the update arrives. Here the update is an
     entry, and its log position is that step on every replica.
+  - **Incarnation.** `log` is the §6.6 log id that the rows of every
+    entry after this one carry, until the next incarnation entry. The
+    group's first leader appends one naming the group's first id in
+    `cluster.json` when neither the log nor the snapshot holds one, and
+    the entries before a group's first incarnation entry carry its id,
+    as with the miner configuration; only `force-leader` writes a later
+    one. An entry naming the log id already in force changes nothing.
+    One that changes it is the forced takeover's boundary, and every
+    replica applies it alike at its position:
+    - the allocator drops its range and pending blocks: its current
+      block becomes the latest applied block with `next` past its
+      `through`, so it issues no id until a block after the entry, and
+      the bundle's cursor check (below) still holds;
+    - a checkpoint entry whose cut is at or below the latest applied
+      incarnation entry is ignored, as one with a cut not above the
+      last is, so every bundle and `checkpoint.json` of an incarnation
+      lies under its own log id;
+    - and the state machine keeps its position with the other changes
+      since the last checkpoint, and the snapshot record the id in
+      force (§6.1, version 3).
+
+    A forced takeover is the one case where a committed entry is
+    truncated, so a replica whose log is cut back at or below an entry
+    it has mined drops its miner and sink state and restores from its
+    bundle as at a start: it then mines the old entries the new log
+    keeps into the same state as the survivor, mining being
+    deterministic, and crosses the incarnation entry at the same
+    position. A rejoining
+    replica thus keeps its tenant snapshots but never its old range.
 
   A reserved kind's body is fixed by the amendment that implements it,
   and kinds are implemented in order: a release reads a kind only if it
@@ -1614,8 +1657,8 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   and CRC. Every CRC is CRC32-C (Castagnoli) as in RFC 0008's frames,
   and the last covers every byte before it.
   - **Reading.** A replica restores from a bundle only if `format` is
-    `1` and the CRC holds; `log` is the group's and `seq` and `term`
-    are the cut it restores (§6.1's record); `current` is `(0, 0]`
+    `1` and the CRC holds; `log`, `seq` and `term` are the log id and
+    the cut it restores (§6.1's record); `current` is `(0, 0]`
     with `next` `1`, or has `after < through <= 2^63 - 1` and
     `after < next <= through + 1`, so `next` is at least `1` and `0`,
     the `NO_TEMPLATE` sentinel, is never issued, and no id at or below
@@ -1650,101 +1693,42 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
 
   ```json
   {"format": 1, "log": 3, "seq": 200, "term": 4,
-   "bundle": "wal/replicated/logs/3/checkpoints/00000000000000000200/",
-   "published_high": 198, "flusher": "0190d2a8-91f4-7c02-8a11-0c9d8e7f6a5b"}
+   "bundle": "wal/replicated/logs/3/checkpoints/00000000000000000200/"}
   ```
 
   `format` is `1`; `log` is the log id; `seq` and `term` are the cut's
-  index and term, both `0` with `bundle` `null` before the group's first
-  checkpoint; `bundle` is the bundle's prefix, relative to the bucket;
-  `published_high` is at or above the highest `ingest_seq` in any file
-  the group has published, `0` when none; `flusher` is the fence below,
-  a lowercase hyphenated UUID. Every number is a JSON integer read as
-  a `u64`, `log` as a `u32`. A reader takes the object
-  only with exactly these fields, `format` `1`, `log` the group's and
-  `bundle` the prefix `log` and `seq` name, or `null` exactly when
-  `seq` is `0`. Any other object, or one
+  index and term; `bundle` is the bundle's prefix, relative to the
+  bucket. Every number is a JSON integer read as a `u64`, `log` as a
+  `u32`. A reader takes the object only with exactly these fields,
+  `format` `1`, `log` the incarnation's and `bundle` the prefix `log`
+  and `seq` name. Any other object, or one
   that does not parse, is unreadable, and a writer never replaces it,
   since a whole-object rewrite would drop a field it does not know: its
   checkpoint fails as a failed bundle write does, and it reports why.
   The object is created with `put_if_absent` and changes only by
-  `put_if_match` on the ETag the writer read. A flusher writes it only
-  while the stored `flusher` is its own (below); a writer that reads a
+  `put_if_match` on the ETag the writer read. A writer that reads a
   stored `seq` at or above its own abandons its write (above);
-  otherwise it writes its `seq`, `term` and `bundle`, with
-  `published_high` the larger of the stored value and its own, so that
-  never falls; a lost race re-reads and decides again. Recovery does
-  not read the object (below); `force-leader` reads `published_high`
-  from it.
-  - **`published_high` is written before the file.** Files are
-    published between checkpoints too (the sink's size and age
-    triggers), so a value written only at a checkpoint would miss them
-    and `force-leader` could reissue their positions. Before the flusher
-    publishes a file whose highest `ingest_seq` is above the stored
-    `published_high`, it raises the stored value to the highest
-    committed `seq` it holds, by the same `put_if_match`, keeping the
-    stored `seq`, `term`, `bundle` and `flusher`, and publishes the file
-    only once that write has returned. A flusher mines only committed
-    entries, so one raise covers every file it publishes until its
-    mining passes that `seq`:
-    a raise costs one conditional put per such pass, not per file, and
-    `force-leader` finds the bound in one read, with no listing. A raise
-    by a delayed former flusher only raises the value, which skips
-    positions and reuses none. A file the raise cannot cover, the store
-    unreachable, the object unreadable or the fence another's, is not
-    published, as during a store outage (B25). A file at or below the
-    stored `published_high` needs no raise: the bound already covers
-    its positions.
-  - **The fence.** `flusher` names the one replica that may write the
-    object, and so publish above its bound. A flusher's fence is its
-    own replica UUID. Before its first write it **claims** the object:
-    a `put_if_match` setting `flusher` to its UUID, keeping every other
-    field, which it makes only if the stored `flusher` is its own or
-    one in force in its own log before its assignment, from the
-    snapshot record's
-    flusher on (the state machine keeps those positions, §6.5 above),
-    or by `put_if_absent` of `{seq 0, term 0, bundle null,
-    published_high 0}` with its UUID when the object is absent. A
-    flusher whose claim, raise or checkpoint write finds the stored
-    `flusher` not its own, or after a lost race re-reads and finds it
-    so, makes no further write and publishes nothing above the stored
-    bound; one that finds it still its own retries.
-  - **A forced takeover takes the fence first.** `force-leader` reads
-    the object, computes its start bound `B`, the largest of the stored
-    `published_high`, the stored `seq` and the survivor's log end, and
-    writes by `put_if_match` `published_high = B` and `flusher` a fresh
-    UUIDv7 `N` that names no replica, keeping `seq`, `term` and
-    `bundle` (creating the object when absent); a lost race re-reads and
-    computes again. Only then does it write its new log, above `B`,
-    whose entries after the membership entry begin with a flusher
-    assignment naming `N`, so `N` is in force in the new log and in no
-    old one. A new flusher there claims from `N`; an old-log flusher's
-    history never holds `N`, so after the takeover it can neither claim
-    nor raise. If the old flusher raised before the takeover's write,
-    the takeover read that raise, its own write's ETag fencing the
-    order, and `B` covers every position the old flusher can publish;
-    if the takeover wrote first, the old flusher's next raise finds `N`
-    and fails, so it publishes nothing above `B`. Files it published
-    before are at or below the stored bound, so `B` covers them too.
-    The leader replaces `N`, which is no learner, by RFC0065.30's rule.
-    A forced takeover is the one case where a committed entry is
-    truncated, so a replica whose log is cut back at or below an entry
-    it has mined drops its miner and sink state and restores from its
-    bundle as at a start, so it never publishes a row from the old log
-    at a position the new one reuses.
+  otherwise it writes its `seq`, `term` and `bundle`; a lost race
+  re-reads and decides again. Recovery does not read the object
+  (below), and neither does `force-leader`: positions under the new log
+  id cannot repeat any published under the old, so it needs no
+  published bound.
   - **Keyed by log id, not group number.** A log incarnation that
     replaces another over a bucket that keeps the old one's objects
     starts its Raft indexes over, and under the group number its writes
-    would lose for good to the old object's higher `seq`.
-    `force-leader` keeps the group's log id, since its new log continues
-    the old one's positions, and starts above the stored `seq` (below),
-    so its checkpoints land above every stored one under the same key.
+    would lose for good to the old object's higher `seq`. A forced
+    takeover's new log id gives it a fresh object too, so a former
+    flusher of the old log, delayed or still running, writes only the
+    old object, which the new log never reads; within one incarnation
+    the monotonic `seq` and the leader's check on the proposer (above)
+    are the only fence needed.
 - **Recovery** of a tail replica on start: the mark is one cut. The
   replica opens the group's log from §6.1's snapshot record, whose last
   log id is the cut `c` of the last checkpoint it applied, and every
   tenant's snapshot in that bundle is taken at `c`. With a record, it
   restores every tenant's miner, the allocator and the configuration
-  from the bundle at `c`'s index, never a later one `checkpoint.json`
+  from the bundle at `c`'s index under the record's log id, never a
+  later one `checkpoint.json`
   names, whose entry may not have applied, and mines the group WAL
   from the entry after `c`; without one, its log holds the group's
   history from its first entry, and it mines all of it. A replica that
@@ -1778,7 +1762,11 @@ record.
   group index but a **log id** allocated once per log incarnation: the
   first start of a cluster allocates one id per group from a counter in
   `<bucket>/wal/log_ids.json` by compare-and-swap, and records the
-  mapping in `cluster.json`. RFC 0066 allocates one per (topic id,
+  mapping in `cluster.json`, each group's ids oldest first; a forced
+  takeover allocates the group a new one the same way and appends it
+  (§6.5). Replicas take the id in force from the log's incarnation
+  entries and the snapshot record, never from `cluster.json` after the
+  group's first. RFC 0066 allocates one per (topic id,
   partition), using the broker's topic UUID, so a recreated topic gets
   new ids. Positions from different logs, backends or topic incarnations
   therefore never compare equal, and switching a tenant's backend or
@@ -2338,6 +2326,14 @@ Q1 and Q2 are RFC 0064's (§7 there).
   of ids until a recovery is defined. That recovery must floor the new
   object above every block any group's log or bundle holds, not only
   above the published ids.
+
+- [ ] **Q7. Is the takeover's version floor the same on every tail
+  replica?** §6.5 has the survivor read, per restored template, the
+  highest `template_version` the audit trail holds. Another tail
+  replica reading it later can see versions a former flusher published
+  meanwhile, and so widen to a different version than the survivor.
+  The floors likely belong in the new log, beside the incarnation
+  entry; the format is open.
 
 Decided as technical calls: RFC0065.10's check uses `openraft`'s
 upstream verification plus our seeded simulation suite, not a TLA+

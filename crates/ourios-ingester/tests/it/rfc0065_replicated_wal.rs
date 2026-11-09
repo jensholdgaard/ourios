@@ -269,6 +269,20 @@ fn rfc0065_20_every_tail_replica_mines_the_same_rows() {
     );
 }
 
+/// Scenario RFC0065.20 — the audit-time arm (B11). Every audit event the
+/// two miners emit is identical, stamped with the `time` of the batch that
+/// emitted it, also on a restored replica and a new flusher, whatever each
+/// replica's clock says.
+#[test]
+#[ignore = "RFC0065.20 stub — the audit-time arm, implemented with the timed batch record"]
+fn rfc0065_20_every_tail_replica_stamps_the_same_audit_times() {
+    todo!(
+        "RFC0065.20 — with each replica's clock hours apart from the others and the \
+         leader's, every audit event is identical on every tail replica, the restored \
+         one and the new flusher, its timestamp the emitting batch's `time`"
+    );
+}
+
 /// Scenario RFC0065.21 — a long store outage is absorbed and searchable (B25, B19).
 /// Given a backlog sized `N`, when the store is unreachable until the
 /// backlog reaches half of `N`, then every export is acked, a query over
@@ -320,6 +334,30 @@ fn rfc0065_23_the_leader_never_mines() {
         "RFC0065.23 — leader ack latency unaffected, the other tail replica becomes \
          the flusher without replaying the log, and after compaction no \
          `(tenant, ingest position)` appears twice"
+    );
+}
+
+/// Scenario RFC0065.23 — the kept-output arms (B11). The new flusher
+/// publishes what it kept above the applied cut, audit events first; a
+/// former flusher's late files are counted once; and a flusher with a gap
+/// replays from the bundle in slices before it publishes or proposes.
+#[test]
+#[ignore = "RFC0065.23 stub — the kept-output arms, implemented with publication from the flusher"]
+fn rfc0065_23_a_flusher_publishes_what_it_kept_and_replays_a_gap() {
+    todo!(
+        "RFC0065.23 — the new flusher publishes its kept rows and audit events above \
+         the applied cut, each template's events before the first file using it, and \
+         keeps nothing at or below an applied cut; a former flusher's late files are \
+         counted once; past the audit ceiling or with the tail volume full, a tail \
+         replica that takes over or the flusher itself drops, counts and records a gap, \
+         then publishes nothing and proposes no cut until a slice-by-slice replay from \
+         the bundle (each slice's audit events durable before its rows, memory at most \
+         one slice) yields the same bytes as a flusher that dropped nothing; a tail \
+         replica past a checkpoint at or above its gap replays nothing; nothing is \
+         published while the store is unreachable; a checkpoint that applies during the \
+         replay (from 100 toward 200, at 120 when 150 applies) restarts it from the new \
+         cut's bundle without reading a purged entry, ends it when the cut reaches the \
+         gap, and every record is still counted once"
     );
 }
 
@@ -522,6 +560,33 @@ async fn rfc0065_29_an_unreadable_control_entry_stops_the_open() {
     }
 }
 
+/// Scenario RFC0065.29 — the batch-record arm (B11): a batch under tag
+/// `0x02`, or under tag `0x05` with a `time` above `2^63 - 1`, stops the
+/// open at that record.
+#[test]
+#[ignore = "RFC0065.29 stub — the batch-record arm, implemented with the timed batch record"]
+fn rfc0065_29_an_untimed_or_out_of_range_batch_refuses_the_log() {
+    todo!(
+        "RFC0065.29 — a group WAL holding a batch under tag 0x02, or under tag 0x05 \
+         with a time above 2^63 - 1, is refused at that record"
+    );
+}
+
+/// Scenario RFC0065.29 — the undecodable-batch arm (B11): a committed batch
+/// whose export does not decode stops the group's miner at that entry on
+/// every tail replica alike, while the group keeps acknowledging.
+#[test]
+#[ignore = "RFC0065.29 stub — the undecodable-batch arm, implemented with mining on tail replicas"]
+fn rfc0065_29_an_undecodable_batch_stops_the_groups_miner() {
+    todo!(
+        "RFC0065.29 — the flusher, another tail replica and one restored before the \
+         entry all stop there: none mines, publishes, proposes a cut at or above it or \
+         serves a tail row past it, each logs the group, log id and decode error, a \
+         query reports the group in `tail_unavailable`, and acks and log replication \
+         continue"
+    );
+}
+
 /// A miner configuration entry at `index` carrying `config`.
 fn miner_config(index: u64, config: ourios_wal::MinerConfigV1) -> Vec<u8> {
     let control = ourios_wal::Control::MinerConfig(config);
@@ -616,5 +681,41 @@ fn rfc0065_31_a_checkpoint_snapshot_holds_the_group_at_its_cut() {
          raft::codec::tests), the leader's control view holds the configuration in force \
          (raft::tests), and a version-1 snapshot record fails the open \
          (raft::snapshot_record::tests)"
+    );
+}
+
+/// Scenario RFC0065.32 — the flusher's proposals and reports reach the
+/// leader (B11). The leader tops id blocks up to three counting the
+/// flusher's unstarted ones, appends only the flusher's checkpoints above
+/// the last, refuses the rest by name, and a flusher refused by a leader
+/// whose assignment the next leader discards reports to that next leader.
+#[test]
+#[ignore = "RFC0065.32 stub — implemented with the Propose call"]
+fn rfc0065_32_the_flushers_proposals_and_reports_reach_the_leader() {
+    todo!(
+        "RFC0065.32 — unstarted plus logged blocks reach three and no purge adds more; \
+         the flusher's checkpoint is appended and answered with its log id; the former \
+         flusher gets not_flusher, a cut not above the last or not committed or with \
+         another highest kind gets stale, another kind or length or proposer gets \
+         malformed, a non-leader gets not_leader with the hint; a resend leaves one \
+         applied checkpoint; a not_flusher refusal from a leader whose assignment is \
+         discarded does not silence the flusher toward the next leader; a report delayed \
+         past a checkpoint that purged the blocks it caused is refused stale and \
+         reserves nothing, and the fresh report keeps at most three unstarted blocks"
+    );
+}
+
+/// Scenario RFC0065.32 — the abandoned-write arm (B11). A flusher whose
+/// `checkpoint.json` write finds an equal or later `seq` still proposes, so
+/// the checkpoint advances and never passes `checkpoint.json`.
+#[test]
+#[ignore = "RFC0065.32 stub — the abandoned-write arm, implemented with the checkpoint barrier"]
+fn rfc0065_32_an_abandoned_checkpoint_write_still_proposes() {
+    todo!(
+        "RFC0065.32 — the current flusher proposes after finding a former flusher's later \
+         seq or its own equal one and every replica applies it; an unreadable object \
+         proposes nothing; checkpoint.json is always at or above every applied cut; a \
+         restarting tail replica restores from the applied cut's bundle; a query from \
+         checkpoint.json's later cut counts every record once"
     );
 }

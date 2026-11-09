@@ -43,6 +43,7 @@ fn healthy(ts_offset: u64) -> MinedRecord {
         body: Some("line".to_string()),
         confidence: 0.0,
         lossy_flag: true,
+        ingest_position: None,
     }
 }
 

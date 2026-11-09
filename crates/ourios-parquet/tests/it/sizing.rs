@@ -97,6 +97,7 @@ fn sized_record(seed: usize) -> MinedRecord {
         body: Some(high_entropy_body(seed)),
         confidence: 0.0,
         lossy_flag: true,
+        ingest_position: None,
     }
 }
 

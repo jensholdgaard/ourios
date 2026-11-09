@@ -158,6 +158,21 @@ fn has_column(schema: &datafusion::common::DFSchema, column: &str) -> bool {
     schema.fields().iter().any(|f| f.name() == column)
 }
 
+/// `df` without the RFC 0065 §6.6 ingest-position columns. They are the
+/// dedup key, never part of a rendered row, so materialization does not
+/// read them. A scan whose files have none of them (the local backend)
+/// keeps its plan unchanged.
+fn unpositioned(
+    df: datafusion::dataframe::DataFrame,
+) -> Result<datafusion::dataframe::DataFrame, QueryError> {
+    let ingest = ourios_parquet::columns::INGEST_POSITION;
+    if ingest.iter().any(|c| has_column(df.schema(), c)) {
+        df.drop_columns(&ingest).map_err(storage_err)
+    } else {
+        Ok(df)
+    }
+}
+
 /// The (post-union) type of `column`, when present. Since RFC 0042 the
 /// promoted columns' union type is the declared class's type
 /// ([`schema_adapt::merge_scanned_schemas`]), so this is how the DSL
@@ -1032,7 +1047,7 @@ impl Querier {
         let state = datafusion::execution::SessionStateBuilder::new_from_existing(state)
             .with_config(config)
             .build();
-        let df = datafusion::dataframe::DataFrame::new(state, logical_plan);
+        let df = unpositioned(datafusion::dataframe::DataFrame::new(state, logical_plan))?;
         let limited = df.limit(0, Some(limit)).map_err(storage_err)?;
         // Plan + collect by hand (rather than `DataFrame::collect`) so this
         // scan's metrics can be read off the retained plan. The caller folds
@@ -1136,6 +1151,42 @@ impl Querier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 0065 §6.6: materialization never reads the ingest-position
+    /// columns, and a scan without them keeps its plan.
+    #[test]
+    fn materialization_projects_out_the_ingest_position() {
+        use datafusion::arrow::array::{ArrayRef, UInt32Array, UInt64Array};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let ctx = SessionContext::new();
+        let template_id: ArrayRef = Arc::new(UInt64Array::from(vec![1]));
+        let group: ArrayRef = Arc::new(UInt32Array::from(vec![7]));
+        let seq: ArrayRef = Arc::new(UInt64Array::from(vec![40]));
+        let index: ArrayRef = Arc::new(UInt32Array::from(vec![0]));
+        let positioned = RecordBatch::try_from_iter([
+            ("template_id", Arc::clone(&template_id)),
+            ("ingest_group", group),
+            ("ingest_seq", seq),
+            ("ingest_index", index),
+        ])
+        .expect("batch");
+        let df = ctx.read_batch(positioned).expect("frame");
+        let narrowed = unpositioned(df).expect("narrowed");
+        let names: Vec<&String> = narrowed
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name())
+            .collect();
+        assert_eq!(names, ["template_id"]);
+
+        let local = RecordBatch::try_from_iter([("template_id", template_id)]).expect("batch");
+        let df = ctx.read_batch(local).expect("frame");
+        let before = df.logical_plan().clone();
+        let after = unpositioned(df).expect("unchanged");
+        assert_eq!(after.logical_plan(), &before, "a local scan keeps its plan");
+    }
 
     /// A remote querier's store calls count as the querier's, and the
     /// template-map acquisition re-attributes its own.
@@ -1306,6 +1357,7 @@ mod tests {
                 body: None,
                 confidence: 1.0,
                 lossy_flag: false,
+                ingest_position: None,
             }
         }
 

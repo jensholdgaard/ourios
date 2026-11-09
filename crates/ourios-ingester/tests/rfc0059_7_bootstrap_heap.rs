@@ -125,6 +125,7 @@ fn row(seq: u64) -> MinedRecord {
         body: Some(text(seq)),
         confidence: 1.0,
         lossy_flag: true,
+        ingest_position: None,
     }
 }
 

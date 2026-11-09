@@ -562,22 +562,12 @@ pub fn batch_to_mined_records(
         let decoded_scope_attrs =
             decode_optional_scope_attributes(scope_attributes.as_ref(), i, row_offset)?;
 
-        let t_ns = u64::try_from(time_unix_nano[i]).map_err(|_| ReaderError::Conversion {
-            column: columns::TIME_UNIX_NANO,
-            detail: "negative i64 timestamp can't be a u64 nanos-since-epoch".to_string(),
-        })?;
-        let observed_t = match &observed_time {
-            None => None,
-            Some(col) => col[i]
-                .map(|v| {
-                    u64::try_from(v).map_err(|_| ReaderError::Conversion {
-                        column: columns::OBSERVED_TIME_UNIX_NANO,
-                        detail: "negative i64 timestamp can't be a u64 nanos-since-epoch"
-                            .to_string(),
-                    })
-                })
-                .transpose()?,
-        };
+        let t_ns = unix_nanos(columns::TIME_UNIX_NANO, time_unix_nano[i])?;
+        let observed_t = observed_time
+            .as_ref()
+            .and_then(|col| col[i])
+            .map(|v| unix_nanos(columns::OBSERVED_TIME_UNIX_NANO, v))
+            .transpose()?;
 
         let bk = decode_body_kind(body_kind[i])?;
         let body_string = match &body {
@@ -632,6 +622,14 @@ pub fn batch_to_mined_records(
     }
 
     Ok(records)
+}
+
+/// A stored `i64` timestamp of `column` as nanoseconds since the epoch.
+fn unix_nanos(column: &'static str, value: i64) -> Result<u64, ReaderError> {
+    u64::try_from(value).map_err(|_| ReaderError::Conversion {
+        column,
+        detail: "negative i64 timestamp can't be a u64 nanos-since-epoch".to_string(),
+    })
 }
 
 /// The RFC 0065 §6.6 ingest position of every row; `None` throughout

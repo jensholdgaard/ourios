@@ -31,7 +31,7 @@ superseded-by: —
 > which compaction keeps one" (§6.6), **extends RFC 0016 §3.4 and RFC
 > 0027's tool results** (`accepted`) with additive `tail_unavailable`
 > and `parquet_unavailable` response fields and an additive
-> `require_complete` request field (§6.7), and adds a group variant to the miner snapshot's
+> `require_complete` request field (§6.7), adds a group variant to the miner snapshot's
 > high-water mark (RFC 0001 §6.9, `accepted`). It reuses RFC 0052's barrier and
 > checkpoint (`green`), RFC 0053's retryable rejection (`drafted`) and
 > RFC 0059's template-id allocation (`green`), whose reservations §6.7
@@ -842,6 +842,17 @@ the mass-failover time and vote-log batching as tuning signals.
 >   `checkpoint.json` for `seq` 100 and proposes its checkpoint entry
 > - **Then** `checkpoint.json` still names 200, the leader rejects the
 >   proposal, and a restarting tail replica restores from 200
+> - **And** a flusher killed between any two of its bundle puts, or
+>   before its `checkpoint.json` put, leaves `checkpoint.json` as it was
+>   and proposes no checkpoint entry, and no `bundle.bin` is present
+>   before every `.snap` it names; a bundle object already present with
+>   other bytes, or a `checkpoint.json` that does not parse, has another
+>   `format`, a missing or unknown field, or a `bundle` that is not its
+>   `seq`'s prefix, is never replaced, and that checkpoint fails with
+>   nothing purged; a retried put of identical bytes completes the
+>   checkpoint; and a new log incarnation
+>   over a bucket holding an old one's objects checkpoints under its
+>   own log id from its first cut
 
 > **Scenario RFC0065.27 — a node failure with many groups fails over like one group (B7)**
 > - **Given** three voter nodes hosting 128 groups, durable fsync on,
@@ -927,6 +938,50 @@ the mass-failover time and vote-log batching as tuning signals.
 >   log's, also when elected after a checkpoint purged every
 >   configuration entry; and an
 >   otherwise valid version-1 snapshot record fails the group's open
+> - **And** the bundle at the cut holds, for each tenant of the group, a
+>   version-3 miner snapshot marked `{log, seq}` with the log id and
+>   the cut, and the allocator's range, its unused blocks and each
+>   tenant's configuration kind and body in force; a replica restored
+>   from it mints the same next template id and the same rows as one
+>   that mined through the cut; a bundle whose `format`, CRC, log id,
+>   cut, current block and `next` (`next` `0`; latest block `(1000,
+>   2000]` with no pending block and `next` `1`; a pending `(0, 2000]`
+>   against that latest block with `next` `1`), pending blocks, tenant
+>   order, a snapshot's length, CRC, version
+>   or mark, or a configuration kind or body is not as §6.5 requires
+>   (a `0x04` body whose `similarity_threshold` differs from the
+>   record's included), or that
+>   misses an object, fails the restore closed rather than replaying,
+>   and no restored allocator issues `0`;
+>   and a local-backend version-3 snapshot loads and restores as it did
+>   before this amendment, while one marked `{log, seq}` is discarded
+> - **And** a restarting tail replica restores from the bundle at its
+>   snapshot record's cut even when `checkpoint.json` names a later one,
+>   and mines only the entries after it; one restarting while the store
+>   is unreachable serves no tail and does not flush for the group,
+>   reports why, keeps taking the log while the group keeps acking, and
+>   restores and mines once the store returns
+> - **And** on a store without `miner/template_ids.v1.json` or
+>   `log_ids.json`, of two replicated starts only the one whose create
+>   of `log_ids.json` succeeds bootstraps the object, by RFC 0059 §3.5,
+>   and marks it `seeded` before any log id is allocated; the other,
+>   paused before its create and resumed after the first has seeded,
+>   allocated log ids and reserved a block and the object was deleted,
+>   does not re-create it; a bootstrapper killed between the
+>   object and `seeded` finishes on its restart while every other start
+>   waits; with `log_ids.json` deleted after log ids were allocated, a
+>   start finding the object present, or holding a group's Raft state,
+>   fails with `LogIdsDeleted` and re-creates nothing, and no log id is
+>   allocated twice; an unreadable `log_ids.json` fails a start that holds no
+>   group's Raft state, while a replica holding one, restarted with the
+>   store unreachable or the lock unreadable, opens its groups and keeps
+>   taking the log; and with the
+>   object deleted after
+>   group A has applied `(0, 1000]` and published nothing, while group
+>   B has applied no block, neither A's leader nor B's bootstraps or
+>   appends a block, and no id A holds is reserved again; nor does a
+>   leader while the object's `reserved_through` is below its group's
+>   latest block's `through`
 
 ## 6. Proposed design
 
@@ -1269,7 +1324,9 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
 - **Checkpoint.** RFC 0052's barrier runs on the flusher: cut at the
   last mined `seq`, publish everything buffered, then write a
   **cut-consistent bundle** for that `seq` to
-  `<bucket>/wal/replicated/groups/<g>/checkpoints/<seq>/`: the miner
+  `<bucket>/wal/replicated/logs/<log>/checkpoints/<seq>/`, where `<log>`
+  is the group's §6.6 log id (its bytes, and `checkpoint.json`'s, are
+  below): the miner
   snapshot of every tenant in the group, the group's id-allocator cursor
   and its unused reserved blocks, and the effective miner configuration
   and algorithm version of every tenant (item 4 below), all taken at
@@ -1293,10 +1350,12 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   checkpoint**: the barrier retries, and nothing is purged until a
   bundle is complete.
 - **Highest published position.** The flusher also records, per group,
-  the highest ingest position in any file it has published
-  (`published_high` in `checkpoint.json`, and in the footer statistics
-  of every file). `ourios wal force-leader` (B8) starts its new log
-  above the larger of that and the survivor's log end, so a position
+  the highest ingest position in any file it has published, in the
+  footer statistics of every file, and as `published_high`, whose
+  object and write rule are deferred to the forced-takeover amendment
+  (§9, Q7); until it lands `checkpoint.json` carries no such field.
+  `ourios wal force-leader` (B8) starts its new log above the larger of
+  that and the survivor's log end, so a position
   that a lost replica flushed but never checkpointed is never issued
   again (§4.5). For the same reason it abandons every unused id block
   the survivor holds, from its log and from the checkpoint snapshot:
@@ -1422,7 +1481,6 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     algorithm applies only once every member reads it. DynSRV updates
     one monitor at the step the update arrives. Here the update is an
     entry, and its log position is that step on every replica.
-
   A reserved kind's body is fixed by the amendment that implements it,
   and kinds are implemented in order: a release reads a kind only if it
   reads every kind below it. A release's highest readable kind,
@@ -1462,22 +1520,231 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   before the next block entry does so at the same log position on every
   replica, so the outcome (no id, body kept, as `id_reservation_failed`
   today) is still identical everywhere.
+- **The high-water object's bootstrap.** A store root serves one WAL
+  backend: running local receivers and replicated groups on the same
+  root, or moving a root from one backend to the other, is unsupported
+  until #1237 specifies it (§9, Q8). On a local root RFC 0059 §3.5 is
+  unchanged, and no local start reads, creates or depends on
+  `log_ids.json`. On a replicated root, whose store supports
+  conditional writes (§6.2), RFC 0059's `miner/template_ids.v1.json` is
+  created once, by one replicated start, and its absence afterwards
+  always means it was deleted. `<bucket>/wal/log_ids.json` (§6.6) is
+  the lock that decides which start that is, and it comes before the
+  object. It is UTF-8 JSON:
+
+  ```json
+  {"format": 1, "bootstrapper": "ourios-receiver-0", "seeded": false, "next": 0}
+  ```
+
+  `format` is `1`; `bootstrapper` is the replicated `node_id` of the
+  start that created the file; `seeded` says whether the high-water
+  object exists under it; `next` is the next log id to allocate, a JSON
+  integer read as a `u32`. Log ids start at `0`, so `next` is also the
+  number allocated, and `0` means none has been. A reader takes it only
+  with exactly these fields and `format` `1`; any other object, or one
+  that does not parse, fails closed the start or step that reads it,
+  and no node replaces it.
+  - **The lock comes first.** A replicated start that finds
+    `log_ids.json` absent, no `template_ids.v<k>.json` and no group's
+    Raft state of its own creates it with `put_if_absent`, naming
+    itself, `seeded` `false` and `next` `0`. Only the start whose
+    create succeeds bootstraps: if no `template_ids.v<k>.json` exists,
+    it runs RFC 0059 §3.5 with that section's table, `restored_max = 0`
+    (no group holds an id before a log id exists) and its own node's
+    `receiver.template_ids_allow_bootstrap`, and creates the object
+    with `put_if_absent`, going on with the object it finds if one is
+    present. It then sets `seeded` to `true` by `put_if_match`, and only
+    then are log ids allocated, by `put_if_match` on `next`.
+  - **A present lock is never bootstrapped past.** A replicated start
+    that finds `log_ids.json` present never creates the object. With
+    `seeded` `false` under another `node_id` it waits, reporting why,
+    until `seeded` is `true`; with `seeded` `true` and the object
+    absent, the object was deleted (§9 Q6), and it fails closed with
+    `HighWaterDeleted`. A replicated start that paused anywhere before
+    the object exists either holds the lock, so it bootstraps before any
+    log id or block exists, or does not, so it never bootstraps: no
+    start re-creates a deleted object from a floor below ids a group
+    holds, whether or not that group has applied a block.
+  - **A crash between the two steps.** A start that finds `seeded`
+    `false` under its own `node_id` is a bootstrapper that crashed
+    between the object and `seeded`. It repeats them and sets `seeded`.
+    That is safe because no log id, and so no group and no reserved
+    block, exists before `seeded`, the object's create is
+    `put_if_absent`, and a `node_id` runs one start at a time (the
+    StatefulSet's pod identity), so no paused start outlives its own
+    restart.
+  - **A deleted lock is never re-created.** The object is created only
+    under the lock and a group exists only under a log id, so a lock
+    absent beside the object, or from a start that holds a group's Raft
+    state, was deleted: re-creating it at `next` `0` would hand out log
+    ids already in Parquet. The start or step fails closed with
+    `LogIdsDeleted`, reporting why, and no node re-creates it. With
+    both the lock and the object deleted nothing on the store tells a
+    new bucket from an emptied one, which is §9 Q6's recovery.
+  - **A formed replica starts without it.** Log ids exist only after
+    `seeded`, and a group only under a log id, so a start that holds a
+    group's Raft state (a log or §6.1's snapshot record) comes after
+    the bootstrap. It opens its groups from that state without reading
+    `log_ids.json` and keeps taking the log. The lock is read where it
+    is needed, when a log id is allocated, and the object when a leader
+    reserves a block, so a store it cannot reach or a lock it cannot
+    read fails that step, not the start, and §6.5's tail recovery
+    retries it.
+
+  Thereafter only the leader writes the object, reserving blocks (RFC
+  0059 §3.2), and a group's latest applied id block (§6.1's record,
+  both `0` when none has been) stands in for `TEMPLATE_IDS_SEATED`'s
+  `max_reserved_seen`. A leader appends no block while the object is
+  absent, or while its `reserved_through` is below that block's
+  `through`, and reports `HighWaterDeleted` or the rollback as RFC 0059
+  §3.1 does; its miner then runs out of ids as above. RFC 0059 §3.1's
+  re-bootstrap removes roots' markers and reaches neither
+  `log_ids.json` nor a block held in a log (§9, Q6).
 - **Snapshot and bundle formats.** The checkpoint bundle (§6.5) and the
   miner snapshots in it carry a format version; the snapshot's
-  `wal_high_water` gains a variant `{ group, seq }`. Once the WAL below a
-  checkpoint is purged, a full replay can no longer rebuild the miner
-  and allocator state, so the local backend's rule of discarding an
-  unreadable snapshot and replaying does not carry over: a release that
-  changes a bundle format ships a migration from the previous one, and a
-  replica that finds neither a usable bundle nor the group's complete
-  history from `seq` 0 **fails closed** for that group (it serves no
-  tail and does not flush, and reports why) rather than mine rows that
-  could differ from its peers'.
-- **Recovery** of a tail replica on start: read the checkpoint `c` and
-  the snapshots, replay the local group WAL from the lower of `c` and
-  the snapshots' marks, and suppress per consumer as RFC 0008 §6.6
-  does. It serves the tail once it has mined through the leader's
-  commit point.
+  `wal_high_water` gains a variant `{ log, seq }` (both below). Once
+  the WAL below a checkpoint is purged, a full replay can no longer
+  rebuild the miner and allocator state, so the local backend's rule of
+  discarding an unreadable snapshot and replaying does not carry over: a
+  release that changes a bundle format ships a migration from the
+  previous one, and a replica that finds neither a usable bundle nor the
+  group's complete history from `seq` 0 **fails closed** for that group
+  (it serves no tail and does not flush, and reports why) rather than
+  mine rows that could differ from its peers'.
+- **The miner snapshot's mark.** A bundle's miner snapshots keep
+  `SNAPSHOT_VERSION` 3 and `ourios-miner`'s snapshot codec (byte 0 the
+  version, then `serde_json` over `SnapshotState`). Only
+  `wal_high_water` takes a second JSON shape, told apart by its keys:
+  the local `{"segment": "<uuid>", "byte": <u64>}` and the replicated
+  `{"log": <u32>, "seq": <u64>}`, `log` the §6.6 log id and `seq`
+  the cut index, meaning the tenant's state folds every entry of the
+  group's log through `seq`. An object with neither key set, or keys
+  of both, is corrupt. The version is not raised: version 4 would send
+  every local version-3 snapshot down the unknown-version path, a full
+  replay that re-mints reclaimed ids (hazard #5), against RFC0065.16.
+  The local writer still emits the same bytes, and the local loader
+  treats a replicated mark as corrupt and applies the discard and
+  replay it already uses; only a tail replica reads that shape, and only in a
+  bundle. A release that raises `SNAPSHOT_VERSION` reads the previous
+  version inside a bundle, the migration the bullet above requires,
+  while the local backend keeps discarding it.
+- **The bundle's bytes.** In the prefix
+  `<bucket>/wal/replicated/logs/<log>/checkpoints/<seq>/`, `<log>` is
+  the log id in decimal and `<seq>` the cut index as 20 zero-padded
+  decimal digits, so key order is cut order. It holds
+  `tenants/<tenant>.snap` for each tenant whose state the group's miner
+  holds at the cut, `<tenant>` percent-encoded by RFC 0005 §3.4 as
+  `snapshot_store.rs` names its files and the bytes exactly what
+  `snapshot()` writes for it, and `bundle.bin`, every integer
+  little-endian:
+
+  ```text
+  format: u8 = 1 | log: u32 | seq: u64 | term: u64 |
+  next: u64 | current after: u64 | current through: u64 |
+  blocks: u32 | blocks × (after: u64 | through: u64) |
+  tenants: u32 | tenants × (len: u16 | tenant: len bytes | config kind: u8 | config body |
+                            snapshot len: u64 | snapshot crc32c: u32) |
+  crc32c: u32
+  ```
+
+  `log`, `seq` and `term` are the log id and the cut's index and term.
+  `next` is the next id the allocator issues and `current` the block
+  `(after, through]` its range comes from, `IdRange`'s `end` being
+  `through + 1`; before the allocator has started a block, `current` is
+  `(0, 0]` and `next` is `1`. `blocks` are the applied blocks it has
+  not started, in log order. The allocator keeps `current` for this,
+  since its range alone cannot show which block it came from. Each
+  tenant is its id's UTF-8 bytes as
+  the `TenantOtlpBatch` prefix carries them (RFC 0046 §3.3, `len` 1 to
+  128), sorted bytewise, none repeated; `config kind` and `config body`
+  are its effective miner configuration, the control-entry kind that is
+  its algorithm version and that kind's body (`0x04` and its 28 bytes);
+  `snapshot len` and `snapshot crc32c` are its `.snap` object's length
+  and CRC. Every CRC is CRC32-C (Castagnoli) as in RFC 0008's frames,
+  and the last covers every byte before it.
+  - **Reading.** A replica restores from a bundle only if `format` is
+    `1` and the CRC holds; `log`, `seq` and `term` are the log id and
+    the cut it restores (§6.1's record); `current` is `(0, 0]`
+    with `next` `1`, or has `after < through <= 2^63 - 1` and
+    `after < next <= through + 1`, so `next` is at least `1` and `0`,
+    the `NO_TEMPLATE` sentinel, is never issued, and no id at or below
+    the block's `after` is; every pending block has
+    `after < through <= 2^63 - 1`, the first's `after` at or above
+    `current`'s `through` and each next one's at or above the previous
+    `through`; the last pending block, else `current`, equals the
+    record's latest id block in both `after` and `through`; the tenants
+    are sorted and
+    unique; each tenant's configuration kind is one it reads, its body
+    passes that kind's checks (`MinerConfig` validation for `0x04`),
+    and, while no per-tenant override is specified, kind and body
+    equal the record's configuration in force byte for byte; and each
+    `.snap` has its length and CRC, decodes under
+    `load_snapshot`, carries the mark `{log, seq}` with this log id and holds no
+    template id at or above `next`. Any other bundle, or one missing an
+    object, fails the restore closed as above. It never lists the
+    prefix: the tenants are the ones `bundle.bin` names.
+  - **Writing.** Each object is created with `put_if_absent`. A put
+    that finds its object present reads it and goes on only if the bytes
+    are the same, as a retry of its own put's are, and otherwise
+    abandons the checkpoint, so no bundle object is ever overwritten.
+    An object is durable once its put returns on the S3-compatible
+    stores this backend requires (§6.2); a store whose put is not, the
+    local filesystem's, syncs it first with `sync_local_blocking`, as
+    RFC 0059 §3.2 step 4 does. The flusher writes `bundle.bin` only
+    once every `.snap` is durable, `checkpoint.json` only once
+    `bundle.bin` is, and proposes the checkpoint entry only once
+    `checkpoint.json` is, so an applied cut always names a complete
+    bundle its proposer wrote. Two flushers' bundles for one cut need
+    not be the same bytes.
+- **`checkpoint.json`** is
+  `<bucket>/wal/replicated/logs/<log>/checkpoint.json`, UTF-8 JSON:
+
+  ```json
+  {"format": 1, "log": 3, "seq": 200, "term": 4,
+   "bundle": "wal/replicated/logs/3/checkpoints/00000000000000000200/"}
+  ```
+
+  `format` is `1`; `log` is the log id; `seq` and `term` are the cut's
+  index and term; `bundle` is the bundle's prefix, relative to the
+  bucket. Every number is a JSON integer read as a `u64`, `log` as a
+  `u32`. A reader takes the object only with exactly these fields,
+  `format` `1`, `log` the group's and `bundle` the prefix `log` and
+  `seq` name. §6.5's `published_high` is not among them yet: where it is
+  kept and when it is written belong to the forced-takeover amendment
+  (§9, Q7). Any other object, or one
+  that does not parse, is unreadable, and a writer never replaces it,
+  since a whole-object rewrite would drop a field it does not know: its
+  checkpoint fails as a failed bundle write does, and it reports why.
+  The object is created with `put_if_absent` and changes only by
+  `put_if_match` on the ETag the writer read. A writer that reads a
+  stored `seq` at or above its own abandons its write (above);
+  otherwise it writes its `seq`, `term` and `bundle`; a lost race
+  re-reads and decides again. Recovery does not read the object
+  (below).
+  - **Keyed by log id, not group number.** A log incarnation that
+    replaces another over a bucket that keeps the old one's objects
+    starts its Raft indexes over, and under the group number its writes
+    would lose for good to the old object's higher `seq`.
+- **Recovery** of a tail replica on start: the mark is one cut. The
+  replica opens the group's log from §6.1's snapshot record, whose last
+  log id is the cut `c` of the last checkpoint it applied, and every
+  tenant's snapshot in that bundle is taken at `c`. With a record, it
+  restores every tenant's miner, the allocator and the configuration
+  from the bundle at `c`'s index, never a later one `checkpoint.json`
+  names, whose entry may not have applied, and mines the group WAL
+  from the entry after `c`; without one, its log holds the group's
+  history from its first entry, and it mines all of it. A replica that
+  installs a snapshot does the same at its cut. It suppresses per
+  consumer as RFC 0008 §6.6 does, and serves the tail once it has mined
+  through the leader's commit point. A replica that cannot read the
+  bundle, the store unreachable or the bundle refused, fails closed for
+  the group as above and retries until it restores; it keeps taking
+  the log as a learner, so the group's acks do not depend on it (B10).
+  The outage of RFC0065.21 writes no checkpoint, so the logs keep every
+  entry above the last cut and a tail replica that stays up serves the
+  whole backlog. One that restarts during the outage cannot restore and
+  serves none of it until the store returns, and a group none of whose
+  tail replicas serves reports its tail unavailable (RFC0065.14).
 
 ### 6.6 Position as the dedup key (B13, H8)
 
@@ -2001,7 +2268,16 @@ from rows.
   the in-process cluster.
 - RFC0065.30: the in-process cluster with tail learners, the patience
   shortened for the test and each failure driven by a gate or a kill.
+- RFC0065.26 and .31's bundle arms: codec tests beside the bundle and
+  `checkpoint.json` readers, one per refusal, and the in-process
+  cluster on the in-memory store, with a failpoint between each pair of
+  bundle puts and the store made unreachable across a tail replica's
+  restart.
 - RFC0065.16: the existing suites, unchanged.
+- RFC0065.31's lock arms (two replicated starts, a crashed
+  bootstrapper, a deletion with groups holding blocks): the in-process
+  cluster on the in-memory store, with failpoints between the lock,
+  the object and `seeded`.
 - RFC0065.17: `deploy/helm/render-tests.sh`.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process
   cluster (ack latency with and without tail load; tail throughput with
@@ -2040,6 +2316,46 @@ Q1 and Q2 are RFC 0064's (§7 there).
   layouts) gets its own RFC. Tail capacity scales at any time (B24),
   and the 16 default groups spread load over up to 16 machines without
   a layout change.
+
+- [ ] **Q6. How does a replicated group recover from a deleted or
+  rolled-back high-water object?** RFC 0059 §3.1's quiesced
+  re-bootstrap removes every root's seated marker. On a replicated root
+  `log_ids.json` stays, so after a deletion no replicated start
+  re-creates the object, a start that must bootstrap fails closed, and
+  the rollback check
+  reads each group's latest applied id block, in its log and snapshot
+  record, which no operator step removes. So after a deletion every
+  group, and after a rollback every group with a block above the
+  object, appends no id block (§6.5) and its miner runs out of ids
+  until a recovery is defined. That recovery must floor the new
+  object above every block any group's log or bundle holds, not only
+  above the published ids.
+
+- [ ] **Q7. How does a forced takeover interact with checkpoint
+  bundles, `checkpoint.json`, id blocks and template versions?** Not
+  yet specified; tracked in #1227. `ourios wal force-leader` must
+  not be implemented until that amendment lands. Known gaps:
+  - `published_high`: which object holds it and when it is written,
+    so that `force-leader` starts above every position ever published,
+    including files published after the last checkpoint (B8).
+  - A former flusher still running after the takeover can still write
+    files, bundles and `checkpoint.json` under the same log id.
+  - The survivor's uncommitted suffix and the new log share one
+    position namespace.
+  - A replica restored from an older bundle can resume an id range the
+    lost suffix already used.
+  - A returning replica purged past the survivor's base.
+  - The `template_version` floor read from the audit trail can differ
+    between tail replicas while a former flusher still publishes.
+
+- [ ] **Q8. Can one store root serve both WAL backends?** Not yet;
+  tracked in #1237. §6.5 makes a root serve one backend: local
+  receivers and replicated groups on one root, or a root moved between
+  them, are unsupported, so a local start bootstrapping the high-water
+  object beside replicated groups, or after one was deleted there, is
+  out of scope by statement. Local starts know nothing of
+  `log_ids.json`, and a mixed root would need one bootstrap lock both
+  backends honour.
 
 Decided as technical calls: RFC0065.10's check uses `openraft`'s
 upstream verification plus our seeded simulation suite, not a TLA+

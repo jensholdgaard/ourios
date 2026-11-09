@@ -82,6 +82,7 @@ mod confidence;
 mod emission;
 mod id_reservation;
 mod ingest;
+mod reconfigure;
 mod restore;
 mod restore_masking;
 mod restore_properties;

@@ -284,6 +284,36 @@ async fn an_entry_over_the_wal_frame_is_refused_and_the_group_keeps_committing()
     cluster.shutdown().await;
 }
 
+/// RFC 0065 §6.5: the leader stamps a batch with its wall clock as it
+/// submits the entry, and every voter's log holds that same time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_leader_stamps_a_batch_with_its_clock_on_submitting_it() {
+    use crate::replicated::raft::types::GroupEntry;
+    use ourios_wal::BatchTime;
+
+    let cluster = Cluster::start(3, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let before = BatchTime::from_system_time(std::time::SystemTime::now());
+    let position = writer(&cluster, leader)
+        .commit("acme", batch(1))
+        .await
+        .expect("committed");
+    let after = BatchTime::from_system_time(std::time::SystemTime::now());
+    let mut stamped = Vec::new();
+    for node in 0..3 {
+        cluster.node(node).applied_through(0, position.seq).await;
+        let log = cluster.node(node).log(0).await;
+        let entry = log.iter().find(|e| e.log_id.index == position.seq);
+        match entry.map(|e| &e.payload) {
+            Some(EntryPayload::Normal(GroupEntry::Batch(timed))) => stamped.push(timed.time),
+            other => panic!("node {node}: expected the batch, got {other:?}"),
+        }
+    }
+    assert!((before..=after).contains(&stamped[0]), "{stamped:?}");
+    assert!(stamped.iter().all(|&t| t == stamped[0]), "{stamped:?}");
+    cluster.shutdown().await;
+}
+
 /// A binding whose one token may write `tenants`.
 fn binding(tenants: &[&str]) -> ourios_serving::AuthBinding {
     let store = ourios_core::auth::build_token_store(Some(&[ourios_core::auth::TokenSpec {

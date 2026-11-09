@@ -969,7 +969,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   allocated log ids and reserved a block and the object was deleted,
 >   does not re-create it; a bootstrapper killed between the
 >   object and `seeded` finishes on its restart while every other start
->   waits; an unreadable `log_ids.json` fails the start; and with the
+>   waits; an unreadable `log_ids.json` fails a start that holds no
+>   group's Raft state, while a replica holding one, restarted with the
+>   store unreachable or the lock unreadable, opens its groups and keeps
+>   taking the log; and with the
 >   object deleted after
 >   group A has applied `(0, 1000]` and published nothing, while group
 >   B has applied no block, neither A's leader nor B's bootstraps or
@@ -1536,7 +1539,8 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   integer read as a `u32`. Log ids start at `0`, so `next` is also the
   number allocated, and `0` means none has been. A reader takes it only
   with exactly these fields and `format` `1`; any other object, or one
-  that does not parse, fails the start closed, and no node replaces it.
+  that does not parse, fails closed the start or step that reads it,
+  and no node replaces it.
   - **The lock comes first.** A replicated start that finds
     `log_ids.json` absent creates it with `put_if_absent`, naming
     itself, `seeded` `false` and `next` `0`. Only the start whose
@@ -1565,6 +1569,15 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     `put_if_absent`, and a `node_id` runs one start at a time (the
     StatefulSet's pod identity), so no paused start outlives its own
     restart.
+  - **A formed replica starts without it.** Log ids exist only after
+    `seeded`, and a group only under a log id, so a start that holds a
+    group's Raft state (a log or §6.1's snapshot record) comes after
+    the bootstrap. It opens its groups from that state without reading
+    `log_ids.json` and keeps taking the log. The lock is read where it
+    is needed, when a log id is allocated, and the object when a leader
+    reserves a block, so a store it cannot reach or a lock it cannot
+    read fails that step, not the start, and §6.5's tail recovery
+    retries it.
 
   Thereafter only the leader writes the object, reserving blocks (RFC
   0059 §3.2), and a group's latest applied id block (§6.1's record,
@@ -2296,7 +2309,8 @@ Q1 and Q2 are RFC 0064's (§7 there).
   rolled-back high-water object?** RFC 0059 §3.1's quiesced
   re-bootstrap removes every root's seated marker. On a replicated root
   `log_ids.json` stays, so after a deletion no replicated start
-  re-creates the object and each fails closed, and the rollback check
+  re-creates the object, a start that must bootstrap fails closed, and
+  the rollback check
   reads each group's latest applied id block, in its log and snapshot
   record, which no operator step removes. So after a deletion every
   group, and after a rollback every group with a block above the

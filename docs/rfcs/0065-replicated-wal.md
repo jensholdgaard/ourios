@@ -31,8 +31,10 @@ superseded-by: —
 > which compaction keeps one" (§6.6), **extends RFC 0016 §3.4 and RFC
 > 0027's tool results** (`accepted`) with additive `tail_unavailable`
 > and `parquet_unavailable` response fields and an additive
-> `require_complete` request field (§6.7), and adds a group variant to the miner snapshot's
-> high-water mark (RFC 0001 §6.9, `accepted`). It reuses RFC 0052's barrier and
+> `require_complete` request field (§6.7), adds a group variant to the miner snapshot's
+> high-water mark (RFC 0001 §6.9, `accepted`), and **amends RFC 0059
+> §3.5** (`green`): a start of any backend creates the template-id
+> high-water object only while `wal/log_ids.json` is absent (§6.5). It reuses RFC 0052's barrier and
 > checkpoint (`green`), RFC 0053's retryable rejection (`drafted`) and
 > RFC 0059's template-id allocation (`green`), whose reservations §6.7
 > moves into the log and scopes per group (coordinate with RFC 0059).
@@ -733,7 +735,8 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Given** `backend: local`
 > - **When** the RFC 0008, RFC 0014 and RFC 0052 suites run
 > - **Then** they pass unchanged, and written Parquet files have no
->   `ingest_*` columns
+>   `ingest_*` columns; on a store without `wal/log_ids.json`, RFC
+>   0059's bootstrap runs exactly as before
 
 > **Scenario RFC0065.17 — the chart renders the replicated shape (B20, B21)**
 > - **Given** `receiver.wal.backend: replicated` and `receiver.replicas: 3`
@@ -975,7 +978,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   B has applied no block, neither A's leader nor B's bootstraps or
 >   appends a block, and no id A holds is reserved again; nor does a
 >   leader while the object's `reserved_through` is below its group's
->   latest block's `through`
+>   latest block's `through`; and with that object deleted, a fresh
+>   local-backend root starting on the same store finds `log_ids.json`
+>   present, does not re-create the object, and fails closed with
+>   `HighWaterDeleted`
 
 ## 6. Proposed design
 
@@ -1554,6 +1560,16 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     never bootstraps, and a group whose leader finds the object absent
     cannot have it re-created from a floor below ids another group
     holds, whether or not its own group has applied a block.
+  - **Amends RFC 0059 §3.5 for every backend sharing the object.**
+    Every start that would run that section's bootstrap, a local
+    backend's included, first reads `log_ids.json`. If it is present,
+    readable or not, the start never creates the object: an absent
+    object is then the deletion of §9 Q6, and the start fails closed
+    with `HighWaterDeleted`, as a replicated start does. If it is
+    absent, RFC 0059 §3.5 runs unchanged, so a store no replicated node
+    has started on behaves exactly as before (RFC0065.16). Without
+    this, a fresh local root could re-create a deleted object at `0`
+    and reserve ids a replicated group holds unpublished.
 
   Thereafter only the leader writes the object, reserving blocks (RFC
   0059 §3.2), and a group's latest applied id block (§6.1's record,
@@ -2237,7 +2253,10 @@ from rows.
   cluster on the in-memory store, with a failpoint between each pair of
   bundle puts and the store made unreachable across a tail replica's
   restart.
-- RFC0065.16: the existing suites, unchanged.
+- RFC0065.16: the existing suites, unchanged; RFC 0059's bootstrap
+  tests run on a store without `log_ids.json`, and one more case puts
+  the file on the store and checks a local start that finds the object
+  absent fails closed (RFC0065.31's cross-backend arm).
 - RFC0065.17: `deploy/helm/render-tests.sh`.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process
   cluster (ack latency with and without tail load; tail throughput with
@@ -2320,8 +2339,8 @@ specification of our own (§8 gives the reasoning).
   RFC 0009 §3.4, §3.5 (compare-and-swap; amended); RFC 0014 §3.2; RFC 0016 §3.4 and RFC 0027 (extended); RFC 0030 (TLS
   sections); RFC 0033 (template map); RFC 0038 §3.5 (spans); RFC 0046
   §3.3 (tenant frame); RFC 0047 (visibility); RFC 0052 §3.1 (barrier,
-  checkpoint); RFC 0053 §3.1 (retryable rejection); RFC 0059 §3.6
-  (several receivers); RFC 0063; RFC 0066 (Kafka backend)
+  checkpoint); RFC 0053 §3.1 (retryable rejection); RFC 0059 §3.5
+  (bootstrap; amended), §3.6 (several receivers); RFC 0063; RFC 0066 (Kafka backend)
 - W. Lin, M. Yang, L. Zhang, L. Zhou, *PacificA: Replication in
   Log-Based Distributed Storage Systems*, Microsoft Research
   MSR-TR-2008-25

@@ -768,6 +768,11 @@ the mass-failover time and vote-log batching as tuning signals.
 >   in the group
 > - **When** their rows are compared position by position
 > - **Then** every row is identical, `template_id` included
+> - **And** every audit event the two miners emit is identical, its
+>   timestamp the `time` of the batch whose mining emitted it, also on
+>   the replica restored from the checkpoint and on the new flusher,
+>   with each replica's clock set hours apart from the others and from
+>   the leader's
 
 > **Scenario RFC0065.21 — a long object-store outage is absorbed and searchable (B25, B19)**
 > - **Given** a three-node cluster sized for a backlog of `N` bytes,
@@ -794,6 +799,20 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Then** the leader's ack latency is unaffected, the other tail
 >   replica becomes the flusher without replaying the log, and after
 >   compaction no `(tenant, ingest position)` appears twice
+> - **And** the new flusher publishes the rows and audit events it kept
+>   above the last applied checkpoint, each template's audit events in
+>   the store before the first file whose rows use it, and keeps
+>   nothing at or below a cut it has applied; a former flusher paused
+>   and resumed before it applies its replacement publishes files whose
+>   repeated positions a query counts once
+> - **And** with the kept audit events driven past the per-group
+>   ceiling, or the tail volume full, before the takeover, the replica
+>   drops what it kept, counts it and records its gap; taking over, it
+>   rebuilds the dropped output from the bundle at its applied cut and
+>   publishes the same rows and audit events, byte for byte, as a
+>   replica that dropped nothing; once it has applied a checkpoint at or
+>   above its gap it rebuilds nothing; and while the store is
+>   unreachable it publishes nothing
 
 > **Scenario RFC0065.24 — a wiped disk rejoins as a new replica (B4, B6, B8)**
 > - **Given** a group of three voters, and a voter restarted under the
@@ -885,6 +904,16 @@ the mass-failover time and vote-log batching as tuning signals.
 >   flight appends no new kind until that change commits; a replica
 >   whose checkpoint records a kind above the highest it reads refuses
 >   to open the log at the checkpoint
+> - **And** a group WAL holding a batch under tag `0x02`, or under tag
+>   `0x05` with a `time` above `2^63 - 1`, is refused at that record
+>   the same way
+> - **And** a committed batch whose export does not decode stops the
+>   group's miner at that entry on the flusher, on another tail replica
+>   and on one restored from a checkpoint before it, alike: none mines,
+>   publishes, proposes a cut at or above it or serves a tail row past
+>   it, each logs the group, the entry's log id and the decode error,
+>   and a query reports the group in `tail_unavailable`; the group keeps
+>   acknowledging exports and every replica keeps taking its log
 
 > **Scenario RFC0065.30 — the leader names one flusher and keeps it (B11)**
 > - **Given** a group with three tail replicas as learners and no
@@ -927,6 +956,36 @@ the mass-failover time and vote-log batching as tuning signals.
 >   log's, also when elected after a checkpoint purged every
 >   configuration entry; and an
 >   otherwise valid version-1 snapshot record fails the group's open
+
+> **Scenario RFC0065.32 — the flusher's proposals and reports reach the leader (B11)**
+> - **Given** a group with a flusher, a second tail replica, a former
+>   flusher still running, and one id block in the log the flusher's
+>   allocator has not started
+> - **When** the flusher reports its allocator and proposes checkpoint
+>   entries with `Propose`, the leader fails over while a proposal is
+>   in flight, and the former flusher reports and proposes too
+> - **Then** after the flusher's report the leader's log holds three
+>   blocks above the flusher's current one, each reserved in the store
+>   first, and a repeated report appends none; the flusher's checkpoint
+>   is appended and answered with its log id once committed; the former
+>   flusher's report and entry are refused `not_flusher` and append
+>   nothing; a proposal whose cut is not above the last checkpoint, not
+>   in the leader's log at or below its commit index, or whose highest
+>   kind differs, is refused `stale`; an entry of another kind, of
+>   another length, or whose `proposer` is not the request's is refused
+>   `malformed`; a call to a non-leader is refused `not_leader` with the
+>   hint, and the flusher reaches the new leader; a proposal resent
+>   after an uncertain outcome leaves at most one applied checkpoint for
+>   its cut
+> - **And** a current flusher whose `checkpoint.json` write finds a
+>   later `seq` a former flusher wrote, or its own earlier write of the
+>   same `seq`, proposes its entry, which every replica applies, so the
+>   group's checkpoint advances; a flusher that finds the object
+>   unreadable proposes nothing; at every step `checkpoint.json` names a
+>   cut at or above every applied one; a tail replica restarting then
+>   restores from the bundle at its applied cut; and a query starting
+>   from `checkpoint.json`'s later cut counts every acknowledged record
+>   once
 
 ## 6. Proposed design
 
@@ -1279,14 +1338,34 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   the restore closed rather than mining differently (B11). Only after
   every object of the bundle is durable does it write `checkpoint.json`
   (the `seq`, the term, the bundle's key) and propose a checkpoint entry
-  to the leader. Publication is **monotonic and fenced**: bundles are
+  to the leader with `Propose` (§6.8). Publication is **monotonic and
+  fenced**: bundles are
   immutable, keyed by their `seq`; `checkpoint.json` changes only by
   `put_if_match` and a writer whose `seq` is not above the stored one
   abandons its write; and the leader appends a checkpoint entry only
   from the flusher named by the latest flusher-assignment entry, with a
   `seq` above the last applied checkpoint, so a delayed former flusher
   can neither move the checkpoint back nor make a replica restore from a
-  cut whose history is purged. Every replica snapshots and purges its group WAL below
+  cut whose history is purged.
+  **An abandoned write still proposes.** A flusher that abandons its
+  `checkpoint.json` write because the stored `seq` is at or above its
+  own, a former flusher's later cut or its own earlier attempt, still
+  proposes its checkpoint entry: its bundle is complete and durable,
+  and that is all an applied cut needs, since recovery restores from
+  the bundle at the applied cut and never reads `checkpoint.json`
+  (below). One whose stored object is unreadable proposes nothing, and
+  its checkpoint fails as a failed bundle write does. So a current
+  flusher whose predecessor ran ahead keeps checkpointing, and the
+  group's checkpoint never stalls until its mining passes the
+  predecessor's cut. An entry is
+  proposed only once `checkpoint.json` names its cut or a later one,
+  and the object never moves back, so `checkpoint.json` is always at
+  or above every applied cut. It may name a later bundle than the
+  applied one: a querier that starts from it (§6.7, step 1) finds the
+  rows between the two cuts in Parquet, since whoever wrote it
+  published every row through its cut before its bundle, and counts
+  them once by position (§6.6). Every bundle a snapshot record can name
+  is kept (§9, Q8). Every replica snapshots and purges its group WAL below
   the checkpoint (RFC 0008 §6.7) when it applies that entry, so no
   history is purged that a miner restore still needs. Unlike RFC 0052
   §3.1 on the local backend, a failed snapshot write here **fails the
@@ -1458,7 +1537,7 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   once its newest entry of a new kind has committed.
 - **Template-id blocks.** The leader keeps reserved id blocks ahead in
   the log (as RFC 0059's refiller keeps three ready), topping them up
-  when the flusher reports its remaining ids. A miner that exhausts them
+  on the flusher's reports (`Propose`, §6.8). A miner that exhausts them
   before the next block entry does so at the same log position on every
   replica, so the outcome (no id, body kept, as `id_reservation_failed`
   today) is still identical everywhere.
@@ -1562,8 +1641,45 @@ never count toward an ack (learners, under §4.3's shape).
   placement does so knowingly. If the volume
   fills anyway, the replica stops caching new rows for the group that
   needed the space and reports that group's tail unavailable (B17)
-  until the checkpoint frees space; acks never wait on a tail volume,
+  until a checkpoint passes the rows it did not cache (its gap, below);
+  acks never wait on a tail volume,
   and no acknowledged record is lost, since the WAL still holds it.
+- **What every tail replica keeps for a takeover (B11).** A tail
+  replica keeps what it would publish as flusher: the rows it mined
+  above the last checkpoint it applied (above), and the audit events
+  its miner emitted for them, each with the log id of the batch whose
+  mining emitted it. When it applies a checkpoint entry it drops the
+  rows and audit events of entries at or below the cut, which the
+  proposer published before writing its bundle (§6.5). When it applies
+  an assignment naming itself it is the flusher, and publishes what it
+  keeps, audit events first as audit-before-record requires, with no
+  replay. A flusher that applies an assignment naming another replica
+  stops publishing at that entry and keeps what it has not published,
+  as every other tail replica does. Until it applies that entry, a
+  former flusher, paused or lagging, may still publish: the rows both
+  publish are removed by position (§6.6), and the audit events both
+  publish are identical, timestamps included (item 5 below; §9, Q9).
+  - **Bounds.** Rows are bounded as above: in memory by the record
+    sink's size and age triggers, the rest by the tail volume. Audit
+    events stay in memory, at most 16 MiB of encoded events per group
+    (a starting value, §6.9). A replica that would pass that drops
+    every audit event it keeps for the group, and one whose full tail
+    volume stops it caching rows drops those rows. Either way it
+    records the highest log id whose output it dropped, the group's
+    **gap**, counts what it dropped (§6.9), and keeps mining and
+    keeping later entries' output. The gap clears when the replica
+    applies a checkpoint whose cut is at or above it, since everything
+    dropped was then published by the proposer.
+  - **A takeover over a gap.** A replica that becomes the flusher while
+    it has a gap first rebuilds what it dropped: it restores the bundle
+    at the last checkpoint it applied into a second miner, as recovery
+    does (§6.5), mines its log from the cut through the gap, and
+    replaces everything it keeps at or below the gap with that miner's
+    rows and audit events, which are the bytes it dropped (item 5
+    below, RFC0065.20). Its log holds those entries, since its WAL is
+    purged only below an applied checkpoint. Then it publishes as
+    above. With the store unreachable it can restore nothing, and
+    could publish nothing either; it rebuilds once the store returns.
 - **Where the mined rows come from: a deterministic miner.** Every tail
   replica mines the same committed log from the same snapshot and gets
   the rows the leader gets, so only raw frames are replicated. A spike
@@ -1591,7 +1707,65 @@ never count toward an ack (learners, under §4.3's shape).
   4. **Miner configuration and version are pinned per epoch**: a
      per-tenant override or a miner upgrade takes effect at a log entry,
      so replicas never mine one entry with different settings.
-  5. **Audit timestamps** come from the entry, not the wall clock.
+  5. **Audit timestamps** come from the entry, not the wall clock. A
+     tenant batch is a `ReplicatedEntry` record with tag `0x05`,
+     **Batch**, whose body after the log id carries the leader's time:
+
+     ```text
+     0x05 Batch | term: u64_le | index: u64_le | time: u64_le |
+           | TenantOtlpBatch payload (RFC 0046 §3.3) |
+     ```
+
+     `time` is the leader's wall clock when it submits the entry to
+     `client_write`, in Unix nanoseconds, `0` for a clock before the
+     epoch and at most `2^63 - 1`, the largest time the audit stream's
+     `TIMESTAMP(NANOS)` column holds (RFC 0010). Every audit event the
+     group's miner emits while mining a batch is stamped with that
+     batch's `time`, on every replica, on a flusher assigned after a
+     reassignment and on a replica restored from a bundle alike, so a
+     bundle carries no clock. The miner emits audit events only while
+     mining a batch. Times are not monotonic across leaders, whose
+     clocks may differ; audit queries take the minimum and maximum
+     (RFC 0010 §6.3), not the order. A record with tag `0x05` and a
+     `time` above `2^63 - 1` refuses the log, as an out-of-range id
+     block does (§6.5). Tag `0x02`, the untimed batch the first slices
+     wrote, is no longer written or read: no deployment runs this
+     backend yet, so a replica that finds one refuses the log, as it
+     refuses a version-1 snapshot record (§6.1). A new tag is used
+     rather than a longer `0x02` body so that a release that reads only
+     `0x02` refuses the record by its tag, instead of reading the time
+     as a tenant length. Tags are not gated as control kinds are: a
+     later tag must wait for a gate of its own before any deployment
+     writes it. The eight bytes come out of the entry's share of RFC
+     0008's frame cap, which still bounds what `Forward` carries
+     (§6.8).
+     The records' own `observed_time_unix_nano` was the alternative
+     that needs no new field, and it is not sound: the client sets it,
+     OTLP lets it be `0`, it can exceed the column's range, and it says
+     when a client saw a line, not when Ourios minted or changed a
+     template, so a skewed client would move a template's first and
+     last seen into another day's partition. Nothing else in the log
+     carries a time.
+     Events the flusher emits while publishing, such as a quarantined
+     record's, are not mined and keep its wall clock.
+  6. **An undecodable batch stops the group's miner.** A committed
+     batch whose tenant prefix or `ExportLogsServiceRequest` does not
+     decode, or that holds more records than `index` numbers, is mined
+     by no replica: every replica's group miner stops at that entry,
+     the same entry on all of them, and stays stopped. That fails the
+     group closed for mining, as an unrestorable bundle does (§6.5): the
+     replica serves no tail for the group, the flusher publishes
+     nothing past the entry and proposes no cut at or above it, and a
+     query reports the group in `tail_unavailable`
+     (B17). It keeps taking the log as a learner, so acks continue
+     until the group's backlog reaches its limit (B25), and the voters,
+     which do not mine, are unaffected. Every receiver decodes an
+     export before it appends or forwards it, so such an entry means a
+     defect or a decoder that changed between releases; a replica on a
+     release that decodes it mines on, and the group recovers when its
+     tail replicas run such a release (§9, Q11). The replica reports
+     the stop in a structured error log naming the group, the entry's
+     log id and the decode error, and in the signal §6.9 lists.
 
   None of this changes merges, body retention or reconstruction
   (`AGENTS.md` §3.1–§3.3). A tail replica whose rows diverge from the
@@ -1756,7 +1930,8 @@ never count toward an ack (learners, under §4.3's shape).
   `InstallSnapshot` (leader to a follower behind the checkpoint); then
   `Forward` (any node to a leader), `Identify` (a leader, or a group's first-ranked voter
   forming its first membership, to a configured peer: the `node_id`
-  and replica UUID it runs under, §6.1),
+  and replica UUID it runs under, §6.1), `Propose` (a group's flusher
+  to its leader: its allocator report and checkpoint entries, below),
   and `Tail` and `TailScan` (querier to tail replica: the read point and
   published keys, then the rows under that read point, §6.7). Catch-up needs no call of its own: the
   leader sends a lagging follower its missing entries by
@@ -1819,6 +1994,91 @@ never count toward an ack (learners, under §4.3's shape).
   is, and a `Forward` message by the peer message limit, one
   maximum-size frame plus its envelope, so an export the leader would
   accept directly is never refused for the tenant prefix.
+- `Propose` carries what only a group's flusher sends its leader: a
+  report of its id allocator, and optionally a control entry for the
+  leader to append, today a checkpoint (`0x02`); §6.7's published entry
+  (kind `0x05`) takes the same path once its amendment fixes its body.
+  One call does both because both are accepted only from the flusher
+  in force and refused alike. Heartbeat answers do not carry the
+  report: they are `openraft`'s append responses, which its
+  replication task consumes and passes nothing else on from, every
+  learner sends them every 50 ms, and only the flusher's report, a
+  few a minute, counts. Like `Forward` the request names no target
+  replica. In the message notation of the peer protocol's other calls
+  (`WireLogId` is `{term: uint64 = 1, index: uint64 = 2}`, and `entry`
+  holds the bytes the group log holds after a control record's log id):
+
+  ```text
+  ProposeRequest {
+    version:         uint32         = 1  // the protocol version (B22)
+    group:           uint32         = 2
+    proposer:        bytes          = 3  // sender's replica UUID, 16 bytes big-endian
+    current_through: uint64         = 4  // its allocator's current block's `through`, or 0
+    entry:           optional bytes = 5  // a control entry's kind byte and body
+  }
+  ProposeResponse {
+    appended:        WireLogId      = 1  // the entry's committed log id; absent without one
+  }
+  ```
+
+  A refusal is a gRPC status whose `ourios-propose-refused` metadata
+  names it, and it refuses the whole request with nothing appended. The
+  leader checks, in order:
+  1. that it hosts the group, else `NOT_FOUND`, `not_hosted`;
+  2. that it leads the group, else `UNAVAILABLE`, `not_leader`, with its
+     leader hint in `ourios-leader` as `Forward` gives it;
+  3. that `proposer` is 16 bytes and `entry`, if present, is kind
+     `0x02` with a 33-byte body whose `proposer` is the request's, else
+     `INVALID_ARGUMENT`, `malformed`;
+  4. that `proposer` is the flusher named by the latest assignment in
+     its log, committed or not, or by its snapshot record when its log
+     holds none, else `FAILED_PRECONDITION`, `not_flusher`;
+  5. for a checkpoint, that its cut is the log id of an entry in its
+     log at or below its commit index, above the cut of the last
+     checkpoint it applied and of every checkpoint entry its log holds
+     after that, and that its highest kind is the log's at the cut,
+     else `FAILED_PRECONDITION`, `stale`.
+
+  The peer certificate admits the caller to the protocol, as for every
+  peer call; it shows the caller is a cluster member, not which one,
+  and no peer call binds a certificate to a `node_id` (§9, Q10). The
+  proposer is identified by its UUID, which is how check 4 refuses a
+  former flusher, the caller the checks exist for. Every replica checks
+  the proposer and the cut again when it applies the entry (§6.5), so
+  checks 4 and 5 only keep out of the log entries every replica would
+  ignore.
+  An accepted request's entry is appended with `client_write`, and the
+  answer carries its log id once it commits. Its report, with or
+  without an entry, tops up the group's id blocks: the leader counts
+  the id blocks its log holds, committed or not, whose `after` is at
+  or above `current_through`, and while there are fewer than three, the
+  target RFC 0059's refiller keeps, it reserves one in the store and
+  appends it (§6.5). A checkpoint purge leaves only the latest applied
+  block in the snapshot record, so the count can miss blocks the
+  flusher has not started yet; that reserves at most three blocks
+  more than needed and reuses no id. With the store unreachable it
+  reserves none, and the miners run out at the same position (§6.5).
+- The flusher sends a report when it applies an assignment naming
+  itself, when its allocator starts a block, when it sees a new leader,
+  and otherwise at least once per flusher patience (10 s, §6.5); it
+  sends a checkpoint entry once per checkpoint, after `checkpoint.json`
+  (§6.5). It sends to the leader its log names and, after `not_leader`,
+  `not_hosted` or a connection not made within the connect timeout, to
+  the hint and then the group's voters in placement order, at most
+  `replication_factor` nodes, as `Forward` does. Unlike `Forward`, it
+  resends after an uncertain outcome (the commit timeout plus the
+  connect timeout passing, a lost answer, a leader that lost
+  leadership after appending): a second copy of a checkpoint is
+  refused as `stale` once the first is in the leader's log, and ignored
+  by every replica if both commit, and a second report appends nothing
+  the first did not. After `not_flusher` it stops proposing and
+  reporting until it applies an assignment naming itself; after
+  `stale` it drops the proposal, leaving its bundle in the store
+  unnamed by any applied cut; after `malformed`, a defect, it reports
+  why and fails the checkpoint as a failed bundle write does. A
+  checkpoint whose entry is not appended has still published its files
+  and written its bundle; the next barrier proposes a later cut, and
+  nothing is purged until one applies.
 - Replication runs over `StreamAppend`, one bidirectional stream per
   `openraft` replication session, so the leader sends appends without
   waiting for the answers to earlier ones (§4.6). Every message on the
@@ -1865,6 +2125,16 @@ never count toward an ack (learners, under §4.3's shape).
   `Tail` calls.
 - Rejections use `error.type` on the existing `ourios.ingest.batches`
   counter: `not_enough_replicas` and `group_unavailable`.
+- Mining on tail replicas needs three signals the registry does not
+  hold yet, to be added there before the code that emits them: per
+  group, a stopped miner, with `error.type` naming why (an undecodable
+  batch, §6.7 item 6, and the miner's other stop causes), as an
+  attribute on an existing per-group instrument if the registry review
+  finds one that fits rather than a metric of its own; the audit
+  events and rows a tail replica dropped from what it keeps for a
+  takeover, and whether it has a gap (§6.7); and the bytes of audit
+  events it keeps. `Propose` calls are traced as above, their refusals
+  as the call's status.
 
 **Defaults are starting values, tuned from these signals.** §3 fixes the
 behaviour; the numbers in it and in §6 are first settings, to be moved
@@ -1882,6 +2152,7 @@ signal that tunes it:
 | Election and heartbeat timeouts | 50 ms heartbeat, 150–300 ms election: failover and tail gap about 1.8 × the election maximum, 0.55 s (§4.6) | failover time, spurious leadership changes |
 | Vote log | one per node, group-committed (§4.7): a node failure at 128 groups failed over in 0.5–0.8 s | failover time when a node's groups elect at once, vote-log fsync latency and votes per fsync |
 | Freshness target (B15) | under 1 s | ack-to-queryable latency, a new histogram on the tail path |
+| Audit events kept for a takeover | 16 MiB per group, then dropped and rebuilt on takeover (§6.7) | audit bytes kept and drops per group, takeovers that had to rebuild |
 
 The backlog bytes and age, flush and ingest throughput per group, and
 the ack-to-queryable latency are new names in the same registry as the
@@ -2012,6 +2283,15 @@ from rows.
 - RFC0065.28: the in-process cluster with the compactor's erasure
   pass on the in-memory store, the flusher paused by a failpoint
   between its object put and its published entry.
+- RFC0065.32 and the arms this amendment adds to .20, .23 and .29:
+  `Propose` message and refusal tests beside the transport's other
+  calls; the batch record's codec tests beside the record codec's; and
+  the in-process cluster on the in-memory store, with a controllable
+  clock per replica, a failpoint before a flusher's `checkpoint.json`
+  put and between its put and its proposal, the kept audit events'
+  ceiling lowered for the test, and an export the miner's decoder
+  refuses appended through a test-only path, since no receiver appends
+  one.
 - `criterion`: ack latency on the replicated backend against the local
   one, and the tail merge, before `validated`.
 
@@ -2040,6 +2320,41 @@ Q1 and Q2 are RFC 0064's (§7 there).
   layouts) gets its own RFC. Tail capacity scales at any time (B24),
   and the 16 default groups spread load over up to 16 machines without
   a layout change.
+
+- [ ] **Q8. When may a checkpoint bundle be deleted?** Not yet: this
+  RFC deletes none. A replica restores from the bundle at the cut its
+  snapshot record holds, which can be below the one `checkpoint.json`
+  names (§6.5), and a bundle a proposal left unnamed by any applied cut
+  is garbage. A deletion rule must keep every bundle at or above the
+  lowest cut any replica's record can hold, learners and a replica
+  that is down included, not only the one `checkpoint.json` names.
+
+- [ ] **Q9. Are audit events published twice during a reassignment
+  removed?** No. A former flusher that has not yet applied its
+  replacement and the new flusher can both publish the same template
+  events (§6.7). They are identical in every field, timestamps
+  included, so RFC 0010's first and last seen and the RFC 0033 map are
+  unchanged by the copy, but a query that counts events counts it
+  twice. Audit events carry no ingest position, so §6.6's dedup does
+  not reach them; whether they need one is open.
+
+- [ ] **Q10. Should a peer certificate bind its `node_id`?** No peer
+  call checks which member a certificate belongs to: the peer CA admits
+  any cluster member, and `Append`, `Vote` and `Propose` name their
+  sender's UUID in the request. Binding would need a certificate per
+  pod, with the `node_id` in its subject alternative name, which the
+  chart's secret-mounted certificates (§6.10) do not provide. Until
+  then a member holding the peer certificate is trusted to name
+  itself.
+
+- [ ] **Q11. How does an operator recover a group whose miner stopped
+  at an undecodable batch? (behaviour)** Today only a release that
+  decodes the entry does (§6.7 item 6); until then the group's
+  backlog grows to its limit and its tenants' exports are then
+  rejected. An operator could instead skip the entry, by a control
+  entry that every replica applies at one position, losing the
+  records it holds. Whether to offer that, and how it is reported,
+  is a behaviour question for the maintainer.
 
 Decided as technical calls: RFC0065.10's check uses `openraft`'s
 upstream verification plus our seeded simulation suite, not a TLA+

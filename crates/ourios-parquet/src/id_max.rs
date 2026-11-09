@@ -367,6 +367,7 @@ mod tests {
             body: Some(format!("line {template_id}")),
             confidence: 1.0,
             lossy_flag: false,
+            ingest_position: None,
         }
     }
 

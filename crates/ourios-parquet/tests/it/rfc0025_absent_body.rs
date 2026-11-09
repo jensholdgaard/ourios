@@ -64,6 +64,7 @@ fn pre_records() -> Vec<MinedRecord> {
             body: None,
             confidence: 1.0,
             lossy_flag: false,
+            ingest_position: None,
         },
         // Structured row (canonical-JSON body bytes).
         MinedRecord {
@@ -95,6 +96,7 @@ fn pre_records() -> Vec<MinedRecord> {
             // the body carries canonical JSON, reconstruction is
             // defined.
             lossy_flag: false,
+            ingest_position: None,
         },
     ]
 }

@@ -41,7 +41,7 @@ use crate::panic_boundary::{Batches, guard_decode};
 use arrow_array::types::Int32Type;
 use arrow_array::{Array, RecordBatch, StructArray};
 use ourios_core::audit::ParamType;
-use ourios_core::record::{BodyKind, MinedRecord, Param};
+use ourios_core::record::{BodyKind, IngestPosition, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use parquet::errors::ParquetError;
 
@@ -522,6 +522,7 @@ pub fn batch_to_mined_records(
     let resource_schema_url = optional_string(batch, columns::RESOURCE_SCHEMA_URL)?;
     let scope_schema_url = optional_string(batch, columns::SCOPE_SCHEMA_URL)?;
     let body = optional_binary(batch, columns::BODY)?;
+    let ingest_positions = decode_ingest_positions(batch, row_offset)?;
 
     // List columns — `params` and `separators` are REQUIRED in
     // the schema but the list itself may be empty per RFC 0005
@@ -561,22 +562,12 @@ pub fn batch_to_mined_records(
         let decoded_scope_attrs =
             decode_optional_scope_attributes(scope_attributes.as_ref(), i, row_offset)?;
 
-        let t_ns = u64::try_from(time_unix_nano[i]).map_err(|_| ReaderError::Conversion {
-            column: columns::TIME_UNIX_NANO,
-            detail: "negative i64 timestamp can't be a u64 nanos-since-epoch".to_string(),
-        })?;
-        let observed_t = match &observed_time {
-            None => None,
-            Some(col) => col[i]
-                .map(|v| {
-                    u64::try_from(v).map_err(|_| ReaderError::Conversion {
-                        column: columns::OBSERVED_TIME_UNIX_NANO,
-                        detail: "negative i64 timestamp can't be a u64 nanos-since-epoch"
-                            .to_string(),
-                    })
-                })
-                .transpose()?,
-        };
+        let t_ns = unix_nanos(columns::TIME_UNIX_NANO, time_unix_nano[i])?;
+        let observed_t = observed_time
+            .as_ref()
+            .and_then(|col| col[i])
+            .map(|v| unix_nanos(columns::OBSERVED_TIME_UNIX_NANO, v))
+            .transpose()?;
 
         let bk = decode_body_kind(body_kind[i])?;
         let body_string = match &body {
@@ -618,6 +609,7 @@ pub fn batch_to_mined_records(
             body: body_string,
             confidence: confidence[i],
             lossy_flag: lossy_flag[i],
+            ingest_position: ingest_positions[i],
         };
         // §3.2 reconstruction invariants — the writer rejects
         // these shapes too (`record_batch::Builders::append`),
@@ -630,6 +622,49 @@ pub fn batch_to_mined_records(
     }
 
     Ok(records)
+}
+
+/// A stored `i64` timestamp of `column` as nanoseconds since the epoch.
+fn unix_nanos(column: &'static str, value: i64) -> Result<u64, ReaderError> {
+    u64::try_from(value).map_err(|_| ReaderError::Conversion {
+        column,
+        detail: "negative i64 timestamp can't be a u64 nanos-since-epoch".to_string(),
+    })
+}
+
+/// The RFC 0065 §6.6 ingest position of every row; `None` throughout
+/// when the batch has none of the three columns (old and local-backend
+/// files, §3.9). A row must carry all three values or none; a partial
+/// position cannot name a record, so it is a conversion error rather
+/// than a silently dropped key.
+fn decode_ingest_positions(
+    batch: &RecordBatch,
+    row_offset: usize,
+) -> Result<Vec<Option<IngestPosition>>, ReaderError> {
+    let groups = optional_u32::<ReaderError>(batch, columns::INGEST_GROUP)?;
+    let seqs = optional_u64::<ReaderError>(batch, columns::INGEST_SEQ)?;
+    let indexes = optional_u32::<ReaderError>(batch, columns::INGEST_INDEX)?;
+    (0..batch.num_rows())
+        .map(|i| {
+            fn cell<T: Copy>(column: &[Option<T>], i: usize) -> Option<T> {
+                column.get(i).copied().flatten()
+            }
+            match (cell(&groups, i), cell(&seqs, i), cell(&indexes, i)) {
+                (Some(group), Some(seq), Some(index)) => {
+                    Ok(Some(IngestPosition { group, seq, index }))
+                }
+                (None, None, None) => Ok(None),
+                _ => Err(ReaderError::Conversion {
+                    column: columns::INGEST_SEQ,
+                    detail: format!(
+                        "row {}: a partial ingest position (RFC 0065 §6.6 needs \
+                         ingest_group, ingest_seq and ingest_index together)",
+                        row_offset + i
+                    ),
+                }),
+            }
+        })
+        .collect()
 }
 
 /// Enforce the RFC 0005 §3.2 / RFC 0001 §6.6 shape invariants
@@ -1400,6 +1435,7 @@ mod tests {
             body: None,
             confidence: 1.0,
             lossy_flag: false,
+            ingest_position: None,
         };
         let partition = PartitionKey::derive(&rec).unwrap();
 

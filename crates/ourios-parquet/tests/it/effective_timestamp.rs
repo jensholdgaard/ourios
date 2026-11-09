@@ -58,6 +58,7 @@ fn rec(time_unix_nano: u64, observed: Option<u64>) -> MinedRecord {
         body: None,
         confidence: 1.0,
         lossy_flag: false,
+        ingest_position: None,
     }
 }
 

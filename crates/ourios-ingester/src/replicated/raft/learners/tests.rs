@@ -357,6 +357,20 @@ async fn an_add_and_a_remove_in_one_pass_both_commit() {
     super::apply(raft, &add_old, committed_at())
         .await
         .expect("the old learner added");
+    // `apply` returns once the edit commits; the metrics watch the second
+    // edit's guard reads from can trail that commit.
+    raft.wait(WAIT)
+        .metrics(
+            |m| {
+                m.committed_membership_config
+                    .membership()
+                    .non_write_voter_ids()
+                    .any(|id| id == old)
+            },
+            "the old learner's add is visible",
+        )
+        .await
+        .expect("the old learner's add is visible");
 
     let replace = Changes {
         add: BTreeMap::from([(new, name(new))]),

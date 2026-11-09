@@ -13,7 +13,7 @@ superseded-by: —
 
 > **Status: `red`.** Every §5 scenario arm has an `#[ignore]`d `todo!`
 > stub naming the slice that discharges it: the in-process cluster arms
-> in `ourios-ingester` (`tests/it/rfc0065_replicated_wal.rs`), and the
+> in `ourios-ingester` (`tests/it/rfc0065_replicated_wal/`), and the
 > config, served-binary and chart arms (RFC0065.1, .3, .11's latency
 > arm, .14's `require_complete` arms, .17) in `ourios-server`
 > (`tests/it/rfc0065_replicated_wal.rs`).

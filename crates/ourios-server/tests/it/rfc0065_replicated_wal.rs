@@ -1,7 +1,7 @@
 //! RFC 0065 — replicated WAL and a queryable tail, the config,
 //! served-binary and chart arms. See `docs/rfcs/0065-replicated-wal.md`
 //! §5 and §8. The in-process cluster arms are in `ourios-ingester`'s
-//! `tests/it/rfc0065_replicated_wal.rs`.
+//! `tests/it/rfc0065_replicated_wal/`.
 //!
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC is
 //! red; each names the slice that discharges it. RFC0065.1's layout arm is

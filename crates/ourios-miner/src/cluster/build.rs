@@ -110,8 +110,9 @@ impl MinerCluster {
     /// it before the tenant is first observed.
     ///
     /// If `tenant_id` was already observed before this call, the
-    /// override has no effect — `TenantState` is allocated once
-    /// and its config is captured at that moment. The
+    /// override is not registered and has no effect, then or later:
+    /// the tenant keeps the configuration it was allocated with and
+    /// follows [`Self::reconfigure`] like any tenant without one. The
     /// startup-only contract is RFC 0004 §3.4's open question
     /// resolved in favour of "captured at allocation".
     /// [`Self::reconfigure`] leaves an overridden tenant's
@@ -121,7 +122,9 @@ impl MinerCluster {
     /// keep the last-set override (`HashMap::insert` semantics).
     #[must_use]
     pub fn with_tenant_config(mut self, tenant_id: TenantId, config: MinerConfig) -> Self {
-        self.tenant_overrides.insert(tenant_id, config);
+        if !self.tenants.contains_key(&tenant_id) {
+            self.tenant_overrides.insert(tenant_id, config);
+        }
         self
     }
 

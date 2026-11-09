@@ -192,6 +192,38 @@ fn reconfigure_reaches_live_and_later_tenants_but_not_overridden_ones() {
 }
 
 #[test]
+fn an_override_registered_for_a_live_tenant_has_no_effect_then_or_later() {
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(with_threshold(0.7));
+    let _ = cluster.ingest(&string_record(&t, "user alice logged in"));
+
+    let mut cluster = cluster.with_tenant_config(t.clone(), with_threshold(0.9));
+    assert_eq!(cluster.effective_config(&t), with_threshold(0.7));
+
+    cluster
+        .reconfigure(with_threshold(0.5))
+        .expect("same shape");
+    assert_eq!(cluster.effective_config(&t), with_threshold(0.5));
+}
+
+#[test]
+fn an_override_registered_before_a_restore_is_the_restored_tenants_config() {
+    let t = TenantId::new("tenant-x");
+    let own = with_threshold(0.9);
+    let mut original = MinerCluster::new(MinerConfig::default());
+    let _ = original.ingest(&string_record(&t, "user alice logged in"));
+    let state = original.snapshot_state(&t);
+
+    let mut restored = MinerCluster::new(MinerConfig::default()).with_tenant_config(t.clone(), own);
+    restored.restore_tenant(&t, &state).expect("restore");
+    restored
+        .reconfigure(with_threshold(0.5))
+        .expect("same shape");
+
+    assert_eq!(restored.effective_config(&t), own);
+}
+
+#[test]
 fn a_ceiling_lowered_below_the_count_keeps_every_template_and_mints_none() {
     let t = TenantId::new("tenant-x");
     let mut cluster = MinerCluster::new(MinerConfig::default());

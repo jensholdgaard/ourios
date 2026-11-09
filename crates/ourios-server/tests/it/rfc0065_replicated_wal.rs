@@ -8,6 +8,19 @@
 //! a unit test in `src/main.rs`: the replicated backend needs a store with
 //! conditional updates, and the local store these tests serve on has none.
 
+/// Scenario RFC0065.1 — the Raft timings arm. Unset, every group runs on
+/// the 50 ms heartbeat and 150–300 ms election timeout; set, on the
+/// configured ones; a zero or mis-ordered value fails startup naming the key.
+#[test]
+#[ignore = "RFC0065.1 stub — the Raft timings arm, implemented with the timing keys"]
+fn rfc0065_1_the_raft_timings_are_configured_and_checked() {
+    todo!(
+        "RFC0065.1 — defaults 50 ms and 150–300 ms, configured values reach every \
+         group's openraft config, and 0, heartbeat >= election minimum or minimum >= \
+         maximum fails startup naming the key"
+    );
+}
+
 /// Scenario RFC0065.3 — crash recovery on the replicated backend (B2, B7).
 /// Given a three-node cluster ingesting steadily, when the acknowledging
 /// replica is killed with `SIGKILL` mid-batch, then another takes over without an

@@ -948,7 +948,9 @@ the mass-failover time and vote-log batching as tuning signals.
 >   2000]` with no pending block and `next` `1`; a pending `(0, 2000]`
 >   against that latest block with `next` `1`), pending blocks, tenant
 >   order, a snapshot's length, CRC, version
->   or mark, or a configuration kind is not as §6.5 requires, or that
+>   or mark, or a configuration kind or body is not as §6.5 requires
+>   (a `0x04` body whose `similarity_threshold` differs from the
+>   record's included), or that
 >   misses an object, fails the restore closed rather than replaying,
 >   and no restored allocator issues `0`;
 >   and a local-backend version-3 snapshot loads and restores as it did
@@ -960,9 +962,15 @@ the mass-failover time and vote-log batching as tuning signals.
 >   reports why, keeps taking the log while the group keeps acking, and
 >   restores and mines once the store returns
 > - **And** on a store without `miner/template_ids.v1.json` or
->   `log_ids.json`, the first start creates the object by RFC 0059 §3.5
->   before it allocates a log id, and a start that loses that create
->   goes on with the winner's object; and with the object deleted after
+>   `log_ids.json`, only the start whose create of `log_ids.json`
+>   succeeds bootstraps the object, by RFC 0059 §3.5, and marks it
+>   `seeded` before any log id is allocated; a start that loses that
+>   create, paused before it and resumed after the other start has
+>   seeded, allocated log ids and reserved a block and the object was
+>   deleted, does not re-create it; a bootstrapper killed between the
+>   object and `seeded` finishes on its restart while every other start
+>   waits; an unreadable `log_ids.json` fails the start; and with the
+>   object deleted after
 >   group A has applied `(0, 1000]` and published nothing, while group
 >   B has applied no block, neither A's leader nor B's bootstraps or
 >   appends a block, and no id A holds is reserved again; nor does a
@@ -1336,10 +1344,12 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   checkpoint**: the barrier retries, and nothing is purged until a
   bundle is complete.
 - **Highest published position.** The flusher also records, per group,
-  the highest ingest position in any file it has published
-  (`published_high` in `checkpoint.json`, and in the footer statistics
-  of every file). `ourios wal force-leader` (B8) starts its new log
-  above the larger of that and the survivor's log end, so a position
+  the highest ingest position in any file it has published, in the
+  footer statistics of every file, and as `published_high`, whose
+  object and write rule are deferred to the forced-takeover amendment
+  (§9, Q7); until it lands `checkpoint.json` carries no such field.
+  `ourios wal force-leader` (B8) starts its new log above the larger of
+  that and the survivor's log end, so a position
   that a lost replica flushed but never checkpointed is never issued
   again (§4.5). For the same reason it abandons every unused id block
   the survivor holds, from its log and from the checkpoint snapshot:
@@ -1505,21 +1515,47 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   replica, so the outcome (no id, body kept, as `id_reservation_failed`
   today) is still identical everywhere.
 - **The high-water object's bootstrap.** On this backend RFC 0059's
-  `miner/template_ids.v1.json` is created once per store, before any
-  log id exists, and its absence afterwards always means it was
-  deleted. A start that finds `<bucket>/wal/log_ids.json` (§6.6) absent
-  first makes sure the object exists: if no `template_ids.v<k>.json`
-  does, it runs RFC 0059 §3.5's bootstrap, with that section's table,
-  `restored_max = 0` and its own node's
-  `receiver.template_ids_allow_bootstrap`, and creates the object with
-  `put_if_absent`; only then does it allocate log ids. A start that
-  loses the create goes on with the winner's object instead of failing
-  with `BootstrapRaceLost`, which guards restored ids, since no
-  replicated group holds an id before a log id exists. Once
-  `log_ids.json` exists no replicated node creates the object again, so
-  a group whose leader finds it absent cannot bootstrap a floor below
-  ids another group holds, whether or not its own group has applied a
-  block. Thereafter only the leader writes it, reserving blocks (RFC
+  `miner/template_ids.v1.json` is created once per store, by one start,
+  before any log id exists, and its absence afterwards always means it
+  was deleted. `<bucket>/wal/log_ids.json` (§6.6) decides which start
+  that is. It is UTF-8 JSON:
+
+  ```json
+  {"format": 1, "bootstrapper": "ourios-receiver-0", "seeded": false, "next": 0}
+  ```
+
+  `format` is `1`; `bootstrapper` is the `node_id` of the start that
+  created the object; `seeded` says whether the high-water object has
+  been made sure of; `next` is the next log id to allocate, a JSON
+  integer read as a `u32`. A reader takes it only with exactly these
+  fields and `format` `1`; any other object, or one that does not
+  parse, fails the start closed, and no node replaces it.
+  - A start that finds `log_ids.json` absent creates it with
+    `put_if_absent`, naming itself, `seeded` `false` and `next` `0`.
+    Only the start whose create succeeds bootstraps: if no
+    `template_ids.v<k>.json` exists, it runs RFC 0059 §3.5's bootstrap,
+    with that section's table, `restored_max = 0` and its own node's
+    `receiver.template_ids_allow_bootstrap`, and creates the object
+    with `put_if_absent`, going on with the object it finds if one is
+    present. It then sets `seeded` to `true` by `put_if_match`, and only
+    then are log ids allocated, by `put_if_match` on `next`.
+  - A start that loses the create, or finds `seeded` `false` under
+    another `node_id`, never bootstraps: it waits, reporting why, until
+    `seeded` is `true`. One that finds `seeded` `false` under its own
+    `node_id`, a bootstrapper that crashed between the two steps,
+    repeats them; that is safe because no log id, and so no group and
+    no reserved block, exists before `seeded`, and the object's create
+    is `put_if_absent`. A `node_id` runs one start at a time (the
+    StatefulSet's pod identity), so no paused start outlives its own
+    restart.
+  - A node that finds `log_ids.json` present never creates the object.
+    So a start that paused while the file was absent either created it,
+    and so bootstraps before any block exists, or lost the create and
+    never bootstraps, and a group whose leader finds the object absent
+    cannot have it re-created from a floor below ids another group
+    holds, whether or not its own group has applied a block.
+
+  Thereafter only the leader writes the object, reserving blocks (RFC
   0059 §3.2), and a group's latest applied id block (§6.1's record,
   both `0` when none has been) stands in for `TEMPLATE_IDS_SEATED`'s
   `max_reserved_seen`. A leader appends no block while the object is
@@ -1602,9 +1638,11 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     `through`; the last pending block, else `current`, equals the
     record's latest id block in both `after` and `through`; the tenants
     are sorted and
-    unique; each configuration kind is one it reads and, until a
-    per-tenant override exists, equals the record's configuration in
-    force; and each `.snap` has its length and CRC, decodes under
+    unique; each tenant's configuration kind is one it reads, its body
+    passes that kind's checks (`MinerConfig` validation for `0x04`),
+    and, while no per-tenant override is specified, kind and body
+    equal the record's configuration in force byte for byte; and each
+    `.snap` has its length and CRC, decodes under
     `load_snapshot`, carries the mark `{group: log, seq}` and holds no
     template id at or above `next`. Any other bundle, or one missing an
     object, fails the restore closed as above. It never lists the
@@ -2242,7 +2280,7 @@ Q1 and Q2 are RFC 0064's (§7 there).
 - [ ] **Q6. How does a replicated group recover from a deleted or
   rolled-back high-water object?** RFC 0059 §3.1's quiesced
   re-bootstrap removes every root's seated marker. On this backend the
-  object is created only before `log_ids.json` exists, and the
+  object is created only before `log_ids.json` is seeded, and the
   rollback check reads each group's latest applied id block, in its
   log and snapshot record; no operator step removes either, so after a
   deletion every group, and after a rollback every group with a block
@@ -2256,7 +2294,8 @@ Q1 and Q2 are RFC 0064's (§7 there).
   yet specified; tracked in #1227. `ourios wal force-leader` must
   not be implemented until that amendment lands. Known gaps:
   - `published_high`: which object holds it and when it is written,
-    so files published after the last checkpoint are covered.
+    so that `force-leader` starts above every position ever published,
+    including files published after the last checkpoint (B8).
   - A former flusher still running after the takeover can still write
     files, bundles and `checkpoint.json` under the same log id.
   - The survivor's uncommitted suffix and the new log share one

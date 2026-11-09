@@ -10,7 +10,7 @@
 # in, and rustup would otherwise download that version during the build.
 # This rust ref carries a tag, so Renovate's docker manager bumps both the
 # tag and the digest, grouped with the toolchain-file bump.
-FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS builder
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS builder
 WORKDIR /build
 COPY . .
 # `--locked` so a stale Cargo.lock fails the build instead of being

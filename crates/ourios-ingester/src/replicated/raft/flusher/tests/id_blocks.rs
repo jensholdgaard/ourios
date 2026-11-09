@@ -2,6 +2,7 @@
 //! reserved in the store before their entry exists, three kept ahead, held
 //! back by the kind gate, and never reused across a leader change.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,17 +11,18 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
+use openraft::ChangeMembers;
+use openraft::async_runtime::WatchReceiver as _;
 use ourios_parquet::Store;
-use tokio::sync::{Semaphore, mpsc};
-
 use ourios_semconv as semconv;
 use ourios_wal::Control;
+use tokio::sync::{Semaphore, mpsc};
 
 use super::{
     PATIENCE, Pass, admit, counted, counted_as, group, heard_from, log,
     membership_change_in_flight, pass, placement, reads_up_to, ready_leader, strs,
 };
-use crate::replicated::raft::cluster::{Cluster, seated_store, write};
+use crate::replicated::raft::cluster::{Cluster, WAIT, name, seated_store, write};
 use crate::replicated::raft::flusher::Steward;
 use crate::replicated::raft::id_blocks::{self, AHEAD, Ahead, Refusal, TopUp};
 use crate::replicated::raft::snapshot_record::IdBlock;
@@ -96,6 +98,124 @@ async fn the_block_is_reserved_before_its_entry_exists() {
     assert_eq!(topped.id_block, Some(TopUp::Appended(block(0))));
     assert!(reserved_through >= Some(BLOCK), "{reserved_through:?}");
     cluster.shutdown().await;
+}
+
+/// A reservation that outlives the membership the kind gate admitted it
+/// under appends nothing: while it is held, the leader admits a tail member
+/// reading below `0x03`, which the gate never asked. The block's ids are
+/// only skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reservation_outliving_its_membership_appends_nothing() {
+    let cluster = Cluster::start_with_tail(3, 1, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let below = 3;
+    reads_up_to(&cluster, below, id_blocks::KIND - 1);
+    let (store, mut reserved, release) = pausing(seated_store(0));
+    let mut steward = steward(store.clone());
+
+    let admit_below = async {
+        reserved.recv().await.expect("a reservation");
+        let learner = cluster.id(below);
+        let add = ChangeMembers::AddNodes(BTreeMap::from([(learner, name(learner))]));
+        let raft = cluster.node(leader).raft(0);
+        raft.change_membership(add, false).await.expect("admitted");
+        release.add_permits(1);
+    };
+    let (passed, ()) = tokio::join!(pass(&mut steward, &cluster, leader, &[]), admit_below);
+
+    assert_eq!(passed.id_block, None, "admitted under another membership");
+    held_back_after_reserving(&cluster, leader, &store).await;
+    cluster.shutdown().await;
+}
+
+/// A reservation that outlives the term the kind gate admitted it under
+/// appends nothing, even when the same node leads the next term.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reservation_outliving_its_term_appends_nothing() {
+    let cluster = Cluster::start(3, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (store, mut reserved, release) = pausing(seated_store(0));
+    let mut steward = steward(store.clone());
+
+    let next_term = async {
+        reserved.recv().await.expect("a reservation");
+        let term = cluster
+            .node(leader)
+            .raft(0)
+            .metrics()
+            .borrow_watched()
+            .current_term;
+        lead_a_later_term(&cluster, leader, term).await;
+        release.add_permits(1);
+    };
+    let (passed, ()) = tokio::join!(pass(&mut steward, &cluster, leader, &[]), next_term);
+
+    assert_eq!(passed.id_block, None, "admitted under another term");
+    held_back_after_reserving(&cluster, leader, &store).await;
+    cluster.shutdown().await;
+}
+
+/// Depose `leader` and elect it again in a term after `term`: a second
+/// node leads while it is cut off, then is cut off itself once `leader`
+/// has caught up. The third node never stands, so each election has one
+/// candidate.
+async fn lead_a_later_term(cluster: &Cluster, leader: usize, term: u64) {
+    let mut others = (0..3).filter(|&i| i != leader);
+    let (interim, third) = (
+        others.next().expect("a node"),
+        others.next().expect("a node"),
+    );
+    let elects = |i: usize, enabled: bool| cluster.node(i).raft(0).runtime_config().elect(enabled);
+    elects(third, false);
+    elects(leader, false);
+    cluster.cut(leader, interim);
+    cluster.cut(leader, third);
+    let interim_id = cluster.id(interim);
+    leads(cluster, interim, term).await;
+
+    elects(interim, false);
+    elects(leader, true);
+    cluster.heal(leader, interim);
+    cluster.heal(leader, third);
+    let led = cluster
+        .node(interim)
+        .raft(0)
+        .metrics()
+        .borrow_watched()
+        .last_log_index;
+    cluster
+        .node(leader)
+        .raft(0)
+        .wait(WAIT)
+        .metrics(
+            |m| m.current_leader == Some(interim_id) && m.last_log_index >= led,
+            "follows the interim leader",
+        )
+        .await
+        .expect("follows the interim leader");
+    cluster.cut(interim, leader);
+    cluster.cut(interim, third);
+    leads(cluster, leader, term + 1).await;
+}
+
+/// Wait for node `i` to lead group 0 in a term after `term`.
+async fn leads(cluster: &Cluster, i: usize, term: u64) {
+    cluster
+        .node(i)
+        .raft(0)
+        .wait(WAIT)
+        .metrics(
+            |m| m.current_leader == Some(m.id) && m.current_term > term,
+            "leads a later term",
+        )
+        .await
+        .expect("leads a later term");
+}
+
+/// The log holds no block, and the store the one reserved and skipped.
+async fn held_back_after_reserving(cluster: &Cluster, leader: usize, store: &Store) {
+    assert_eq!(Ahead::of(group(cluster, leader)).blocks, 0);
+    assert_eq!(high_water(store).await, Some(BLOCK), "reserved, so skipped");
 }
 
 /// A reservation that fails appends nothing and says why; so does a store

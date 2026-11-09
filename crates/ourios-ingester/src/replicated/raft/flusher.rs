@@ -47,7 +47,7 @@ use super::id_blocks::{self, Ahead, TopUp};
 use super::learners::{self, Changes, Group, Tail};
 use super::miner_config;
 use super::telemetry::{FlusherCounts, Meters};
-use super::types::{GroupEntry, NodeId, RaftTypes};
+use super::types::{GroupEntry, LogId, NodeId, RaftTypes};
 
 /// How long a flusher may go unhealthy, and a new leader keep its log's
 /// flusher, before the leader names another (§6.5). Fixed, not a setting.
@@ -364,6 +364,7 @@ impl Steward {
             highest_kind,
             still: |steward: &mut Self| steward.plan_block(group).is_some(),
         };
+        let admitted = standing(group.raft);
         if !self.admit(group, tail, planned).await {
             return Ok(None);
         }
@@ -371,9 +372,10 @@ impl Steward {
             Ok(block) => block,
             Err(refusal) => return Ok(Some(TopUp::Refused(refusal))),
         };
-        // Deposed, or topped up by another leader, during the reservation:
-        // the block's ids are skipped, never appended later.
-        if self.plan_block(group).is_none() {
+        // A term or membership other than the one admitted under may hold
+        // a member the gate never asked, and a group topped up meanwhile
+        // needs no block: the block's ids are skipped, never appended later.
+        if standing(group.raft) != admitted || self.plan_block(group).is_none() {
             return Ok(None);
         }
         propose(group, id_blocks::control(block)).await?;
@@ -456,6 +458,12 @@ impl Steward {
         };
         Some(since.elapsed())
     }
+}
+
+/// The term and the latest membership's log id a kind gate decides under.
+fn standing(raft: &GroupRaft) -> (u64, Option<LogId>) {
+    let metrics = raft.metrics().borrow_watched().clone();
+    (metrics.current_term, *metrics.membership_config.log_id())
 }
 
 /// Append `control` to the group's log and wait for it to commit.

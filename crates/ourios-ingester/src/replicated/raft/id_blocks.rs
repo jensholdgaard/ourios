@@ -88,6 +88,9 @@ pub enum Refusal {
     /// The store has no template-id high-water. Only the bootstrap creates
     /// it, never a reservation (RFC 0059 §3.2).
     Absent,
+    /// The high-water reads below a block the log holds: it was rolled
+    /// back, and reserving from the block could reuse another group's ids.
+    RolledBack,
     /// The reservation failed, with the failure's `error.type`.
     Failed(&'static str),
 }
@@ -118,7 +121,8 @@ pub fn control(block: IdBlock) -> Control {
 /// The [`Refusal`]; nothing is to be appended.
 pub async fn reserve(store: &Store, floor: u64, group: u32) -> Result<IdBlock, Refusal> {
     let store = store.clone();
-    let reserved = tokio::task::spawn_blocking(move || template_ids::reserve(&store, floor)).await;
+    let reserved =
+        tokio::task::spawn_blocking(move || template_ids::reserve_above_held(&store, floor)).await;
     let failed = match reserved {
         Ok(Ok(block)) => match IdBlock::new(block.after(), block.through()) {
             Some(block) => return Ok(block),
@@ -133,6 +137,7 @@ pub async fn reserve(store: &Store, floor: u64, group: u32) -> Result<IdBlock, R
     report(group, failed.error_type(), &failed);
     match failed {
         TemplateIdsError::HighWaterDeleted => Err(Refusal::Absent),
+        TemplateIdsError::HighWaterRolledBack { .. } => Err(Refusal::RolledBack),
         e => Err(Refusal::Failed(e.error_type())),
     }
 }
@@ -186,6 +191,32 @@ mod tests {
         let ahead = Ahead::starting(block(1_000, 2_000)).then(block(1_500, 2_500));
         assert_eq!(ahead, Ahead::starting(block(1_000, 2_000)));
         assert_eq!(ahead.then(None), ahead, "an invalid body counts neither");
+    }
+
+    /// Group A holds `(0, 1000]` and group B `(1000, 2000]`; with the
+    /// object rolled back to `0`, A's next reservation is refused rather
+    /// than handing out B's ids again, and nothing is written.
+    #[tokio::test]
+    async fn a_high_water_rolled_back_below_the_log_is_refused() {
+        let store = Store::in_memory();
+        let seat = |n| {
+            store
+                .put_blocking(template_ids::HIGH_WATER_KEY, template_ids::encode(n))
+                .expect("put");
+        };
+        seat(0);
+        let a = reserve(&store, 0, 1).await.expect("group A's block");
+        let b = reserve(&store, 0, 2).await.expect("group B's block");
+        assert_eq!(
+            (a, b),
+            (block(0, 1_000).expect("a"), block(1_000, 2_000).expect("b"))
+        );
+
+        seat(0);
+        let refused = reserve(&store, a.through(), 1).await;
+        assert_eq!(refused, Err(Refusal::RolledBack));
+        let read = template_ids::read(&store).expect("read").expect("present");
+        assert_eq!(read.reserved_through, 0, "nothing written");
     }
 
     #[test]

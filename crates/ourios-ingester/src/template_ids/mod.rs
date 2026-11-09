@@ -427,9 +427,50 @@ fn landed(store: &Store, outcome: Result<(), StoreError>) -> Result<Written, Tem
 /// left at or below [`MAX_TEMPLATE_ID`]. A block that would pass it is
 /// shortened to end there.
 pub fn reserve(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
+    reserve_with(store, Floor::Raise(floor))
+}
+
+/// As [`reserve`], except that a high-water read below `floor` is never
+/// raised to it: `floor` is the end of a block a replicated group's log
+/// already holds, so the object was rolled back, and reserving from the
+/// floor could hand out ids another group already holds.
+///
+/// # Errors
+///
+/// [`TemplateIdsError::HighWaterRolledBack`], with nothing written, when
+/// an attempt reads the high-water below `floor`; otherwise as
+/// [`reserve`].
+pub fn reserve_above_held(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
+    reserve_with(store, Floor::Refuse(floor))
+}
+
+/// A reservation's floor, and what it does with a high-water read below
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Floor {
+    /// Reserve from the floor: the allocator's own ids lie at or below it.
+    Raise(u64),
+    /// Fail as rolled back.
+    Refuse(u64),
+}
+
+impl Floor {
+    /// The id a block reserved over `prior` starts after.
+    fn after(self, prior: &HighWater) -> Result<u64, TemplateIdsError> {
+        let found = prior.reserved_through;
+        match self {
+            Self::Refuse(seen) if found < seen => {
+                Err(TemplateIdsError::HighWaterRolledBack { seen, found })
+            }
+            Self::Raise(floor) | Self::Refuse(floor) => Ok(found.max(floor)),
+        }
+    }
+}
+
+fn reserve_with(store: &Store, floor: Floor) -> Result<IdBlock, TemplateIdsError> {
     for _ in 0..MAX_CAS_ATTEMPTS {
         let prior = read(store)?.ok_or(TemplateIdsError::HighWaterDeleted)?;
-        let after = prior.reserved_through.max(floor);
+        let after = floor.after(&prior)?;
         // The final block is shortened at the domain's top, so
         // `MAX_TEMPLATE_ID` itself stays issuable.
         let through = after.saturating_add(BLOCK).min(MAX_TEMPLATE_ID);

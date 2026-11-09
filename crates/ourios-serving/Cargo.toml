@@ -68,7 +68,7 @@ axum = { version = "=0.8.9", default-features = false, features = ["tokio", "htt
 base64 = "=0.23.1"
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
 rand = "=0.8.8"
-rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"] }
+rsa = { version = "=0.10.0", default-features = false, features = ["std", "pem"] }
 # The AuthMetrics test collects the exported stream via the in-memory
 # provider guard.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }

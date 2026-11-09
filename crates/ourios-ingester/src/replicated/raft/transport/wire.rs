@@ -11,8 +11,8 @@ use std::io;
 
 use openraft::impls::leader_id_std::LeaderId;
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, StreamAppendError,
-    StreamAppendResult, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, AppendError, AppendResult, SnapshotResponse,
+    StreamAppendError, StreamAppendResult, VoteRequest, VoteResponse,
 };
 use openraft::type_config::alias::{SnapshotMetaOf, SnapshotOf};
 use prost::Message as _;
@@ -421,6 +421,30 @@ impl Reply for AppendResponse {
             AppendOutcome::HigherVote(vote) => AppendEntriesResponse::HigherVote(vote.try_into()?),
         })
     }
+}
+
+/// The leader's reading of `response` to an append that carried the log
+/// from `prev` through `last`: a success matches through `last`, and a
+/// conflict is on `prev`. The wire carries no conflict hint.
+///
+/// # Errors
+///
+/// [`Malformed`] for a conflict on an append without a `prev_log_id`,
+/// which every log holds.
+pub fn append_result(
+    response: &AppendEntriesResponse<RaftTypes>,
+    prev: Option<LogId>,
+    last: Option<LogId>,
+) -> Result<AppendResult<RaftTypes>, Malformed> {
+    Ok(match response {
+        AppendEntriesResponse::Success => Ok(last),
+        AppendEntriesResponse::PartialSuccess(id) => Ok(*id),
+        AppendEntriesResponse::Conflict => Err(AppendError::Conflict {
+            log_id: required(prev, "a conflict's prev_log_id")?,
+            hint: None,
+        }),
+        AppendEntriesResponse::HigherVote(vote) => Err(AppendError::HigherVote(*vote)),
+    })
 }
 
 /// A `StreamAppend` answer to one request of the stream, in the order
@@ -1164,5 +1188,40 @@ mod tests {
             }))
             .expect("marker");
         assert!(decode_entry(&marker).is_err());
+    }
+
+    #[test]
+    fn an_append_result_takes_its_log_ids_from_the_append_sent() {
+        let id = |index| LogId::from(WireLogId { term: 1, index });
+        let (prev, last) = (Some(id(3)), Some(id(5)));
+        let vote = Vote::new(2, node(1));
+        let cases = [
+            (AppendEntriesResponse::Success, Ok(last)),
+            (
+                AppendEntriesResponse::PartialSuccess(Some(id(4))),
+                Ok(Some(id(4))),
+            ),
+            (
+                AppendEntriesResponse::Conflict,
+                Err(AppendError::Conflict {
+                    log_id: id(3),
+                    hint: None,
+                }),
+            ),
+            (
+                AppendEntriesResponse::HigherVote(vote),
+                Err(AppendError::HigherVote(vote)),
+            ),
+        ];
+        for (response, expected) in cases {
+            let result = append_result(&response, prev, last).expect("well formed");
+            assert_eq!(result, expected, "{response}");
+        }
+    }
+
+    #[test]
+    fn a_conflict_on_an_append_from_the_empty_log_is_refused() {
+        let last = Some(LogId::from(WireLogId { term: 1, index: 1 }));
+        assert!(append_result(&AppendEntriesResponse::Conflict, None, last).is_err());
     }
 }

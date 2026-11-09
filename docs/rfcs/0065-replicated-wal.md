@@ -945,7 +945,7 @@ the mass-failover time and vote-log batching as tuning signals.
 >   configuration entry; and an
 >   otherwise valid version-1 snapshot record fails the group's open
 > - **And** the bundle at the cut holds, for each tenant of the group, a
->   version-3 miner snapshot marked `{group, seq}` with the log id and
+>   version-3 miner snapshot marked `{log, seq}` with the log id and
 >   the cut, and the allocator's range, its unused blocks and each
 >   tenant's configuration kind and body in force; a replica restored
 >   from it mints the same next template id and the same rows as one
@@ -960,7 +960,7 @@ the mass-failover time and vote-log batching as tuning signals.
 >   misses an object, fails the restore closed rather than replaying,
 >   and no restored allocator issues `0`;
 >   and a local-backend version-3 snapshot loads and restores as it did
->   before this amendment, while one marked `{group, seq}` is discarded
+>   before this amendment, while one marked `{log, seq}` is discarded
 > - **And** a restarting tail replica restores from the bundle at its
 >   snapshot record's cut even when `checkpoint.json` names a later one,
 >   and mines only the entries after it; one restarting while the store
@@ -1542,7 +1542,8 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   `format` is `1`; `bootstrapper` is the `node_id` of the start that
   created the file; `seeded` says whether the high-water object exists
   under it; `next` is the next log id to allocate, a JSON integer read
-  as a `u32`, `0` on a store where none ever is. A reader takes it only
+  as a `u32`. Log ids start at `0`, so `next` is also the number
+  allocated, and `0` means none has been. A reader takes it only
   with exactly these fields and `format` `1`; any other object, or one
   that does not parse, fails the start closed, and no node replaces it.
   **This amends RFC 0059 §3.5 for every backend sharing the object**,
@@ -1621,15 +1622,15 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   version, then `serde_json` over `SnapshotState`). Only
   `wal_high_water` takes a second JSON shape, told apart by its keys:
   the local `{"segment": "<uuid>", "byte": <u64>}` and the replicated
-  `{"group": <u32>, "seq": <u64>}`, `group` the §6.6 log id and `seq`
+  `{"log": <u32>, "seq": <u64>}`, `log` the §6.6 log id and `seq`
   the cut index, meaning the tenant's state folds every entry of the
   group's log through `seq`. An object with neither key set, or keys
   of both, is corrupt. The version is not raised: version 4 would send
   every local version-3 snapshot down the unknown-version path, a full
   replay that re-mints reclaimed ids (hazard #5), against RFC0065.16.
   The local writer still emits the same bytes, and the local loader
-  treats a replicated mark as corrupt, the discard and replay it
-  already applies; only a tail replica reads that shape, and only in a
+  treats a replicated mark as corrupt and applies the discard and
+  replay it already uses; only a tail replica reads that shape, and only in a
   bundle. A release that raises `SNAPSHOT_VERSION` reads the previous
   version inside a bundle, the migration the bullet above requires,
   while the local backend keeps discarding it.

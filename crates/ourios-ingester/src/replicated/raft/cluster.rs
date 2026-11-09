@@ -12,6 +12,7 @@ use std::time::Duration;
 use openraft::RaftMetrics;
 use openraft::async_runtime::WatchReceiver as _;
 use openraft::storage::RaftLogReader as _;
+use ourios_parquet::Store;
 use ourios_wal::{TenantBatch, WalConfig, WalOffset};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -26,6 +27,7 @@ use super::telemetry::Meters;
 use super::transport::{Identity, Peers, ReplicationServer};
 use super::types::{Entry, GroupEntry, NodeId, RaftTypes, TenantBatchBytes};
 use super::vote_log;
+use crate::template_ids::{self, HIGH_WATER_KEY};
 
 mod tests;
 
@@ -94,6 +96,16 @@ pub(crate) fn cut_to(dir: &Path, synced: WalOffset) -> u64 {
         }
     }
     lost
+}
+
+/// An in-memory store whose template-id high-water is seated at
+/// `reserved_through`, for a leader to reserve id blocks in.
+pub(crate) fn seated_store(reserved_through: u64) -> Store {
+    let store = Store::in_memory();
+    store
+        .put_blocking(HIGH_WATER_KEY, template_ids::encode(reserved_through))
+        .expect("seat the high-water");
+    store
 }
 
 pub(crate) fn bind() -> (TcpIncoming, SocketAddr) {

@@ -19,6 +19,8 @@ use crate::replicated::raft::transport::Identity;
 use crate::replicated::raft::types::{GroupEntry, LogId, NodeId};
 use ourios_semconv as semconv;
 
+mod config;
+
 const P: Duration = Duration::from_secs(10);
 
 fn id(n: u64) -> NodeId {
@@ -376,6 +378,8 @@ async fn an_uncommitted_new_kind_holds_back_a_learner() {
 /// new kind, and counts the hold as one; once it commits, the assignment
 /// is appended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: a pass also appends the miner configuration, kind 0x04, so it holds \
+            back two new kinds; see a_membership_change_in_flight_holds_back_each_new_kind"]
 async fn a_membership_change_in_flight_holds_back_a_new_kind() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -422,6 +426,72 @@ async fn a_membership_change_in_flight_holds_back_a_new_kind() {
     cluster.shutdown().await;
 }
 
+/// Start a membership change on `leader` that adds `learner` and stays
+/// in flight until the returned followers' gates open.
+async fn membership_change_in_flight(
+    cluster: &Cluster,
+    leader: usize,
+    (learner, node_id): (NodeId, String),
+) -> (tokio::task::JoinHandle<()>, Vec<usize>) {
+    let followers: Vec<_> = (0..3).filter(|&i| i != leader).collect();
+    for &f in &followers {
+        cluster.node(f).gate.close();
+    }
+    let raft = cluster.node(leader).raft(0);
+    let changing = raft.clone();
+    let add = ChangeMembers::AddNodes(BTreeMap::from([(learner, node_id)]));
+    let membership = tokio::spawn(async move {
+        changing
+            .change_membership(add, false)
+            .await
+            .expect("committed");
+    });
+    raft.wait(WAIT)
+        .metrics(
+            |m| m.membership_config.log_id() != m.committed_membership_config.log_id(),
+            "a membership change in flight",
+        )
+        .await
+        .expect("in flight");
+    (membership, followers)
+}
+
+/// RFC0065.29: with a membership change in flight the leader appends no
+/// new kind, the assignment nor the miner configuration, and counts each
+/// hold; once it commits, both are appended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_membership_change_in_flight_holds_back_each_new_kind() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (placed, order) = placement(&cluster, 3..5);
+    let first = [placed[0].as_str()];
+    admit(&cluster, leader, &first).await;
+    heard_from(&cluster, leader, &order[..1]).await;
+    let second = (cluster.id(order[1]), placed[1].clone());
+    let (membership, followers) = membership_change_in_flight(&cluster, leader, second).await;
+
+    let reader = Reader::new();
+    let mut steward = counted(&reader);
+    let held = pass(&mut steward, &cluster, leader, &first).await;
+    assert_eq!(
+        held,
+        Pass::default(),
+        "a new kind beside a membership change"
+    );
+    assert_eq!(log(&cluster, leader).controls().highest_kind, 0);
+    let holds = reader.points(semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS);
+    assert_eq!(holds, [counted_as("membership_change", 2)], "one per kind");
+
+    for &f in &followers {
+        cluster.node(f).gate.open();
+    }
+    membership.await.expect("join");
+    let appended = pass(&mut steward, &cluster, leader, &first).await;
+    assert_eq!(appended.assigned, Some(cluster.id(order[0])));
+    assert!(appended.configured.is_some(), "the configuration held back");
+    cluster.shutdown().await;
+}
+
 /// A leader whose log purged the last assignment below its snapshot
 /// still sees the snapshot's flusher, so a steward new to the lead keeps
 /// it for the patience rather than treating the group as unassigned.
@@ -463,6 +533,9 @@ async fn a_flusher_purged_below_the_snapshot_is_kept_for_the_patience() {
 /// cut still sees the snapshot's flusher, so a steward new to the lead
 /// keeps it for the patience rather than treating the group as unassigned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the assigning pass also appends the miner configuration, so the cut's \
+            highest kind is 0x04, not 0x01; see \
+            a_flusher_purged_below_a_checkpoint_at_the_kind_in_force_is_kept"]
 async fn a_flusher_purged_below_a_checkpoint_is_kept_for_the_patience() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -496,6 +569,60 @@ async fn a_flusher_purged_below_a_checkpoint_is_kept_for_the_patience() {
     cluster.shutdown().await;
 }
 
+/// Write an entry on `leader`, have `flusher` propose a checkpoint cut at
+/// it with the highest kind the log holds, and wait for every node in
+/// `nodes` to purge through the cut, returning its index.
+async fn checkpoint_purging(
+    cluster: &Cluster,
+    (leader, flusher): (usize, NodeId),
+    nodes: &[usize],
+) -> u64 {
+    let raft = cluster.node(leader).raft(0);
+    let index = write(raft, 1).await;
+    let entries = cluster.node(leader).log(0).await;
+    let written = entries.iter().find(|e| e.log_id.index == index);
+    let term = written.expect("in the log").log_id.leader_id.term;
+    let checkpoint = Control::Checkpoint {
+        proposer: *flusher.uuid().as_bytes(),
+        cut: ourios_wal::RaftLogId { term, index },
+        highest_kind: group(cluster, leader).controls().highest_kind,
+    };
+    propose(raft, GroupEntry::Control(checkpoint)).await;
+    let reached = |id: Option<&LogId>| id.is_some_and(|id| id.index >= index);
+    for &i in nodes {
+        cluster
+            .node(i)
+            .raft(0)
+            .wait(WAIT)
+            .metrics(|m| reached(m.purged.as_ref()), "purged at the cut")
+            .await
+            .expect("purged");
+    }
+    index
+}
+
+/// A leader whose log purged the last assignment below a checkpoint's
+/// cut still sees the snapshot's flusher, so a steward new to the lead
+/// keeps it for the patience rather than treating the group as unassigned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flusher_purged_below_a_checkpoint_at_the_kind_in_force_is_kept() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (placed, _) = placement(&cluster, 3..5);
+    let placed = strs(&placed);
+    let mut steward = Steward::with_patience(PATIENCE);
+    let flusher = pass_until_assigned(&mut steward, &cluster, leader, &placed).await;
+
+    checkpoint_purging(&cluster, (leader, flusher), &[leader]).await;
+    assert_eq!(log(&cluster, leader).controls().flusher, None);
+    assert_eq!(group(&cluster, leader).controls().flusher, Some(flusher));
+
+    let mut new_to_the_lead = Steward::with_patience(PATIENCE);
+    let kept = pass(&mut new_to_the_lead, &cluster, leader, &placed).await;
+    assert_eq!(kept.assigned, None, "reassigned within the patience");
+    cluster.shutdown().await;
+}
+
 /// A steward on [`PATIENCE`] counting to `reader`.
 fn counted(reader: &Reader) -> Steward {
     Steward::counting(PATIENCE, Meters::on(&reader.meter()).flusher())
@@ -510,6 +637,8 @@ fn counted_as(reason: &str, value: u64) -> (Vec<String>, u64) {
 /// reading below the kind, and the assignment once it commits, each by
 /// group and reason; a pass that assigns nothing counts neither.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: each pass also gates the miner configuration, kind 0x04, which counts \
+            its own holds; see each_held_kind_and_committed_assignment_is_counted"]
 async fn held_kinds_and_committed_assignments_are_counted() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -545,6 +674,49 @@ async fn held_kinds_and_committed_assignments_are_counted() {
         [counted_as("member_unconfirmed", 2)],
         "an assignment held"
     );
+    cluster.shutdown().await;
+}
+
+/// The leader counts each kind its gate holds back in a pass for a member
+/// reading below it, the flusher assignment's and the miner
+/// configuration's, and the assignment once it commits, each by group and
+/// reason; a pass that holds back nothing counts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_held_kind_and_committed_assignment_is_counted() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (placed, order) = placement(&cluster, 3..5);
+    let placed = strs(&placed);
+    let voter = (0..3).find(|&i| i != leader).expect("a follower");
+    let reader = Reader::new();
+    let mut steward = counted(&reader);
+    let holds = semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS;
+    let assignments = semconv::OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS;
+
+    admit(&cluster, leader, &placed).await;
+    heard_from(&cluster, leader, &order).await;
+    reads_up_to(&cluster, voter, 0);
+    for n in 1..=2 {
+        let held = pass(&mut steward, &cluster, leader, &placed).await;
+        assert_eq!(held.assigned, None, "a voter reads below the kind");
+        let counted = reader.points(holds);
+        assert_eq!(counted, [counted_as("member_unconfirmed", 2 * n)]);
+    }
+    assert!(reader.points(assignments).is_empty(), "nothing committed");
+
+    reads_up_to(&cluster, voter, 1);
+    let first = pass(&mut steward, &cluster, leader, &placed).await;
+    assert_eq!(first.assigned, Some(cluster.id(order[0])));
+    assert_eq!(first.configured, None, "a voter reads below 0x04");
+    reads_up_to(&cluster, voter, Control::HIGHEST_KIND);
+    let configured = pass(&mut steward, &cluster, leader, &placed).await;
+    assert!(configured.configured.is_some());
+    let kept = pass(&mut steward, &cluster, leader, &placed).await;
+    assert_eq!(kept, Pass::default());
+    let counted = reader.points(assignments);
+    assert_eq!(counted, [counted_as("unassigned", 1)]);
+    let counted = reader.points(holds);
+    assert_eq!(counted, [counted_as("member_unconfirmed", 5)]);
     cluster.shutdown().await;
 }
 

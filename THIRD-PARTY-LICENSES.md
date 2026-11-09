@@ -7206,10 +7206,10 @@ limitations under the License.
 
 Used by:
 
-- `openraft` 0.10.0-alpha.37 — <https://github.com/databendlabs/openraft>
-- `openraft-macros` 0.10.0-alpha.37 — <https://github.com/databendlabs/openraft>
-- `openraft-rt-tokio` 0.10.0-alpha.37 — <https://github.com/drmingdrmer/openraft>
-- `openraft-rt` 0.10.0-alpha.37 — <https://github.com/databendlabs/openraft>
+- `openraft` 0.10.0-alpha.38 — <https://github.com/databendlabs/openraft>
+- `openraft-macros` 0.10.0-alpha.38 — <https://github.com/databendlabs/openraft>
+- `openraft-rt-tokio` 0.10.0-alpha.38 — <https://github.com/drmingdrmer/openraft>
+- `openraft-rt` 0.10.0-alpha.38 — <https://github.com/databendlabs/openraft>
 - `ourios-bench` 0.17.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-config` 0.17.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-core` 0.17.0 — <https://github.com/jensholdgaard/ourios>

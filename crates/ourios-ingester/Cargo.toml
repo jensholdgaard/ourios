@@ -178,7 +178,7 @@ twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_
 # `main` revision, not a crates.io release: the safety fixes §4.5
 # requires (9567ffea, 0240eca5) are on `main` only. `serde` so the Raft
 # messages the peer transport will carry are serialisable.
-openraft = { git = "https://github.com/databendlabs/openraft", rev = "73273a67fd5bee278fa2155a1ed11963a70ee789", default-features = false, features = ["tokio-rt", "serde"] }
+openraft = { git = "https://github.com/databendlabs/openraft", rev = "d132ba8753d0c484bbb8b19f2b6ac7f6ae626509", default-features = false, features = ["tokio-rt", "serde"] }
 # CRC32-C on each `votes.log` record (RFC 0065 §6.1), the checksum RFC
 # 0008 frames use. Already in the tree via ourios-wal.
 crc32c = "0.6"

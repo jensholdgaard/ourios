@@ -175,6 +175,15 @@ fn option() -> RPCOption {
     RPCOption::new(Duration::from_secs(5))
 }
 
+/// One node serving on loopback, and a client to it.
+async fn one_node() -> (Node, PeerClient) {
+    let (incoming, addr) = bind();
+    let peers = Peers::plaintext();
+    let node = start(1, incoming, &peers, ReplicationServer::default()).await;
+    let client = client_to(&peers, node.id, addr).await;
+    (node, client)
+}
+
 /// A client to `target`, reached at `addr`.
 async fn client_to(peers: &Peers, target: NodeId, addr: SocketAddr) -> PeerClient {
     let peers = peers
@@ -276,6 +285,8 @@ const MIB: usize = 1024 * 1024;
 
 /// tonic's default limit is 4 MiB; a WAL frame may be 16.
 #[tokio::test]
+#[ignore = "superseded: append_entries answers an AppendResult since openraft 817899a, \
+            see an_entry_over_four_mib_is_matched_through_its_log_id"]
 async fn an_entry_over_four_mib_replicates() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
@@ -284,11 +295,27 @@ async fn an_entry_over_four_mib_replicates() {
     let response = client
         .append_entries(append(vec![entry(0, 5 * MIB)]), option())
         .await;
-    assert_eq!(response.expect("append"), AppendEntriesResponse::Success);
+    assert_eq!(
+        AppendEntriesResponse::from(response.expect("append")),
+        AppendEntriesResponse::Success
+    );
+    node.kill().await;
+}
+
+/// tonic's default limit is 4 MiB; a WAL frame may be 16.
+#[tokio::test]
+async fn an_entry_over_four_mib_is_matched_through_its_log_id() {
+    let (mut node, mut client) = one_node().await;
+    let rpc = append(vec![entry(0, 5 * MIB)]);
+    let last = rpc.last_log_id();
+    let response = client.append_entries(rpc, option()).await;
+    assert_eq!(response.expect("append"), Ok(last));
     node.kill().await;
 }
 
 #[tokio::test]
+#[ignore = "superseded: append_entries answers an AppendResult since openraft 817899a, \
+            see a_batch_over_the_byte_budget_is_matched_through_its_prefix"]
 async fn a_batch_over_the_byte_budget_is_a_partial_success() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
@@ -298,9 +325,20 @@ async fn a_batch_over_the_byte_budget_is_a_partial_success() {
     let second = rpc.entries[1].log_id;
     let response = client.append_entries(rpc, option()).await;
     assert_eq!(
-        response.expect("append"),
+        AppendEntriesResponse::from(response.expect("append")),
         AppendEntriesResponse::PartialSuccess(Some(second))
     );
+    node.kill().await;
+}
+
+/// The prefix that fits the byte budget is matched, not the whole batch.
+#[tokio::test]
+async fn a_batch_over_the_byte_budget_is_matched_through_its_prefix() {
+    let (mut node, mut client) = one_node().await;
+    let rpc = append((0..3).map(|i| entry(i, 7 * MIB)).collect());
+    let second = rpc.entries[1].log_id;
+    let response = client.append_entries(rpc, option()).await;
+    assert_eq!(response.expect("append"), Ok(Some(second)));
     node.kill().await;
 }
 
@@ -568,6 +606,8 @@ fn consecutive(runs: &[u64]) -> Vec<AppendEntriesRequest<RaftTypes>> {
 
 type StreamAnswer = Result<openraft::raft::StreamAppendResult<RaftTypes>, RPCError<RaftTypes>>;
 
+/// The answers to `requests` streamed, without conflict hints: the wire
+/// carries none.
 async fn streamed(
     client: &mut PeerClient,
     requests: Vec<AppendEntriesRequest<RaftTypes>>,
@@ -575,7 +615,9 @@ async fn streamed(
 ) -> Result<Vec<StreamAnswer>, RPCError<RaftTypes>> {
     let input = futures_util::stream::iter(requests);
     let answers = client.stream_append(input, option).await?;
-    Ok(answers.collect().await)
+    let unhinted =
+        answers.map(|answer| answer.map(|result| result.map_err(StreamAppendError::from)));
+    Ok(unhinted.collect().await)
 }
 
 fn matched(answers: &[StreamAnswer]) -> Vec<Option<u64>> {
@@ -638,6 +680,8 @@ async fn three_nodes_replicate_through_stream_append() {
 /// Every message is answered in order with the log id it matched
 /// through; the unary path still serves alongside.
 #[tokio::test]
+#[ignore = "superseded: append_entries answers an AppendResult since openraft 817899a, \
+            see a_stream_answers_each_append_in_order_beside_the_unary_path"]
 async fn a_stream_answers_each_append_in_order() {
     let (incoming, addr) = bind();
     let peers = Peers::plaintext();
@@ -650,7 +694,27 @@ async fn a_stream_answers_each_append_in_order() {
 
     let next = consecutive(&[3, 2, 1, 1]).remove(3);
     let unary = client.append_entries(next, option()).await;
-    assert_eq!(unary.expect("unary"), AppendEntriesResponse::Success);
+    assert_eq!(
+        AppendEntriesResponse::from(unary.expect("unary")),
+        AppendEntriesResponse::Success
+    );
+    node.kill().await;
+}
+
+/// Every message is answered in order with the log id it matched
+/// through; the unary path still serves alongside.
+#[tokio::test]
+async fn a_stream_answers_each_append_in_order_beside_the_unary_path() {
+    let (mut node, mut client) = one_node().await;
+    let answers = streamed(&mut client, consecutive(&[3, 2, 1, 0]), option())
+        .await
+        .expect("stream");
+    assert_eq!(matched(&answers), [Some(2), Some(4), Some(5), Some(5)]);
+
+    let next = consecutive(&[3, 2, 1, 1]).remove(3);
+    let last = next.last_log_id();
+    let unary = client.append_entries(next, option()).await;
+    assert_eq!(unary.expect("unary"), Ok(last));
     node.kill().await;
 }
 

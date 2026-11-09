@@ -839,6 +839,15 @@ the mass-failover time and vote-log batching as tuning signals.
 >   written `checkpoint.json` for a cut above the survivor's log end, the
 >   survivor's first checkpoint is above that `seq`, under the same log
 >   id
+> - **And** with a tail flusher of the old log still running, holding
+>   committed entry 300 unpublished while `checkpoint.json`'s
+>   `published_high` is 200: when the flusher raises before the
+>   takeover writes, the takeover's start bound is above 300; when the
+>   takeover writes first, the flusher's raise fails and it publishes
+>   no file above 200, nor claims or checkpoints, so no position of the
+>   new log appears in two files with different rows; and that flusher,
+>   rejoining the new log as a learner or later made its flusher,
+>   publishes no row mined from the old log above the bound
 
 > **Scenario RFC0065.26 — a delayed former flusher cannot move a checkpoint back**
 > - **Given** a group whose new flusher has checkpointed `seq` 200 and
@@ -855,7 +864,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   `format`, a missing or unknown field, or a `bundle` that is not its
 >   `seq`'s prefix, is never replaced, and that checkpoint fails with
 >   nothing purged; a retried put of identical bytes completes the
->   checkpoint; `published_high` never falls, and no file is published
+>   checkpoint; a flusher claims `checkpoint.json` before its first write
+>   only from a flusher in force before it in its log, and a former
+>   flusher, once the next has claimed, writes nothing more;
+>   `published_high` never falls, and no file is published
 >   with an `ingest_seq` above the stored `published_high`, also before
 >   the group's first checkpoint; and a new log incarnation
 >   over a bucket holding an old one's objects checkpoints under its
@@ -951,7 +963,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   tenant's configuration kind and body in force; a replica restored
 >   from it mints the same next template id and the same rows as one
 >   that mined through the cut; a bundle whose `format`, CRC, log id,
->   cut, range (`next` `0` included), blocks, tenant order, a snapshot's length, CRC, version
+>   cut, current block and `next` (`next` `0`; latest block `(1000,
+>   2000]` with no pending block and `next` `1`; a pending `(0, 2000]`
+>   against that latest block with `next` `1`), pending blocks, tenant
+>   order, a snapshot's length, CRC, version
 >   or mark, or a configuration kind is not as §6.5 requires, or that
 >   misses an object, fails the restore closed rather than replaying,
 >   and no restored allocator issues `0`;
@@ -1345,9 +1360,10 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   would pass it is published, below, and in the footer statistics of
   every file). `ourios wal force-leader` (B8) starts its new log
   above the largest of that, `checkpoint.json`'s `seq` and the
-  survivor's log end, so its checkpoints are not refused and a position
-  that a lost replica flushed but never checkpointed is never issued
-  again (§4.5). For the same reason it abandons every unused id block
+  survivor's log end, written to `checkpoint.json` with its fence
+  before the new log is (below), so its checkpoints are not refused
+  and a position that a lost replica flushed but never checkpointed is
+  never issued again (§4.5). For the same reason it abandons every unused id block
   the survivor holds, from its log and from the checkpoint snapshot:
   the lost suffix may already have minted ids from them, and published
   rows with them. Before mining any new entry the survivor reserves
@@ -1574,7 +1590,8 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   little-endian:
 
   ```text
-  format: u8 = 1 | log: u32 | seq: u64 | term: u64 | next: u64 | end: u64 |
+  format: u8 = 1 | log: u32 | seq: u64 | term: u64 |
+  next: u64 | current after: u64 | current through: u64 |
   blocks: u32 | blocks × (after: u64 | through: u64) |
   tenants: u32 | tenants × (len: u16 | tenant: len bytes | config kind: u8 | config body |
                             snapshot len: u64 | snapshot crc32c: u32) |
@@ -1582,10 +1599,13 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   ```
 
   `log`, `seq` and `term` are the log id and the cut's index and term.
-  `next` and `end` are the allocator's current range as `IdRange`
-  holds it, the next id to issue and the end of its block, exclusive
-  (`1` and `1` before any block); `blocks` are the applied blocks it
-  has not started, in log order. Each tenant is its id's UTF-8 bytes as
+  `next` is the next id the allocator issues and `current` the block
+  `(after, through]` its range comes from, `IdRange`'s `end` being
+  `through + 1`; before the allocator has started a block, `current` is
+  `(0, 0]` and `next` is `1`. `blocks` are the applied blocks it has
+  not started, in log order. The allocator keeps `current` for this,
+  since its range alone cannot show which block it came from. Each
+  tenant is its id's UTF-8 bytes as
   the `TenantOtlpBatch` prefix carries them (RFC 0046 §3.3, `len` 1 to
   128), sorted bytewise, none repeated; `config kind` and `config body`
   are its effective miner configuration, the control-entry kind that is
@@ -1595,12 +1615,16 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   and the last covers every byte before it.
   - **Reading.** A replica restores from a bundle only if `format` is
     `1` and the CRC holds; `log` is the group's and `seq` and `term`
-    are the cut it restores (§6.1's record); `1 <= next <= end <=
-    2^63`, so `0`, the `NO_TEMPLATE` sentinel, is never issued;
-    every block has `after < through <= 2^63 - 1`, the first's `after`
-    at or above `end - 1` and each next one's at or above the previous
-    `through`; the last block's `through`, else `end - 1`, is the
-    record's latest id block's `through`; the tenants are sorted and
+    are the cut it restores (§6.1's record); `current` is `(0, 0]`
+    with `next` `1`, or has `after < through <= 2^63 - 1` and
+    `after < next <= through + 1`, so `next` is at least `1` and `0`,
+    the `NO_TEMPLATE` sentinel, is never issued, and no id at or below
+    the block's `after` is; every pending block has
+    `after < through <= 2^63 - 1`, the first's `after` at or above
+    `current`'s `through` and each next one's at or above the previous
+    `through`; the last pending block, else `current`, equals the
+    record's latest id block in both `after` and `through`; the tenants
+    are sorted and
     unique; each configuration kind is one it reads and, until a
     per-tenant override exists, equals the record's configuration in
     force; and each `.snap` has its length and CRC, decodes under
@@ -1627,15 +1651,16 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   ```json
   {"format": 1, "log": 3, "seq": 200, "term": 4,
    "bundle": "wal/replicated/logs/3/checkpoints/00000000000000000200/",
-   "published_high": 198}
+   "published_high": 198, "flusher": "0190d2a8-91f4-7c02-8a11-0c9d8e7f6a5b"}
   ```
 
   `format` is `1`; `log` is the log id; `seq` and `term` are the cut's
   index and term, both `0` with `bundle` `null` before the group's first
   checkpoint; `bundle` is the bundle's prefix, relative to the bucket;
   `published_high` is at or above the highest `ingest_seq` in any file
-  the group has published, `0` when none. Every number is a JSON
-  integer read as a `u64`, `log` as a `u32`. A reader takes the object
+  the group has published, `0` when none; `flusher` is the fence below,
+  a lowercase hyphenated UUID. Every number is a JSON integer read as
+  a `u64`, `log` as a `u32`. A reader takes the object
   only with exactly these fields, `format` `1`, `log` the group's and
   `bundle` the prefix `log` and `seq` name, or `null` exactly when
   `seq` is `0`. Any other object, or one
@@ -1643,7 +1668,8 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
   since a whole-object rewrite would drop a field it does not know: its
   checkpoint fails as a failed bundle write does, and it reports why.
   The object is created with `put_if_absent` and changes only by
-  `put_if_match` on the ETag the writer read. A writer that reads a
+  `put_if_match` on the ETag the writer read. A flusher writes it only
+  while the stored `flusher` is its own (below); a writer that reads a
   stored `seq` at or above its own abandons its write (above);
   otherwise it writes its `seq`, `term` and `bundle`, with
   `published_high` the larger of the stored value and its own, so that
@@ -1657,22 +1683,61 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     publishes a file whose highest `ingest_seq` is above the stored
     `published_high`, it raises the stored value to the highest
     committed `seq` it holds, by the same `put_if_match`, keeping the
-    stored `seq`, `term` and `bundle` (creating the object with `seq`
-    `0` when absent), and publishes the file only once that write has
-    returned. A flusher mines only committed entries, so one raise
-    covers every file it publishes until its mining passes that `seq`:
+    stored `seq`, `term`, `bundle` and `flusher`, and publishes the file
+    only once that write has returned. A flusher mines only committed
+    entries, so one raise covers every file it publishes until its
+    mining passes that `seq`:
     a raise costs one conditional put per such pass, not per file, and
     `force-leader` finds the bound in one read, with no listing. A raise
     by a delayed former flusher only raises the value, which skips
     positions and reuses none. A file the raise cannot cover, the store
-    unreachable or the object unreadable, is not published, as during a
-    store outage (B25).
+    unreachable, the object unreadable or the fence another's, is not
+    published, as during a store outage (B25). A file at or below the
+    stored `published_high` needs no raise: the bound already covers
+    its positions.
+  - **The fence.** `flusher` names the one replica that may write the
+    object, and so publish above its bound. A flusher's fence is its
+    own replica UUID. Before its first write it **claims** the object:
+    a `put_if_match` setting `flusher` to its UUID, keeping every other
+    field, which it makes only if the stored `flusher` is its own or
+    one in force in its own log before its assignment, from the
+    snapshot record's
+    flusher on (the state machine keeps those positions, §6.5 above),
+    or by `put_if_absent` of `{seq 0, term 0, bundle null,
+    published_high 0}` with its UUID when the object is absent. A
+    flusher whose claim, raise or checkpoint write finds the stored
+    `flusher` not its own, or after a lost race re-reads and finds it
+    so, makes no further write and publishes nothing above the stored
+    bound; one that finds it still its own retries.
+  - **A forced takeover takes the fence first.** `force-leader` reads
+    the object, computes its start bound `B`, the largest of the stored
+    `published_high`, the stored `seq` and the survivor's log end, and
+    writes by `put_if_match` `published_high = B` and `flusher` a fresh
+    UUIDv7 `N` that names no replica, keeping `seq`, `term` and
+    `bundle` (creating the object when absent); a lost race re-reads and
+    computes again. Only then does it write its new log, above `B`,
+    whose entries after the membership entry begin with a flusher
+    assignment naming `N`, so `N` is in force in the new log and in no
+    old one. A new flusher there claims from `N`; an old-log flusher's
+    history never holds `N`, so after the takeover it can neither claim
+    nor raise. If the old flusher raised before the takeover's write,
+    the takeover read that raise, its own write's ETag fencing the
+    order, and `B` covers every position the old flusher can publish;
+    if the takeover wrote first, the old flusher's next raise finds `N`
+    and fails, so it publishes nothing above `B`. Files it published
+    before are at or below the stored bound, so `B` covers them too.
+    The leader replaces `N`, which is no learner, by RFC0065.30's rule.
+    A forced takeover is the one case where a committed entry is
+    truncated, so a replica whose log is cut back at or below an entry
+    it has mined drops its miner and sink state and restores from its
+    bundle as at a start, so it never publishes a row from the old log
+    at a position the new one reuses.
   - **Keyed by log id, not group number.** A log incarnation that
     replaces another over a bucket that keeps the old one's objects
     starts its Raft indexes over, and under the group number its writes
     would lose for good to the old object's higher `seq`.
     `force-leader` keeps the group's log id, since its new log continues
-    the old one's positions, and starts above the stored `seq` (above),
+    the old one's positions, and starts above the stored `seq` (below),
     so its checkpoints land above every stored one under the same key.
 - **Recovery** of a tail replica on start: the mark is one cut. The
   replica opens the group's log from §6.1's snapshot record, whose last

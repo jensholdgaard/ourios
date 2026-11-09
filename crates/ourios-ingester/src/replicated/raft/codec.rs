@@ -68,7 +68,10 @@ pub(super) fn encode_entry(entry: &Entry) -> io::Result<Vec<u8>> {
     let membership;
     let body = match &entry.payload {
         EntryPayload::Blank => EntryBody::Blank,
-        EntryPayload::Normal(GroupEntry::Batch(batch)) => EntryBody::Normal(batch.as_bytes()),
+        EntryPayload::Normal(GroupEntry::Batch(timed)) => EntryBody::Batch {
+            time: timed.time,
+            batch: timed.batch.as_bytes(),
+        },
         EntryPayload::Normal(GroupEntry::Control(control)) => {
             EntryBody::Control(checked(*control)?)
         }
@@ -93,9 +96,9 @@ pub(super) fn decode(payload: &[u8]) -> io::Result<Replayed> {
         ReplicatedRecord::Entry { log_id, body } => {
             let payload = match body {
                 EntryBody::Blank => EntryPayload::Blank,
-                EntryBody::Normal(bytes) => {
-                    let batch = TenantBatchBytes::new(bytes.to_vec()).map_err(invalid)?;
-                    EntryPayload::Normal(GroupEntry::Batch(batch))
+                EntryBody::Batch { time, batch } => {
+                    let batch = TenantBatchBytes::new(batch.to_vec()).map_err(invalid)?;
+                    EntryPayload::Normal(GroupEntry::batch(time, batch))
                 }
                 EntryBody::Membership(bytes) => EntryPayload::Membership(decode_membership(bytes)?),
                 EntryBody::Control(control) => {
@@ -194,7 +197,7 @@ pub(super) fn take_membership(bytes: &[u8]) -> io::Result<(Membership, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ourios_wal::{Control, ReplicatedRecordError, TenantBatch};
+    use ourios_wal::{BatchTime, Control, ReplicatedRecordError, TenantBatch};
 
     fn id(n: u64) -> NodeId {
         NodeId::from(n)
@@ -215,7 +218,9 @@ mod tests {
     #[test]
     fn every_payload_round_trips() {
         let batch = TenantBatch::encode("acme", b"proto").expect("batch");
-        let normal = EntryPayload::Normal(GroupEntry::Batch(
+        let time = BatchTime::from_nanos(1_700_000_000_000_000_001).expect("in range");
+        let normal = EntryPayload::Normal(GroupEntry::batch(
+            time,
             TenantBatchBytes::new(batch).expect("valid"),
         ));
         let flusher = Control::FlusherAssignment(*id(4).uuid().as_bytes());
@@ -254,6 +259,46 @@ mod tests {
             encode_entry(&entry).expect("encode"),
             record.encode().expect("encode")
         );
+    }
+
+    /// A batch is the WAL codec's timed batch, `0x05`; replay refuses the
+    /// untimed `0x02` and a time above `2^63 - 1` (RFC 0065 §6.5).
+    #[test]
+    fn a_batch_is_the_timed_record_and_an_untimed_or_out_of_range_one_is_refused() {
+        let batch = TenantBatch::encode("acme", b"proto").expect("batch");
+        let time = BatchTime::from_nanos(42).expect("in range");
+        let entry = Entry {
+            log_id: log_id(3, 7),
+            payload: EntryPayload::Normal(GroupEntry::batch(
+                time,
+                TenantBatchBytes::new(batch.clone()).expect("valid"),
+            )),
+        };
+        let bytes = encode_entry(&entry).expect("encode");
+        let record = ReplicatedRecord::Entry {
+            log_id: RaftLogId { term: 3, index: 7 },
+            body: EntryBody::Batch {
+                time,
+                batch: &batch,
+            },
+        };
+        assert_eq!(bytes, record.encode().expect("encode"));
+        assert_eq!(bytes[0], 0x05);
+
+        let mut untimed = bytes.clone();
+        untimed[0] = 0x02;
+        let e = decode(&untimed).expect_err("an untimed batch");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let unknown = ReplicatedRecordError::UnknownTag { found: 0x02 };
+        assert_eq!(e.to_string(), unknown.to_string());
+
+        let mut late = bytes;
+        late[17..25].copy_from_slice(&(BatchTime::MAX.nanos() + 1).to_le_bytes());
+        let e = decode(&late).expect_err("a time out of range");
+        let invalid = ReplicatedRecordError::InvalidBatchTime {
+            found: BatchTime::MAX.nanos() + 1,
+        };
+        assert_eq!(e.to_string(), invalid.to_string());
     }
 
     #[test]

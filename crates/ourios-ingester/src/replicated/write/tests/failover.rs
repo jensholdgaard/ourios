@@ -31,7 +31,8 @@ fn marker(n: u32) -> String {
 
 fn carries(entry: &Entry, marker: &str) -> bool {
     match &entry.payload {
-        EntryPayload::Normal(GroupEntry::Batch(batch)) => batch
+        EntryPayload::Normal(GroupEntry::Batch(timed)) => timed
+            .batch
             .as_bytes()
             .windows(marker.len())
             .any(|w| w == marker.as_bytes()),

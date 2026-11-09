@@ -572,6 +572,54 @@ fn rfc0065_29_an_untimed_or_out_of_range_batch_refuses_the_log() {
     );
 }
 
+/// Scenario RFC0065.29 — the batch-record arm (B11): a log holding a timed
+/// batch opens with its time, and a batch under tag `0x02`, or under tag
+/// `0x05` with a `time` above `2^63 - 1`, stops the open at that record.
+#[tokio::test]
+async fn rfc0065_29_an_untimed_or_out_of_range_batch_stops_the_open() {
+    use openraft::EntryPayload;
+    use openraft::storage::RaftLogReader as _;
+    use ourios_ingester::replicated::raft::types::GroupEntry;
+    use ourios_wal::BatchTime;
+
+    let payload = ourios_wal::TenantBatch::encode("acme", b"export").expect("batch");
+    let time = BatchTime::from_nanos(1_700_000_000_000_000_000).expect("in range");
+    let timed = |index| {
+        record(
+            index,
+            ourios_wal::EntryBody::Batch {
+                time,
+                batch: &payload,
+            },
+        )
+    };
+    let first = timed(1);
+    let (opened, _dir) = open_holding(&[&first]);
+    let mut log = opened.expect("a log holding a timed batch opens");
+    let entries = log.try_get_log_entries(..).await.expect("read");
+    let read = entries.iter().find_map(|e| match &e.payload {
+        EntryPayload::Normal(GroupEntry::Batch(batch)) => Some(batch.time),
+        _ => None,
+    });
+    assert_eq!(read, Some(time), "the batch's time");
+
+    let mut untimed = vec![0x02];
+    untimed.extend_from_slice(&timed(2)[1..17]);
+    untimed.extend_from_slice(&payload);
+    let mut late = timed(2);
+    late[17..25].copy_from_slice(&(BatchTime::MAX.nanos() + 1).to_le_bytes());
+    for (unreadable, why) in [
+        (&untimed, "unknown ReplicatedEntry tag 0x02"),
+        (&late, "is above 2^63 - 1"),
+    ] {
+        let (refused, _dir) = open_holding(&[&first, unreadable]);
+        let Err(error) = refused else {
+            panic!("{why}: the batch did not stop the open");
+        };
+        assert!(error.to_string().contains(why), "{error}");
+    }
+}
+
 /// Scenario RFC0065.29 — the undecodable-batch arm (B11): a committed batch
 /// whose export does not decode stops the group's miner at that entry on
 /// every tail replica alike, while the group keeps acknowledging.

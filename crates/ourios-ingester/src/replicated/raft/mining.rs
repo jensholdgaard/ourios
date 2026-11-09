@@ -13,25 +13,29 @@
 //!
 //! Each event returns the audit events the miner emitted with the rows it
 //! mined, so the template events those rows need can be written ahead of
-//! them, as the local receiver writes them.
+//! them, as the local receiver writes them. Every audit event is stamped
+//! with the time the leader wrote into the batch being mined, so replicas
+//! stamp it alike whatever their own clocks say.
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::audit::{AuditEvent, SharedAuditSink};
-use ourios_core::clock::{Clock, SystemClock};
+use ourios_core::clock::Clock;
 use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{self, IdReservationError, IdReserver, MinerCluster, TreeShapeChanged};
-use ourios_wal::TenantBatch;
+use ourios_wal::{BatchTime, TenantBatch};
 use prost::Message as _;
 
 use super::snapshot_record::{GroupMinerConfig, IdBlock};
 use super::state_machine::{Applied, AppliedEvent};
-use super::types::{LogId, TenantBatchBytes};
+use super::types::{LogId, TimedBatch};
 use crate::receiver::tenant::assign;
 
 /// Where a mined record was ingested: the index of its entry in the
@@ -157,22 +161,45 @@ impl IdReserver for LogBlocks {
     }
 }
 
-/// A decoded batch: its entry and its records, under the frame's tenant.
+/// The time of the batch being mined: the miner's only clock, so every
+/// audit event it emits carries the batch's time.
+#[derive(Debug, Clone, Default)]
+struct BatchClock(Arc<AtomicU64>);
+
+impl BatchClock {
+    fn set(&self, time: BatchTime) {
+        self.0.store(time.nanos(), Ordering::Relaxed);
+    }
+}
+
+impl Clock for BatchClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_nanos(self.0.load(Ordering::Relaxed))
+    }
+}
+
+/// A decoded batch: its entry, its time and its records, under the
+/// frame's tenant.
 struct Frame {
     at: LogId,
+    time: BatchTime,
     records: Vec<OtlpLogRecord>,
 }
 
 impl Frame {
-    fn decode(at: LogId, batch: &TenantBatchBytes) -> Result<Self, GroupMinerError> {
+    fn decode(at: LogId, timed: &TimedBatch) -> Result<Self, GroupMinerError> {
         let undecodable = |detail: String| GroupMinerError::Undecodable { at, detail };
         let frame =
-            TenantBatch::decode(batch.as_bytes()).map_err(|e| undecodable(e.to_string()))?;
+            TenantBatch::decode(timed.batch.as_bytes()).map_err(|e| undecodable(e.to_string()))?;
         let request = ExportLogsServiceRequest::decode(frame.protobuf)
             .map_err(|e| undecodable(e.to_string()))?;
         let records = assign(request, &TenantId::new(frame.tenant));
         match u32::try_from(records.len()) {
-            Ok(_) => Ok(Self { at, records }),
+            Ok(_) => Ok(Self {
+                at,
+                time: timed.time,
+                records,
+            }),
             Err(_) => Err(undecodable(format!(
                 "{} records, more than an ingest index numbers",
                 records.len()
@@ -180,8 +207,13 @@ impl Frame {
         }
     }
 
-    fn mine(&self, miner: &mut MinerCluster) -> Result<Vec<MinedRow>, GroupMinerError> {
+    fn mine(
+        &self,
+        miner: &mut MinerCluster,
+        clock: &BatchClock,
+    ) -> Result<Vec<MinedRow>, GroupMinerError> {
         let at = self.at;
+        clock.set(self.time);
         // `decode` bounds the count to u32, so the zip numbers every record.
         self.records
             .iter()
@@ -201,12 +233,8 @@ impl Frame {
 }
 
 enum Stage {
-    /// No configuration has applied: the batches wait for the first, and
-    /// the clock for the miner it builds.
-    Unconfigured {
-        pending: Vec<Frame>,
-        clock: Box<dyn Clock>,
-    },
+    /// No configuration has applied: the batches wait for the first.
+    Unconfigured(Vec<Frame>),
     Mining(Box<MinerCluster>),
     Stopped(GroupMinerError),
 }
@@ -216,6 +244,7 @@ pub struct GroupMiner {
     stage: Stage,
     blocks: LogBlocks,
     audit: SharedAuditSink,
+    clock: BatchClock,
     last: Option<LogId>,
 }
 
@@ -227,22 +256,14 @@ impl Default for GroupMiner {
 
 impl GroupMiner {
     /// A miner for a group whose log it follows from the start, stamping
-    /// audit events from the system clock.
+    /// each audit event with the time of the batch it mined.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_clock(Box::new(SystemClock::new()))
-    }
-
-    /// [`Self::new`], stamping audit events from `clock`.
-    #[must_use]
-    pub fn with_clock(clock: Box<dyn Clock>) -> Self {
         Self {
-            stage: Stage::Unconfigured {
-                pending: Vec::new(),
-                clock,
-            },
+            stage: Stage::Unconfigured(Vec::new()),
             blocks: LogBlocks::default(),
             audit: SharedAuditSink::new(),
+            clock: BatchClock::default(),
             last: None,
         }
     }
@@ -263,7 +284,7 @@ impl GroupMiner {
     pub fn apply(&mut self, applied: Applied) -> Result<Mined, GroupMinerError> {
         let followed = match &self.stage {
             Stage::Stopped(error) => Err(error.clone()),
-            Stage::Unconfigured { .. } | Stage::Mining(_) => self.follow(applied),
+            Stage::Unconfigured(_) | Stage::Mining(_) => self.follow(applied),
         };
         let audit = self.audit.drain();
         match followed {
@@ -298,11 +319,11 @@ impl GroupMiner {
 
     fn batch(&mut self, frame: Frame) -> Result<Vec<MinedRow>, GroupMinerError> {
         match &mut self.stage {
-            Stage::Unconfigured { pending, .. } => {
+            Stage::Unconfigured(pending) => {
                 pending.push(frame);
                 Ok(Vec::new())
             }
-            Stage::Mining(miner) => frame.mine(miner),
+            Stage::Mining(miner) => frame.mine(miner, &self.clock),
             Stage::Stopped(error) => Err(error.clone()),
         }
     }
@@ -318,19 +339,18 @@ impl GroupMiner {
                 miner.reconfigure(config.config()).map_err(refused)?;
                 Ok(Vec::new())
             }
-            Stage::Unconfigured { pending, clock } => {
+            Stage::Unconfigured(pending) => {
                 let pending = std::mem::take(pending);
-                let clock = std::mem::replace(clock, Box::new(SystemClock::new()));
                 let audit = Box::new(self.audit.clone());
                 let reserver = Box::new(self.blocks.clone());
                 let mut miner = Box::new(
                     MinerCluster::with_audit_sink(config.config(), audit)
-                        .with_clock(clock)
+                        .with_clock(Box::new(self.clock.clone()))
                         .with_id_reserver(reserver),
                 );
                 let mut rows = Vec::new();
                 for frame in &pending {
-                    rows.extend(frame.mine(&mut miner)?);
+                    rows.extend(frame.mine(&mut miner, &self.clock)?);
                 }
                 self.stage = Stage::Mining(miner);
                 Ok(rows)

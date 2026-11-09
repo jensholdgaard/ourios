@@ -812,7 +812,9 @@ the mass-failover time and vote-log batching as tuning signals.
 >   drops repeated until more than the ceiling's worth of audit events
 >   lies between the cut and the gap; as flusher it publishes nothing it
 >   keeps and proposes no cut until it has replayed from the bundle at
->   its applied cut, slice by slice, each slice's audit events in the
+>   its applied cut, or from the group's first entry when the drops
+>   came before any checkpoint, slice by slice, each slice's audit
+>   events in the
 >   store before its rows' files and its memory never above one slice
 >   plus the miner's state; it then publishes the same rows and audit
 >   events, byte for byte, as a flusher that dropped nothing; once a
@@ -1054,7 +1056,9 @@ the mass-failover time and vote-log batching as tuning signals.
 >   their entries, is refused `stale` and reserves nothing; the
 >   flusher's fresh report, sent when it applies that checkpoint, is
 >   counted, and the group never holds more than three blocks the
->   flusher has not started
+>   flusher has not started; two overlapping deliveries of one report
+>   with two blocks unstarted, a retry after a timeout among them,
+>   together reserve and append one block
 > - **And** a current flusher whose `checkpoint.json` write finds a
 >   later `seq` a former flusher wrote, or its own earlier write of the
 >   same `seq`, proposes its entry, which every replica applies, so the
@@ -1966,8 +1970,11 @@ never count toward an ack (learners, under §4.3's shape).
     has rebuilt what it dropped. It rebuilds by a **bounded replay**: it
     restores the bundle at the last checkpoint it applied into a second
     miner, as recovery does (§6.5), and mines its log from the cut
-    through the gap in slices, each closed by the record sink's size or
-    age trigger as a flush is. For each slice it publishes the slice's
+    through the gap in slices; with no checkpoint applied yet, the
+    second miner starts empty and mines from the group's first entry,
+    as recovery without a snapshot record does. Each slice is closed by
+    the record sink's size or age trigger, as a flush is. For each
+    slice it publishes the slice's
     audit events, durable in the store, before the files holding the
     slice's rows, as audit-before-record requires, and then drops the
     slice, so the replay holds one slice and the second miner's state,
@@ -2383,7 +2390,11 @@ never count toward an ack (learners, under §4.3's shape).
   checkpoint, whose blocks the flusher has since mined and whose
   entries the purge removed, is refused rather than counted short, and
   a repeated report counts the blocks the first appended and appends
-  none. The count needs nothing persisted beyond
+  none. The leader handles one report per group at a time: it counts,
+  reserves and appends under the group's refill lock, and the next
+  report waits until that append is in its log, so two reports that
+  overlap, a retry after a timeout among them, each count the other's
+  block. The count needs nothing persisted beyond
   the bundle's pending blocks; the snapshot record keeps only the
   latest block, so the leader could not count pending ones itself
   without a new record field. With the store unreachable it reserves

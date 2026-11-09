@@ -4934,7 +4934,7 @@ Used by:
 - `fastrand` 2.4.1 — <https://github.com/smol-rs/fastrand>
 - `find-msvc-tools` 0.1.9 — <https://github.com/rust-lang/cc-rs>
 - `fixedbitset` 0.5.7 — <https://github.com/petgraph/fixedbitset>
-- `flate2` 1.1.10 — <https://github.com/rust-lang/flate2-rs>
+- `flate2` 1.1.11 — <https://github.com/rust-lang/flate2-rs>
 - `fnv` 1.0.7 — <https://github.com/servo/rust-fnv>
 - `form_urlencoded` 1.2.2 — <https://github.com/servo/rust-url>
 - `glob` 0.3.3 — <https://github.com/rust-lang/glob>
@@ -4949,7 +4949,7 @@ Used by:
 - `idna` 1.1.0 — <https://github.com/servo/rust-url/>
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
-- `itertools` 0.13.0 — <https://github.com/rust-itertools/itertools>
+- `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.15.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
 - `js-sys` 0.3.103 — <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys>
@@ -4982,7 +4982,7 @@ Used by:
 - `regex` 1.13.1 — <https://github.com/rust-lang/regex>
 - `ring` 0.17.14 — <https://github.com/briansmith/ring>
 - `rustc_version` 0.4.1 — <https://github.com/djc/rustc-version-rs>
-- `rustix` 1.1.5 — <https://github.com/bytecodealliance/rustix>
+- `rustix` 1.1.6 — <https://github.com/bytecodealliance/rustix>
 - `rustls-native-certs` 0.8.4 — <https://github.com/rustls/rustls-native-certs>
 - `rustls` 0.23.46 — <https://github.com/rustls/rustls>
 - `rusty-fork` 0.3.1 — <https://github.com/altsysrq/rusty-fork>
@@ -5000,7 +5000,7 @@ Used by:
 - `unicode-width` 0.2.2 — <https://github.com/unicode-rs/unicode-width>
 - `unicode-xid` 0.2.6 — <https://github.com/unicode-rs/unicode-xid>
 - `url` 2.5.8 — <https://github.com/servo/rust-url>
-- `uuid` 1.28.0 — <https://github.com/uuid-rs/uuid>
+- `uuid` 1.29.2 — <https://github.com/uuid-rs/uuid>
 - `validit` 0.2.6 — <https://github.com/drmingdrmer/validit>
 - `version_check` 0.9.5 — <https://github.com/SergioBenitez/version_check>
 - `wait-timeout` 0.2.1 — <https://github.com/alexcrichton/wait-timeout>
@@ -6983,10 +6983,10 @@ limitations under the License.
 
 Used by:
 
-- `openraft` 0.10.0-alpha.37 — <https://github.com/databendlabs/openraft>
-- `openraft-macros` 0.10.0-alpha.37 — <https://github.com/databendlabs/openraft>
-- `openraft-rt-tokio` 0.10.0-alpha.37 — <https://github.com/drmingdrmer/openraft>
-- `openraft-rt` 0.10.0-alpha.37 — <https://github.com/databendlabs/openraft>
+- `openraft` 0.10.0-alpha.38 — <https://github.com/databendlabs/openraft>
+- `openraft-macros` 0.10.0-alpha.38 — <https://github.com/databendlabs/openraft>
+- `openraft-rt-tokio` 0.10.0-alpha.38 — <https://github.com/drmingdrmer/openraft>
+- `openraft-rt` 0.10.0-alpha.38 — <https://github.com/databendlabs/openraft>
 - `ourios-bench` 0.17.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-config` 0.17.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-core` 0.17.0 — <https://github.com/jensholdgaard/ourios>
@@ -9274,7 +9274,6 @@ THE SOFTWARE.
 Used by:
 
 - `tonic-types` 0.14.6 — <https://github.com/hyperium/tonic>
-- `tonic` 0.14.6 — <https://github.com/hyperium/tonic>
 
 <details>
 <summary>Full license text</summary>
@@ -9321,6 +9320,40 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
+- `tonic` 0.14.9 — <https://github.com/grpc/grpc-rust>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+Copyright 2019 gRPC authors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ```
 
@@ -10687,7 +10720,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 Used by:
 
-- `zlib-rs` 0.6.5 — <https://github.com/trifectatechfoundation/zlib-rs>
+- `zlib-rs` 0.6.8 — <https://github.com/trifectatechfoundation/zlib-rs>
 
 <details>
 <summary>Full license text</summary>

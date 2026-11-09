@@ -2277,7 +2277,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2292,9 +2292,9 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "476de73bddf2ef8490aa4ee8f1cf40b430bf1d56c48c22080e5186952cd580e6"
+checksum = "20ed7f62ce0ae0da1a8b93c3c7104ab7e0760a74491e097c701fff966e945390"
 dependencies = [
  "bit-set 0.8.0",
  "regex-automata",
@@ -2358,9 +2358,9 @@ dependencies = [
 
 [[package]]
 name = "flate2"
-version = "1.1.10"
+version = "1.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
 dependencies = [
  "crc32fast",
  "miniz_oxide 0.9.1",
@@ -3134,9 +3134,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.58.6"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f622c574a29fb3034a0a90645afee194dfedc75fc124228801b6e77041075bd1"
+checksum = "e1324c9bebe052584e96e7c80d2f9cf2d86e1a6d83d621a46932c5636996be18"
 dependencies = [
  "ahash",
  "bytecount",
@@ -3162,23 +3162,24 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.58.6"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a968fffd387b2ab005bf00c1851f5d26e90df05b6f7ad609ed0d620033cca5e7"
+checksum = "fe90ff57cd46c2e873aa3628f87fdf32421c5f800b64e96e93efa094215235b5"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.58.6"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39b7670345e5ce87371339d13705dbb9276b7e3e934bbe1efa2c6734a1f65a96"
+checksum = "65422cdf4b8d9b214579884c7125713e521e0cf11b738f232589360a7b61bcb5"
 dependencies = [
  "ahash",
  "bytecount",
  "fraction",
  "getrandom 0.3.4",
+ "memchr",
  "num-cmp",
  "num-traits",
  "serde_json",
@@ -3652,8 +3653,8 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.37"
-source = "git+https://github.com/databendlabs/openraft?rev=73273a67fd5bee278fa2155a1ed11963a70ee789#73273a67fd5bee278fa2155a1ed11963a70ee789"
+version = "0.10.0-alpha.38"
+source = "git+https://github.com/databendlabs/openraft?rev=d132ba8753d0c484bbb8b19f2b6ac7f6ae626509#d132ba8753d0c484bbb8b19f2b6ac7f6ae626509"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -3679,8 +3680,8 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.37"
-source = "git+https://github.com/databendlabs/openraft?rev=73273a67fd5bee278fa2155a1ed11963a70ee789#73273a67fd5bee278fa2155a1ed11963a70ee789"
+version = "0.10.0-alpha.38"
+source = "git+https://github.com/databendlabs/openraft?rev=d132ba8753d0c484bbb8b19f2b6ac7f6ae626509#d132ba8753d0c484bbb8b19f2b6ac7f6ae626509"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -3691,8 +3692,8 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.37"
-source = "git+https://github.com/databendlabs/openraft?rev=73273a67fd5bee278fa2155a1ed11963a70ee789#73273a67fd5bee278fa2155a1ed11963a70ee789"
+version = "0.10.0-alpha.38"
+source = "git+https://github.com/databendlabs/openraft?rev=d132ba8753d0c484bbb8b19f2b6ac7f6ae626509#d132ba8753d0c484bbb8b19f2b6ac7f6ae626509"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -3703,8 +3704,8 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.37"
-source = "git+https://github.com/databendlabs/openraft?rev=73273a67fd5bee278fa2155a1ed11963a70ee789#73273a67fd5bee278fa2155a1ed11963a70ee789"
+version = "0.10.0-alpha.38"
+source = "git+https://github.com/databendlabs/openraft?rev=d132ba8753d0c484bbb8b19f2b6ac7f6ae626509#d132ba8753d0c484bbb8b19f2b6ac7f6ae626509"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -4121,7 +4122,7 @@ dependencies = [
  "opentelemetry_sdk",
  "ourios-semconv",
  "reqwest 0.13.5",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "rustls",
  "serde_json",
  "tokio",
@@ -4149,7 +4150,7 @@ dependencies = [
  "ourios-core",
  "ourios-wal",
  "proptest",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "tempfile",
  "uuid",
 ]
@@ -4575,7 +4576,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -4853,9 +4854,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.58.6"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "558f3855529c0a7e78a48e409fa653456e55f1b167eab4109c16a255b7727e3f"
+checksum = "aafb75c629a3f4cf1d1503eb9d588153392cde1bb4424adb75ed737e16201fd6"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -5118,15 +5119,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5185,7 +5186,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5753,8 +5754,8 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.3",
  "once_cell",
- "rustix 1.1.5",
- "windows-sys 0.52.0",
+ "rustix 1.1.6",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6000,9 +6001,9 @@ dependencies = [
 
 [[package]]
 name = "tonic"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
+checksum = "e2cdfc673aabd30fe8fee92e65837b644c37c5d47f0f97ae6d5e0f1237d15e1b"
 dependencies = [
  "async-trait",
  "axum",
@@ -6023,6 +6024,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
@@ -6281,9 +6283,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.28.0"
+version = "1.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cc1186384beb7dd8eedea376413fd654937285ea6c9cfbb928dc3043ea4b606"
+checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -6499,7 +6501,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6704,7 +6706,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix 1.1.5",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -6836,9 +6838,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.5"
+version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5431d5661c32445236631278f27946e444ddafe4684cac70b185272d4f9c52d5"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

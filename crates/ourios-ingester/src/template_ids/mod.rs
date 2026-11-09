@@ -37,10 +37,13 @@ pub(crate) mod names {
     /// seated (RFC 0059 §3.5); registered in ourios-semconv#8.
     pub(crate) const PREDATES_HIGH_WATER: &str = "predates_high_water";
 
+    /// A reservation failed; the replicated leader's id-block top-up
+    /// reports under it too (RFC 0065 §6.5).
+    pub(crate) use ourios_semconv::EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_FAILED as REFILL_FAILED;
+
     pub(super) use ourios_semconv::{
         EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAP_PROGRESS as BOOTSTRAP_PROGRESS,
         EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAPPED as BOOTSTRAPPED,
-        EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_FAILED as REFILL_FAILED,
         EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_STOPPED as REFILL_STOPPED,
         OURIOS_RECEIVER_TEMPLATE_IDS_AUDIT_MAX as AUDIT_MAX,
         OURIOS_RECEIVER_TEMPLATE_IDS_DATA_MAX as DATA_MAX,
@@ -347,7 +350,7 @@ fn refuse_later_version(store: &Store) -> Result<(), TemplateIdsError> {
     }
 }
 
-fn encode(reserved_through: u64) -> Vec<u8> {
+pub(crate) fn encode(reserved_through: u64) -> Vec<u8> {
     serde_json::json!({ FIELD: reserved_through })
         .to_string()
         .into_bytes()
@@ -424,9 +427,50 @@ fn landed(store: &Store, outcome: Result<(), StoreError>) -> Result<Written, Tem
 /// left at or below [`MAX_TEMPLATE_ID`]. A block that would pass it is
 /// shortened to end there.
 pub fn reserve(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
+    reserve_with(store, Floor::Raise(floor))
+}
+
+/// As [`reserve`], except that a high-water read below `floor` is never
+/// raised to it: `floor` is the end of a block a replicated group's log
+/// already holds, so the object was rolled back, and reserving from the
+/// floor could hand out ids another group already holds.
+///
+/// # Errors
+///
+/// [`TemplateIdsError::HighWaterRolledBack`], with nothing written, when
+/// an attempt reads the high-water below `floor`; otherwise as
+/// [`reserve`].
+pub fn reserve_above_held(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
+    reserve_with(store, Floor::Refuse(floor))
+}
+
+/// A reservation's floor, and what it does with a high-water read below
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Floor {
+    /// Reserve from the floor: the allocator's own ids lie at or below it.
+    Raise(u64),
+    /// Fail as rolled back.
+    Refuse(u64),
+}
+
+impl Floor {
+    /// The id a block reserved over `prior` starts after.
+    fn after(self, prior: &HighWater) -> Result<u64, TemplateIdsError> {
+        let found = prior.reserved_through;
+        match self {
+            Self::Refuse(seen) if found < seen => {
+                Err(TemplateIdsError::HighWaterRolledBack { seen, found })
+            }
+            Self::Raise(floor) | Self::Refuse(floor) => Ok(found.max(floor)),
+        }
+    }
+}
+
+fn reserve_with(store: &Store, floor: Floor) -> Result<IdBlock, TemplateIdsError> {
     for _ in 0..MAX_CAS_ATTEMPTS {
         let prior = read(store)?.ok_or(TemplateIdsError::HighWaterDeleted)?;
-        let after = prior.reserved_through.max(floor);
+        let after = floor.after(&prior)?;
         // The final block is shortened at the domain's top, so
         // `MAX_TEMPLATE_ID` itself stays issuable.
         let through = after.saturating_add(BLOCK).min(MAX_TEMPLATE_ID);

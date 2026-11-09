@@ -20,6 +20,18 @@
 //! checkpoint entry publishes its cut on `GroupSm::checkpoints`, the
 //! host triggers the build, and the builder records the checkpoint's
 //! snapshot rather than the state at the last entry applied.
+//!
+//! A tail replica opens it with `GroupSm::open_mining` and receives,
+//! in log order, an [`Applied`] event for every entry its miner follows
+//! (§6.5): the miner takes its id blocks and configuration only from
+//! these, never from its own reading of the log. The channel is bounded
+//! and `apply` waits for room, so a lagging miner holds back only this
+//! replica's apply; a tail replica is a learner, whose apply no
+//! acknowledgement waits on, and a voter opens with no channel. Each
+//! event owns its data, so purging the log never races a lagging miner.
+//! A snapshot the replica opens from or installs reaches the miner as
+//! [`AppliedEvent::Installed`], ahead of every entry after it: the
+//! entries below it never will.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,7 +42,8 @@ use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::type_config::alias::{SnapshotOf, StoredMembershipOf};
 use openraft::{EntryPayload, OptionalSend};
 use ourios_wal::{Control, MinerConfigV1};
-use tokio::sync::watch;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use super::checkpoint::{Change, History, Proposal};
@@ -38,9 +51,34 @@ use super::gate::SyncGate;
 use super::snapshot_record::{
     self, GroupMinerConfig, GroupSnapshot, GroupState, IdBlock, SnapshotMeta,
 };
-use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes};
+use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes, TenantBatchBytes};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
+
+/// What applying one entry changed for the group's miner.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppliedEvent {
+    /// A tenant's batch, owned.
+    Batch(TenantBatchBytes),
+    /// An id block the group applied; an ignored block emits nothing.
+    IdBlock(IdBlock),
+    /// The miner configuration in force from this entry.
+    MinerConfig(GroupMinerConfig),
+    /// The replica a flusher assignment named.
+    Flusher(NodeId),
+    /// A checkpoint the group applied, with its cut.
+    Checkpoint(LogId),
+    /// A snapshot installed in place of the log through this position:
+    /// the entries below it never reach the miner.
+    Installed(GroupState),
+}
+
+/// One [`AppliedEvent`] and the log position it applied at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Applied {
+    pub at: LogId,
+    pub event: AppliedEvent,
+}
 
 struct State {
     applied: Option<LogId>,
@@ -75,7 +113,7 @@ impl State {
         }
     }
 
-    /// Apply one entry; returns the cut of a checkpoint it applied.
+    /// Apply one entry; returns what it changed for the group's miner.
     ///
     /// # Errors
     ///
@@ -85,7 +123,7 @@ impl State {
         &mut self,
         log_id: LogId,
         payload: EntryPayload<GroupEntry, Membership>,
-    ) -> io::Result<Option<LogId>> {
+    ) -> io::Result<Option<AppliedEvent>> {
         self.applied = Some(log_id);
         self.history.entered(log_id);
         match payload {
@@ -98,11 +136,12 @@ impl State {
             EntryPayload::Normal(GroupEntry::Control(control)) => {
                 self.apply_control(log_id, control)
             }
-            EntryPayload::Blank | EntryPayload::Normal(GroupEntry::Batch(_)) => Ok(None),
+            EntryPayload::Normal(GroupEntry::Batch(batch)) => Ok(Some(AppliedEvent::Batch(batch))),
+            EntryPayload::Blank => Ok(None),
         }
     }
 
-    fn apply_control(&mut self, at: LogId, control: Control) -> io::Result<Option<LogId>> {
+    fn apply_control(&mut self, at: LogId, control: Control) -> io::Result<Option<AppliedEvent>> {
         let kind = control.kind();
         if kind > self.group.highest_kind {
             self.group.highest_kind = kind;
@@ -113,7 +152,7 @@ impl State {
                 let flusher = NodeId::from(Uuid::from_bytes(replica));
                 self.group.flusher = Some(flusher);
                 self.history.changed(at.index, Change::Flusher(flusher));
-                Ok(None)
+                Ok(Some(AppliedEvent::Flusher(flusher)))
             }
             Control::Checkpoint {
                 proposer,
@@ -121,15 +160,15 @@ impl State {
                 highest_kind,
             } => {
                 let proposal = Proposal::new(proposer, cut, highest_kind);
-                Ok(self.history.apply(at, self.group.flusher, proposal))
+                let applied = self.history.apply(at, self.group.flusher, proposal);
+                Ok(applied.map(AppliedEvent::Checkpoint))
             }
-            Control::IdBlock { after, through } => {
-                self.apply_id_block(at, IdBlock::new(after, through));
-                Ok(None)
-            }
+            Control::IdBlock { after, through } => Ok(self
+                .apply_id_block(at, IdBlock::new(after, through))
+                .map(AppliedEvent::IdBlock)),
             Control::MinerConfig(body) => {
-                self.apply_miner_config(at, body)?;
-                Ok(None)
+                let config = self.apply_miner_config(at, body)?;
+                Ok(Some(AppliedEvent::MinerConfig(config)))
             }
         }
     }
@@ -142,7 +181,11 @@ impl State {
     /// `prefix_depth` or `max_node_children` from the configuration in
     /// force: a snapshot's routes are valid only at the shape it was mined
     /// at, so every replica stops rather than apply it.
-    fn apply_miner_config(&mut self, at: LogId, body: MinerConfigV1) -> io::Result<()> {
+    fn apply_miner_config(
+        &mut self,
+        at: LogId,
+        body: MinerConfigV1,
+    ) -> io::Result<GroupMinerConfig> {
         let refused = |why: String| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -161,21 +204,22 @@ impl State {
             _ => {
                 self.group.miner_config = Some(config);
                 self.history.changed(at.index, Change::MinerConfig(config));
-                Ok(())
+                Ok(config)
             }
         }
     }
 
     /// Apply the block unless it starts below the end of the latest one
     /// applied: allocating from it could issue an id twice. An ignored
-    /// block never becomes the one the next is compared with.
-    fn apply_id_block(&mut self, at: LogId, block: Option<IdBlock>) {
+    /// block never becomes the one the next is compared with. Returns the
+    /// block if it applied.
+    fn apply_id_block(&mut self, at: LogId, block: Option<IdBlock>) -> Option<IdBlock> {
         let previous = self.group.id_block;
         let follows = |block: &IdBlock| previous.is_none_or(|p| block.after() >= p.through());
-        if let Some(block) = block.filter(follows) {
-            self.group.id_block = Some(block);
-            self.history.changed(at.index, Change::IdBlock(block));
-        }
+        let block = block.filter(follows)?;
+        self.group.id_block = Some(block);
+        self.history.changed(at.index, Change::IdBlock(block));
+        Some(block)
     }
 }
 
@@ -196,6 +240,8 @@ pub struct GroupSm {
     record: Arc<Record>,
     /// The cut of the group's checkpoint.
     cuts: Arc<watch::Sender<Option<LogId>>>,
+    /// Where a tail replica's miner receives what each entry applied.
+    events: Option<mpsc::Sender<Applied>>,
 }
 
 impl GroupSm {
@@ -206,6 +252,57 @@ impl GroupSm {
     ///
     /// The record cannot be read, or fails its CRC or version check.
     pub(super) fn open(dir: &Path, gate: Arc<SyncGate>) -> io::Result<Self> {
+        Self::opened(dir, gate, None)
+    }
+
+    /// [`Self::open`], sending an [`Applied`] event on `events` for every
+    /// entry applied after the snapshot it opens through, if any, and
+    /// first [`AppliedEvent::Installed`] with that snapshot. Once the
+    /// receiver is dropped, the events are discarded.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`], or `events` has no room for the snapshot's
+    /// event.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no host opens a tail replica's group yet")
+    )]
+    pub(super) fn open_mining(
+        dir: &Path,
+        gate: Arc<SyncGate>,
+        events: mpsc::Sender<Applied>,
+    ) -> io::Result<Self> {
+        let sm = Self::opened(dir, gate, Some(events))?;
+        sm.send_opened_snapshot()?;
+        Ok(sm)
+    }
+
+    /// Send the snapshot the group opened from, if any, as the first
+    /// event: the miner never sees the entries below it.
+    fn send_opened_snapshot(&self) -> io::Result<()> {
+        let installed = self.state().snapshot.as_ref().and_then(|snapshot| {
+            Some(Applied {
+                at: snapshot.meta.last_log_id?,
+                event: AppliedEvent::Installed(snapshot.state),
+            })
+        });
+        let (Some(events), Some(applied)) = (&self.events, installed) else {
+            return Ok(());
+        };
+        match events.try_send(applied) {
+            Err(TrySendError::Full(_)) => Err(io::Error::other(
+                "the miner's channel is full before the group opened",
+            )),
+            Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
+        }
+    }
+
+    fn opened(
+        dir: &Path,
+        gate: Arc<SyncGate>,
+        events: Option<mpsc::Sender<Applied>>,
+    ) -> io::Result<Self> {
         let state = State::opened(snapshot_record::read(dir)?);
         let cuts = watch::Sender::new(state.history.cut());
         Ok(Self {
@@ -216,7 +313,21 @@ impl GroupSm {
                 publishing: tokio::sync::Mutex::new(()),
             }),
             cuts: Arc::new(cuts),
+            events,
         })
+    }
+
+    /// Publish a checkpoint's cut, and hand the event to the miner,
+    /// waiting while its channel is full.
+    async fn publish(&self, applied: Applied) {
+        if let AppliedEvent::Checkpoint(cut) = applied.event {
+            self.cuts.send_replace(Some(cut));
+        }
+        if let Some(events) = &self.events {
+            // A miner that stopped has dropped its receiver; the replica
+            // applies on without it.
+            events.send(applied).await.ok();
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -324,9 +435,10 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
             + OptionalSend,
     {
         while let Some((entry, responder)) = entries.try_next().await? {
-            let checkpoint = self.state().apply(entry.log_id, entry.payload)?;
-            if let Some(cut) = checkpoint {
-                self.cuts.send_replace(Some(cut));
+            let at = entry.log_id;
+            let event = self.state().apply(at, entry.payload)?;
+            if let Some(event) = event {
+                self.publish(Applied { at, event }).await;
             }
             if let Some(responder) = responder {
                 responder.send(());
@@ -358,6 +470,10 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
         self.record(snapshot.clone()).await?;
         *self.state() = State::opened(Some(snapshot));
         self.cuts.send_replace(meta.last_log_id);
+        if let Some(at) = meta.last_log_id {
+            let event = AppliedEvent::Installed(group);
+            self.publish(Applied { at, event }).await;
+        }
         Ok(())
     }
 
@@ -791,6 +907,150 @@ mod tests {
             sm.miner_config(),
             "as the whole log"
         );
+    }
+
+    fn mining(dir: &Path, capacity: usize) -> (GroupSm, mpsc::Receiver<Applied>) {
+        let (events, received) = mpsc::channel(capacity);
+        let sm = GroupSm::open_mining(dir, Arc::default(), events).expect("open");
+        (sm, received)
+    }
+
+    fn drained(received: &mut mpsc::Receiver<Applied>) -> Vec<(u64, AppliedEvent)> {
+        std::iter::from_fn(|| received.try_recv().ok())
+            .map(|applied| (applied.at.index, applied.event))
+            .collect()
+    }
+
+    fn batch_bytes() -> TenantBatchBytes {
+        let payload = ourios_wal::TenantBatch::encode("acme", b"p").expect("batch");
+        TenantBatchBytes::new(payload).expect("valid")
+    }
+
+    /// A mining replica receives, in log order, each batch, flusher
+    /// assignment, applied id block, configuration in force and applied
+    /// checkpoint; membership, blank and ignored entries send nothing.
+    #[tokio::test]
+    async fn a_mining_replica_receives_what_each_entry_applied_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut sm, mut received) = mining(dir.path(), 64);
+        let block = IdBlock::new;
+        let entries = vec![
+            entry(1, EntryPayload::Membership(voters(&[1, 2]))),
+            batch(2),
+            assign(3, 7),
+            entry(4, id_block(block(0, 100))),
+            entry(5, id_block(block(0, 50))),
+            entry(6, EntryPayload::Blank),
+            entry(7, configured(FIRST)),
+            checkpoint(8, 9, (2, 2), 0),
+            checkpoint(9, 7, (2, 2), 0),
+            entry(10, configured(RAISED)),
+            batch(11),
+        ];
+        apply(&mut sm, entries).await;
+        let expected = vec![
+            (2, AppliedEvent::Batch(batch_bytes())),
+            (3, AppliedEvent::Flusher(NodeId::from(7))),
+            (4, AppliedEvent::IdBlock(block(0, 100).expect("valid"))),
+            (7, AppliedEvent::MinerConfig(in_force(FIRST))),
+            (9, AppliedEvent::Checkpoint(cut(2).expect("cut"))),
+            (10, AppliedEvent::MinerConfig(in_force(RAISED))),
+            (11, AppliedEvent::Batch(batch_bytes())),
+        ];
+        assert_eq!(drained(&mut received), expected);
+    }
+
+    /// A voter opens with no channel and applies the same log.
+    #[tokio::test]
+    async fn a_voter_opens_with_no_channel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        assert!(sm.events.is_none());
+        apply(&mut sm, vec![batch(1), assign(2, 7), batch(3)]).await;
+        assert_eq!(sm.applied().map(|id| id.index), Some(3));
+    }
+
+    /// A full channel holds the apply until the miner takes an event, and
+    /// a miner that dropped its receiver holds it back no more.
+    #[tokio::test]
+    async fn a_full_channel_holds_back_only_the_apply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sm, mut received) = mining(dir.path(), 1);
+        let mut applying = sm.clone();
+        let mut apply_task =
+            tokio::spawn(async move { apply(&mut applying, vec![batch(1), batch(2)]).await });
+        let held = tokio::time::timeout(Duration::from_millis(50), &mut apply_task).await;
+        assert!(held.is_err(), "the second batch waits for room");
+        assert_eq!(
+            sm.applied().map(|id| id.index),
+            Some(2),
+            "applied, not sent"
+        );
+        assert_eq!(received.recv().await.map(|a| a.at.index), Some(1));
+        apply_task.await.expect("join");
+        assert_eq!(received.recv().await.map(|a| a.at.index), Some(2));
+
+        drop(received);
+        let mut sm = sm;
+        apply(&mut sm, vec![batch(3), batch(4)]).await;
+        assert_eq!(sm.applied().map(|id| id.index), Some(4));
+    }
+
+    /// An install sends the state it installed at the snapshot's cut.
+    #[tokio::test]
+    async fn an_install_sends_the_state_it_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut sm, mut received) = mining(dir.path(), 4);
+        let group = GroupState {
+            flusher: Some(NodeId::from(9)),
+            highest_kind: 4,
+            id_block: IdBlock::new(0, 100),
+            miner_config: Some(in_force(FIRST)),
+        };
+        sm.install_snapshot(&at(5), group).await.expect("install");
+        assert_eq!(
+            drained(&mut received),
+            vec![(5, AppliedEvent::Installed(group))]
+        );
+    }
+
+    /// A mining open of a group with a recorded snapshot sends the
+    /// snapshot first, then the entries after it; one with no recorded
+    /// snapshot sends nothing at open.
+    #[tokio::test]
+    async fn a_mining_reopen_sends_its_snapshot_before_any_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut sm, mut received) = mining(dir.path(), 8);
+        assert!(drained(&mut received).is_empty(), "no snapshot recorded");
+        let entries = vec![
+            assign(1, 7),
+            entry(2, configured(FIRST)),
+            batch(3),
+            checkpoint(4, 7, (2, 3), 4),
+        ];
+        apply(&mut sm, entries).await;
+        let built = sm.build_snapshot().await.expect("build");
+        drop(sm);
+
+        let (mut reopened, mut received) = mining(dir.path(), 8);
+        apply(&mut reopened, vec![batch(4)]).await;
+        assert_eq!(
+            drained(&mut received),
+            vec![
+                (3, AppliedEvent::Installed(built.snapshot)),
+                (4, AppliedEvent::Batch(batch_bytes())),
+            ]
+        );
+
+        let (events, _received) = mpsc::channel(1);
+        events
+            .try_send(Applied {
+                at: cut(1).expect("id"),
+                event: AppliedEvent::Flusher(NodeId::from(7)),
+            })
+            .expect("room");
+        let full = GroupSm::open_mining(dir.path(), Arc::default(), events);
+        assert!(full.is_err(), "no room for the snapshot");
     }
 
     /// A build that starts while an install is held at its fsync waits for

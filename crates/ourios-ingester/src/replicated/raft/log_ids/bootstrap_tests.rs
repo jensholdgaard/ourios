@@ -25,21 +25,37 @@ fn lock(bootstrapper: &str, seeded: bool, next: u32) -> LogIds {
     }
 }
 
-/// Start `node_id` on `store`, sending each reason it waits under to
+/// The start of one node.
+#[derive(Clone, Copy)]
+struct Node<'a> {
+    id: &'a str,
+    raft_state: RaftState,
+    allow_bootstrap: bool,
+}
+
+impl<'a> Node<'a> {
+    fn new(id: &'a str, raft_state: RaftState) -> Self {
+        Self {
+            id,
+            raft_state,
+            allow_bootstrap: false,
+        }
+    }
+}
+
+/// Start `node` on `store`, sending each reason it waits under to
 /// `reports`.
 async fn start_reporting(
     store: Store,
-    node_id: &str,
-    raft_state: RaftState,
-    allow_bootstrap: bool,
+    node: Node<'_>,
     reports: Option<mpsc::UnboundedSender<&'static str>>,
 ) -> Result<Started, StartError> {
     let scan = ScanOptions::default();
     let lock_start = LockStart {
         store: &store,
-        node_id,
-        raft_state,
-        allow_bootstrap,
+        node_id: node.id,
+        raft_state: node.raft_state,
+        allow_bootstrap: node.allow_bootstrap,
         scan: &scan,
         retry: RETRY,
     };
@@ -54,7 +70,7 @@ async fn start_reporting(
 }
 
 async fn run(store: &Store, node_id: &str, raft_state: RaftState) -> Result<Started, StartError> {
-    start_reporting(store.clone(), node_id, raft_state, false, None).await
+    start_reporting(store.clone(), Node::new(node_id, raft_state), None).await
 }
 
 /// A start in its own task, with the reasons it waits under.
@@ -68,7 +84,7 @@ fn spawn_start(
     let (reports, reported) = mpsc::unbounded_channel();
     let store = store.clone();
     let task = tokio::spawn(async move {
-        start_reporting(store, node_id, RaftState::Empty, false, Some(reports)).await
+        start_reporting(store, Node::new(node_id, RaftState::Empty), Some(reports)).await
     });
     (task, reported)
 }
@@ -117,6 +133,11 @@ async fn high_water(store: &Store) -> Option<u64> {
         .map(|read| read.reserved_through)
 }
 
+/// The lock and the high-water as the store holds them.
+async fn root_of(store: &Store) -> (Option<LogIds>, Option<u64>) {
+    (lock_of(store).await, high_water(store).await)
+}
+
 fn bootstrapped(high_water: u64) -> Started {
     Started::Bootstrapped(Seated {
         high_water,
@@ -125,7 +146,7 @@ fn bootstrapped(high_water: u64) -> Started {
 }
 
 #[track_caller]
-fn assert_high_water_deleted(outcome: Result<Started, StartError>) {
+fn assert_high_water_deleted(outcome: &Result<Started, StartError>) {
     assert!(
         matches!(
             outcome,
@@ -145,8 +166,7 @@ async fn a_fresh_start_bootstraps_the_object_and_seeds_it_before_any_log_id() {
         run(&store, A, RaftState::Empty).await.ok(),
         Some(bootstrapped(0))
     );
-    assert_eq!(lock_of(&store).await, Some(lock(A, true, 0)));
-    assert_eq!(high_water(&store).await, Some(0));
+    assert_eq!(root_of(&store).await, (Some(lock(A, true, 0)), Some(0)));
     assert_eq!(allocate(&store).await.ok(), Some(0));
 }
 
@@ -165,10 +185,9 @@ async fn of_two_racing_starts_only_the_lock_holder_bootstraps() {
         B => (b, a),
         other => panic!("the lock names {other}"),
     };
-    assert_eq!(won, bootstrapped(0));
-    assert_eq!(lost, Started::Seeded);
+    assert_eq!((won, lost), (bootstrapped(0), Started::Seeded));
+    assert_eq!(root_of(&store).await, (Some(holder.clone()), Some(0)));
     assert!(holder.seeded, "{holder:?}");
-    assert_eq!(high_water(&store).await, Some(0));
 }
 
 /// Issue #1241: a start paused before its create of the lock, resumed
@@ -202,7 +221,7 @@ async fn a_start_paused_before_its_create_never_re_creates_a_deleted_object() {
         .expect("delete the object");
 
     paused.release.send(()).expect("B is held");
-    assert_high_water_deleted(resumed.await.expect("joined"));
+    assert_high_water_deleted(&resumed.await.expect("joined"));
     assert_eq!(high_water(&store).await, None, "the object was re-created");
     assert_eq!(lock_of(&store).await, Some(lock(A, true, 2)));
 }
@@ -216,8 +235,9 @@ async fn a_bootstrapper_killed_after_the_object_finishes_on_its_restart_while_ot
     put_high_water(&store, 0).await;
 
     let (waiter, mut reported) = spawn_start(&store, B);
-    assert_eq!(next_report(&mut reported).await, "log_ids_unseeded");
-    assert_eq!(next_report(&mut reported).await, "log_ids_unseeded");
+    for _ in 0..2 {
+        assert_eq!(next_report(&mut reported).await, "log_ids_unseeded");
+    }
     assert!(!waiter.is_finished(), "B passed an unseeded lock");
     assert_eq!(lock_of(&store).await, Some(lock(A, false, 0)));
 
@@ -227,10 +247,9 @@ async fn a_bootstrapper_killed_after_the_object_finishes_on_its_restart_while_ot
         bootstrapped: false,
     });
     assert_eq!(restarted.ok(), Some(finished));
-    assert_eq!(lock_of(&store).await, Some(lock(A, true, 0)));
-    assert_eq!(high_water(&store).await, Some(0));
-    let waited = waiter.await.expect("joined");
-    assert_eq!(waited.ok(), Some(Started::Seeded));
+    assert_eq!(root_of(&store).await, (Some(lock(A, true, 0)), Some(0)));
+    let outcome = waiter.await.expect("joined");
+    assert_eq!(outcome.ok(), Some(Started::Seeded));
 }
 
 /// A bootstrapper killed after its create of the lock and before the
@@ -248,8 +267,7 @@ async fn a_bootstrapper_killed_before_the_object_repeats_both_steps() {
         run(&store, A, RaftState::Empty).await.ok(),
         Some(bootstrapped(0))
     );
-    assert_eq!(lock_of(&store).await, Some(lock(A, true, 0)));
-    assert_eq!(high_water(&store).await, Some(0));
+    assert_eq!(root_of(&store).await, (Some(lock(A, true, 0)), Some(0)));
 }
 
 /// With the lock deleted after log ids were allocated, a start finding
@@ -321,7 +339,7 @@ async fn a_seeded_lock_beside_a_deleted_object_fails_every_start_closed() {
         .await
         .expect("delete the object");
     for node_id in [A, B] {
-        assert_high_water_deleted(run(&store, node_id, RaftState::Empty).await);
+        assert_high_water_deleted(&run(&store, node_id, RaftState::Empty).await);
     }
     assert_eq!(high_water(&store).await, None, "the object was re-created");
     assert_eq!(lock_of(&store).await, Some(lock(A, true, 1)));
@@ -422,7 +440,11 @@ async fn an_unauthorised_lock_holder_on_a_store_with_data_seeds_nothing() {
     assert_eq!(high_water(&store).await, None);
     assert_eq!(lock_of(&store).await, Some(lock(A, false, 0)));
 
-    let authorised = start_reporting(store.clone(), A, RaftState::Empty, true, None).await;
+    let node = Node {
+        allow_bootstrap: true,
+        ..Node::new(A, RaftState::Empty)
+    };
+    let authorised = start_reporting(store.clone(), node, None).await;
     assert_eq!(authorised.ok(), Some(bootstrapped(0)));
     assert_eq!(lock_of(&store).await, Some(lock(A, true, 0)));
 }

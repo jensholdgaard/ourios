@@ -51,6 +51,7 @@ use super::gate::SyncGate;
 use super::snapshot_record::{
     self, GroupMinerConfig, GroupSnapshot, GroupState, IdBlock, SnapshotMeta,
 };
+use super::telemetry::Storage;
 use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes, TimedBatch};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
@@ -347,6 +348,9 @@ impl GroupSm {
         self.state().snapshot = Some(snapshot);
         Ok(())
     }
+
+    #[allow(clippy::unused_self, clippy::needless_pass_by_value, unused_variables)] // stub
+    pub(super) fn count_stops(&mut self, group: u32, storage: Storage) {}
 
     /// The last entry applied.
     #[must_use]

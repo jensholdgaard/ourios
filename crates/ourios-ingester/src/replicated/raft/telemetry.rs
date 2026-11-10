@@ -159,6 +159,7 @@ impl FlusherCounts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Component {
     LogStore(u32),
+    StateMachine(u32),
     VoteLog,
 }
 
@@ -166,6 +167,7 @@ impl Component {
     fn as_str(self) -> &'static str {
         match self {
             Self::LogStore(_) => "log_store",
+            Self::StateMachine(_) => "state_machine",
             Self::VoteLog => "vote_log",
         }
     }
@@ -177,7 +179,7 @@ impl Component {
     /// Its attributes on a sync: the log store's group with it.
     fn attributes(self) -> Vec<KeyValue> {
         match self {
-            Self::LogStore(group) => vec![self.kv(), group_kv(group)],
+            Self::LogStore(group) | Self::StateMachine(group) => vec![self.kv(), group_kv(group)],
             Self::VoteLog => vec![self.kv()],
         }
     }
@@ -230,7 +232,7 @@ impl Storage {
         let error_type = error_type(error.kind());
         let group = match component {
             Component::LogStore(group) => Some(i64::from(group)),
-            Component::VoteLog => None,
+            Component::VoteLog | Component::StateMachine(_) => None,
         };
         tracing::error!(
             name: semconv::EVENT_OURIOS_WAL_REPLICATION_STOPPED,
@@ -455,6 +457,8 @@ fn lags(metrics: &RaftMetrics<RaftTypes>) -> Vec<(String, u64)> {
         .collect()
 }
 
+#[cfg(test)]
+mod state_machine_tests;
 #[cfg(test)]
 mod storage_tests;
 #[cfg(test)]

@@ -454,6 +454,9 @@ fn wal_inputs_from_file(wal: &crate::config::file::WalSection) -> WalInputs<'_> 
         replication_factor: replicated.replication_factor.as_deref(),
         tail_replicas: replicated.tail_replicas.as_deref(),
         tail_clients: replicated.tail_clients.as_deref(),
+        heartbeat_interval_ms: replicated.heartbeat_interval_ms.as_deref(),
+        election_timeout_min_ms: replicated.election_timeout_min_ms.as_deref(),
+        election_timeout_max_ms: replicated.election_timeout_max_ms.as_deref(),
         tls: Some(&replicated.tls),
     }
 }

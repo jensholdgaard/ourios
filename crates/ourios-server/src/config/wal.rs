@@ -6,8 +6,9 @@
 //! `receiver.wal.*`. Every error names the offending key.
 
 use std::net::{Ipv6Addr, SocketAddr};
-use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 
+use ourios_ingester::replicated::raft::{RaftTimings, RaftTimingsError};
 use ourios_serving::tls::TlsSettings;
 
 use crate::config::file::TlsSection;
@@ -50,6 +51,8 @@ pub struct ReplicatedWal {
     pub tail_clients: Vec<String>,
     /// Peer mTLS; always carries a client CA.
     pub tls: TlsSettings,
+    /// The Raft timings every group on the node runs on.
+    pub raft_timings: RaftTimings,
 }
 
 /// What this node is in the cluster layout (RFC 0065 §3.8).
@@ -109,6 +112,15 @@ pub struct WalInputs<'a> {
     pub tail_replicas: Option<&'a str>,
     /// `OURIOS_RECEIVER_WAL_TAIL_CLIENTS` / `receiver.wal.replicated.tail_clients`.
     pub tail_clients: Option<&'a str>,
+    /// `OURIOS_RECEIVER_WAL_HEARTBEAT_INTERVAL_MS` /
+    /// `receiver.wal.replicated.heartbeat_interval_ms`.
+    pub heartbeat_interval_ms: Option<&'a str>,
+    /// `OURIOS_RECEIVER_WAL_ELECTION_TIMEOUT_MIN_MS` /
+    /// `receiver.wal.replicated.election_timeout_min_ms`.
+    pub election_timeout_min_ms: Option<&'a str>,
+    /// `OURIOS_RECEIVER_WAL_ELECTION_TIMEOUT_MAX_MS` /
+    /// `receiver.wal.replicated.election_timeout_max_ms`.
+    pub election_timeout_max_ms: Option<&'a str>,
     /// `receiver.wal.replicated.tls` (config-file only).
     pub tls: Option<&'a TlsSection>,
 }
@@ -126,6 +138,9 @@ pub struct WalEnv {
     replication_factor: Option<String>,
     tail_replicas: Option<String>,
     tail_clients: Option<String>,
+    heartbeat_interval_ms: Option<String>,
+    election_timeout_min_ms: Option<String>,
+    election_timeout_max_ms: Option<String>,
 }
 
 impl WalEnv {
@@ -142,6 +157,9 @@ impl WalEnv {
             replication_factor: var("REPLICATION_FACTOR"),
             tail_replicas: var("TAIL_REPLICAS"),
             tail_clients: var("TAIL_CLIENTS"),
+            heartbeat_interval_ms: var("HEARTBEAT_INTERVAL_MS"),
+            election_timeout_min_ms: var("ELECTION_TIMEOUT_MIN_MS"),
+            election_timeout_max_ms: var("ELECTION_TIMEOUT_MAX_MS"),
         }
     }
 
@@ -158,6 +176,9 @@ impl WalEnv {
             replication_factor: self.replication_factor.as_deref(),
             tail_replicas: self.tail_replicas.as_deref(),
             tail_clients: self.tail_clients.as_deref(),
+            heartbeat_interval_ms: self.heartbeat_interval_ms.as_deref(),
+            election_timeout_min_ms: self.election_timeout_min_ms.as_deref(),
+            election_timeout_max_ms: self.election_timeout_max_ms.as_deref(),
             tls: None,
         }
     }
@@ -171,8 +192,10 @@ impl WalEnv {
 /// An unknown backend, or for `replicated`: a missing or malformed
 /// field, a `node_id` in neither or both of `peers` and `tail_peers`, a
 /// `replication_factor` other than 3 or 5 or above the voter count, a
-/// `tail_replicas` outside `1..=tail_peers`, no `tail_clients`, or a
-/// missing `tls` block or client CA. Each names the field.
+/// `tail_replicas` outside `1..=tail_peers`, no `tail_clients`, a Raft
+/// timing that is not a positive integer or breaks `heartbeat_interval_ms
+/// < election_timeout_min_ms < election_timeout_max_ms`, or a missing
+/// `tls` block or client CA. Each names the field.
 pub fn build_wal_backend(inputs: WalInputs<'_>) -> Result<WalBackend, String> {
     match present(inputs.backend) {
         None | Some("local") => Ok(WalBackend::Local),
@@ -210,8 +233,32 @@ const TAIL_CLIENTS: Leaf = Leaf {
     field: "tail_clients",
     env: "TAIL_CLIENTS",
 };
+const HEARTBEAT_INTERVAL: Leaf = Leaf {
+    field: "heartbeat_interval_ms",
+    env: "HEARTBEAT_INTERVAL_MS",
+};
+const ELECTION_TIMEOUT_MIN: Leaf = Leaf {
+    field: "election_timeout_min_ms",
+    env: "ELECTION_TIMEOUT_MIN_MS",
+};
+const ELECTION_TIMEOUT_MAX: Leaf = Leaf {
+    field: "election_timeout_max_ms",
+    env: "ELECTION_TIMEOUT_MAX_MS",
+};
 
 impl Leaf {
+    /// A positive whole number of milliseconds, `default` when unset.
+    fn millis(self, raw: Option<&str>, default: NonZeroU64) -> Result<NonZeroU64, String> {
+        match present(raw) {
+            None => Ok(default),
+            Some(raw) => raw.parse().map_err(|_| {
+                self.error(format_args!(
+                    "must be a positive integer number of milliseconds, got {raw:?}"
+                ))
+            }),
+        }
+    }
+
     fn error(self, detail: impl std::fmt::Display) -> String {
         format!(
             "receiver.wal.replicated.{} (OURIOS_RECEIVER_WAL_{}) {detail}",
@@ -283,6 +330,7 @@ fn build_replicated(inputs: WalInputs<'_>) -> Result<ReplicatedWal, String> {
         .into_iter()
         .map(str::to_owned)
         .collect();
+    let raft_timings = parse_raft_timings(inputs)?;
     let tls = peer_tls(inputs.tls)?;
     Ok(ReplicatedWal {
         node_id,
@@ -295,6 +343,33 @@ fn build_replicated(inputs: WalInputs<'_>) -> Result<ReplicatedWal, String> {
         tail_replicas,
         tail_clients,
         tls,
+        raft_timings,
+    })
+}
+
+/// The three timings, each defaulted when unset, then ordered as
+/// `heartbeat < election minimum < election maximum`.
+fn parse_raft_timings(inputs: WalInputs<'_>) -> Result<RaftTimings, String> {
+    let defaults = RaftTimings::default();
+    let heartbeat = HEARTBEAT_INTERVAL.millis(
+        inputs.heartbeat_interval_ms,
+        defaults.heartbeat_interval_ms(),
+    )?;
+    let min = ELECTION_TIMEOUT_MIN.millis(
+        inputs.election_timeout_min_ms,
+        defaults.election_timeout_min_ms(),
+    )?;
+    let max = ELECTION_TIMEOUT_MAX.millis(
+        inputs.election_timeout_max_ms,
+        defaults.election_timeout_max_ms(),
+    )?;
+    RaftTimings::new(heartbeat, min, max).map_err(|e| match e {
+        RaftTimingsError::HeartbeatNotBelowElectionMin => HEARTBEAT_INTERVAL.error(format_args!(
+            "{heartbeat} must be below election_timeout_min_ms {min}"
+        )),
+        RaftTimingsError::ElectionMinNotBelowMax => ELECTION_TIMEOUT_MIN.error(format_args!(
+            "{min} must be below election_timeout_max_ms {max}"
+        )),
     })
 }
 
@@ -458,8 +533,9 @@ mod tests {
             .map(|&(key, value)| (key, Some(value)))
             .collect();
         for &(key, value) in edits {
-            if let Some(leaf) = leaves.iter_mut().find(|(k, _)| *k == key) {
-                leaf.1 = value;
+            match leaves.iter_mut().find(|(k, _)| *k == key) {
+                Some(leaf) => leaf.1 = value,
+                None => leaves.push((key, value)),
             }
         }
         leaves
@@ -517,6 +593,9 @@ mod tests {
                 replication_factor: leaf("replication_factor"),
                 tail_replicas: leaf("tail_replicas"),
                 tail_clients: leaf("tail_clients"),
+                heartbeat_interval_ms: leaf("heartbeat_interval_ms"),
+                election_timeout_min_ms: leaf("election_timeout_min_ms"),
+                election_timeout_max_ms: leaf("election_timeout_max_ms"),
                 tls: None,
             },
             ..ReceiverInputs::default()
@@ -564,6 +643,7 @@ mod tests {
                     min_version: ourios_serving::tls::TlsMinVersion::V1_2,
                     reload_interval: None,
                 },
+                raft_timings: RaftTimings::default(),
             }
         );
     }
@@ -767,6 +847,57 @@ mod tests {
 
         for backend in ["kafka", "Replicated", "raft"] {
             assert_both_front_ends_fail(backend, &[], "receiver.wal.backend ");
+        }
+    }
+
+    /// Each invalid Raft timing, with the key its error must name.
+    const INVALID_TIMINGS: [(&[Edit], &str); 9] = [
+        (
+            &[("heartbeat_interval_ms", Some("0"))],
+            "heartbeat_interval_ms",
+        ),
+        (
+            &[("election_timeout_min_ms", Some("0"))],
+            "election_timeout_min_ms",
+        ),
+        (
+            &[("election_timeout_max_ms", Some("0"))],
+            "election_timeout_max_ms",
+        ),
+        (
+            &[("heartbeat_interval_ms", Some("-50"))],
+            "heartbeat_interval_ms",
+        ),
+        (
+            &[("election_timeout_max_ms", Some("1s"))],
+            "election_timeout_max_ms",
+        ),
+        (
+            &[("heartbeat_interval_ms", Some("150"))],
+            "heartbeat_interval_ms",
+        ),
+        (
+            &[("heartbeat_interval_ms", Some("200"))],
+            "heartbeat_interval_ms",
+        ),
+        (
+            &[("election_timeout_min_ms", Some("300"))],
+            "election_timeout_min_ms",
+        ),
+        (
+            &[("election_timeout_max_ms", Some("100"))],
+            "election_timeout_min_ms",
+        ),
+    ];
+
+    /// Scenario RFC0065.1, the Raft timings arm through both front-ends: a
+    /// zero, non-numeric or mis-ordered timing fails naming its key, the
+    /// rest of the timings at their defaults.
+    #[test]
+    fn rfc0065_1_invalid_raft_timings_fail_naming_the_key() {
+        for (edits, key) in INVALID_TIMINGS {
+            let key = format!("receiver.wal.replicated.{key} ");
+            assert_both_front_ends_fail("replicated", edits, &key);
         }
     }
 

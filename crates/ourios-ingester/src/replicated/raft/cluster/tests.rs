@@ -437,6 +437,7 @@ async fn a_group_that_fails_to_open_stops_the_ones_before_it() {
         wal: wal_config(replica.dir.path()),
         groups: replica.groups.clone(),
         peers: Peers::plaintext(),
+        timings: replica.timings,
     };
     match GroupHost::open(spec()).await {
         Err(HostError::Log { group: 1, .. }) => {}

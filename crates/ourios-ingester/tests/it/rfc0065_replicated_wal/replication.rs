@@ -5,8 +5,9 @@
 /// Scenario RFC0065.1 — the default-timings arm. A three-voter group on
 /// `group_config()` unchanged, 50 ms heartbeat and 150–300 ms election,
 /// commits and acknowledges exports and fails over when its leader stops.
+/// The in-process cluster is crate-internal, so the test is a unit test.
 #[test]
-#[ignore = "RFC0065.1 stub — the default-timings arm, implemented with the timing keys"]
+#[ignore = "covered by replicated::write::tests::failover::rfc0065_1_a_group_on_the_default_timings_acks_and_fails_over"]
 fn rfc0065_1_a_group_on_the_default_timings_acks_and_fails_over() {
     todo!(
         "RFC0065.1 — on the shipped timings, exports are acknowledged and a stopped \

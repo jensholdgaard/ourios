@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
+use super::RaftTimings;
 use super::gate::SyncGate;
 use super::host::{GroupHost, GroupRaft, HostSpec, Wiring};
 use super::log_store::group_dir;
@@ -46,26 +48,21 @@ pub(crate) fn wal_config(root: &Path) -> WalConfig {
     }
 }
 
-/// The longest election timeout [`raft_config`] allows.
+/// The longest election timeout [`test_timings`] allows.
 pub(crate) const ELECTION_TIMEOUT_MAX: Duration = Duration::from_secs(2);
 
-/// [`group_config`](super::group_config) with a longer election timeout
-/// and heartbeat interval. The default 150–300 ms timeout is also the
-/// leader's quorum lease, which a loaded CI runner can miss, unseating a
-/// leader the test still writes to. `openraft` gives each heartbeat and
-/// append the heartbeat interval as its deadline, which the transport cuts
-/// to three quarters, so at the default 50 ms a loaded runner times many of
-/// them out and the leader's view of when it last heard from a replica
-/// goes stale.
-pub(crate) fn raft_config() -> openraft::Config {
-    openraft::Config {
-        election_timeout_min: 1_000,
-        election_timeout_max: ELECTION_TIMEOUT_MAX.as_millis().try_into().expect("fits"),
-        heartbeat_interval: 200,
-        ..super::group_config().expect("group config")
-    }
-    .validate()
-    .expect("test config")
+/// The harness's timings: longer than the defaults in election timeout and
+/// heartbeat interval. The default 150–300 ms timeout is also the leader's
+/// quorum lease, which a loaded CI runner can miss, unseating a leader the
+/// test still writes to. `openraft` gives each heartbeat and append the
+/// heartbeat interval as its deadline, which the transport cuts to three
+/// quarters, so at the default 50 ms a loaded runner times many of them
+/// out and the leader's view of when it last heard from a replica goes
+/// stale. [`Cluster::start_on`] runs a cluster on other timings.
+pub(crate) fn test_timings() -> RaftTimings {
+    let millis = |ms: u64| NonZeroU64::new(ms).expect("non-zero");
+    let max = u64::try_from(ELECTION_TIMEOUT_MAX.as_millis()).expect("fits");
+    RaftTimings::new(millis(200), millis(1_000), millis(max)).expect("ordered timings")
 }
 
 /// §8's crash model: drop every byte past the boundary `synced` names.
@@ -138,14 +135,15 @@ pub(crate) fn name(id: NodeId) -> String {
 }
 
 /// A replica's identity, the `node_id` it runs under, the directory its
-/// logs and votes live in, the groups it votes in, and where its host
-/// reports.
+/// logs and votes live in, the groups it votes in, where its host
+/// reports, and the timings its groups run on.
 pub(crate) struct Replica {
     pub(crate) id: NodeId,
     pub(crate) node_id: String,
     pub(crate) dir: TempDir,
     pub(crate) groups: Vec<u32>,
     pub(crate) meters: Meters,
+    pub(crate) timings: RaftTimings,
 }
 
 impl Replica {
@@ -159,6 +157,7 @@ impl Replica {
             dir,
             groups: groups.to_vec(),
             meters: Meters::global(),
+            timings: test_timings(),
         }
     }
 }
@@ -197,10 +196,10 @@ impl Node {
             wal: wal_config(replica.dir.path()),
             groups: replica.groups.clone(),
             peers: peers.clone(),
+            timings: replica.timings,
         };
         server.identify_as(Identity::new(replica.node_id.clone(), replica.id));
         let wiring = Wiring {
-            config: raft_config(),
             server,
             gate: Arc::clone(&gate),
         };
@@ -340,11 +339,38 @@ pub(crate) struct Cluster {
     slots: Vec<Slot>,
 }
 
+/// How many nodes a cluster starts with, and the timings they run on.
+struct Shape {
+    voters: u64,
+    tail: u64,
+    timings: RaftTimings,
+}
+
+/// `(voters, tail)` nodes on [`test_timings`].
+impl From<(u64, u64)> for Shape {
+    fn from((voters, tail): (u64, u64)) -> Self {
+        Self {
+            voters,
+            tail,
+            timings: test_timings(),
+        }
+    }
+}
+
 impl Cluster {
     /// Start `size` nodes and bootstrap each of `groups` from node 0
     /// with every node a voter.
     pub(crate) async fn start(size: u64, groups: &[u32]) -> Self {
         Self::start_metered(size, groups, |_| Meters::global()).await
+    }
+
+    /// [`Self::start`] with every node on `timings`.
+    pub(crate) async fn start_on(size: u64, groups: &[u32], timings: RaftTimings) -> Self {
+        let shape = Shape {
+            timings,
+            ..Shape::from((size, 0))
+        };
+        Self::open(shape, groups, |_| Meters::global()).await
     }
 
     /// [`Self::start`], node `i` reporting to `meters(i)`.
@@ -353,22 +379,18 @@ impl Cluster {
         groups: &[u32],
         meters: impl Fn(usize) -> Meters,
     ) -> Self {
-        Self::open((size, 0), groups, meters).await
+        Self::open(Shape::from((size, 0)), groups, meters).await
     }
 
     /// `voters` nodes that vote in every group, and `tail` more, nodes
     /// `voters..`, that host every group but are in no membership until a
     /// leader adds them as learners.
     pub(crate) async fn start_with_tail(voters: u64, tail: u64, groups: &[u32]) -> Self {
-        Self::open((voters, tail), groups, |_| Meters::global()).await
+        Self::open(Shape::from((voters, tail)), groups, |_| Meters::global()).await
     }
 
-    async fn open(
-        (voters, tail): (u64, u64),
-        groups: &[u32],
-        meters: impl Fn(usize) -> Meters,
-    ) -> Self {
-        let (cluster, members) = Self::open_unformed((voters, tail), groups, meters).await;
+    async fn open(shape: Shape, groups: &[u32], meters: impl Fn(usize) -> Meters) -> Self {
+        let (cluster, members) = Self::open_unformed(shape, groups, meters).await;
         for &group in groups {
             let first = cluster.node(0).raft(group);
             first.initialize(members.clone()).await.expect("initialize");
@@ -379,13 +401,17 @@ impl Cluster {
     /// `size` nodes that host every group with none initialized, as a
     /// fresh cluster starts before its groups form (§6.1).
     pub(crate) async fn start_unformed(size: u64, groups: &[u32]) -> Self {
-        Self::open_unformed((size, 0), groups, |_| Meters::global())
+        Self::open_unformed(Shape::from((size, 0)), groups, |_| Meters::global())
             .await
             .0
     }
 
     async fn open_unformed(
-        (voters, tail): (u64, u64),
+        Shape {
+            voters,
+            tail,
+            timings,
+        }: Shape,
         groups: &[u32],
         meters: impl Fn(usize) -> Meters,
     ) -> (Self, BTreeMap<NodeId, String>) {
@@ -407,6 +433,7 @@ impl Cluster {
         for (n, (_, (incoming, _))) in (1..).zip(bound) {
             let replica = Replica {
                 meters: meters(cluster.slots.len()),
+                timings,
                 ..Replica::new(n, groups)
             };
             let server = ReplicationServer::default();
@@ -504,6 +531,7 @@ impl Cluster {
         };
         let replica = Replica {
             node_id: old.node_id.clone(),
+            timings: old.timings,
             ..Replica::new(n, &old.groups)
         };
         self.slots[i] = Slot::Down(replica);

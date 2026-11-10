@@ -32,12 +32,99 @@ mod tests;
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// The `openraft` settings §4.5 fixes for every group; the timeouts start
-/// at `openraft`'s defaults (§6.9).
+/// A node's Raft timings for every group it hosts (RFC 0065 §3.8), in
+/// milliseconds. The heartbeat interval is also each append's deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaftTimings {
+    heartbeat_interval: NonZeroU64,
+    election_timeout_min: NonZeroU64,
+    election_timeout_max: NonZeroU64,
+}
+
+/// Which ordering of [`RaftTimings`] a set of values breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaftTimingsError {
+    HeartbeatNotBelowElectionMin,
+    ElectionMinNotBelowMax,
+}
+
+impl std::fmt::Display for RaftTimingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::HeartbeatNotBelowElectionMin => {
+                "the heartbeat interval must be below the election timeout minimum"
+            }
+            Self::ElectionMinNotBelowMax => {
+                "the election timeout minimum must be below its maximum"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RaftTimingsError {}
+
+const fn millis(n: u64) -> NonZeroU64 {
+    match NonZeroU64::new(n) {
+        Some(n) => n,
+        None => NonZeroU64::MIN,
+    }
+}
+
+impl RaftTimings {
+    /// # Errors
+    ///
+    /// [`RaftTimingsError`] unless `heartbeat < election_min < election_max`.
+    pub const fn new(
+        heartbeat: NonZeroU64,
+        election_min: NonZeroU64,
+        election_max: NonZeroU64,
+    ) -> Result<Self, RaftTimingsError> {
+        match (heartbeat.get(), election_min.get(), election_max.get()) {
+            (heartbeat, min, _) if heartbeat >= min => {
+                Err(RaftTimingsError::HeartbeatNotBelowElectionMin)
+            }
+            (_, min, max) if min >= max => Err(RaftTimingsError::ElectionMinNotBelowMax),
+            _ => Ok(Self {
+                heartbeat_interval: heartbeat,
+                election_timeout_min: election_min,
+                election_timeout_max: election_max,
+            }),
+        }
+    }
+
+    #[must_use]
+    pub const fn heartbeat_interval_ms(self) -> NonZeroU64 {
+        self.heartbeat_interval
+    }
+
+    #[must_use]
+    pub const fn election_timeout_min_ms(self) -> NonZeroU64 {
+        self.election_timeout_min
+    }
+
+    #[must_use]
+    pub const fn election_timeout_max_ms(self) -> NonZeroU64 {
+        self.election_timeout_max
+    }
+}
+
+/// §4.6's defaults: a 50 ms heartbeat and a 150–300 ms election timeout.
+impl Default for RaftTimings {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: millis(50),
+            election_timeout_min: millis(150),
+            election_timeout_max: millis(300),
+        }
+    }
+}
+
+/// The `openraft` settings §4.5 fixes for every group, on `timings`.
 ///
 /// Leader restore stays off: the group log's committed marker rides a
 /// later fsync, and `openraft`'s restore is unsafe without a synced
@@ -48,8 +135,11 @@ use std::time::{Duration, Instant};
 /// # Errors
 ///
 /// [`openraft::ConfigError`] when the settings do not validate.
-pub fn group_config() -> Result<openraft::Config, openraft::ConfigError> {
+pub fn group_config(timings: RaftTimings) -> Result<openraft::Config, openraft::ConfigError> {
     openraft::Config {
+        heartbeat_interval: timings.heartbeat_interval.get(),
+        election_timeout_min: timings.election_timeout_min.get(),
+        election_timeout_max: timings.election_timeout_max.get(),
         enable_leader_restore: Some(false),
         allow_log_reversion: Some(false),
         enable_pre_vote: Some(true),

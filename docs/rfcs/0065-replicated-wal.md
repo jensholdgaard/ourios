@@ -240,6 +240,9 @@ receiver:
       tail_replicas: 1                          # learners per group from the tail pool, ≥ 1
       tail_clients: "${env:OURIOS_RECEIVER_WAL_TAIL_CLIENTS}" # querier certificate identities allowed to call Tail
       tls: { ... }                              # peer mTLS; RFC 0030's TlsSection leaves
+      heartbeat_interval_ms: 50                 # Raft heartbeat, and each append's deadline
+      election_timeout_min_ms: 150              # a follower's wait for the leader, drawn
+      election_timeout_max_ms: 300              #   between these two at each election
 ```
 
 Every leaf is `${env:VAR}`-substitutable like `ReceiverSection`, with
@@ -261,6 +264,22 @@ choices fixed at first start (§6.1); `tail_peers`, `tail_replicas` and
 and credentials. `tail_clients` is a comma-separated list of
 certificate identities and must be non-empty, since without it no
 querier could read the tail (§6.8).
+
+The three Raft timings are tunables under RFC 0004 §3.2, each a
+positive integer number of milliseconds, with
+`heartbeat_interval_ms < election_timeout_min_ms <
+election_timeout_max_ms`; any other value fails startup naming the
+key. Their defaults are §4.6's measured ones. `openraft` gives every
+heartbeat and append the heartbeat interval as its deadline, and the
+peer transport waits three quarters of it, so a follower has that long
+to receive, fsync and answer an append. A node whose disk's fsync
+approaches that budget raises the heartbeat interval, and the election
+timeouts with it; the cost is failover and tail-gap time, about 1.8 ×
+the election maximum (§4.6). They are read at start, apply to every
+group on the node, and may change at any time; nodes may differ, though
+a cluster normally sets them alike. The metrics that tune them are the
+group's leadership changes and term (§6.9): elections without a node
+failure mean the timings are too tight for the disk.
 
 ## 4. Background — the Rust replication ecosystem
 
@@ -604,6 +623,14 @@ the mass-failover time and vote-log batching as tuning signals.
 >   of the rest fails startup with an error naming the field
 > - **And** a node whose `peers`, `groups` or `replication_factor`
 >   differs from the recorded layout fails startup naming the field
+> - **And** with the Raft timings unset every group runs with a 50 ms
+>   heartbeat and a 150–300 ms election timeout; set, every group on the
+>   node runs with the configured ones; and a value of `0`, a heartbeat
+>   not below the election minimum, or an election minimum not below its
+>   maximum fails startup naming the key
+> - **And** a three-voter group on the default timings commits and
+>   acknowledges exports, and fails over when its leader stops, in the
+>   CI suite
 
 > **Scenario RFC0065.2 — an ack waits for the write quorum (B1, B3)**
 > - **Given** a group of three voters
@@ -2546,7 +2573,7 @@ signal that tunes it:
 | `tail_replicas` | 1 | tail call latency and saturation per tail replica |
 | Tail memory before local Parquet | the record sink's size and age triggers | tail replica memory, local file count and query bytes read |
 | Tail volume | 2 × 24 h of the stated ingest rate (a node hosting every group); alerts at 50 % and 80 % | groups hosted and tail WAL and cache bytes per node during real outages |
-| Election and heartbeat timeouts | 50 ms heartbeat, 150–300 ms election: failover and tail gap about 1.8 × the election maximum, 0.55 s (§4.6) | failover time, spurious leadership changes |
+| Election and heartbeat timeouts | 50 ms heartbeat, 150–300 ms election (§3.8 keys): failover and tail gap about 1.8 × the election maximum, 0.55 s (§4.6) | failover time, spurious leadership changes |
 | Vote log | one per node, group-committed (§4.7): a node failure at 128 groups failed over in 0.5–0.8 s | failover time when a node's groups elect at once, vote-log fsync latency and votes per fsync |
 | Freshness target (B15) | under 1 s | ack-to-queryable latency, a new histogram on the tail path |
 | Audit events kept for a takeover | 16 MiB per group, then dropped and replayed before the flusher publishes (§6.7) | audit bytes kept and drops per group, replays and their length |

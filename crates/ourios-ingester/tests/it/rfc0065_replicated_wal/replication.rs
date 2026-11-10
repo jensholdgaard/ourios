@@ -1,5 +1,18 @@
-//! The write path: fencing, routing, rebuild, the simulation suite and
-//! the many-groups failover (RFC0065.4, .8, .9, .10, .27).
+//! The write path: the shipped Raft timings, fencing, routing, rebuild,
+//! the simulation suite and the many-groups failover (RFC0065.1, .4, .8,
+//! .9, .10, .27).
+
+/// Scenario RFC0065.1 — the default-timings arm. A three-voter group on
+/// `group_config()` unchanged, 50 ms heartbeat and 150–300 ms election,
+/// commits and acknowledges exports and fails over when its leader stops.
+#[test]
+#[ignore = "RFC0065.1 stub — the default-timings arm, implemented with the timing keys"]
+fn rfc0065_1_a_group_on_the_default_timings_acks_and_fails_over() {
+    todo!(
+        "RFC0065.1 — on the shipped timings, exports are acknowledged and a stopped \
+         leader is replaced, in the CI suite"
+    );
+}
 
 /// Scenario RFC0065.4 — a replaced writer cannot acknowledge (B5), the
 /// clock arm: the resumed former writer, with its clock set arbitrarily,

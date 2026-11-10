@@ -268,22 +268,36 @@ pub fn record_or_check(
     store: &Store,
     configured: &VotingLayout,
 ) -> Result<LayoutCheck, LayoutError> {
-    if !store.supports_conditional_update() {
-        return Err(LayoutError::NoConditionalUpdate);
-    }
-    match read(store)? {
-        Some(recorded) => compare(&recorded, configured),
+    match check_existing(store, configured)? {
+        Some(check) => Ok(check),
         None => create(store, configured),
     }
 }
 
-/// Check `configured` against the recorded layout without recording it.
+/// Check `configured` against the recorded layout, if there is one,
+/// without recording it: a node not yet allowed to join learns whether
+/// it ever could, and the bucket is left as it was.
 ///
 /// # Errors
 ///
-/// As [`record_or_check`].
+/// [`LayoutError::NoConditionalUpdate`] on a store without conditional
+/// updates; [`LayoutError::Mismatch`] naming every differing field;
+/// otherwise a store or decode failure.
 pub fn check_recorded(store: &Store, configured: &VotingLayout) -> Result<(), LayoutError> {
-    record_or_check(store, configured).map(|_| ())
+    check_existing(store, configured).map(|_| ())
+}
+
+/// `None` when no layout is recorded yet.
+fn check_existing(
+    store: &Store,
+    configured: &VotingLayout,
+) -> Result<Option<LayoutCheck>, LayoutError> {
+    if !store.supports_conditional_update() {
+        return Err(LayoutError::NoConditionalUpdate);
+    }
+    read(store)?
+        .map(|recorded| compare(&recorded, configured))
+        .transpose()
 }
 
 /// Create the record, or check against the one a concurrent first start

@@ -640,8 +640,10 @@ fn check_wal_backend(
     }
 }
 
-/// Check the configured voting layout against the recorded one, then
-/// read or create this replica's identity (RFC 0065 §6.1).
+/// Check the configured voting layout against the recorded one and read
+/// this replica's identity (RFC 0065 §6.1), recording and creating
+/// nothing: a refused start leaves the bucket and `wal_root` as it found
+/// them.
 fn check_replicated_layout(
     replicated: &ReplicatedWal,
     store: &ourios_parquet::Store,
@@ -653,8 +655,8 @@ fn check_replicated_layout(
         replicated.groups,
         replicated.replication_factor.voters(),
     );
-    layout::record_or_check(store, &configured).map_err(|e| failed(&e))?;
-    replica_id::load_or_create(wal_root).map_err(|e| failed(&e))?;
+    layout::check_recorded(store, &configured).map_err(|e| failed(&e))?;
+    replica_id::load_existing(wal_root).map_err(|e| failed(&e))?;
     Ok(())
 }
 
@@ -1083,6 +1085,10 @@ receiver:
     /// conditional updates, which the local store the served-binary tests
     /// run on lacks.
     #[test]
+    #[ignore = "superseded: a refused start no longer records the layout, so the mismatch is \
+                checked against a pre-recorded one in \
+                rfc0065_1_a_recorded_layout_mismatch_fails_naming_the_field_and_writes_nothing, \
+                #1250"]
     fn rfc0065_1_a_layout_mismatch_fails_naming_the_field() {
         let store = ourios_parquet::Store::in_memory();
         let wal_root = tempfile::TempDir::new().expect("temp");
@@ -1252,6 +1258,8 @@ receiver:
     /// The replicated backend keeps its identity in `wal_root/replica.id`
     /// across starts and refuses one it cannot read (RFC 0065 §6.1).
     #[test]
+    #[ignore = "superseded: a refused start no longer creates replica.id, so an existing one is \
+                checked in a_refused_replicated_start_keeps_an_existing_replica_id, #1250"]
     fn the_replicated_backend_keeps_its_replica_id() {
         let store = ourios_parquet::Store::in_memory();
         let wal_root = tempfile::TempDir::new().expect("temp");

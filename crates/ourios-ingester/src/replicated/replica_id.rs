@@ -133,10 +133,13 @@ const READ: &str = "read";
 /// file when it exists but cannot be read or decoded; otherwise a
 /// failure creating it or making it durable.
 pub fn load_or_create(wal_root: &Path) -> Result<Identity, ReplicaIdError> {
-    let path = wal_root.join(REPLICA_ID_FILE);
-    let identity = match read(&path)? {
+    let identity = match load_existing(wal_root)? {
         Some(id) => Identity::Existing(id),
-        None => create(wal_root, &path, ReplicaId(Uuid::now_v7()))?,
+        None => create(
+            wal_root,
+            &wal_root.join(REPLICA_ID_FILE),
+            ReplicaId(Uuid::now_v7()),
+        )?,
     };
     snapshot_store::fsync_root(wal_root).map_err(|source| ReplicaIdError::Sync {
         path: wal_root.to_path_buf(),
@@ -145,13 +148,15 @@ pub fn load_or_create(wal_root: &Path) -> Result<Identity, ReplicaIdError> {
     Ok(identity)
 }
 
-/// Read this replica's identity from `wal_root` without creating one.
+/// Read this replica's identity from `wal_root`, `None` if it has none
+/// yet. Nothing is created or written, not even `wal_root`.
 ///
 /// # Errors
 ///
-/// As [`load_or_create`] for a file that exists.
+/// [`ReplicaIdError::Io`] or [`ReplicaIdError::Malformed`] naming the
+/// file when it exists but cannot be read or decoded.
 pub fn load_existing(wal_root: &Path) -> Result<Option<ReplicaId>, ReplicaIdError> {
-    load_or_create(wal_root).map(|identity| Some(identity.id()))
+    read(&wal_root.join(REPLICA_ID_FILE))
 }
 
 fn read(path: &Path) -> Result<Option<ReplicaId>, ReplicaIdError> {
@@ -368,12 +373,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_unreadable_identity_fails_naming_the_file() {
+    /// Run `load` on a `wal_root` whose identity is a directory, assert it
+    /// fails naming the file, and return that `wal_root`.
+    fn assert_an_unreadable_identity_fails<T: std::fmt::Debug>(
+        load: impl Fn(&Path) -> Result<T, ReplicaIdError>,
+    ) -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().expect("temp");
         let path = dir.path().join(REPLICA_ID_FILE);
         std::fs::create_dir(&path).expect("a directory where the file belongs");
-        let err = load_or_create(dir.path()).expect_err("unreadable");
+        let err = load(dir.path()).expect_err("unreadable");
         assert!(
             matches!(&err, ReplicaIdError::Io { op, .. } if *op == READ),
             "{err}"
@@ -382,6 +390,12 @@ mod tests {
             err.to_string().contains(&path.display().to_string()),
             "{err}"
         );
+        dir
+    }
+
+    #[test]
+    fn an_unreadable_identity_fails_naming_the_file() {
+        assert_an_unreadable_identity_fails(load_or_create);
     }
 
     fn entries(root: &Path) -> Vec<String> {
@@ -433,18 +447,7 @@ mod tests {
 
     #[test]
     fn loading_an_unreadable_identity_fails_naming_the_file() {
-        let dir = tempfile::TempDir::new().expect("temp");
-        let path = dir.path().join(REPLICA_ID_FILE);
-        std::fs::create_dir(&path).expect("a directory where the file belongs");
-        let err = load_existing(dir.path()).expect_err("unreadable");
-        assert!(
-            matches!(&err, ReplicaIdError::Io { op, .. } if *op == READ),
-            "{err}"
-        );
-        assert!(
-            err.to_string().contains(&path.display().to_string()),
-            "{err}"
-        );
+        let dir = assert_an_unreadable_identity_fails(load_existing);
         assert_eq!(entries(dir.path()), [REPLICA_ID_FILE]);
     }
 }

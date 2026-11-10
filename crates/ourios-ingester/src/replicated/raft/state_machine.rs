@@ -909,6 +909,48 @@ mod tests {
         );
     }
 
+    /// Batches, the first miner configuration at index 4, and a batch.
+    fn configured_at_4() -> Vec<EntryResponder<RaftTypes>> {
+        vec![
+            assign(1, 7),
+            batch(2),
+            batch(3),
+            entry(4, configured(FIRST)),
+            batch(5),
+        ]
+    }
+
+    /// A flusher's checkpoint whose cut lies before the group's first
+    /// miner configuration is ignored and offers no build, so nothing is
+    /// purged.
+    #[tokio::test]
+    async fn a_checkpoint_before_the_first_miner_configuration_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let cuts = sm.checkpoints();
+        apply(&mut sm, configured_at_4()).await;
+        apply(&mut sm, vec![checkpoint(6, 7, (2, 3), 1)]).await;
+        assert_eq!(*cuts.borrow(), None, "no configuration at the cut");
+        let builder = sm.try_create_snapshot_builder(false).await;
+        assert!(builder.is_none(), "nothing to build, nothing purged");
+    }
+
+    /// A flusher's checkpoint at or above the first miner configuration
+    /// applies and snapshots the configuration.
+    #[tokio::test]
+    async fn a_checkpoint_at_or_above_the_first_miner_configuration_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let cuts = sm.checkpoints();
+        apply(&mut sm, configured_at_4()).await;
+        apply(&mut sm, vec![checkpoint(7, 7, (2, 4), 4)]).await;
+        assert_eq!(*cuts.borrow(), cut(4), "at the configuration");
+        apply(&mut sm, vec![checkpoint(8, 7, (2, 5), 4)]).await;
+        assert_eq!(*cuts.borrow(), cut(5), "above it");
+        let built = sm.build_snapshot().await.expect("build");
+        assert_eq!(built.snapshot.miner_config, Some(in_force(FIRST)));
+    }
+
     fn mining(dir: &Path, capacity: usize) -> (GroupSm, mpsc::Receiver<Applied>) {
         let (events, received) = mpsc::channel(capacity);
         let sm = GroupSm::open_mining(dir, Arc::default(), events).expect("open");

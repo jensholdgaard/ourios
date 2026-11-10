@@ -286,6 +286,46 @@ mod tests {
         assert_eq!(history.term_at(7), Some(3), "from the cut");
     }
 
+    fn default_config() -> GroupMinerConfig {
+        let body = super::super::miner_config::body_of(&ourios_config::MinerConfig::default());
+        GroupMinerConfig::new(body).expect("valid")
+    }
+
+    /// [`history`] with the first miner configuration at index 5.
+    fn configured_at_5() -> History {
+        let mut history = history();
+        history.changed(5, Change::HighestKind(4));
+        history.changed(5, Change::MinerConfig(default_config()));
+        history
+    }
+
+    /// A cut before the group's first miner configuration is ignored, as
+    /// the batches below it were never mined.
+    #[test]
+    fn a_cut_before_the_first_miner_configuration_is_ignored() {
+        let flusher = Some(NodeId::from(7));
+        let mut history = configured_at_5();
+        let held = history.changes.len();
+        let before = history.apply(id(3, 9), flusher, proposal(7, id(2, 3), 1));
+        assert_eq!(before, None, "no configuration in force at the cut");
+        assert_eq!(history.cut(), None);
+        assert_eq!(history.changes.len(), held, "nothing trimmed");
+    }
+
+    /// A cut at or above the first miner configuration applies, and the
+    /// configuration stays in force through the checkpoint.
+    #[test]
+    fn a_cut_at_or_above_the_first_miner_configuration_applies() {
+        let flusher = Some(NodeId::from(7));
+        let mut history = configured_at_5();
+        let at = history.apply(id(3, 9), flusher, proposal(7, id(3, 5), 4));
+        assert_eq!(at, Some(id(3, 5)), "the configuration's own entry");
+        let checkpoint = history.checkpoint().expect("applied");
+        assert_eq!(checkpoint.state.miner_config, Some(default_config()));
+        let above = history.apply(id(3, 10), flusher, proposal(7, id(3, 7), 4));
+        assert_eq!(above, Some(id(3, 7)), "in force from the checkpoint");
+    }
+
     /// A checkpoint holds the id block in force at its cut, not one
     /// applied after it, and the next keeps it over the trim.
     #[test]

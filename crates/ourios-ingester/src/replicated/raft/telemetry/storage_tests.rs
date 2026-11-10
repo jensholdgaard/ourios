@@ -11,7 +11,7 @@ use ourios_semconv as semconv;
 use ourios_wal::TenantBatch;
 
 use super::tests::Reader;
-use super::{Meters, error_type};
+use super::{Component, Meters, error_type};
 use crate::replicated::raft::cluster::wal_config;
 use crate::replicated::raft::codec::raft_id;
 use crate::replicated::raft::gate::SyncGate;
@@ -52,6 +52,86 @@ fn votes(dir: &Path, rewrite_bytes: u64, reader: &Reader) -> (VoteLog, Arc<SyncG
 
 fn vote(term: u64) -> Vote {
     Vote::new(term, NodeId::from(7))
+}
+
+/// Each event `run` logs on this thread: its name and its fields but the
+/// message, as `key=value`, in key order.
+fn events(run: impl FnOnce()) -> Vec<(String, Vec<String>)> {
+    use std::sync::{Mutex, PoisonError};
+    use tracing_subscriber::prelude::*;
+
+    type Captured = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+    struct Capture(Captured);
+
+    #[derive(Default)]
+    struct Fields(Vec<String>);
+
+    impl tracing::field::Visit for Fields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push(format!("{}={value}", field.name()));
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() != "message" {
+                self.0.push(format!("{}={value:?}", field.name()));
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            fields.0.sort();
+            let name = event.metadata().name().to_owned();
+            let mut events = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            events.push((name, fields.0));
+        }
+    }
+
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&captured)));
+    tracing::subscriber::with_default(subscriber, run);
+    let events = captured.lock().unwrap_or_else(PoisonError::into_inner);
+    events.clone()
+}
+
+/// A stop is the registered event, once per stopped writer: with the
+/// group for a log store, without one for the node's vote log.
+#[test]
+fn a_stop_is_one_registered_event_per_writer() {
+    let reader = Reader::new();
+    let storage = Meters::on(&reader.meter()).storage();
+    let logged = events(|| {
+        let full = io::Error::new(io::ErrorKind::StorageFull, "disk full");
+        storage.stopped(Component::LogStore(3), &[3], &full);
+        let other = io::Error::other("fsync failed");
+        storage.stopped(Component::VoteLog, &[1, 2], &other);
+    });
+
+    let event = |fields: &[&str]| {
+        let fields = fields.iter().map(|f| (*f).to_owned()).collect();
+        (
+            semconv::EVENT_OURIOS_WAL_REPLICATION_STOPPED.to_owned(),
+            fields,
+        )
+    };
+    let expected = [
+        event(&[
+            "error.type=storage_full",
+            "ourios.wal.group=3",
+            "ourios.wal.replication.component=log_store",
+        ]),
+        event(&[
+            "error.type=other",
+            "ourios.wal.replication.component=vote_log",
+        ]),
+    ];
+    assert_eq!(logged, expected);
 }
 
 #[test]

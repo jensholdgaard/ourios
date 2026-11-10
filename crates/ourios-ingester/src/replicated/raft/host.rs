@@ -18,13 +18,13 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
 use super::gate::SyncGate;
-use super::group_config;
 use super::log_store::{GroupLog, GroupLogReader, group_dir};
 use super::state_machine::GroupSm;
 use super::telemetry::{Meters, ReplicationTelemetry};
 use super::transport::{Peers, ReplicationServer};
 use super::types::{LogId, NodeId, RaftTypes};
 use super::vote_log::VoteLog;
+use super::{RaftTimings, group_config};
 
 pub type GroupRaft = Raft<RaftTypes, GroupSm>;
 
@@ -39,6 +39,8 @@ pub struct HostSpec {
     /// ([`VotingLayout::groups_of`](crate::replicated::layout::VotingLayout::groups_of)).
     pub groups: Vec<u32>,
     pub peers: Peers,
+    /// The Raft timings every group runs on.
+    pub timings: RaftTimings,
 }
 
 /// Why a node's groups could not be opened.
@@ -230,10 +232,9 @@ async fn blocking<T: Send + 'static>(
         .unwrap_or_else(|e| Err(io::Error::other(e)))
 }
 
-/// What a host is opened with besides its spec: the Raft settings, the
-/// server its groups register with, and the gate their fsyncs pass.
+/// What a host is opened with besides its spec: the server its groups
+/// register with, and the gate their fsyncs pass.
 pub(super) struct Wiring {
-    pub(super) config: openraft::Config,
     pub(super) server: ReplicationServer<GroupSm>,
     pub(super) gate: Arc<SyncGate>,
 }
@@ -248,9 +249,7 @@ impl GroupHost {
     /// [`HostError`] naming the vote log or the group that failed.
     pub async fn open(spec: HostSpec) -> Result<Self, HostError> {
         let meters = Meters::global();
-        let config = group_config().map_err(HostError::Config)?;
         let wiring = Wiring {
-            config,
             server: ReplicationServer::default(),
             gate: Arc::default(),
         };
@@ -259,14 +258,10 @@ impl GroupHost {
 
     pub(super) async fn open_with(
         spec: HostSpec,
-        Wiring {
-            config,
-            server,
-            gate,
-        }: Wiring,
+        Wiring { server, gate }: Wiring,
         meters: &Meters,
     ) -> Result<Self, HostError> {
-        let config = Arc::new(config);
+        let config = Arc::new(group_config(spec.timings).map_err(HostError::Config)?);
         let root = spec.wal.root.clone();
         let votes = blocking(move || VoteLog::open(&root))
             .await

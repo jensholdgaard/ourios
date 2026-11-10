@@ -8,6 +8,11 @@
 //! a unit test in `src/main.rs`: the replicated backend needs a store with
 //! conditional updates, and the local store these tests serve on has none.
 
+use ourios_ingester::replicated::raft::group_config;
+use ourios_server::config::file::parse;
+use ourios_server::config::resolve::server_config_from_file;
+use ourios_server::config::wal::{ReplicatedWal, WalBackend};
+
 /// Scenario RFC0065.1 — the start arm. With `receiver.wal.backend:
 /// replicated` and every field set, the server starts; today
 /// `check_wal_backend` refuses it, as `only_the_local_wal_backend_starts`
@@ -21,17 +26,81 @@ fn rfc0065_1_a_valid_replicated_config_starts() {
     );
 }
 
+/// A replicated `receiver.wal` with every required leaf and the given
+/// timing lines, `${env:…}` resolved from `env`.
+fn replicated_wal(timings: &str, env: &[(&str, &str)]) -> Result<ReplicatedWal, String> {
+    let yaml = format!(
+        "storage:\n  local:\n    bucket_root: /data\nreceiver:\n  enabled: true\n  \
+         wal_root: /wal\n  wal:\n    backend: replicated\n    replicated:\n      \
+         node_id: receiver-0\n      peers: receiver-0=r0.wal:4320,receiver-1=r1.wal:4320,\
+         receiver-2=r2.wal:4320\n      tail_peers: tail-0=t0.wal:4320\n      \
+         tail_clients: querier-a\n      tls:\n        cert_file: /tls/peer.crt\n        \
+         key_file: /tls/peer.key\n        client_ca_file: /tls/ca.crt\n{timings}"
+    );
+    let lookup = |name: &str| {
+        env.iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+    };
+    let file = parse(&yaml, &lookup).map_err(|e| e.to_string())?;
+    match server_config_from_file(&file)?.receiver.map(|r| r.wal) {
+        Some(WalBackend::Replicated(wal)) => Ok(*wal),
+        other => Err(format!("not a replicated receiver: {other:?}")),
+    }
+}
+
+/// The heartbeat and election timeouts of the `openraft` config every
+/// group on the node is built with.
+fn group_timings(wal: &ReplicatedWal) -> (u64, u64, u64) {
+    let config = group_config(wal.raft_timings).expect("a valid group config");
+    (
+        config.heartbeat_interval,
+        config.election_timeout_min,
+        config.election_timeout_max,
+    )
+}
+
 /// Scenario RFC0065.1 — the Raft timings arm. Unset, every group runs on
 /// the 50 ms heartbeat and 150–300 ms election timeout; set, on the
-/// configured ones; a zero or mis-ordered value fails startup naming the key.
+/// configured ones; a zero or mis-ordered value fails startup naming the
+/// key. The env front-end's arm is
+/// `config::wal::tests::rfc0065_1_invalid_raft_timings_fail_naming_the_key`.
 #[test]
-#[ignore = "RFC0065.1 stub — the Raft timings arm, implemented with the timing keys"]
 fn rfc0065_1_the_raft_timings_are_configured_and_checked() {
-    todo!(
-        "RFC0065.1 — defaults 50 ms and 150–300 ms, configured values reach every \
-         group's openraft config, and 0, heartbeat >= election minimum or minimum >= \
-         maximum fails startup naming the key"
-    );
+    let unset = replicated_wal("", &[]).expect("the timings default");
+    assert_eq!(group_timings(&unset), (50, 150, 300));
+
+    let set = "      heartbeat_interval_ms: ${env:HEARTBEAT}\n      \
+               election_timeout_min_ms: ${env:ELECTION_MIN}\n      \
+               election_timeout_max_ms: 2000\n";
+    let env = [("HEARTBEAT", "200"), ("ELECTION_MIN", "1000")];
+    let configured = replicated_wal(set, &env).expect("configured timings resolve");
+    assert_eq!(group_timings(&configured), (200, 1000, 2000));
+
+    let invalid = [
+        ("      heartbeat_interval_ms: 0\n", "heartbeat_interval_ms"),
+        (
+            "      election_timeout_min_ms: 0\n",
+            "election_timeout_min_ms",
+        ),
+        (
+            "      election_timeout_max_ms: 0\n",
+            "election_timeout_max_ms",
+        ),
+        (
+            "      heartbeat_interval_ms: 150\n",
+            "heartbeat_interval_ms",
+        ),
+        (
+            "      election_timeout_min_ms: 300\n",
+            "election_timeout_min_ms",
+        ),
+    ];
+    for (line, key) in invalid {
+        let error = replicated_wal(line, &[]).expect_err(line);
+        let named = format!("receiver.wal.replicated.{key} ");
+        assert!(error.starts_with(&named), "{line:?}: {error}");
+    }
 }
 
 /// Scenario RFC0065.3 — crash recovery on the replicated backend (B2, B7).

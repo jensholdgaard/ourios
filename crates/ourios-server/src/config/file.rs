@@ -487,6 +487,12 @@ pub struct ReplicatedWalSection {
     pub tail_replicas: Option<String>,
     #[serde(deserialize_with = "scalar_opt")]
     pub tail_clients: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub heartbeat_interval_ms: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub election_timeout_min_ms: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub election_timeout_max_ms: Option<String>,
     /// Peer mTLS (RFC 0030's `TlsSection` leaves).
     pub tls: TlsSection,
 }
@@ -1055,6 +1061,9 @@ impl WalSection {
         substitute(&mut replicated.replication_factor, lookup)?;
         substitute(&mut replicated.tail_replicas, lookup)?;
         substitute(&mut replicated.tail_clients, lookup)?;
+        substitute(&mut replicated.heartbeat_interval_ms, lookup)?;
+        substitute(&mut replicated.election_timeout_min_ms, lookup)?;
+        substitute(&mut replicated.election_timeout_max_ms, lookup)?;
         replicated.tls.substitute(lookup)
     }
 }
@@ -1995,6 +2004,9 @@ receiver:
         client_ca_file: ${env:L85}
         min_version: ${env:L86}
         reload_interval_secs: ${env:L87}
+      heartbeat_interval_ms: ${env:L88}
+      election_timeout_min_ms: ${env:L89}
+      election_timeout_max_ms: ${env:L90}
 querier:
   enabled: ${env:L29}
   http_addr: ${env:L30}

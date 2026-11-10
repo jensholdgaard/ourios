@@ -62,6 +62,27 @@ impl Reader {
             })
             .collect()
     }
+
+    /// `name`'s histogram points as `(attribute values, count)`, the
+    /// attributes in key order.
+    pub(crate) fn counts(&self, name: &str) -> Vec<(Vec<String>, u64)> {
+        let mut counts: Vec<_> = self
+            .collect()
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .filter(|m| m.name() == name)
+            .flat_map(|m| match m.data() {
+                AggregatedMetrics::F64(MetricData::Histogram(histogram)) => histogram
+                    .data_points()
+                    .map(|dp| (values(dp.attributes()), dp.count()))
+                    .collect::<Vec<_>>(),
+                other => panic!("{name} is not an f64 histogram: {other:?}"),
+            })
+            .collect();
+        counts.sort();
+        counts
+    }
 }
 
 fn values<'a>(attributes: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> Vec<String> {

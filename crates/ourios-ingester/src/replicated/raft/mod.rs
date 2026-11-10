@@ -217,6 +217,35 @@ fn writer_gone() -> io::Error {
     io::Error::other("the storage writer thread has stopped")
 }
 
+/// A WAL write's failure as an I/O error of the kind it carries, which
+/// `error.type` reports.
+trait WalFailure: std::fmt::Display {
+    fn kind(&self) -> io::ErrorKind;
+
+    fn to_io(&self) -> io::Error {
+        io::Error::new(self.kind(), self.to_string())
+    }
+}
+
+impl WalFailure for ourios_wal::AppendError {
+    fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::Io { source, .. } => source.kind(),
+            Self::RotationRetrying(fault) | Self::RotationTerminal(fault) => fault.kind(),
+            Self::TooLarge { .. } => io::ErrorKind::InvalidInput,
+        }
+    }
+}
+
+impl WalFailure for ourios_wal::SyncError {
+    fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::Io { source, .. } => source.kind(),
+            Self::RotationRetrying(fault) | Self::RotationTerminal(fault) => fault.kind(),
+        }
+    }
+}
+
 /// How a writer thread's batch ended.
 enum Flush {
     /// Written, and fsynced when the batch asked for it.

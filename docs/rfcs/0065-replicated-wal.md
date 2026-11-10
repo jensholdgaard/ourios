@@ -1939,7 +1939,10 @@ record.
   group's first-ranked voter allocates it from the counter in
   `<bucket>/wal/log_ids.json` by compare-and-swap when it records the
   group's first membership, and records it in the group's `formed.json`
-  (§6.1). `cluster.json` is written once per cluster and holds no
+  (§6.1). The counter never hands out `u32::MAX`: an allocation that
+  finds it as the next id fails closed as `log_ids_exhausted`, and no
+  id is reused or wrapped back to 0, since either would let two logs'
+  rows compare equal. `cluster.json` is written once per cluster and holds no
   per-group state. RFC 0066 allocates one per (topic id,
   partition), using the broker's topic UUID, so a recreated topic gets
   new ids. Positions from different logs, backends or topic incarnations

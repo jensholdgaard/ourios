@@ -18,12 +18,13 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::host::GroupRaft;
+use super::log_ids::{AllocateError, Refused, allocate};
 use super::transport::{IdentifyError, Identity, Peers};
 use super::types::{NodeId, RaftTypes};
 
 /// The record format this build reads and writes; a reader refuses every
 /// other one.
-pub const FORMED_FORMAT: u32 = 1;
+pub const FORMED_FORMAT: u32 = 2;
 
 /// The key, under the store root, of `group`'s formation record.
 #[must_use]
@@ -36,6 +37,7 @@ pub fn formed_key(group: u32) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Formation {
     group: u32,
+    log: u32,
     members: BTreeMap<String, NodeId>,
 }
 
@@ -44,6 +46,7 @@ pub struct Formation {
 struct Record {
     format: u32,
     group: u32,
+    log: u32,
     members: Vec<RecordMember>,
 }
 
@@ -63,18 +66,27 @@ impl Formation {
     /// [`Unreadable`] naming why a reader would refuse it.
     pub fn new(
         group: u32,
+        log: u32,
         members: BTreeMap<String, NodeId>,
         voters: &[&str],
     ) -> Result<Self, Unreadable> {
-        let formation = Self { group, members };
-        formation.check_voters(formation.members.keys().cloned().collect(), voters)?;
-        formation.check_replicas()?;
-        Ok(formation)
+        check_membership(&members, voters)?;
+        Ok(Self {
+            group,
+            log,
+            members,
+        })
     }
 
     #[must_use]
     pub fn group(&self) -> u32 {
         self.group
+    }
+
+    /// The group's log id (§6.6), allocated from `log_ids.json`.
+    #[must_use]
+    pub fn log(&self) -> u32 {
+        self.log
     }
 
     /// Each voter's `node_id` with its UUID, by `node_id` bytewise.
@@ -110,6 +122,7 @@ impl Formation {
         serde_json::to_vec(&Record {
             format: FORMED_FORMAT,
             group: self.group,
+            log: self.log,
             members,
         })
     }
@@ -146,10 +159,13 @@ impl Formation {
             .into_iter()
             .map(|m| Ok((m.node_id, replica(&m.replica)?)))
             .collect::<Result<BTreeMap<_, _>, Unreadable>>()?;
-        let formation = Self { group, members };
-        formation.check_voters(recorded, voters)?;
-        formation.check_replicas()?;
-        Ok(formation)
+        check_voters(&members, recorded, voters)?;
+        check_replicas(&members)?;
+        Ok(Self {
+            group,
+            log: record.log,
+            members,
+        })
     }
 
     /// Where `node_id`, running as `replica`, stands in the record.
@@ -161,28 +177,37 @@ impl Formation {
             None => None,
         }
     }
+}
 
-    fn check_voters(&self, mut recorded: Vec<String>, voters: &[&str]) -> Result<(), Unreadable> {
-        let mut expected: Vec<String> = voters.iter().map(|&v| v.to_owned()).collect();
-        recorded.sort();
-        expected.sort();
-        if recorded.len() == self.members.len() && recorded == expected {
-            Ok(())
-        } else {
-            Err(Unreadable::Voters { recorded, expected })
-        }
+/// Whether `members` is a membership a reader would accept for `voters`:
+/// exactly the voters, one UUID each.
+fn check_membership(members: &BTreeMap<String, NodeId>, voters: &[&str]) -> Result<(), Unreadable> {
+    check_voters(members, members.keys().cloned().collect(), voters)?;
+    check_replicas(members)
+}
+
+/// `recorded`, the `node_id`s as a record lists them, are exactly `voters`
+/// and name each of `members` once.
+fn check_voters(
+    members: &BTreeMap<String, NodeId>,
+    mut recorded: Vec<String>,
+    voters: &[&str],
+) -> Result<(), Unreadable> {
+    let mut expected: Vec<String> = voters.iter().map(|&v| v.to_owned()).collect();
+    recorded.sort();
+    expected.sort();
+    if recorded.len() == members.len() && recorded == expected {
+        Ok(())
+    } else {
+        Err(Unreadable::Voters { recorded, expected })
     }
+}
 
-    fn check_replicas(&self) -> Result<(), Unreadable> {
-        let mut seen = BTreeSet::new();
-        match self
-            .members
-            .values()
-            .find(|&&replica| !seen.insert(replica))
-        {
-            Some(&shared) => Err(Unreadable::SharedReplica(shared)),
-            None => Ok(()),
-        }
+fn check_replicas(members: &BTreeMap<String, NodeId>) -> Result<(), Unreadable> {
+    let mut seen = BTreeSet::new();
+    match members.values().find(|&&replica| !seen.insert(replica)) {
+        Some(&shared) => Err(Unreadable::SharedReplica(shared)),
+        None => Ok(()),
     }
 }
 
@@ -303,6 +328,8 @@ pub enum FormError {
         group: u32,
         source: Fatal<RaftTypes>,
     },
+    /// No log id can be allocated for the group's record.
+    LogIds { group: u32, reason: Refused },
 }
 
 impl FormError {
@@ -314,6 +341,7 @@ impl FormError {
             Self::Unreadable { reason, .. } => reason.error_type(),
             Self::Initialize { .. } => "initialize_refused",
             Self::Raft { .. } => "raft_stopped",
+            Self::LogIds { reason, .. } => reason.error_type(),
         }
     }
 }
@@ -331,6 +359,7 @@ impl fmt::Display for FormError {
                 write!(f, "initialize group {group}: {source}")
             }
             Self::Raft { group, source } => write!(f, "group {group}: {source}"),
+            Self::LogIds { group, reason } => write!(f, "group {group}'s log id: {reason}"),
         }
     }
 }
@@ -342,6 +371,7 @@ impl std::error::Error for FormError {
             Self::Unreadable { reason, .. } => Some(reason),
             Self::Initialize { source, .. } => Some(source),
             Self::Raft { source, .. } => Some(source),
+            Self::LogIds { reason, .. } => Some(reason),
         }
     }
 }
@@ -416,6 +446,10 @@ pub enum Waiting {
     Encode(serde_json::Error),
     /// The record could not be written.
     RecordWrite(StoreError),
+    /// `log_ids.json` could not be read or written.
+    LogIdsStore(StoreError),
+    /// The high-water object is not seeded yet, so no log id exists.
+    LogIdsUnseeded { bootstrapper: String },
 }
 
 impl Waiting {
@@ -429,6 +463,8 @@ impl Waiting {
             Self::NotAMembership(_) => "not_a_membership",
             Self::Encode(_) => "encode",
             Self::RecordWrite(_) => "record_write",
+            Self::LogIdsStore(_) => "log_ids_store",
+            Self::LogIdsUnseeded { .. } => "log_ids_unseeded",
         }
     }
 }
@@ -442,6 +478,11 @@ impl fmt::Display for Waiting {
             Self::NotAMembership(reason) => write!(f, "the answers are not a membership: {reason}"),
             Self::Encode(e) => write!(f, "encode the formation record: {e}"),
             Self::RecordWrite(e) => write!(f, "write the formation record: {e}"),
+            Self::LogIdsStore(e) => write!(f, "allocate the group's log id: {e}"),
+            Self::LogIdsUnseeded { bootstrapper } => write!(
+                f,
+                "{bootstrapper} has not seeded the high-water object, so no log id exists yet"
+            ),
         }
     }
 }
@@ -452,6 +493,8 @@ enum Pass {
     /// This voter wrote the record, or lost the race to one: read it now.
     Recorded,
     Wait(Waiting),
+    /// The pass failed closed.
+    Fail(FormError),
 }
 
 /// Form `voter`'s group on its `raft` (§6.1), passing until it has formed: a voter
@@ -484,6 +527,7 @@ pub async fn form<P: Identifier>(
         match pass(voter, raft, reach).await? {
             Pass::Done(formed) => return Ok(formed),
             Pass::Recorded => {}
+            Pass::Fail(e) => return Err(e),
             Pass::Wait(why) => {
                 waiting(&why);
                 tokio::time::sleep(reach.patience.retry).await;
@@ -550,20 +594,33 @@ async fn initialize(
 async fn record<P: Identifier>(voter: Voter<'_>, replica: NodeId, reach: &Reach<'_, P>) -> Pass {
     match encoded(voter, replica, reach).await {
         Ok(bytes) => write(reach.store, voter.group, bytes).await,
-        Err(why) => Pass::Wait(why),
+        Err(pass) => pass,
     }
 }
 
-/// The record's bytes, once every voter has answered with a membership.
+/// The record's bytes, once every voter has answered with a membership,
+/// under a log id allocated only then: an id is spent once allocated, so
+/// a pass that would not write allocates none.
 async fn encoded<P: Identifier>(
     voter: Voter<'_>,
     replica: NodeId,
     reach: &Reach<'_, P>,
-) -> Result<Vec<u8>, Waiting> {
-    let members = answers(voter, replica, reach).await?;
-    let formation =
-        Formation::new(voter.group, members, voter.voters).map_err(Waiting::NotAMembership)?;
-    formation.encode().map_err(Waiting::Encode)
+) -> Result<Vec<u8>, Pass> {
+    let group = voter.group;
+    let members = answers(voter, replica, reach).await.map_err(Pass::Wait)?;
+    let not_a_membership = |reason| Pass::Wait(Waiting::NotAMembership(reason));
+    check_membership(&members, voter.voters).map_err(not_a_membership)?;
+    let log = allocate(reach.store).await.map_err(|e| match e {
+        AllocateError::Store(e) => Pass::Wait(Waiting::LogIdsStore(e)),
+        AllocateError::Unseeded { bootstrapper } => {
+            Pass::Wait(Waiting::LogIdsUnseeded { bootstrapper })
+        }
+        AllocateError::Refused(reason) => Pass::Fail(FormError::LogIds { group, reason }),
+    })?;
+    let formation = Formation::new(group, log, members, voter.voters).map_err(not_a_membership)?;
+    formation
+        .encode()
+        .map_err(|e| Pass::Wait(Waiting::Encode(e)))
 }
 
 /// Create the record; a record already there is the one the next pass reads.
@@ -606,5 +663,7 @@ async fn read(store: &Store, group: u32) -> Result<Option<Vec<u8>>, StoreError> 
         .unwrap_or_else(|e| Err(StoreError::Runtime(std::io::Error::other(e))))
 }
 
+#[cfg(test)]
+mod format_2_tests;
 #[cfg(test)]
 mod tests;

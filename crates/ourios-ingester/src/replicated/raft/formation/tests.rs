@@ -19,7 +19,7 @@ use crate::replicated::raft::cluster::{Cluster, Node, leader, write};
 use crate::replicated::raft::transport::{IdentifyError, Identity, Peers};
 use crate::replicated::raft::types::NodeId;
 
-const GROUP: u32 = 3;
+pub(super) const GROUP: u32 = 3;
 
 /// The record §6.1 shows, as written there.
 const RFC_EXAMPLE: &str = r#"{"format": 1, "group": 3, "members": [
@@ -36,25 +36,27 @@ const GOLDEN: &str = concat!(
 );
 
 /// The example's voters, in a placement order that is not the record's.
-const VOTERS: [&str; 3] = [
+pub(super) const VOTERS: [&str; 3] = [
     "ourios-receiver-2",
     "ourios-receiver-0",
     "ourios-receiver-4",
 ];
 
-const R0: &str = "0190d2a8-7c1e-7b3a-9f00-5e1c2d3a4b5c";
-const R2: &str = "0190d2a8-91f4-7c02-8a11-0c9d8e7f6a5b";
-const R4: &str = "0190d2a8-a3b7-7d4e-b622-1f2e3d4c5b6a";
+pub(super) const R0: &str = "0190d2a8-7c1e-7b3a-9f00-5e1c2d3a4b5c";
+pub(super) const R2: &str = "0190d2a8-91f4-7c02-8a11-0c9d8e7f6a5b";
+pub(super) const R4: &str = "0190d2a8-a3b7-7d4e-b622-1f2e3d4c5b6a";
 
-fn uuid(text: &str) -> NodeId {
+pub(super) fn uuid(text: &str) -> NodeId {
     NodeId::from(Uuid::parse_str(text).expect("a UUID"))
 }
 
-fn decode(json: &str) -> Result<Formation, Unreadable> {
+pub(super) fn decode(json: &str) -> Result<Formation, Unreadable> {
     Formation::decode(json.as_bytes(), GROUP, &VOTERS)
 }
 
 #[test]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            the_format_2_rfc_example_decodes_and_encodes_as_the_golden_bytes"]
 fn the_rfc_example_decodes_and_encodes_as_the_golden_bytes() {
     let formation = decode(RFC_EXAMPLE).expect("the RFC example is readable");
     assert_eq!(formation.group(), GROUP);
@@ -75,6 +77,8 @@ fn the_rfc_example_decodes_and_encodes_as_the_golden_bytes() {
 /// Members are written by `node_id` bytewise, whatever order the voters
 /// rank in, each replica as a lowercase hyphenated UUID.
 #[test]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            format_2_members_are_written_by_node_id_bytewise"]
 fn members_are_written_by_node_id_bytewise_with_lowercase_uuids() {
     let voters = ["b", "a", "B"];
     let replica = |n: u128| {
@@ -87,7 +91,7 @@ fn members_are_written_by_node_id_bytewise_with_lowercase_uuids() {
         ("a".to_owned(), replica(2)),
         ("B".to_owned(), replica(3)),
     ]);
-    let formation = Formation::new(7, members, &voters).expect("the voters' answers");
+    let formation = Formation::new(7, 0, members, &voters).expect("the voters' answers");
     let encoded = String::from_utf8(formation.encode().expect("encode")).expect("UTF-8");
     assert_eq!(
         encoded,
@@ -101,7 +105,7 @@ fn members_are_written_by_node_id_bytewise_with_lowercase_uuids() {
 }
 
 /// Receiver `n`'s member entry.
-fn member(n: u8, replica: &str) -> String {
+pub(super) fn member(n: u8, replica: &str) -> String {
     format!(r#"{{"node_id":"ourios-receiver-{n}","replica":"{replica}"}}"#)
 }
 
@@ -112,7 +116,7 @@ fn record_of(format: u8, group: u32, members: &[String]) -> String {
     )
 }
 
-fn assert_refused(cases: Vec<(&str, String, &str)>) {
+pub(super) fn assert_refused(cases: Vec<(&str, String, &str)>) {
     for (case, json, error_type) in cases {
         let refused = decode(&json).expect_err(case);
         assert_eq!(refused.error_type(), error_type, "{case}: {refused}");
@@ -122,6 +126,8 @@ fn assert_refused(cases: Vec<(&str, String, &str)>) {
 /// A record that does not parse, is truncated, or is another format's or
 /// another group's is refused with its reason.
 #[test]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            an_unparsable_or_foreign_format_2_record_is_refused_with_its_reason"]
 fn an_unparsable_or_foreign_record_is_refused_with_its_reason() {
     let all = [member(0, R0), member(2, R2), member(4, R4)];
     let truncated = &GOLDEN[..GOLDEN.len() - 3];
@@ -182,6 +188,8 @@ fn an_unparsable_or_foreign_record_is_refused_with_its_reason() {
 /// A record whose members are not exactly the voters, one UUID each in
 /// the canonical form, is refused with its reason.
 #[test]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            a_format_2_record_of_other_members_is_refused_with_its_reason"]
 fn a_record_of_other_members_is_refused_with_its_reason() {
     let m0 = member(0, R0);
     let m2 = member(2, R2);
@@ -232,6 +240,8 @@ fn a_record_of_other_members_is_refused_with_its_reason() {
 /// A record names a voter's replica, another one under its `node_id`, or
 /// not the voter at all.
 #[test]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            a_voter_stands_by_the_uuid_its_format_2_record_holds"]
 fn a_voter_stands_by_the_uuid_recorded_for_its_node_id() {
     let formation = decode(GOLDEN).expect("readable");
     let recorded = uuid(R0);
@@ -250,13 +260,13 @@ fn a_voter_stands_by_the_uuid_recorded_for_its_node_id() {
 #[test]
 fn answers_that_are_not_the_voters_are_not_a_formation() {
     let one = NodeId::from(Uuid::from_u128(1));
-    let other = Formation::new(GROUP, BTreeMap::from([("x".to_owned(), one)]), &VOTERS);
+    let other = Formation::new(GROUP, 0, BTreeMap::from([("x".to_owned(), one)]), &VOTERS);
     assert_eq!(
         other.map(|_| ()).map_err(|e| e.error_type()),
         Err("other_voters")
     );
     let shared = VOTERS.iter().map(|&v| (v.to_owned(), one)).collect();
-    let shared = Formation::new(GROUP, shared, &VOTERS);
+    let shared = Formation::new(GROUP, 0, shared, &VOTERS);
     assert_eq!(
         shared.map(|_| ()).map_err(|e| e.error_type()),
         Err("shared_replica")
@@ -264,7 +274,7 @@ fn answers_that_are_not_the_voters_are_not_a_formation() {
 }
 
 /// Peers that answer `Identify` from a table; the rest are unanswered.
-struct Answering(BTreeMap<String, NodeId>);
+pub(super) struct Answering(pub(super) BTreeMap<String, NodeId>);
 
 impl Identifier for Answering {
     fn identify(
@@ -280,12 +290,12 @@ impl Identifier for Answering {
     }
 }
 
-const PATIENCE: Patience = Patience {
+pub(super) const PATIENCE: Patience = Patience {
     identify: Duration::from_secs(2),
     retry: Duration::from_millis(20),
 };
 
-async fn recorded(store: &Store, group: u32) -> Option<Vec<u8>> {
+pub(super) async fn recorded(store: &Store, group: u32) -> Option<Vec<u8>> {
     match store.get(&formed_key(group)).await {
         Ok(bytes) => Some(bytes),
         Err(e) if e.is_not_found() => None,
@@ -294,7 +304,7 @@ async fn recorded(store: &Store, group: u32) -> Option<Vec<u8>> {
 }
 
 /// The example's first-ranked voter, receiver 2.
-const RECORDER: Voter<'static> = Voter {
+pub(super) const RECORDER: Voter<'static> = Voter {
     group: GROUP,
     voters: &VOTERS,
     node_id: "ourios-receiver-2",
@@ -303,6 +313,8 @@ const RECORDER: Voter<'static> = Voter {
 /// The first-ranked voter writes the record only once every other voter
 /// has answered, itself under its own UUID.
 #[tokio::test]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            the_record_holds_a_log_id_allocated_once_every_voter_answered"]
 async fn the_record_waits_for_every_voter_and_holds_each_answer() {
     let store = Store::in_memory();
     let one = Answering(BTreeMap::from([("ourios-receiver-0".to_owned(), uuid(R0))]));
@@ -341,11 +353,12 @@ async fn the_record_waits_for_every_voter_and_holds_each_answer() {
     );
 }
 
-fn waited_for(pass: &Pass) -> &'static str {
+pub(super) fn waited_for(pass: &Pass) -> &'static str {
     match pass {
         Pass::Wait(why) => why.as_str(),
         Pass::Recorded => "recorded",
         Pass::Done(_) => "done",
+        Pass::Fail(e) => e.error_type(),
     }
 }
 
@@ -378,6 +391,8 @@ async fn answers_under_one_uuid_are_not_recorded() {
 /// A record already there is kept: losing the create race is a pass that
 /// reads the winner next.
 #[tokio::test]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            a_record_already_there_is_kept_and_its_allocated_id_is_spent"]
 async fn a_record_already_there_is_kept() {
     let store = Store::in_memory();
     store
@@ -410,19 +425,19 @@ fn the_record_lives_beside_the_layout() {
 }
 
 /// The cluster's group-0 voters in placement order: every node votes.
-fn layout(cluster: &Cluster, size: usize) -> VotingLayout {
+pub(super) fn layout(cluster: &Cluster, size: usize) -> VotingLayout {
     let names = (0..size).map(|i| cluster.node(i).node_id().to_owned());
     VotingLayout::new(names, NonZeroU32::MIN, size)
 }
 
 /// The index of the node running as `node_id`.
-fn index_of(cluster: &Cluster, size: usize, node_id: &str) -> usize {
+pub(super) fn index_of(cluster: &Cluster, size: usize, node_id: &str) -> usize {
     (0..size)
         .find(|&i| cluster.node(i).node_id() == node_id)
         .expect("a node")
 }
 
-async fn form_on(
+pub(super) async fn form_on(
     peers: &Peers,
     node: &Node,
     voters: &[&str],
@@ -487,7 +502,7 @@ async fn a_voter_that_waits_reports_why_to_the_caller() {
     cluster.shutdown().await;
 }
 
-fn voter_ids(node: &Node) -> BTreeSet<NodeId> {
+pub(super) fn voter_ids(node: &Node) -> BTreeSet<NodeId> {
     let metrics = node.raft(0).metrics().borrow_watched().clone();
     metrics.membership_config.membership().voter_ids().collect()
 }
@@ -495,6 +510,8 @@ fn voter_ids(node: &Node) -> BTreeSet<NodeId> {
 /// Three fresh voters form one group from the record and elect a leader;
 /// every voter holds exactly the recorded membership.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            three_fresh_voters_form_one_group_under_one_log_id"]
 async fn three_fresh_voters_form_one_group_from_the_record() {
     let cluster = Cluster::start_unformed(3, &[0]).await;
     let store = Store::in_memory();
@@ -540,7 +557,7 @@ async fn three_fresh_voters_form_one_group_from_the_record() {
 /// Have the first-ranked voter record the membership, then restart it on
 /// an empty volume before it initializes. Returns its index, its old UUID
 /// and the record.
-async fn record_then_wipe(
+pub(super) async fn record_then_wipe(
     cluster: &mut Cluster,
     store: &Store,
     voters: &[&str],
@@ -578,6 +595,8 @@ async fn record_then_wipe(
 /// a new UUID, never initializes. (Its join by replacement is the rejoin
 /// arm, `rfc0065_24_a_wiped_voter_rejoins_under_a_new_identity`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            rfc0065_24_a_format_2_formation_interrupted_by_a_wiped_voter_still_forms_once"]
 async fn rfc0065_24_a_formation_interrupted_by_a_wiped_voter_still_forms_once() {
     let mut cluster = Cluster::start_unformed(3, &[0]).await;
     let store = Store::in_memory();
@@ -639,6 +658,8 @@ async fn rfc0065_24_a_formation_interrupted_by_a_wiped_voter_still_forms_once() 
 /// nothing, and each voter reports why. The whole record, untruncated,
 /// would form the group, so only the cut makes it unreadable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: formed.json is format 2 with a log id (RFC 0065 §6.1); see \
+            rfc0065_24_an_unreadable_format_2_record_forms_nothing"]
 async fn rfc0065_24_an_unreadable_formation_record_forms_nothing() {
     let cluster = Cluster::start_unformed(3, &[0]).await;
     let store = Store::in_memory();

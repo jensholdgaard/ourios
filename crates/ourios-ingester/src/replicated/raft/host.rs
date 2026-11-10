@@ -18,7 +18,7 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
 use super::gate::SyncGate;
-use super::log_store::{GroupLog, GroupLogReader, group_dir};
+use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
 use super::state_machine::GroupSm;
 use super::telemetry::{Meters, ReplicationTelemetry};
 use super::transport::{Peers, ReplicationServer};
@@ -113,8 +113,11 @@ impl Launch<'_> {
             ..self.spec.wal.clone()
         };
         let (votes, gate) = (self.votes.clone(), Arc::clone(&self.gate));
-        let storage = self.meters.storage();
-        let mut log = blocking(move || GroupLog::open_with(wal, group, votes, gate, storage))
+        let disk = Disk {
+            gate,
+            storage: self.meters.storage(),
+        };
+        let mut log = blocking(move || GroupLog::open_with(wal, group, votes, disk))
             .await
             .map_err(|source| HostError::Log { group, source })?;
         let reader = log.get_log_reader().await;

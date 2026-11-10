@@ -39,7 +39,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::impls::leader_id_std::LeaderId;
 use tokio::sync::oneshot;
@@ -236,6 +236,8 @@ impl VoteLog {
         let file = OpenOptions::new().append(true).open(&path)?;
         let latest: Latest = Arc::new(Mutex::new(latest));
         let hosted = Hosted::default();
+        // Unbounded: each group waits for its vote to be saved before its
+        // next one, so the queue holds at most one request per group.
         let (tx, rx) = mpsc::channel();
         let writer = Writer {
             file,
@@ -482,6 +484,21 @@ struct Stops {
     hosted: Hosted,
 }
 
+impl Stops {
+    /// Time a write-and-fsync that began at `started`; a failure, always
+    /// the writer's first, also stops every hosted group.
+    fn timed(&self, started: Instant, done: io::Result<()>) -> io::Result<()> {
+        let failed = done.as_ref().err().map(io::Error::kind);
+        let elapsed = started.elapsed();
+        self.storage.synced(Component::VoteLog, elapsed, failed);
+        if let Err(e) = &done {
+            let groups: Vec<u32> = lock(&self.hosted).iter().copied().collect();
+            self.storage.stopped(Component::VoteLog, &groups, e);
+        }
+        done
+    }
+}
+
 impl Writer {
     fn run(mut self, rx: &Receiver<Request>) {
         while let Ok(first) = rx.recv() {
@@ -516,6 +533,7 @@ impl Writer {
                 "the vote log failed earlier: {reason}"
             )));
         }
+        let started = Instant::now();
         let mut bytes = Vec::new();
         let records = batch.iter().map(|r| encode(r.group, &r.vote));
         let len = lay_out(&mut bytes, self.len, records);
@@ -525,7 +543,7 @@ impl Writer {
         else {
             return Flush::Crashed;
         };
-        match synced {
+        match self.stops.timed(started, synced) {
             Ok(()) => {
                 self.len = len;
                 Flush::Done
@@ -542,12 +560,15 @@ impl Writer {
         if self.len as u64 <= self.rewrite_bytes {
             return true;
         }
+        let started = Instant::now();
         let gate = Arc::clone(&self.gate);
         let Some(rewritten) = sync_through(&gate, || self.rewrite()) else {
             return false;
         };
-        if let Err(e) = rewritten {
-            self.failed = Some(format!("rewrite {VOTES_FILE}: {e}"));
+        let rewritten =
+            rewritten.map_err(|e| io::Error::new(e.kind(), format!("rewrite {VOTES_FILE}: {e}")));
+        if let Err(e) = self.stops.timed(started, rewritten) {
+            self.failed = Some(e.to_string());
         }
         true
     }

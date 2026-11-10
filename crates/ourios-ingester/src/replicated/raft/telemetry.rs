@@ -154,18 +154,31 @@ impl FlusherCounts {
     }
 }
 
-/// The storage writer a signal is about.
+/// The storage writer a signal is about: a group's log store, or the
+/// node's vote log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Component {
-    LogStore,
+    LogStore(u32),
     VoteLog,
 }
 
 impl Component {
     fn as_str(self) -> &'static str {
         match self {
-            Self::LogStore => "log_store",
+            Self::LogStore(_) => "log_store",
             Self::VoteLog => "vote_log",
+        }
+    }
+
+    fn kv(self) -> KeyValue {
+        KeyValue::new(semconv::OURIOS_WAL_REPLICATION_COMPONENT, self.as_str())
+    }
+
+    /// Its attributes on a sync: the log store's group with it.
+    fn attributes(self) -> Vec<KeyValue> {
+        match self {
+            Self::LogStore(group) => vec![self.kv(), group_kv(group)],
+            Self::VoteLog => vec![self.kv()],
         }
     }
 }
@@ -198,27 +211,53 @@ impl Storage {
         }
     }
 
-    /// One write-and-fsync by `component`, of `group` for the log store,
-    /// taking `elapsed` and failing with `failed`.
+    /// One write-and-fsync by `component`, taking `elapsed` and failing
+    /// with `failed`.
     pub(crate) fn synced(
         &self,
         component: Component,
-        group: Option<u32>,
         elapsed: Duration,
         failed: Option<io::ErrorKind>,
     ) {
-        let _ = (component, group, elapsed, failed, &self.syncs);
+        let mut attributes = component.attributes();
+        attributes.extend(failed.map(error_kv));
+        self.syncs.record(elapsed.as_secs_f64(), &attributes);
     }
 
-    /// `component` stopped serving `group` on an error of `kind`.
-    pub(crate) fn stopped(&self, component: Component, group: u32, kind: io::ErrorKind) {
-        let _ = (component, group, kind, &self.stops);
+    /// `component` failed with `error` and stopped serving `groups`: logged
+    /// once, and counted once per group.
+    pub(crate) fn stopped(&self, component: Component, groups: &[u32], error: &io::Error) {
+        let error_type = error_type(error.kind());
+        tracing::error!(
+            {
+                { semconv::OURIOS_WAL_REPLICATION_COMPONENT } = component.as_str(),
+                { crate::metrics::ERROR_TYPE } = error_type.as_str(),
+            },
+            "the replicated WAL's {} stopped groups {groups:?} until the node restarts: {error}",
+            component.as_str(),
+        );
+        for &group in groups {
+            let attributes = [component.kv(), group_kv(group), error_kv(error.kind())];
+            self.stops.add(1, &attributes);
+        }
     }
+}
+
+fn error_kv(kind: io::ErrorKind) -> KeyValue {
+    KeyValue::new(crate::metrics::ERROR_TYPE, error_type(kind))
 }
 
 /// `kind` as `error.type`: its name in snake case.
 pub(super) fn error_type(kind: io::ErrorKind) -> String {
-    format!("{kind:?}")
+    let name = format!("{kind:?}");
+    let mut snake = String::with_capacity(name.len() + 4);
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            snake.push('_');
+        }
+        snake.push(c.to_ascii_lowercase());
+    }
+    snake
 }
 
 /// A counter's name, description and unit.

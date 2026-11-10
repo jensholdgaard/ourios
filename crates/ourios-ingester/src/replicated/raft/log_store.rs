@@ -21,6 +21,7 @@ use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
 use openraft::{EntryPayload, OptionalSend};
@@ -36,7 +37,7 @@ use super::mining::GroupLogRead;
 use super::telemetry::{Component, Storage, Takeovers};
 use super::types::{Entry, GroupEntry, LogId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
-use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership, writer_gone};
+use super::{Flush, OWNER_WAIT, Owner, WalFailure as _, sync_through, take_ownership, writer_gone};
 
 /// The group's ownership lock, inside its WAL root (the WAL reads only
 /// `*.wal` names there).
@@ -320,6 +321,13 @@ impl Command {
     }
 }
 
+/// How a group log's writer reaches the disk: through the test gate, timing
+/// each write-and-fsync on `storage`.
+pub(super) struct Disk {
+    pub(super) gate: Arc<SyncGate>,
+    pub(super) storage: Storage,
+}
+
 /// `RaftLogStorage` for one group: its only writer. It is not `Clone`,
 /// and every write takes `&mut self`, so writes reach the WAL thread in
 /// the order they change the index; readers come from
@@ -370,15 +378,18 @@ impl GroupLog {
     /// The WAL cannot be opened or replayed, or holds a record this
     /// build cannot read or a log with a hole.
     pub fn open(wal: WalConfig, group: u32, votes: VoteLog) -> io::Result<Self> {
-        Self::open_with(wal, group, votes, Arc::default(), Storage::global())
+        let disk = Disk {
+            gate: Arc::default(),
+            storage: Storage::global(),
+        };
+        Self::open_with(wal, group, votes, disk)
     }
 
     pub(super) fn open_with(
         wal: WalConfig,
         group: u32,
         votes: VoteLog,
-        gate: Arc<SyncGate>,
-        storage: Storage,
+        Disk { gate, storage }: Disk,
     ) -> io::Result<Self> {
         if votes.latest(group).is_some() && !holds_segments(&wal.root)? {
             return Err(lost(&wal.root));
@@ -392,12 +403,17 @@ impl GroupLog {
         // node's `votes.lock` outlives every group writer.
         let owner = take_ownership(&wal.root.join(GROUP_LOCK_FILE), OWNER_WAIT, "group log")?;
         let (wal, index, recovered) = recover(wal, &gate)?;
+        votes.host(group);
+        // Unbounded: a queued command carries frames of entries the index
+        // already holds in memory, so the queue grows no faster than it.
         let (tx, rx) = mpsc::channel();
         #[cfg(test)]
         let hooks_gate = Arc::clone(&gate);
         let writer = Writer {
             wal,
             failed: None,
+            group,
+            storage,
             gate,
             _owner: owner,
             _votes: votes.clone(),
@@ -628,6 +644,8 @@ struct Writer {
     /// Set by the first failed append or sync: the WAL's tail is then
     /// unknown, so every later command fails.
     failed: Option<String>,
+    group: u32,
+    storage: Storage,
     gate: Arc<SyncGate>,
     /// Both released when the thread exits; see [`GroupLog::open`].
     _owner: Owner,
@@ -658,24 +676,31 @@ impl Writer {
                 "the group WAL failed earlier: {reason}"
             )));
         }
+        let started = Instant::now();
         for frame in batch.iter().flat_map(Command::frames) {
             if let Err(e) = self.wal.append(FrameKind::ReplicatedEntry, frame) {
-                return self.fail(&e);
+                return self.fail(started, e.to_io());
             }
         }
         if !batch.iter().any(Command::needs_sync) {
             return Flush::Done;
         }
         let wal = &mut self.wal;
-        let sync = || wal.sync().map_err(|e| io::Error::other(e.to_string()));
+        let sync = || wal.sync().map_err(|e| e.to_io());
         match sync_through(&self.gate, sync) {
             None => Flush::Crashed,
             Some(Ok(offset)) => {
                 self.record_synced(offset);
+                let elapsed = started.elapsed();
+                self.storage.synced(self.component(), elapsed, None);
                 Flush::Done
             }
-            Some(Err(e)) => self.fail(&e),
+            Some(Err(e)) => self.fail(started, e),
         }
+    }
+
+    fn component(&self) -> Component {
+        Component::LogStore(self.group)
     }
 
     #[cfg(test)]
@@ -687,10 +712,15 @@ impl Writer {
     #[allow(clippy::unused_self)] // the test build records the offset for its crash model
     fn record_synced(&self, _: WalOffset) {}
 
-    fn fail(&mut self, e: &impl std::fmt::Display) -> Flush {
-        let reason = e.to_string();
-        self.failed = Some(reason.clone());
-        Flush::Failed(io::Error::other(reason))
+    /// The first failure: timed, logged, counted as the group's stop, and
+    /// latched.
+    fn fail(&mut self, started: Instant, e: io::Error) -> Flush {
+        let elapsed = started.elapsed();
+        self.storage
+            .synced(self.component(), elapsed, Some(e.kind()));
+        self.storage.stopped(self.component(), &[self.group], &e);
+        self.failed = Some(e.to_string());
+        Flush::Failed(e)
     }
 }
 
@@ -728,17 +758,17 @@ pub(super) mod test_hooks {
             votes: VoteLog,
             gate: Arc<SyncGate>,
         ) -> io::Result<Self> {
-            Self::open_with(wal, group, votes, gate, Storage::global())
+            let storage = Storage::global();
+            Self::open_with(wal, group, votes, Disk { gate, storage })
         }
 
         pub(in crate::replicated::raft) fn open_metered(
             wal: WalConfig,
             group: u32,
             votes: VoteLog,
-            gate: Arc<SyncGate>,
-            storage: Storage,
+            disk: Disk,
         ) -> io::Result<Self> {
-            Self::open_with(wal, group, votes, gate, storage)
+            Self::open_with(wal, group, votes, disk)
         }
 
         /// Stop the writer once every command it holds is done; no other

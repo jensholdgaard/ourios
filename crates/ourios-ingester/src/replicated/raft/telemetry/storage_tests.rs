@@ -15,7 +15,7 @@ use super::{Meters, error_type};
 use crate::replicated::raft::cluster::wal_config;
 use crate::replicated::raft::codec::raft_id;
 use crate::replicated::raft::gate::SyncGate;
-use crate::replicated::raft::log_store::{GroupLog, group_dir};
+use crate::replicated::raft::log_store::{Disk, GroupLog, group_dir};
 use crate::replicated::raft::types::{Entry, NodeId, RaftTypes, TenantBatchBytes, Vote};
 use crate::replicated::raft::vote_log::{self, VoteLog};
 
@@ -75,15 +75,20 @@ async fn a_failed_group_log_fsync_is_timed_once_and_stops_the_group_once() {
     let reader = Reader::new();
     let gate = Arc::new(SyncGate::default());
     let config = wal_config(&group_dir(dir.path(), 3));
-    let storage = Meters::on(&reader.meter()).storage();
-    let mut log = GroupLog::open_metered(config, 3, votes, Arc::clone(&gate), storage)
-        .expect("group log");
+    let disk = Disk {
+        gate: Arc::clone(&gate),
+        storage: Meters::on(&reader.meter()).storage(),
+    };
+    let mut log = GroupLog::open_metered(config, 3, votes, disk).expect("group log");
     append(&mut log, 0).await.expect("fsynced");
     gate.fail();
     assert!(append(&mut log, 1).await.is_err(), "the fsync failed");
     assert!(append(&mut log, 2).await.is_err(), "refused after it");
 
-    let timed = [point(["3", "log_store"]), point(["other", "3", "log_store"])];
+    let timed = [
+        point(["3", "log_store"]),
+        point(["other", "3", "log_store"]),
+    ];
     assert_eq!(reader.counts(SYNCS), timed);
     let stops = [point(["other", "3", "log_store"])];
     assert_eq!(reader.points(STOPS), stops);
@@ -102,7 +107,7 @@ async fn a_failed_vote_log_fsync_stops_every_group_it_hosts() {
     assert!(votes.save(2, vote(1)).await.is_err(), "the fsync failed");
     assert!(votes.save(1, vote(2)).await.is_err(), "refused after it");
 
-    let timed = [point(["vote_log"]), point(["other", "vote_log"])];
+    let timed = [point(["other", "vote_log"]), point(["vote_log"])];
     assert_eq!(reader.counts(SYNCS), timed);
     let mut stops = reader.points(STOPS);
     stops.sort();
@@ -125,7 +130,7 @@ async fn a_failed_vote_log_rewrite_is_timed_and_stops_the_groups() {
     saved.expect("answered before the rewrite");
     assert!(votes.save(4, vote(2)).await.is_err(), "refused after it");
 
-    let timed = [point(["vote_log"]), point(["other", "vote_log"])];
+    let timed = [point(["other", "vote_log"]), point(["vote_log"])];
     assert_eq!(reader.counts(SYNCS), timed);
     assert_eq!(reader.points(STOPS), [point(["other", "4", "vote_log"])]);
 }

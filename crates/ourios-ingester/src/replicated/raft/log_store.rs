@@ -32,6 +32,7 @@ use tokio::sync::oneshot;
 use super::codec::{self, Replayed};
 pub use super::controls::{HeldControls, LogControls};
 use super::gate::SyncGate;
+use super::mining::GroupLogRead;
 use super::telemetry::Takeovers;
 use super::types::{Entry, GroupEntry, LogId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
@@ -502,6 +503,12 @@ impl RaftLogReader<RaftTypes> for GroupLogReader {
 
     async fn read_vote(&mut self) -> Result<Option<Vote>, io::Error> {
         Ok(self.votes.latest(self.group))
+    }
+}
+
+impl GroupLogRead for GroupLogReader {
+    fn entry(&self, index: u64) -> Option<Entry> {
+        lock_index(&self.index).entries.get(&index).cloned()
     }
 }
 

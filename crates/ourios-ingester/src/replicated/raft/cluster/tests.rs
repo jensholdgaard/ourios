@@ -12,7 +12,8 @@ use tokio::task::JoinHandle;
 use openraft::type_config::alias::StoredMembershipOf;
 
 use super::super::host::HostError;
-use super::super::snapshot_record::{GroupSnapshot, IdBlock};
+use super::super::miner_config::body_of;
+use super::super::snapshot_record::{GroupMinerConfig, GroupSnapshot, IdBlock};
 use super::super::types::{Entry, GroupEntry, LogId};
 use super::{
     Cluster, GroupHost, GroupRaft, HostSpec, NodeId, Peers, RaftTypes, Replica, WAIT, batch,
@@ -208,11 +209,7 @@ async fn a_crashed_follower_restarts_from_its_fsynced_log_and_catches_up() {
 }
 
 /// A checkpoint entry proposed by `proposer` with its cut at `cut`, where
-/// the log's highest kind is the flusher assignment's.
-fn checkpoint(proposer: NodeId, cut: &Entry) -> GroupEntry {
-    checkpoint_of_kind(proposer, cut, 1)
-}
-
+/// the log's highest kind is `highest_kind`.
 fn checkpoint_of_kind(proposer: NodeId, cut: &Entry, highest_kind: u8) -> GroupEntry {
     GroupEntry::Control(ourios_wal::Control::Checkpoint {
         proposer: *proposer.uuid().as_bytes(),
@@ -270,7 +267,34 @@ type GroupView = (Option<NodeId>, StoredMembershipOf<RaftTypes>);
 /// cut installs the snapshot and ends as one that applied the whole log,
 /// and a restart reopens from the snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: a cut needs a miner configuration in force (RFC 0065 §6.5); see \
+            a_checkpoint_snapshots_the_configured_group_at_its_cut_for_every_replica, #1246"]
 async fn a_checkpoint_snapshots_the_group_at_its_cut_for_every_replica() {
+    snapshots_the_group_at_its_cut_for_every_replica(None, 1).await;
+}
+
+/// As above, with the first miner configuration applied before the cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_snapshots_the_configured_group_at_its_cut_for_every_replica() {
+    let snapshot = snapshots_the_group_at_its_cut_for_every_replica(Some(configured()), 4).await;
+    let config = GroupMinerConfig::new(default_config()).expect("valid");
+    assert_eq!(snapshot.state.miner_config, Some(config));
+}
+
+fn default_config() -> ourios_wal::MinerConfigV1 {
+    body_of(&ourios_config::MinerConfig::default())
+}
+
+fn configured() -> GroupEntry {
+    GroupEntry::Control(ourios_wal::Control::MinerConfig(default_config()))
+}
+
+/// Run the scenario above, proposing `configuration` after the first
+/// assignment, and return the checkpoint's snapshot.
+async fn snapshots_the_group_at_its_cut_for_every_replica(
+    configuration: Option<GroupEntry>,
+    highest_kind: u8,
+) -> GroupSnapshot {
     let mut cluster = Cluster::start_with_tail(3, 1, &[GROUP]).await;
     let leader = cluster.leader(GROUP, None).await;
     let (lagging, voter) = ((leader + 1) % 3, (leader + 2) % 3);
@@ -278,6 +302,9 @@ async fn a_checkpoint_snapshots_the_group_at_its_cut_for_every_replica() {
     let (first, second, learner) = (cluster.id(leader), cluster.id(voter), cluster.id(3));
     let raft = cluster.node(leader).raft(GROUP);
     propose(raft, assign(first)).await;
+    if let Some(configuration) = configuration {
+        propose(raft, configuration).await;
+    }
     let cut = entry_at(&cluster, leader, commit(&cluster, leader, 0..2).await).await;
     let sm = cluster
         .node(leader)
@@ -290,8 +317,12 @@ async fn a_checkpoint_snapshots_the_group_at_its_cut_for_every_replica() {
         .await
         .expect("learner added");
     let not_the_flusher = entry_at(&cluster, leader, reassigned).await;
-    propose(raft, checkpoint(first, &not_the_flusher)).await;
-    propose(raft, checkpoint(second, &cut)).await;
+    propose(
+        raft,
+        checkpoint_of_kind(first, &not_the_flusher, highest_kind),
+    )
+    .await;
+    propose(raft, checkpoint_of_kind(second, &cut, highest_kind)).await;
     let last = commit(&cluster, leader, 2..4).await;
 
     let (snapshot, whole_log) = group_on(&cluster, leader, (last, cut.log_id)).await;
@@ -303,7 +334,7 @@ async fn a_checkpoint_snapshots_the_group_at_its_cut_for_every_replica() {
     assert_eq!(snapshot.meta.last_membership, membership_at_cut);
     assert_eq!(
         (snapshot.state.flusher, snapshot.state.highest_kind),
-        (Some(first), 1)
+        (Some(first), highest_kind)
     );
     assert_eq!(whole_log.0, Some(second));
     assert!(whole_log.1.nodes().any(|(&id, _)| id == learner));
@@ -325,10 +356,11 @@ async fn a_checkpoint_snapshots_the_group_at_its_cut_for_every_replica() {
     let reopened = group_on(&cluster, leader, (last, cut.log_id)).await;
     assert_eq!(
         reopened,
-        (snapshot, whole_log),
+        (snapshot.clone(), whole_log),
         "reopened from the snapshot"
     );
     cluster.shutdown().await;
+    snapshot
 }
 
 fn id_block((after, through): (u64, u64)) -> GroupEntry {
@@ -346,7 +378,22 @@ fn id_block_on(cluster: &Cluster, i: usize) -> Option<IdBlock> {
 /// latest block as one that applied the whole log, ignoring the blocks
 /// below `(0, 100]` though that block's entry was purged before it ran.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: a cut needs a miner configuration in force (RFC 0065 §6.5); see \
+            a_checkpoint_carries_the_id_block_in_force_at_its_configured_cut, #1246"]
 async fn a_checkpoint_carries_the_id_block_in_force_at_its_cut() {
+    carries_the_id_block_in_force_at_its_cut(None, 3).await;
+}
+
+/// As above, with the first miner configuration applied before the cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_carries_the_id_block_in_force_at_its_configured_cut() {
+    carries_the_id_block_in_force_at_its_cut(Some(configured()), 4).await;
+}
+
+async fn carries_the_id_block_in_force_at_its_cut(
+    configuration: Option<GroupEntry>,
+    highest_kind: u8,
+) {
     let mut cluster = Cluster::start(3, &[GROUP]).await;
     let leader = cluster.leader(GROUP, None).await;
     let (lagging, voter) = ((leader + 1) % 3, (leader + 2) % 3);
@@ -355,11 +402,14 @@ async fn a_checkpoint_carries_the_id_block_in_force_at_its_cut() {
     let raft = cluster.node(leader).raft(GROUP);
     propose(raft, assign(flusher)).await;
     propose(raft, id_block((0, 100))).await;
+    if let Some(configuration) = configuration {
+        propose(raft, configuration).await;
+    }
     let cut = entry_at(&cluster, leader, commit(&cluster, leader, 0..2).await).await;
     for block in [(0, 50), (50, 150), (100, 200)] {
         propose(raft, id_block(block)).await;
     }
-    propose(raft, checkpoint_of_kind(flusher, &cut, 3)).await;
+    propose(raft, checkpoint_of_kind(flusher, &cut, highest_kind)).await;
     let last = commit(&cluster, leader, 2..4).await;
 
     let (snapshot, _) = group_on(&cluster, leader, (last, cut.log_id)).await;

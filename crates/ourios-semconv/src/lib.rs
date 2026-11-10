@@ -838,6 +838,25 @@ pub const OURIOS_WAL_REPLICATION_LAG_DESCRIPTION: &str = "Log entries a replicat
 /// `ourios.wal.replication.lag` unit (UCUM).
 pub const OURIOS_WAL_REPLICATION_LAG_UNIT: &str = "{entry}";
 
+/// `ourios.wal.replication.stops` (counter, unit `{stop}`).
+pub const OURIOS_WAL_REPLICATION_STOPS: &str = "ourios.wal.replication.stops";
+
+/// `ourios.wal.replication.stops` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_STOPS_DESCRIPTION: &str =
+    "Times a part of a replication group stopped on an error it does not recover from by itself.";
+
+/// `ourios.wal.replication.stops` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_STOPS_UNIT: &str = "{stop}";
+
+/// `ourios.wal.replication.sync.duration` (histogram, unit `s`).
+pub const OURIOS_WAL_REPLICATION_SYNC_DURATION: &str = "ourios.wal.replication.sync.duration";
+
+/// `ourios.wal.replication.sync.duration` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_SYNC_DURATION_DESCRIPTION: &str = "Wall-clock time for a replicated WAL storage writer to write one batch of queued commands and fsync it.";
+
+/// `ourios.wal.replication.sync.duration` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_SYNC_DURATION_UNIT: &str = "s";
+
 /// `ourios.wal.replication.takeovers` (counter, unit `{takeover}`).
 pub const OURIOS_WAL_REPLICATION_TAKEOVERS: &str = "ourios.wal.replication.takeovers";
 
@@ -1150,6 +1169,9 @@ pub const OURIOS_WAL_RECOVERY_TAIL_SHAPE: &str = "ourios.wal.recovery.tail.shape
 
 /// `ourios.wal.replica` attribute key.
 pub const OURIOS_WAL_REPLICA: &str = "ourios.wal.replica";
+
+/// `ourios.wal.replication.component` attribute key.
+pub const OURIOS_WAL_REPLICATION_COMPONENT: &str = "ourios.wal.replication.component";
 
 /// `ourios.wal.replication.control.hold.reason` attribute key.
 pub const OURIOS_WAL_REPLICATION_CONTROL_HOLD_REASON: &str =

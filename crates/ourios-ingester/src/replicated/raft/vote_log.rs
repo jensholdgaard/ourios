@@ -94,8 +94,6 @@ impl Default for Options {
 }
 
 type Latest = Arc<Mutex<HashMap<u32, Vote>>>;
-/// The groups whose logs the node opened over this vote log.
-type Hosted = Arc<Mutex<BTreeSet<u32>>>;
 
 struct Request {
     group: u32,
@@ -168,7 +166,7 @@ fn lost(path: &Path) -> io::Error {
 pub struct VoteLog {
     tx: Sender<Request>,
     latest: Latest,
-    hosted: Hosted,
+    stops: Arc<Stops>,
 }
 
 impl VoteLog {
@@ -208,7 +206,7 @@ impl VoteLog {
     /// Note that `group`'s log is open over this vote log, so a failure
     /// of the vote log counts as a stop of the group.
     pub(super) fn host(&self, group: u32) {
-        lock(&self.hosted).insert(group);
+        self.stops.host(group);
     }
 
     fn open_with(wal_root: &Path, options: Options) -> io::Result<Self> {
@@ -235,7 +233,10 @@ impl VoteLog {
         };
         let file = OpenOptions::new().append(true).open(&path)?;
         let latest: Latest = Arc::new(Mutex::new(latest));
-        let hosted = Hosted::default();
+        let stops = Arc::new(Stops {
+            storage,
+            hosting: Mutex::default(),
+        });
         // Unbounded: each group waits for its vote to be saved before its
         // next one, so the queue holds at most one request per group.
         let (tx, rx) = mpsc::channel();
@@ -247,16 +248,13 @@ impl VoteLog {
             latest: Arc::clone(&latest),
             failed: None,
             gate,
-            stops: Stops {
-                storage,
-                hosted: Arc::clone(&hosted),
-            },
+            stops: Arc::clone(&stops),
             _owner: owner,
         };
         std::thread::Builder::new()
             .name("ourios-votes".to_owned())
             .spawn(move || writer.run(&rx))?;
-        Ok(Self { tx, latest, hosted })
+        Ok(Self { tx, latest, stops })
     }
 
     /// The group's latest durable vote.
@@ -472,7 +470,7 @@ struct Writer {
     /// unknown, so every later save fails.
     failed: Option<String>,
     gate: Arc<SyncGate>,
-    stops: Stops,
+    stops: Arc<Stops>,
     /// Released when the thread exits; see [`VoteLog::open`].
     _owner: Owner,
 }
@@ -481,10 +479,28 @@ struct Writer {
 /// stops.
 struct Stops {
     storage: Storage,
-    hosted: Hosted,
+    hosting: Mutex<Hosting>,
+}
+
+/// The groups whose logs the node opened over the vote log, and the kind
+/// of its failure once it has failed: under one lock, so a group that
+/// registers while the writer fails is counted exactly once.
+#[derive(Default)]
+struct Hosting {
+    groups: BTreeSet<u32>,
+    failed: Option<io::ErrorKind>,
 }
 
 impl Stops {
+    /// Register `group`; if the vote log has already failed, the group is
+    /// stopped now.
+    fn host(&self, group: u32) {
+        let mut hosting = lock(&self.hosting);
+        if let (true, Some(kind)) = (hosting.groups.insert(group), hosting.failed) {
+            self.storage.also_stopped(Component::VoteLog, group, kind);
+        }
+    }
+
     /// Time a write-and-fsync that began at `started`; a failure, always
     /// the writer's first, also stops every hosted group.
     fn timed(&self, started: Instant, done: io::Result<()>) -> io::Result<()> {
@@ -492,7 +508,9 @@ impl Stops {
         let elapsed = started.elapsed();
         self.storage.synced(Component::VoteLog, elapsed, failed);
         if let Err(e) = &done {
-            let groups: Vec<u32> = lock(&self.hosted).iter().copied().collect();
+            let mut hosting = lock(&self.hosting);
+            hosting.failed = Some(e.kind());
+            let groups: Vec<u32> = hosting.groups.iter().copied().collect();
             self.storage.stopped(Component::VoteLog, &groups, e);
         }
         done

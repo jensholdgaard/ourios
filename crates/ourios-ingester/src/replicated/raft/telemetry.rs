@@ -237,9 +237,15 @@ impl Storage {
             component.as_str(),
         );
         for &group in groups {
-            let attributes = [component.kv(), group_kv(group), error_kv(error.kind())];
-            self.stops.add(1, &attributes);
+            self.also_stopped(component, group, error.kind());
         }
+    }
+
+    /// `component`, already stopped on an error of `kind`, stops `group`
+    /// as well: counted, not logged again.
+    pub(crate) fn also_stopped(&self, component: Component, group: u32, kind: io::ErrorKind) {
+        let attributes = [component.kv(), group_kv(group), error_kv(kind)];
+        self.stops.add(1, &attributes);
     }
 }
 

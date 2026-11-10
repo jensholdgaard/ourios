@@ -39,18 +39,18 @@ fn rfc0065_24_a_formation_interrupted_by_a_wiped_voter_rejoins_by_replacement() 
     );
 }
 
-/// Scenario RFC0065.24 — the log-id arm (B13). The group's `formed.json`
-/// is format 2 and records a log id allocated from `log_ids.json`, which
-/// every replica writes as `ingest_group`.
+/// Scenario RFC0065.24 — the log-id arm (B13), the `ingest_group` half.
+/// The record half is `replicated::raft::formation::format_2_tests::
+/// rfc0065_24_the_formation_record_carries_the_groups_log_id`: a format-2
+/// `formed.json` carrying a log id allocated from `log_ids.json`; an id
+/// allocated and never recorded, standing in for a recording voter killed
+/// between the allocation and its write, followed by a recorded later id;
+/// two groups recorded under distinct ids; and a format-1 record forming
+/// nothing.
 #[test]
-#[ignore = "RFC0065.24 stub — the log-id arm, implemented with log ids"]
+#[ignore = "RFC0065.24 stub — the ingest_group half, implemented with publication"]
 fn rfc0065_24_the_formation_record_carries_the_groups_log_id() {
-    todo!(
-        "RFC0065.24 — formed.json is format 2 with a log id from log_ids.json, every \
-         replica writes it as ingest_group, a recording voter killed between the \
-         allocation and its write records a later id and no id is recorded twice, and a \
-         format-1 record forms nothing"
-    );
+    todo!("RFC0065.24 — every replica of the group writes the recorded log id as ingest_group");
 }
 
 /// Scenario RFC0065.24 — the unreadable-disk arm (B4, B6). A node whose

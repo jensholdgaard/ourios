@@ -18,13 +18,13 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::host::GroupRaft;
-use super::log_ids::Refused;
+use super::log_ids::{AllocateError, Refused, allocate};
 use super::transport::{IdentifyError, Identity, Peers};
 use super::types::{NodeId, RaftTypes};
 
 /// The record format this build reads and writes; a reader refuses every
 /// other one.
-pub const FORMED_FORMAT: u32 = 1;
+pub const FORMED_FORMAT: u32 = 2;
 
 /// The key, under the store root, of `group`'s formation record.
 #[must_use]
@@ -46,6 +46,7 @@ pub struct Formation {
 struct Record {
     format: u32,
     group: u32,
+    log: u32,
     members: Vec<RecordMember>,
 }
 
@@ -69,14 +70,12 @@ impl Formation {
         members: BTreeMap<String, NodeId>,
         voters: &[&str],
     ) -> Result<Self, Unreadable> {
-        let formation = Self {
+        check_membership(&members, voters)?;
+        Ok(Self {
             group,
             log,
             members,
-        };
-        formation.check_voters(formation.members.keys().cloned().collect(), voters)?;
-        formation.check_replicas()?;
-        Ok(formation)
+        })
     }
 
     #[must_use]
@@ -123,6 +122,7 @@ impl Formation {
         serde_json::to_vec(&Record {
             format: FORMED_FORMAT,
             group: self.group,
+            log: self.log,
             members,
         })
     }
@@ -159,14 +159,13 @@ impl Formation {
             .into_iter()
             .map(|m| Ok((m.node_id, replica(&m.replica)?)))
             .collect::<Result<BTreeMap<_, _>, Unreadable>>()?;
-        let formation = Self {
+        check_voters(&members, recorded, voters)?;
+        check_replicas(&members)?;
+        Ok(Self {
             group,
-            log: 0,
+            log: record.log,
             members,
-        };
-        formation.check_voters(recorded, voters)?;
-        formation.check_replicas()?;
-        Ok(formation)
+        })
     }
 
     /// Where `node_id`, running as `replica`, stands in the record.
@@ -178,28 +177,37 @@ impl Formation {
             None => None,
         }
     }
+}
 
-    fn check_voters(&self, mut recorded: Vec<String>, voters: &[&str]) -> Result<(), Unreadable> {
-        let mut expected: Vec<String> = voters.iter().map(|&v| v.to_owned()).collect();
-        recorded.sort();
-        expected.sort();
-        if recorded.len() == self.members.len() && recorded == expected {
-            Ok(())
-        } else {
-            Err(Unreadable::Voters { recorded, expected })
-        }
+/// Whether `members` is a membership a reader would accept for `voters`:
+/// exactly the voters, one UUID each.
+fn check_membership(members: &BTreeMap<String, NodeId>, voters: &[&str]) -> Result<(), Unreadable> {
+    check_voters(members, members.keys().cloned().collect(), voters)?;
+    check_replicas(members)
+}
+
+/// `recorded`, the `node_id`s as a record lists them, are exactly `voters`
+/// and name each of `members` once.
+fn check_voters(
+    members: &BTreeMap<String, NodeId>,
+    mut recorded: Vec<String>,
+    voters: &[&str],
+) -> Result<(), Unreadable> {
+    let mut expected: Vec<String> = voters.iter().map(|&v| v.to_owned()).collect();
+    recorded.sort();
+    expected.sort();
+    if recorded.len() == members.len() && recorded == expected {
+        Ok(())
+    } else {
+        Err(Unreadable::Voters { recorded, expected })
     }
+}
 
-    fn check_replicas(&self) -> Result<(), Unreadable> {
-        let mut seen = BTreeSet::new();
-        match self
-            .members
-            .values()
-            .find(|&&replica| !seen.insert(replica))
-        {
-            Some(&shared) => Err(Unreadable::SharedReplica(shared)),
-            None => Ok(()),
-        }
+fn check_replicas(members: &BTreeMap<String, NodeId>) -> Result<(), Unreadable> {
+    let mut seen = BTreeSet::new();
+    match members.values().find(|&&replica| !seen.insert(replica)) {
+        Some(&shared) => Err(Unreadable::SharedReplica(shared)),
+        None => Ok(()),
     }
 }
 
@@ -586,20 +594,33 @@ async fn initialize(
 async fn record<P: Identifier>(voter: Voter<'_>, replica: NodeId, reach: &Reach<'_, P>) -> Pass {
     match encoded(voter, replica, reach).await {
         Ok(bytes) => write(reach.store, voter.group, bytes).await,
-        Err(why) => Pass::Wait(why),
+        Err(pass) => pass,
     }
 }
 
-/// The record's bytes, once every voter has answered with a membership.
+/// The record's bytes, once every voter has answered with a membership,
+/// under a log id allocated only then: an id is spent once allocated, so
+/// a pass that would not write allocates none.
 async fn encoded<P: Identifier>(
     voter: Voter<'_>,
     replica: NodeId,
     reach: &Reach<'_, P>,
-) -> Result<Vec<u8>, Waiting> {
-    let members = answers(voter, replica, reach).await?;
-    let formation =
-        Formation::new(voter.group, 0, members, voter.voters).map_err(Waiting::NotAMembership)?;
-    formation.encode().map_err(Waiting::Encode)
+) -> Result<Vec<u8>, Pass> {
+    let group = voter.group;
+    let members = answers(voter, replica, reach).await.map_err(Pass::Wait)?;
+    let not_a_membership = |reason| Pass::Wait(Waiting::NotAMembership(reason));
+    check_membership(&members, voter.voters).map_err(not_a_membership)?;
+    let log = allocate(reach.store).await.map_err(|e| match e {
+        AllocateError::Store(e) => Pass::Wait(Waiting::LogIdsStore(e)),
+        AllocateError::Unseeded { bootstrapper } => {
+            Pass::Wait(Waiting::LogIdsUnseeded { bootstrapper })
+        }
+        AllocateError::Refused(reason) => Pass::Fail(FormError::LogIds { group, reason }),
+    })?;
+    let formation = Formation::new(group, log, members, voter.voters).map_err(not_a_membership)?;
+    formation
+        .encode()
+        .map_err(|e| Pass::Wait(Waiting::Encode(e)))
 }
 
 /// Create the record; a record already there is the one the next pass reads.

@@ -5,6 +5,8 @@
 use std::fmt;
 
 use ourios_parquet::{Store, StoreError};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// The key, under the store root, of the lock and counter.
 pub const LOG_IDS_KEY: &str = "wal/log_ids.json";
@@ -24,6 +26,15 @@ pub struct LogIds {
     pub next: u32,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Record {
+    format: u32,
+    bootstrapper: String,
+    seeded: bool,
+    next: u32,
+}
+
 impl LogIds {
     /// The bytes [`LOG_IDS_KEY`] holds.
     ///
@@ -31,7 +42,12 @@ impl LogIds {
     ///
     /// A serialisation failure, not expected for this shape.
     pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
-        Ok(Vec::new())
+        serde_json::to_vec(&Record {
+            format: LOG_IDS_FORMAT,
+            bootstrapper: self.bootstrapper.clone(),
+            seeded: self.seeded,
+            next: self.next,
+        })
     }
 
     /// Decode `bytes`.
@@ -39,8 +55,32 @@ impl LogIds {
     /// # Errors
     ///
     /// [`LockUnreadable`] naming why no reader takes it.
-    pub fn decode(_bytes: &[u8]) -> Result<Self, LockUnreadable> {
-        Err(LockUnreadable::Malformed("not implemented".to_owned()))
+    pub fn decode(bytes: &[u8]) -> Result<Self, LockUnreadable> {
+        // The format is read on its own first, as `formed.json`'s is: another
+        // format may hold other fields, which is a version mismatch.
+        #[derive(Deserialize)]
+        struct Header {
+            format: u32,
+        }
+        let malformed = |e: serde_json::Error| LockUnreadable::Malformed(e.to_string());
+        // Derived structs also read a JSON array positionally, which the
+        // lock's shape does not allow.
+        let value: Value = serde_json::from_slice(bytes).map_err(malformed)?;
+        if !value.is_object() {
+            return Err(LockUnreadable::Malformed(
+                "the lock is not a JSON object".to_owned(),
+            ));
+        }
+        let header: Header = serde_json::from_slice(bytes).map_err(malformed)?;
+        if header.format != LOG_IDS_FORMAT {
+            return Err(LockUnreadable::Format(header.format));
+        }
+        let record: Record = serde_json::from_slice(bytes).map_err(malformed)?;
+        Ok(Self {
+            bootstrapper: record.bootstrapper,
+            seeded: record.seeded,
+            next: record.next,
+        })
     }
 }
 
@@ -155,8 +195,60 @@ impl std::error::Error for AllocateError {}
 /// # Errors
 ///
 /// [`AllocateError`].
-pub async fn allocate(_store: &Store) -> Result<u32, AllocateError> {
-    Err(AllocateError::Refused(Refused::Deleted))
+pub async fn allocate(store: &Store) -> Result<u32, AllocateError> {
+    if !store.supports_conditional_update() {
+        return Err(AllocateError::Refused(Refused::NoConditionalUpdate));
+    }
+    loop {
+        let (lock, e_tag) = read(store).await?;
+        let id = next_of(&lock)?;
+        let advanced = LogIds {
+            next: id + 1,
+            ..lock
+        };
+        if swapped(store, &advanced, &e_tag).await? {
+            return Ok(id);
+        }
+    }
+}
+
+/// The lock and the `ETag` a swap of it must match.
+async fn read(store: &Store) -> Result<(LogIds, String), AllocateError> {
+    let refused = AllocateError::Refused;
+    let (bytes, e_tag) = match store.get_with_etag(LOG_IDS_KEY).await {
+        Ok(got) => got,
+        Err(e) if e.is_not_found() => return Err(refused(Refused::Deleted)),
+        Err(e) => return Err(AllocateError::Store(e)),
+    };
+    let lock = LogIds::decode(&bytes).map_err(|reason| refused(Refused::Unreadable(reason)))?;
+    let e_tag = e_tag.ok_or(refused(Refused::NoConditionalUpdate))?;
+    Ok((lock, e_tag))
+}
+
+/// Replace the lock with `lock` if it is still the version `e_tag` names;
+/// `false` when another allocation won the race.
+async fn swapped(store: &Store, lock: &LogIds, e_tag: &str) -> Result<bool, AllocateError> {
+    let bytes = lock
+        .encode()
+        .map_err(|e| AllocateError::Store(StoreError::Runtime(std::io::Error::other(e))))?;
+    match store.put_if_match(LOG_IDS_KEY, bytes, e_tag).await {
+        Ok(()) => Ok(true),
+        Err(e) if e.is_precondition() => Ok(false),
+        Err(e) => Err(AllocateError::Store(e)),
+    }
+}
+
+/// The id `lock` would hand out, if it hands out one.
+fn next_of(lock: &LogIds) -> Result<u32, AllocateError> {
+    match lock.next {
+        _ if !lock.seeded => Err(AllocateError::Unseeded {
+            bootstrapper: lock.bootstrapper.clone(),
+        }),
+        // `next` cannot advance past the last id, so it is never handed out:
+        // a wrapped `next` would hand out ids already in Parquet.
+        u32::MAX => Err(AllocateError::Refused(Refused::Exhausted)),
+        next => Ok(next),
+    }
 }
 
 #[cfg(test)]

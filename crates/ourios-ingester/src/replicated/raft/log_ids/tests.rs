@@ -36,75 +36,48 @@ fn the_rfc_example_decodes_and_encodes_as_the_golden_bytes() {
     assert_eq!(LogIds::decode(&max), Ok(lock(true, u32::MAX)));
 }
 
-/// A lock that is not exactly the format-1 fields is refused with its
-/// reason; no reader takes it.
-#[test]
-fn a_lock_not_of_the_lock_shape_is_refused_with_its_reason() {
-    let cases = [
-        ("not JSON", "next: 0".to_owned(), "malformed"),
-        (
-            "truncated",
-            GOLDEN[..GOLDEN.len() - 2].to_owned(),
-            "malformed",
-        ),
-        ("empty", String::new(), "malformed"),
-        (
-            "an array",
-            r#"[1,"ourios-receiver-0",false,0]"#.to_owned(),
-            "malformed",
-        ),
-        (
-            "another format",
-            r#"{"format":2,"next":0}"#.to_owned(),
-            "unsupported_format",
-        ),
+/// Locks a reader refuses as malformed, each named.
+fn malformed_locks() -> Vec<(&'static str, String)> {
+    let next = |text: &str| GOLDEN.replace(r#""next":0"#, text);
+    vec![
+        ("not JSON", "next: 0".to_owned()),
+        ("truncated", GOLDEN[..GOLDEN.len() - 2].to_owned()),
+        ("empty", String::new()),
+        ("an array", r#"[1,"ourios-receiver-0",false,0]"#.to_owned()),
         (
             "a string format",
             GOLDEN.replace(r#""format":1"#, r#""format":"1""#),
-            "malformed",
         ),
-        (
-            "an unknown field",
-            GOLDEN.replace(r#""next":0"#, r#""next":0,"extra":0"#),
-            "malformed",
-        ),
-        (
-            "a missing field",
-            GOLDEN.replace(r#","seeded":false"#, ""),
-            "malformed",
-        ),
-        (
-            "a field named twice",
-            GOLDEN.replace(r#""next":0"#, r#""next":5,"next":0"#),
-            "malformed",
-        ),
-        (
-            "a negative next",
-            GOLDEN.replace(r#""next":0"#, r#""next":-1"#),
-            "malformed",
-        ),
-        (
-            "a next past u32",
-            GOLDEN.replace(r#""next":0"#, r#""next":4294967296"#),
-            "malformed",
-        ),
-        (
-            "a fractional next",
-            GOLDEN.replace(r#""next":0"#, r#""next":1.5"#),
-            "malformed",
-        ),
+        ("an unknown field", next(r#""next":0,"extra":0"#)),
+        ("a missing field", GOLDEN.replace(r#","seeded":false"#, "")),
+        ("a field named twice", next(r#""next":5,"next":0"#)),
+        ("a negative next", next(r#""next":-1"#)),
+        ("a next past u32", next(r#""next":4294967296"#)),
+        ("a fractional next", next(r#""next":1.5"#)),
         (
             "a string seeded",
             GOLDEN.replace(r#""seeded":false"#, r#""seeded":"false""#),
-            "malformed",
         ),
         (
             "a numeric bootstrapper",
             GOLDEN.replace(r#""ourios-receiver-0""#, "0"),
-            "malformed",
         ),
-    ];
-    for (case, json, error_type) in cases {
+    ]
+}
+
+/// A lock that is not exactly the format-1 fields is refused with its
+/// reason; no reader takes it.
+#[test]
+fn a_lock_not_of_the_lock_shape_is_refused_with_its_reason() {
+    let malformed = malformed_locks()
+        .into_iter()
+        .map(|(case, json)| (case, json, "malformed"));
+    let other_format = (
+        "another format",
+        r#"{"format":2,"next":0}"#.to_owned(),
+        "unsupported_format",
+    );
+    for (case, json, error_type) in malformed.chain([other_format]) {
         let refused = LogIds::decode(json.as_bytes()).expect_err(case);
         assert_eq!(refused.error_type(), error_type, "{case}: {refused}");
     }

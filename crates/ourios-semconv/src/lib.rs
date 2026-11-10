@@ -1329,3 +1329,6 @@ pub const EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED: &str =
 
 /// `ourios.wal.recovery.tail.truncated` log event name.
 pub const EVENT_OURIOS_WAL_RECOVERY_TAIL_TRUNCATED: &str = "ourios.wal.recovery.tail.truncated";
+
+/// `ourios.wal.replication.stopped` log event name.
+pub const EVENT_OURIOS_WAL_REPLICATION_STOPPED: &str = "ourios.wal.replication.stopped";

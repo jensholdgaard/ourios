@@ -32,20 +32,21 @@
 //! a time, through an OS lock on `wal_root/votes.lock` that its thread
 //! holds until it exits. The WAL root must be on a local filesystem.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::impls::leader_id_std::LeaderId;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::gate::SyncGate;
+use super::telemetry::{Component, Storage};
 use super::types::{NodeId, Vote};
 use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership};
 
@@ -72,15 +73,23 @@ struct Options {
     rewrite_bytes: u64,
     owner_wait: Duration,
     gate: Arc<SyncGate>,
+    storage: Storage,
 }
 
-impl Default for Options {
-    fn default() -> Self {
+impl Options {
+    fn storing(storage: Storage) -> Self {
         Self {
             rewrite_bytes: DEFAULT_REWRITE_BYTES,
             owner_wait: OWNER_WAIT,
             gate: Arc::default(),
+            storage,
         }
+    }
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self::storing(Storage::global())
     }
 }
 
@@ -157,6 +166,7 @@ fn lost(path: &Path) -> io::Error {
 pub struct VoteLog {
     tx: Sender<Request>,
     latest: Latest,
+    stops: Arc<Stops>,
 }
 
 impl VoteLog {
@@ -173,6 +183,32 @@ impl VoteLog {
         Self::open_with(wal_root, Options::default())
     }
 
+    /// [`VoteLog::open`], recording to `storage`.
+    pub(super) fn open_storing(wal_root: &Path, storage: Storage) -> io::Result<Self> {
+        Self::open_with(wal_root, Options::storing(storage))
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_metered(
+        wal_root: &Path,
+        rewrite_bytes: u64,
+        gate: Arc<SyncGate>,
+        storage: Storage,
+    ) -> io::Result<Self> {
+        let options = Options {
+            rewrite_bytes,
+            gate,
+            ..Options::storing(storage)
+        };
+        Self::open_with(wal_root, options)
+    }
+
+    /// Note that `group`'s log is open over this vote log, so a failure
+    /// of the vote log counts as a stop of the group.
+    pub(super) fn host(&self, group: u32) {
+        self.stops.host(group);
+    }
+
     fn open_with(wal_root: &Path, options: Options) -> io::Result<Self> {
         ourios_wal::prepare_root(wal_root)
             .map_err(|e| io::Error::other(format!("prepare {}: {e:?}", wal_root.display())))?;
@@ -184,6 +220,7 @@ impl VoteLog {
         let Options {
             rewrite_bytes,
             gate,
+            storage,
             ..
         } = options;
         let path = wal_root.join(VOTES_FILE);
@@ -196,6 +233,12 @@ impl VoteLog {
         };
         let file = OpenOptions::new().append(true).open(&path)?;
         let latest: Latest = Arc::new(Mutex::new(latest));
+        let stops = Arc::new(Stops {
+            storage,
+            hosting: Mutex::default(),
+        });
+        // Unbounded: each group waits for its vote to be saved before its
+        // next one, so the queue holds at most one request per group.
         let (tx, rx) = mpsc::channel();
         let writer = Writer {
             file,
@@ -205,12 +248,13 @@ impl VoteLog {
             latest: Arc::clone(&latest),
             failed: None,
             gate,
+            stops: Arc::clone(&stops),
             _owner: owner,
         };
         std::thread::Builder::new()
             .name("ourios-votes".to_owned())
             .spawn(move || writer.run(&rx))?;
-        Ok(Self { tx, latest })
+        Ok(Self { tx, latest, stops })
     }
 
     /// The group's latest durable vote.
@@ -426,8 +470,51 @@ struct Writer {
     /// unknown, so every later save fails.
     failed: Option<String>,
     gate: Arc<SyncGate>,
+    stops: Arc<Stops>,
     /// Released when the thread exits; see [`VoteLog::open`].
     _owner: Owner,
+}
+
+/// Where the vote log reports its writes, and the groups its failure
+/// stops.
+struct Stops {
+    storage: Storage,
+    hosting: Mutex<Hosting>,
+}
+
+/// The groups whose logs the node opened over the vote log, and the kind
+/// of its failure once it has failed: under one lock, so a group that
+/// registers while the writer fails is counted exactly once.
+#[derive(Default)]
+struct Hosting {
+    groups: BTreeSet<u32>,
+    failed: Option<io::ErrorKind>,
+}
+
+impl Stops {
+    /// Register `group`; if the vote log has already failed, the group is
+    /// stopped now.
+    fn host(&self, group: u32) {
+        let mut hosting = lock(&self.hosting);
+        if let (true, Some(kind)) = (hosting.groups.insert(group), hosting.failed) {
+            self.storage.also_stopped(Component::VoteLog, group, kind);
+        }
+    }
+
+    /// Time a write-and-fsync that began at `started`; a failure, always
+    /// the writer's first, also stops every hosted group.
+    fn timed(&self, started: Instant, done: io::Result<()>) -> io::Result<()> {
+        let failed = done.as_ref().err().map(io::Error::kind);
+        let elapsed = started.elapsed();
+        self.storage.synced(Component::VoteLog, elapsed, failed);
+        if let Err(e) = &done {
+            let mut hosting = lock(&self.hosting);
+            hosting.failed = Some(e.kind());
+            let groups: Vec<u32> = hosting.groups.iter().copied().collect();
+            self.storage.stopped(Component::VoteLog, &groups, e);
+        }
+        done
+    }
 }
 
 impl Writer {
@@ -464,6 +551,7 @@ impl Writer {
                 "the vote log failed earlier: {reason}"
             )));
         }
+        let started = Instant::now();
         let mut bytes = Vec::new();
         let records = batch.iter().map(|r| encode(r.group, &r.vote));
         let len = lay_out(&mut bytes, self.len, records);
@@ -473,7 +561,7 @@ impl Writer {
         else {
             return Flush::Crashed;
         };
-        match synced {
+        match self.stops.timed(started, synced) {
             Ok(()) => {
                 self.len = len;
                 Flush::Done
@@ -490,12 +578,15 @@ impl Writer {
         if self.len as u64 <= self.rewrite_bytes {
             return true;
         }
+        let started = Instant::now();
         let gate = Arc::clone(&self.gate);
         let Some(rewritten) = sync_through(&gate, || self.rewrite()) else {
             return false;
         };
-        if let Err(e) = rewritten {
-            self.failed = Some(format!("rewrite {VOTES_FILE}: {e}"));
+        let rewritten =
+            rewritten.map_err(|e| io::Error::new(e.kind(), format!("rewrite {VOTES_FILE}: {e}")));
+        if let Err(e) = self.stops.timed(started, rewritten) {
+            self.failed = Some(e.to_string());
         }
         true
     }

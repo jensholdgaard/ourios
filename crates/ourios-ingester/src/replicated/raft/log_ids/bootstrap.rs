@@ -183,9 +183,11 @@ async fn passed(
     start: &LockStart<'_>,
     waiting: &mut impl FnMut(&Waiting),
 ) -> Result<Started, StartError> {
+    let mut claim = Claim::Inherited;
     loop {
-        match pass(start).await? {
+        match pass(start, claim).await? {
             Pass::Done(started) => return Ok(started),
+            Pass::Claimed => claim = Claim::Created,
             Pass::Again => {}
             Pass::Wait(why) => {
                 waiting(&why);
@@ -209,28 +211,41 @@ async fn from_raft_state(store: &Store) -> Result<Started, StartError> {
 /// What one pass left to do.
 enum Pass {
     Done(Started),
+    /// This start's create of the lock landed: read it again now.
+    Claimed,
     /// The lock changed under this pass: read it again now.
     Again,
     Wait(Waiting),
 }
 
-async fn pass(start: &LockStart<'_>) -> Result<Pass, StartError> {
+/// How a start came to hold a lock unseeded under its own `node_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// This process created it, so an object it finds is not its own: the
+    /// lock had been deleted after another start bootstrapped.
+    Created,
+    /// A run before this one created it and stopped before `seeded`, so
+    /// an object it finds is that run's.
+    Inherited,
+}
+
+async fn pass(start: &LockStart<'_>, claim: Claim) -> Result<Pass, StartError> {
     match start.store.get_with_etag(LOG_IDS_KEY).await {
         Ok((bytes, e_tag)) => {
             let lock = LogIds::decode(&bytes).map_err(StartError::Unreadable)?;
             let e_tag = e_tag.ok_or(StartError::NoConditionalUpdate)?;
-            held(start, lock, &e_tag).await
+            held(start, (lock, &e_tag), claim).await
         }
-        Err(e) if e.is_not_found() => claim(start).await,
+        Err(e) if e.is_not_found() => create_lock(start).await,
         Err(e) => Ok(Pass::Wait(Waiting::Store(e))),
     }
 }
 
 /// Create the lock under this start, unless an object shows it was
 /// deleted. Whoever's create landed, the next pass reads the lock.
-async fn claim(start: &LockStart<'_>) -> Result<Pass, StartError> {
+async fn create_lock(start: &LockStart<'_>) -> Result<Pass, StartError> {
     match on_blocking(start.store, high_water_exists).await {
-        Ok(true) => return Err(StartError::LogIdsDeleted(Evidence::HighWater)),
+        Ok(true) => return created_since(start.store).await,
         Ok(false) => {}
         Err(e) => return waited_or_failed(e),
     }
@@ -244,8 +259,20 @@ async fn claim(start: &LockStart<'_>) -> Result<Pass, StartError> {
         Err(e) => Err(e),
     };
     match created {
-        Err(e) if !e.is_already_exists() => Ok(Pass::Wait(Waiting::Store(e))),
-        Ok(()) | Err(_) => Ok(Pass::Again),
+        Ok(()) => Ok(Pass::Claimed),
+        Err(e) if e.is_already_exists() => Ok(Pass::Again),
+        Err(e) => Ok(Pass::Wait(Waiting::Store(e))),
+    }
+}
+
+/// An object found after the lock was read absent: another start may have
+/// bootstrapped in between, so the lock was deleted only if it is still
+/// absent.
+async fn created_since(store: &Store) -> Result<Pass, StartError> {
+    match store.get(LOG_IDS_KEY).await {
+        Ok(_) => Ok(Pass::Again),
+        Err(e) if e.is_not_found() => Err(StartError::LogIdsDeleted(Evidence::HighWater)),
+        Err(e) => Ok(Pass::Wait(Waiting::Store(e))),
     }
 }
 
@@ -259,10 +286,14 @@ fn high_water_exists(store: &Store) -> Result<bool, TemplateIdsError> {
     }
 }
 
-async fn held(start: &LockStart<'_>, lock: LogIds, e_tag: &str) -> Result<Pass, StartError> {
+async fn held(
+    start: &LockStart<'_>,
+    (lock, e_tag): (LogIds, &str),
+    claim: Claim,
+) -> Result<Pass, StartError> {
     match lock {
         LogIds { seeded: true, .. } => seeded(start.store).await,
-        _ if lock.bootstrapper == start.node_id => bootstrap(start, lock, e_tag).await,
+        _ if lock.bootstrapper == start.node_id => bootstrap(start, (lock, e_tag), claim).await,
         LogIds { bootstrapper, .. } => Ok(Pass::Wait(Waiting::Unseeded { bootstrapper })),
     }
 }
@@ -277,9 +308,14 @@ async fn seeded(store: &Store) -> Result<Pass, StartError> {
 }
 
 /// This start holds the lock unseeded, having just created it or crashed
-/// before `seeded`: no log id exists yet, so it creates the object, or
-/// goes on with the one it finds, and sets `seeded`.
-async fn bootstrap(start: &LockStart<'_>, lock: LogIds, e_tag: &str) -> Result<Pass, StartError> {
+/// before `seeded`: no log id exists yet, so it creates the object and
+/// sets `seeded`. Only a lock a run before this one created goes on with
+/// an object it finds.
+async fn bootstrap(
+    start: &LockStart<'_>,
+    (lock, e_tag): (LogIds, &str),
+    claim: Claim,
+) -> Result<Pass, StartError> {
     let allow_bootstrap = start.allow_bootstrap;
     let scan = start.scan.clone();
     let seat = move |store: &Store| seat_replicated_root(store, allow_bootstrap, &scan);
@@ -287,6 +323,9 @@ async fn bootstrap(start: &LockStart<'_>, lock: LogIds, e_tag: &str) -> Result<P
         Ok(seated) => seated,
         Err(e) => return waited_or_failed(e),
     };
+    if claim == Claim::Created && !seated.bootstrapped {
+        return withdrawn(start.store).await;
+    }
     let lock = LogIds {
         seeded: true,
         ..lock
@@ -298,6 +337,17 @@ async fn bootstrap(start: &LockStart<'_>, lock: LogIds, e_tag: &str) -> Result<P
     match swapped {
         Ok(()) => Ok(Pass::Done(Started::Bootstrapped(seated))),
         Err(e) if e.is_precondition() || e.is_not_found() => Ok(Pass::Again),
+        Err(e) => Ok(Pass::Wait(Waiting::Store(e))),
+    }
+}
+
+/// Delete the lock this process created over another start's object, so
+/// that no restart takes it for its own crash and seeds it at `next` `0`.
+/// A failed delete is retried by the next pass, which finds the object
+/// again.
+async fn withdrawn(store: &Store) -> Result<Pass, StartError> {
+    match store.delete(LOG_IDS_KEY).await {
+        Ok(()) => Err(StartError::LogIdsDeleted(Evidence::HighWater)),
         Err(e) => Ok(Pass::Wait(Waiting::Store(e))),
     }
 }

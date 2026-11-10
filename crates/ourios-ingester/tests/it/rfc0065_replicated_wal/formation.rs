@@ -40,11 +40,13 @@ fn rfc0065_24_a_formation_interrupted_by_a_wiped_voter_rejoins_by_replacement() 
 }
 
 /// Scenario RFC0065.24 — the log-id arm (B13), the `ingest_group` half.
-/// The record half, a format-2 `formed.json` carrying a log id allocated
-/// from `log_ids.json`, a later id after a voter killed between the
-/// allocation and its write, no id recorded twice and a format-1 record
-/// forming nothing, is `replicated::raft::formation::format_2_tests::
-/// rfc0065_24_the_formation_record_carries_the_groups_log_id`.
+/// The record half is `replicated::raft::formation::format_2_tests::
+/// rfc0065_24_the_formation_record_carries_the_groups_log_id`: a format-2
+/// `formed.json` carrying a log id allocated from `log_ids.json`; an id
+/// allocated and never recorded, standing in for a recording voter killed
+/// between the allocation and its write, followed by a recorded later id;
+/// two groups recorded under distinct ids; and a format-1 record forming
+/// nothing.
 #[test]
 #[ignore = "RFC0065.24 stub — the ingest_group half, implemented with publication"]
 fn rfc0065_24_the_formation_record_carries_the_groups_log_id() {

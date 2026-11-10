@@ -5,14 +5,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
+use openraft::async_runtime::WatchReceiver as _;
 use ourios_parquet::Store;
 use uuid::Uuid;
 
 use super::tests::{
-    Answering, GROUP, PATIENCE, R0, R2, R4, RECORDER, assert_refused, decode, form_on, index_of,
-    layout, member, record_then_wipe, recorded, uuid, voter_ids, waited_for,
+    Answering, GROUP, PATIENCE, R0, R2, R4, RECORDER, VOTERS, assert_refused, decode, form_on,
+    index_of, layout, member, record_then_wipe, recorded, uuid, voter_ids, waited_for,
 };
-use super::{FormError, Formation, Formed, Pass, Reach, Standing, formed_key, record};
+use super::{FormError, Formation, Formed, Pass, Reach, Standing, Waiting, formed_key, record};
 use crate::replicated::layout::VotingLayout;
 use crate::replicated::raft::cluster::{Cluster, leader, write};
 use crate::replicated::raft::log_ids::{LOG_IDS_KEY, LogIds, Refused, allocate};
@@ -135,18 +136,42 @@ fn an_unparsable_or_foreign_format_2_record_is_refused_with_its_reason() {
             GOLDEN.replace(r#""group":3"#, r#""group":3,"extra":0"#),
             "malformed",
         ),
+        ("no log id", log(""), "malformed"),
+        ("a string log id", log(r#""log":"7""#), "malformed"),
+        ("a negative log id", log(r#""log":-1"#), "malformed"),
+        ("a log id past u32", log(r#""log":4294967296"#), "malformed"),
+    ]);
+    let bad_bytes = Formation::decode(&[0xff, 0xfe], GROUP, &VOTERS).expect_err("bytes");
+    assert_eq!(bad_bytes.error_type(), "malformed");
+}
+
+/// A record naming a field twice is ambiguous, whichever copy a reader
+/// would keep, so it is refused.
+#[test]
+fn a_format_2_record_naming_a_field_twice_is_refused() {
+    assert_refused(vec![
         (
             "a format named twice",
             GOLDEN.replace(r#""format":2"#, r#""format":1,"format":2"#),
             "malformed",
         ),
-        ("no log id", log(""), "malformed"),
-        ("a string log id", log(r#""log":"7""#), "malformed"),
-        ("a negative log id", log(r#""log":-1"#), "malformed"),
-        ("a log id past u32", log(r#""log":4294967296"#), "malformed"),
+        (
+            "a group named twice",
+            GOLDEN.replace(r#""group":3"#, r#""group":4,"group":3"#),
+            "malformed",
+        ),
         (
             "a log id named twice",
-            log(r#""log":8,"log":7"#),
+            GOLDEN.replace(r#""log":7"#, r#""log":8,"log":7"#),
+            "malformed",
+        ),
+        (
+            "a member's replica named twice",
+            GOLDEN.replacen(
+                r#""replica":""#,
+                &format!(r#""replica":"{R2}","replica":""#),
+                1,
+            ),
             "malformed",
         ),
     ]);
@@ -168,7 +193,17 @@ fn a_format_2_record_of_other_members_is_refused_with_its_reason() {
         ),
         (
             "a non-voter",
-            record_of(7, GROUP, &[m0.clone(), m1, m4.clone()]),
+            record_of(7, GROUP, &[m0.clone(), m1.clone(), m4.clone()]),
+            "other_voters",
+        ),
+        (
+            "an extra member",
+            record_of(7, GROUP, &[m0.clone(), m1, m2.clone(), m4.clone()]),
+            "other_voters",
+        ),
+        (
+            "a voter twice",
+            record_of(7, GROUP, &[m0.clone(), m2.clone(), m2.clone(), m4]),
             "other_voters",
         ),
         (
@@ -178,7 +213,16 @@ fn a_format_2_record_of_other_members_is_refused_with_its_reason() {
         ),
         (
             "an uppercase UUID",
-            record_of(7, GROUP, &[m0, m2, member(4, &R4.to_uppercase())]),
+            record_of(
+                7,
+                GROUP,
+                &[m0.clone(), m2.clone(), member(4, &R4.to_uppercase())],
+            ),
+            "malformed",
+        ),
+        (
+            "an unhyphenated UUID",
+            record_of(7, GROUP, &[m0, m2, member(4, &R4.replace('-', ""))]),
             "malformed",
         ),
     ]);
@@ -239,7 +283,16 @@ async fn the_record_holds_a_log_id_allocated_once_every_voter_answered() {
         patience: PATIENCE,
     };
     let waited = record(RECORDER, uuid(R2), &reach).await;
-    assert_eq!(waited_for(&waited), "unanswered");
+    assert!(
+        matches!(&waited, Pass::Wait(Waiting::Unanswered { peer, .. }) if peer == "ourios-receiver-4"),
+        "{}",
+        waited_for(&waited)
+    );
+    assert_eq!(
+        recorded(&store, GROUP).await,
+        None,
+        "written before every answer"
+    );
     assert_eq!(next(&store).await, 7, "an id spent before every answer");
 
     let both = both_answer();
@@ -286,13 +339,17 @@ async fn a_record_already_there_is_kept_and_its_allocated_id_is_spent() {
         .put(&formed_key(GROUP), GOLDEN.as_bytes().to_vec())
         .await
         .expect("put");
-    let both = both_answer();
+    let other = |n| NodeId::from(Uuid::from_u128(n));
+    let answering = Answering(BTreeMap::from([
+        ("ourios-receiver-0".to_owned(), other(5)),
+        ("ourios-receiver-4".to_owned(), other(6)),
+    ]));
     let reach = Reach {
         store: &store,
-        peers: &both,
+        peers: &answering,
         patience: PATIENCE,
     };
-    let pass = record(RECORDER, uuid(R2), &reach).await;
+    let pass = record(RECORDER, other(7), &reach).await;
     assert_eq!(waited_for(&pass), "recorded");
     assert_eq!(
         recorded(&store, GROUP).await.as_deref(),
@@ -383,6 +440,14 @@ async fn three_fresh_voters_form_one_group_under_one_log_id() {
     assert_eq!(formation.log(), 3);
     assert_eq!(next(&store).await, 4, "one id allocated");
     let expected: BTreeSet<_> = (0..3).map(|i| cluster.id(i)).collect();
+    assert_eq!(
+        formation
+            .membership()
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
 
     let nodes = [cluster.node(0), cluster.node(1), cluster.node(2)];
     let led = leader(0, &nodes, None).await;
@@ -443,7 +508,11 @@ async fn rfc0065_24_a_format_2_formation_interrupted_by_a_wiped_voter_still_form
         );
     }
     let restarted = cluster.node(first);
-    assert!(!restarted.raft(0).is_initialized().await.expect("running"));
+    assert!(
+        !restarted.raft(0).is_initialized().await.expect("running"),
+        "the wiped voter initialized a second membership"
+    );
+    assert!(restarted.log(0).await.is_empty());
     assert_eq!(recorded(&store, 0).await, Some(bytes), "written once");
     assert_eq!(next(&store).await, 1, "one id allocated");
     cluster.shutdown().await;
@@ -478,6 +547,7 @@ fn unreadable_records(voters: &[&str]) -> Vec<(String, &'static str)> {
         ("formed.json: not JSON".to_owned(), "malformed"),
         (whole[..whole.len() - 2].to_owned(), "malformed"),
         (with(1, 0, "", &sorted), "unsupported_format"),
+        (with(3, 0, r#""log":0,"#, &sorted), "unsupported_format"),
         (with(2, 1, r#""log":0,"#, &sorted), "other_group"),
         (with(2, 0, r#""log":0,"#, &strangers), "other_voters"),
         (with(2, 0, "", &sorted), "malformed"),
@@ -510,17 +580,17 @@ async fn rfc0065_24_an_unreadable_format_2_record_forms_nothing() {
             );
             assert_eq!(refused.error_type(), error_type, "{json}: {refused}");
         }
-        assert_eq!(recorded(&store, 0).await, Some(json.into_bytes()));
+        assert_eq!(
+            recorded(&store, 0).await,
+            Some(json.into_bytes()),
+            "the first-ranked voter left the record alone"
+        );
     }
     for i in 0..3 {
-        assert!(
-            !cluster
-                .node(i)
-                .raft(0)
-                .is_initialized()
-                .await
-                .expect("running")
-        );
+        let raft = cluster.node(i).raft(0);
+        assert!(!raft.is_initialized().await.expect("running"));
+        let metrics = raft.metrics().borrow_watched().clone();
+        assert_eq!(metrics.current_leader, None);
     }
     assert_eq!(next(&store).await, 0, "no id allocated");
     cluster.shutdown().await;
@@ -564,9 +634,10 @@ async fn form_group(cluster: &Cluster, store: &Store, voters: &[&str], group: u3
 }
 
 /// Scenario RFC0065.24 — the log-id arm (B13): the group's `formed.json`
-/// is format 2 and carries a log id allocated from `log_ids.json`; a
-/// recording voter killed between the allocation and its write records a
-/// later id on its next attempt, no id is recorded twice, and a format-1
+/// is format 2 and carries a log id allocated from `log_ids.json`. A
+/// recording voter killed between the allocation and its write is stood in
+/// for by an allocation with no write after it: the record then holds a
+/// later id. Two groups are recorded under distinct ids, and a format-1
 /// record forms nothing. (Every replica writing it as `ingest_group` comes
 /// with publication.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -574,8 +645,8 @@ async fn rfc0065_24_the_formation_record_carries_the_groups_log_id() {
     let cluster = Cluster::start_unformed(3, &[0, 1]).await;
     let store = Store::in_memory();
     put_lock(&store, &seeded(0)).await;
-    // The recording voter allocated id 0 and was killed before it wrote
-    // the record: the id is spent.
+    // An allocation with no write after it, what a recording voter killed
+    // between the two leaves behind: id 0 is spent.
     assert_eq!(allocate(&store).await.ok(), Some(0));
 
     let g0 = voters_of(&cluster, 2, 0);

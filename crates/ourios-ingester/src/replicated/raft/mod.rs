@@ -32,9 +32,54 @@ mod tests;
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+/// A node's Raft timings for every group it hosts (RFC 0065 §3.8), in
+/// milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaftTimings {
+    heartbeat_interval_ms: NonZeroU64,
+    election_timeout_min_ms: NonZeroU64,
+    election_timeout_max_ms: NonZeroU64,
+}
+
+const fn millis(n: u64) -> NonZeroU64 {
+    match NonZeroU64::new(n) {
+        Some(n) => n,
+        None => NonZeroU64::MIN,
+    }
+}
+
+impl RaftTimings {
+    #[must_use]
+    pub const fn heartbeat_interval_ms(self) -> NonZeroU64 {
+        self.heartbeat_interval_ms
+    }
+
+    #[must_use]
+    pub const fn election_timeout_min_ms(self) -> NonZeroU64 {
+        self.election_timeout_min_ms
+    }
+
+    #[must_use]
+    pub const fn election_timeout_max_ms(self) -> NonZeroU64 {
+        self.election_timeout_max_ms
+    }
+}
+
+/// §4.6's defaults: a 50 ms heartbeat and a 150–300 ms election timeout.
+impl Default for RaftTimings {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_ms: millis(50),
+            election_timeout_min_ms: millis(150),
+            election_timeout_max_ms: millis(300),
+        }
+    }
+}
 
 /// The `openraft` settings §4.5 fixes for every group; the timeouts start
 /// at `openraft`'s defaults (§6.9).
@@ -48,7 +93,7 @@ use std::time::{Duration, Instant};
 /// # Errors
 ///
 /// [`openraft::ConfigError`] when the settings do not validate.
-pub fn group_config() -> Result<openraft::Config, openraft::ConfigError> {
+pub fn group_config(_timings: RaftTimings) -> Result<openraft::Config, openraft::ConfigError> {
     openraft::Config {
         enable_leader_restore: Some(false),
         allow_log_reversion: Some(false),

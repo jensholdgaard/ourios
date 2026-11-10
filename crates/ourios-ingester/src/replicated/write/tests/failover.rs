@@ -1,5 +1,5 @@
-//! Failover on the write path: RFC0065.3's takeover arm, RFC0065.4,
-//! RFC0065.5 and RFC0065.6. Each ends by crashing every node and checking
+//! Failover on the write path: RFC0065.1's default-timings arm,
+//! RFC0065.3's takeover arm, RFC0065.4, RFC0065.5 and RFC0065.6. Each ends by crashing every node and checking
 //! that every acknowledged export survived on at least two (§3.4), so a
 //! node these tests take down goes down by crash, never by a clean kill.
 
@@ -14,6 +14,7 @@ use openraft::storage::RaftLogReader as _;
 use super::{committed, export, followers, held, ready_leader, rejected_as, writer};
 use crate::receiver::ReceiveError;
 use crate::replicated::ingest::ReplicatedIngest;
+use crate::replicated::raft::RaftTimings;
 use crate::replicated::raft::cluster::{Cluster, ELECTION_TIMEOUT_MAX, wal_config, write};
 use crate::replicated::raft::log_store::{GroupLog, group_dir};
 use crate::replicated::raft::types::{Entry, GroupEntry};
@@ -104,6 +105,52 @@ async fn assert_two_fsynced_copies(cluster: &mut Cluster, acked: &[Acked]) {
             ack.1
         );
     }
+}
+
+/// Export `n`, acknowledged by whichever live node leads group 0. A client
+/// retries the rejection a leadership change gives, so this does too.
+async fn acked_by_the_leader(cluster: &Cluster, n: u32) -> Acked {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let leader = cluster.leader(0, None).await;
+        let ingest = ReplicatedIngest::new(writer(cluster, leader));
+        match ingest.ingest(export(&marker(n))).await {
+            Ok(ingested) => return (marker(n), committed(ingested)),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("export {n} was never acknowledged: {e}"),
+        }
+    }
+}
+
+/// RFC0065.1, the default-timings arm: a three-voter group on the shipped
+/// 50 ms heartbeat and 150–300 ms election timeout acknowledges exports,
+/// and when its leader stops a follower takes over and acknowledges more,
+/// each on at least two fsynced copies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0065_1_a_group_on_the_default_timings_acks_and_fails_over() {
+    let mut cluster = Cluster::start_on(3, &[0], RaftTimings::default()).await;
+    for i in 0..3 {
+        let config = cluster.node(i).raft(0).config();
+        let timings = (
+            config.heartbeat_interval,
+            config.election_timeout_min,
+            config.election_timeout_max,
+        );
+        assert_eq!(timings, (50, 150, 300), "node {i}'s group 0 timings");
+    }
+    let mut all = Vec::new();
+    for n in 0..5 {
+        all.push(acked_by_the_leader(&cluster, n).await);
+    }
+    let old = cluster.leader(0, None).await;
+    cluster.crash(old).await;
+    cluster.leader(0, Some(old)).await;
+    for n in 5..10 {
+        all.push(acked_by_the_leader(&cluster, n).await);
+    }
+    assert_two_fsynced_copies(&mut cluster, &all).await;
 }
 
 /// RFC0065.3 (B2, B7), the takeover arm: the leader crashes while exports

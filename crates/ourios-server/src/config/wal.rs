@@ -8,6 +8,7 @@
 use std::net::{Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
+use ourios_ingester::replicated::raft::RaftTimings;
 use ourios_serving::tls::TlsSettings;
 
 use crate::config::file::TlsSection;
@@ -50,6 +51,8 @@ pub struct ReplicatedWal {
     pub tail_clients: Vec<String>,
     /// Peer mTLS; always carries a client CA.
     pub tls: TlsSettings,
+    /// The Raft timings every group on the node runs on.
+    pub raft_timings: RaftTimings,
 }
 
 /// What this node is in the cluster layout (RFC 0065 §3.8).
@@ -109,6 +112,15 @@ pub struct WalInputs<'a> {
     pub tail_replicas: Option<&'a str>,
     /// `OURIOS_RECEIVER_WAL_TAIL_CLIENTS` / `receiver.wal.replicated.tail_clients`.
     pub tail_clients: Option<&'a str>,
+    /// `OURIOS_RECEIVER_WAL_HEARTBEAT_INTERVAL_MS` /
+    /// `receiver.wal.replicated.heartbeat_interval_ms`.
+    pub heartbeat_interval_ms: Option<&'a str>,
+    /// `OURIOS_RECEIVER_WAL_ELECTION_TIMEOUT_MIN_MS` /
+    /// `receiver.wal.replicated.election_timeout_min_ms`.
+    pub election_timeout_min_ms: Option<&'a str>,
+    /// `OURIOS_RECEIVER_WAL_ELECTION_TIMEOUT_MAX_MS` /
+    /// `receiver.wal.replicated.election_timeout_max_ms`.
+    pub election_timeout_max_ms: Option<&'a str>,
     /// `receiver.wal.replicated.tls` (config-file only).
     pub tls: Option<&'a TlsSection>,
 }
@@ -158,6 +170,9 @@ impl WalEnv {
             replication_factor: self.replication_factor.as_deref(),
             tail_replicas: self.tail_replicas.as_deref(),
             tail_clients: self.tail_clients.as_deref(),
+            heartbeat_interval_ms: None,
+            election_timeout_min_ms: None,
+            election_timeout_max_ms: None,
             tls: None,
         }
     }
@@ -295,6 +310,7 @@ fn build_replicated(inputs: WalInputs<'_>) -> Result<ReplicatedWal, String> {
         tail_replicas,
         tail_clients,
         tls,
+        raft_timings: RaftTimings::default(),
     })
 }
 
@@ -458,8 +474,9 @@ mod tests {
             .map(|&(key, value)| (key, Some(value)))
             .collect();
         for &(key, value) in edits {
-            if let Some(leaf) = leaves.iter_mut().find(|(k, _)| *k == key) {
-                leaf.1 = value;
+            match leaves.iter_mut().find(|(k, _)| *k == key) {
+                Some(leaf) => leaf.1 = value,
+                None => leaves.push((key, value)),
             }
         }
         leaves
@@ -517,6 +534,9 @@ mod tests {
                 replication_factor: leaf("replication_factor"),
                 tail_replicas: leaf("tail_replicas"),
                 tail_clients: leaf("tail_clients"),
+                heartbeat_interval_ms: leaf("heartbeat_interval_ms"),
+                election_timeout_min_ms: leaf("election_timeout_min_ms"),
+                election_timeout_max_ms: leaf("election_timeout_max_ms"),
                 tls: None,
             },
             ..ReceiverInputs::default()
@@ -564,6 +584,7 @@ mod tests {
                     min_version: ourios_serving::tls::TlsMinVersion::V1_2,
                     reload_interval: None,
                 },
+                raft_timings: RaftTimings::default(),
             }
         );
     }
@@ -767,6 +788,57 @@ mod tests {
 
         for backend in ["kafka", "Replicated", "raft"] {
             assert_both_front_ends_fail(backend, &[], "receiver.wal.backend ");
+        }
+    }
+
+    /// Each invalid Raft timing, with the key its error must name.
+    const INVALID_TIMINGS: [(&[Edit], &str); 9] = [
+        (
+            &[("heartbeat_interval_ms", Some("0"))],
+            "heartbeat_interval_ms",
+        ),
+        (
+            &[("election_timeout_min_ms", Some("0"))],
+            "election_timeout_min_ms",
+        ),
+        (
+            &[("election_timeout_max_ms", Some("0"))],
+            "election_timeout_max_ms",
+        ),
+        (
+            &[("heartbeat_interval_ms", Some("-50"))],
+            "heartbeat_interval_ms",
+        ),
+        (
+            &[("election_timeout_max_ms", Some("1s"))],
+            "election_timeout_max_ms",
+        ),
+        (
+            &[("heartbeat_interval_ms", Some("150"))],
+            "heartbeat_interval_ms",
+        ),
+        (
+            &[("heartbeat_interval_ms", Some("200"))],
+            "heartbeat_interval_ms",
+        ),
+        (
+            &[("election_timeout_min_ms", Some("300"))],
+            "election_timeout_min_ms",
+        ),
+        (
+            &[("election_timeout_max_ms", Some("100"))],
+            "election_timeout_min_ms",
+        ),
+    ];
+
+    /// Scenario RFC0065.1, the Raft timings arm through both front-ends: a
+    /// zero, non-numeric or mis-ordered timing fails naming its key, the
+    /// rest of the timings at their defaults.
+    #[test]
+    fn rfc0065_1_invalid_raft_timings_fail_naming_the_key() {
+        for (edits, key) in INVALID_TIMINGS {
+            let key = format!("receiver.wal.replicated.{key} ");
+            assert_both_front_ends_fail("replicated", edits, &key);
         }
     }
 

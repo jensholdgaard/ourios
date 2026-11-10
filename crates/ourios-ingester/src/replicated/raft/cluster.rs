@@ -62,7 +62,7 @@ pub(crate) fn raft_config() -> openraft::Config {
         election_timeout_min: 1_000,
         election_timeout_max: ELECTION_TIMEOUT_MAX.as_millis().try_into().expect("fits"),
         heartbeat_interval: 200,
-        ..super::group_config().expect("group config")
+        ..super::group_config(super::RaftTimings::default()).expect("group config")
     }
     .validate()
     .expect("test config")
@@ -345,6 +345,11 @@ impl Cluster {
     /// with every node a voter.
     pub(crate) async fn start(size: u64, groups: &[u32]) -> Self {
         Self::start_metered(size, groups, |_| Meters::global()).await
+    }
+
+    /// [`Self::start`] with every node on `timings`.
+    pub(crate) async fn start_on(size: u64, groups: &[u32], _timings: super::RaftTimings) -> Self {
+        Self::start(size, groups).await
     }
 
     /// [`Self::start`], node `i` reporting to `meters(i)`.

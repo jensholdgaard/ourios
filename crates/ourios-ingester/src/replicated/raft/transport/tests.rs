@@ -252,7 +252,7 @@ async fn a_peer_with_no_listener_is_unreachable() {
 
 #[test]
 fn groups_run_without_leader_restore_and_with_pre_vote() {
-    let c = super::super::group_config().expect("config");
+    let c = super::super::group_config(super::super::RaftTimings::default()).expect("config");
     let flags = (
         c.enable_leader_restore,
         c.enable_pre_vote,

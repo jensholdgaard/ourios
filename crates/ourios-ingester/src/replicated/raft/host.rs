@@ -18,13 +18,13 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
 use super::gate::SyncGate;
-use super::group_config;
 use super::log_store::{GroupLog, GroupLogReader, group_dir};
 use super::state_machine::GroupSm;
 use super::telemetry::{Meters, ReplicationTelemetry};
 use super::transport::{Peers, ReplicationServer};
 use super::types::{LogId, NodeId, RaftTypes};
 use super::vote_log::VoteLog;
+use super::{RaftTimings, group_config};
 
 pub type GroupRaft = Raft<RaftTypes, GroupSm>;
 
@@ -248,7 +248,7 @@ impl GroupHost {
     /// [`HostError`] naming the vote log or the group that failed.
     pub async fn open(spec: HostSpec) -> Result<Self, HostError> {
         let meters = Meters::global();
-        let config = group_config().map_err(HostError::Config)?;
+        let config = group_config(RaftTimings::default()).map_err(HostError::Config)?;
         let wiring = Wiring {
             config,
             server: ReplicationServer::default(),

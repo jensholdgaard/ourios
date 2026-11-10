@@ -118,6 +118,30 @@ async fn a_failed_vote_log_fsync_stops_every_group_it_hosts() {
     assert_eq!(stops, expected);
 }
 
+/// A group whose log opens over a vote log that has already failed is
+/// stopped too: counted once when it registers, however often it does.
+#[tokio::test]
+async fn a_group_registered_after_the_vote_log_failed_is_counted_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reader = Reader::new();
+    let (votes, gate) = votes(dir.path(), u64::MAX, &reader);
+    votes.host(1);
+    gate.fail();
+    assert!(votes.save(1, vote(1)).await.is_err(), "the fsync failed");
+    votes.host(2);
+    votes.host(2);
+    votes.host(1);
+    assert!(votes.save(2, vote(1)).await.is_err(), "refused after it");
+
+    let mut stops = reader.points(STOPS);
+    stops.sort();
+    let expected = [
+        point(["other", "1", "vote_log"]),
+        point(["other", "2", "vote_log"]),
+    ];
+    assert_eq!(stops, expected);
+}
+
 /// A failed rewrite latches the vote log as a failed write does.
 #[tokio::test]
 async fn a_failed_vote_log_rewrite_is_timed_and_stops_the_groups() {

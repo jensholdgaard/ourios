@@ -121,15 +121,22 @@ fn rfc0065_31_one_replicated_start_bootstraps_the_high_water() {
 /// whose cut has no miner configuration in force is ignored and refused,
 /// and the batches before the first configuration are mined from the WAL.
 #[test]
-#[ignore = "RFC0065.31 stub — the first-configuration arm, implemented with the checkpoint \
-            barrier"]
+#[ignore = "RFC0065.31 stub — the first-configuration arm's remaining clauses: the leader's \
+            stale refusal lands with the Propose call, the tail replicas' mining with the host \
+            mining on them, and the restart from the cut's bundle with the bundle"]
 fn rfc0065_31_a_cut_before_the_first_configuration_is_ignored() {
     todo!(
-        "RFC0065.31 — every replica ignores the checkpoint and purges nothing, the leader \
-         refuses the proposal as stale, and once the configuration applies every tail \
-         replica mines the earlier batches, read back from the WAL, into the same rows; a \
-         checkpoint applied during that read-back restarts a slow replica's miner from \
-         the cut's bundle, after which it mines the same rows"
+        "RFC0065.31 — remaining: the leader refuses the proposal as stale (Propose, §6.8 \
+         check 5); every served tail replica mines the earlier batches into the same rows; \
+         a checkpoint applied during the read-back restarts a slow replica's miner from the \
+         cut's bundle, after which it mines the same rows. Covered: a flusher's cut before \
+         the first configuration is ignored by every replica, trims nothing and offers no \
+         build, while one at or above it applies (raft::checkpoint::tests, \
+         raft::state_machine::tests, the in-process cluster in raft::cluster::tests); the \
+         group miner keeps only the first waiting batch's index and reads the batches back \
+         from the group's log when the configuration applies, mining the same rows with \
+         their own batch times, and one the log no longer holds stops it naming the entry \
+         (raft::mining::tests)"
     );
 }
 

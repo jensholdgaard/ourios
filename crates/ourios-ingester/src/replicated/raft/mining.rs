@@ -2,14 +2,16 @@
 //! from its state machine's [`Applied`] events, so every tail replica
 //! that applies the same log mines the same rows, `template_id` included.
 //!
-//! It holds no task and does no I/O. Its template ids come only from the
-//! id blocks the group applied, in log order ([`LogBlocks`]), and its
-//! configuration only from the group's miner configuration entries, the
-//! cluster default with no per-tenant override. The entries before the
-//! first configuration are mined under it once it applies, so the miner
-//! mines nothing until then. Anything it cannot mine exactly as its peers
-//! would, a batch it cannot decode or a snapshot installed over the log,
-//! stops it for good with the error naming the entry.
+//! It holds no task and does no I/O of its own. Its template ids come only
+//! from the id blocks the group applied, in log order ([`LogBlocks`]), and
+//! its configuration only from the group's miner configuration entries,
+//! the cluster default with no per-tenant override. The batches before the
+//! first configuration are mined under it once it applies, read back from
+//! the group's log ([`GroupLogRead`]), which no checkpoint can purge below
+//! a configuration; until then the miner keeps only the index of the first.
+//! Anything it cannot mine exactly as its peers would, a batch it cannot
+//! decode, one its log no longer holds or a snapshot installed over the
+//! log, stops it for good with the error naming the entry.
 //!
 //! Each event returns the audit events the miner emitted with the rows it
 //! mined, so the template events those rows need can be written ahead of
@@ -23,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use openraft::EntryPayload;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::audit::{AuditEvent, SharedAuditSink};
 use ourios_core::clock::Clock;
@@ -35,7 +38,7 @@ use prost::Message as _;
 
 use super::snapshot_record::{GroupMinerConfig, IdBlock};
 use super::state_machine::{Applied, AppliedEvent};
-use super::types::{LogId, TimedBatch};
+use super::types::{Entry, GroupEntry, LogId, TimedBatch};
 use crate::receiver::tenant::assign;
 
 /// Where a mined record was ingested: the index of its entry in the
@@ -80,6 +83,9 @@ pub enum GroupMinerError {
     /// A snapshot replaced the log through `at`; the miner state at its
     /// cut is in the checkpoint bundle, not in the events.
     Installed { at: LogId },
+    /// The first configuration applied at `at`, and the group's log no
+    /// longer holds the entry at `index`, applied before it.
+    Purged { at: LogId, index: u64 },
 }
 
 impl fmt::Display for GroupMinerError {
@@ -101,6 +107,11 @@ impl fmt::Display for GroupMinerError {
                     "a snapshot through {at} replaced the log the miner follows"
                 )
             }
+            Self::Purged { at, index } => write!(
+                f,
+                "the log no longer holds entry {index}, to mine under the first \
+                 configuration at {at}"
+            ),
         }
     }
 }
@@ -159,6 +170,13 @@ impl IdReserver for LogBlocks {
             ))
         })
     }
+}
+
+/// The group's log, which the miner reads the batches applied before
+/// the first configuration back from.
+pub trait GroupLogRead: Send {
+    /// The entry at `index`, if the log holds it.
+    fn entry(&self, index: u64) -> Option<Entry>;
 }
 
 /// The time of the batch being mined: the miner's only clock, so every
@@ -233,8 +251,11 @@ impl Frame {
 }
 
 enum Stage {
-    /// No configuration has applied: the batches wait for the first.
-    Unconfigured(Vec<Frame>),
+    /// No configuration has applied: the batches from the index of the
+    /// `first` one applied wait for it in the group's log.
+    Unconfigured {
+        first: Option<u64>,
+    },
     Mining(Box<MinerCluster>),
     Stopped(GroupMinerError),
 }
@@ -242,25 +263,21 @@ enum Stage {
 /// A group's miner, fed its state machine's events in log order.
 pub struct GroupMiner {
     stage: Stage,
+    log: Box<dyn GroupLogRead>,
     blocks: LogBlocks,
     audit: SharedAuditSink,
     clock: BatchClock,
     last: Option<LogId>,
 }
 
-impl Default for GroupMiner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GroupMiner {
     /// A miner for a group whose log it follows from the start, stamping
     /// each audit event with the time of the batch it mined.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(log: impl GroupLogRead + 'static) -> Self {
         Self {
-            stage: Stage::Unconfigured(Vec::new()),
+            stage: Stage::Unconfigured { first: None },
+            log: Box::new(log),
             blocks: LogBlocks::default(),
             audit: SharedAuditSink::new(),
             clock: BatchClock::default(),
@@ -284,7 +301,7 @@ impl GroupMiner {
     pub fn apply(&mut self, applied: Applied) -> Result<Mined, GroupMinerError> {
         let followed = match &self.stage {
             Stage::Stopped(error) => Err(error.clone()),
-            Stage::Unconfigured(_) | Stage::Mining(_) => self.follow(applied),
+            Stage::Unconfigured { .. } | Stage::Mining(_) => self.follow(applied),
         };
         let audit = self.audit.drain();
         match followed {
@@ -306,7 +323,7 @@ impl GroupMiner {
             _ => self.last = Some(at),
         }
         match event {
-            AppliedEvent::Batch(batch) => self.batch(Frame::decode(at, &batch)?),
+            AppliedEvent::Batch(batch) => self.batch(at, &batch),
             AppliedEvent::IdBlock(block) => {
                 self.blocks.push(block);
                 Ok(Vec::new())
@@ -317,15 +334,37 @@ impl GroupMiner {
         }
     }
 
-    fn batch(&mut self, frame: Frame) -> Result<Vec<MinedRow>, GroupMinerError> {
+    fn batch(&mut self, at: LogId, batch: &TimedBatch) -> Result<Vec<MinedRow>, GroupMinerError> {
         match &mut self.stage {
-            Stage::Unconfigured(pending) => {
-                pending.push(frame);
+            Stage::Unconfigured { first } => {
+                first.get_or_insert(at.index);
                 Ok(Vec::new())
             }
-            Stage::Mining(miner) => frame.mine(miner, &self.clock),
+            Stage::Mining(miner) => Frame::decode(at, batch)?.mine(miner, &self.clock),
             Stage::Stopped(error) => Err(error.clone()),
         }
+    }
+
+    /// Mine the batches in the group's log from `first` up to the first
+    /// configuration at `at`, in log order.
+    fn read_back(
+        &self,
+        miner: &mut MinerCluster,
+        first: u64,
+        at: LogId,
+    ) -> Result<Vec<MinedRow>, GroupMinerError> {
+        let mut rows = Vec::new();
+        for index in first..at.index {
+            match self.log.entry(index) {
+                None => return Err(GroupMinerError::Purged { at, index }),
+                Some(Entry {
+                    log_id,
+                    payload: EntryPayload::Normal(GroupEntry::Batch(batch)),
+                }) => rows.extend(Frame::decode(log_id, &batch)?.mine(miner, &self.clock)?),
+                Some(_) => {}
+            }
+        }
+        Ok(rows)
     }
 
     fn configure(
@@ -339,8 +378,8 @@ impl GroupMiner {
                 miner.reconfigure(config.config()).map_err(refused)?;
                 Ok(Vec::new())
             }
-            Stage::Unconfigured(pending) => {
-                let pending = std::mem::take(pending);
+            Stage::Unconfigured { first } => {
+                let first = *first;
                 let audit = Box::new(self.audit.clone());
                 let reserver = Box::new(self.blocks.clone());
                 let mut miner = Box::new(
@@ -348,10 +387,10 @@ impl GroupMiner {
                         .with_clock(Box::new(self.clock.clone()))
                         .with_id_reserver(reserver),
                 );
-                let mut rows = Vec::new();
-                for frame in &pending {
-                    rows.extend(frame.mine(&mut miner, &self.clock)?);
-                }
+                let rows = match first {
+                    Some(first) => self.read_back(&mut miner, first, at)?,
+                    None => Vec::new(),
+                };
                 self.stage = Stage::Mining(miner);
                 Ok(rows)
             }

@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use openraft::EntryPayload;
-use openraft::storage::RaftStateMachine as _;
+use openraft::storage::{IOFlushed, RaftLogStorage as _, RaftStateMachine as _};
+use openraft::type_config::TypeConfigExt as _;
 use openraft::vote::leader_id_std::CommittedLeaderId;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
@@ -11,9 +14,12 @@ use ourios_wal::{Control, MinerConfigV1, UpstreamTemplates};
 use proptest::prelude::*;
 use tokio::sync::mpsc;
 
+use super::super::cluster::wal_config;
+use super::super::log_store::{GroupLog, group_dir};
 use super::super::snapshot_record::GroupState;
 use super::super::state_machine::GroupSm;
-use super::super::types::{Entry, GroupEntry, TenantBatchBytes};
+use super::super::types::{Entry, GroupEntry, RaftTypes, TenantBatchBytes};
+use super::super::vote_log::{self, VoteLog};
 use super::*;
 
 const CORPUS: [&str; 2] = [
@@ -125,19 +131,44 @@ fn events_of(entries: &[GroupEntry], capacity: usize) -> Vec<Applied> {
             }
             applied
         });
-        let stream = (1..).zip(entries.iter().cloned()).map(|(index, data)| {
-            let entry = Entry {
-                log_id: log_id(index),
-                payload: EntryPayload::Normal(data),
-            };
-            Ok((entry, None))
-        });
+        let stream = logged(entries).into_iter().map(|entry| Ok((entry, None)));
         sm.apply(futures_util::stream::iter(stream))
             .await
             .expect("apply");
         drop(sm);
         consumer.await.expect("join")
     })
+}
+
+/// `entries` in a log from index 1, as [`events_of`] applies them.
+fn logged(entries: &[GroupEntry]) -> Vec<Entry> {
+    (1..)
+        .zip(entries.iter().cloned())
+        .map(|(index, data)| Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(data),
+        })
+        .collect()
+}
+
+/// A log held in memory, entries by index.
+struct HeldLog(BTreeMap<u64, Entry>);
+
+impl GroupLogRead for HeldLog {
+    fn entry(&self, index: u64) -> Option<Entry> {
+        self.0.get(&index).cloned()
+    }
+}
+
+/// A miner over a log holding `entries` from index 1.
+fn miner_of(entries: &[GroupEntry]) -> GroupMiner {
+    let held = logged(entries).into_iter().map(|e| (e.log_id.index, e));
+    GroupMiner::new(HeldLog(held.collect()))
+}
+
+/// A miner over an empty log, for events no entry backs.
+fn unlogged() -> GroupMiner {
+    miner_of(&[])
 }
 
 /// What `miner` mined from `events`, one [`Mined`] per event.
@@ -148,8 +179,8 @@ fn mined_each(mut miner: GroupMiner, events: Vec<Applied>) -> Vec<Mined> {
         .collect()
 }
 
-fn mined(events: Vec<Applied>) -> Vec<MinedRow> {
-    mined_each(GroupMiner::new(), events)
+fn mined(entries: &[GroupEntry], events: Vec<Applied>) -> Vec<MinedRow> {
+    mined_each(miner_of(entries), events)
         .into_iter()
         .flat_map(|mined| mined.rows)
         .collect()
@@ -159,7 +190,7 @@ fn mined(events: Vec<Applied>) -> Vec<MinedRow> {
 fn two_replicas(entries: &[GroupEntry]) -> [(Vec<Applied>, Vec<MinedRow>); 2] {
     [64, 1].map(|capacity| {
         let events = events_of(entries, capacity);
-        (events.clone(), mined(events))
+        (events.clone(), mined(entries, events))
     })
 }
 
@@ -324,7 +355,7 @@ fn batches_before_the_first_configuration_are_mined_under_it() {
             batch("acme", &["a b c d y"]),
         ]
     };
-    let mut miner = GroupMiner::new();
+    let mut miner = miner_of(&log(0.7));
     let per_event: Vec<Vec<IngestPosition>> = events_of(&log(0.7), 8)
         .into_iter()
         .map(|applied| {
@@ -379,7 +410,7 @@ fn an_undecodable_batch_stops_the_miner() {
         vec![configured(0.7), garbled.clone(), batch("acme", &["ok"])],
     ] {
         let events = events_of(&entries, 8);
-        let mut miner = GroupMiner::new();
+        let mut miner = miner_of(&entries);
         let outcomes: Vec<_> = events.into_iter().map(|e| miner.apply(e)).collect();
         let first_error = outcomes.iter().find_map(|outcome| outcome.clone().err());
         let Some(GroupMinerError::Undecodable { at, .. }) = first_error.clone() else {
@@ -407,7 +438,7 @@ fn applied(index: u64, event: AppliedEvent) -> Applied {
 /// refuses first, is an error rather than a panic.
 #[test]
 fn a_shape_change_is_an_error() {
-    let mut miner = GroupMiner::new();
+    let mut miner = unlogged();
     let first = AppliedEvent::MinerConfig(in_force(BASE));
     miner.apply(applied(1, first)).expect("first");
     let deeper = in_force(MinerConfigV1 {
@@ -427,14 +458,14 @@ fn a_shape_change_is_an_error() {
 /// the log, stops the miner.
 #[test]
 fn an_event_out_of_order_or_an_install_stops_the_miner() {
-    let mut miner = GroupMiner::new();
+    let mut miner = unlogged();
     miner
         .apply(applied(2, AppliedEvent::MinerConfig(in_force(BASE))))
         .expect("first");
     let repeated = miner.apply(applied(2, AppliedEvent::Flusher(1.into())));
     assert!(matches!(repeated, Err(GroupMinerError::OutOfOrder { .. })));
 
-    let mut miner = GroupMiner::new();
+    let mut miner = unlogged();
     let installed = miner.apply(applied(5, AppliedEvent::Installed(GroupState::default())));
     assert_eq!(installed, Err(GroupMinerError::Installed { at: log_id(5) }));
     let later = miner.apply(applied(6, AppliedEvent::MinerConfig(in_force(BASE))));
@@ -474,7 +505,7 @@ fn an_index_that_does_not_advance_stops_the_miner_whatever_the_term() {
     let config = || AppliedEvent::MinerConfig(in_force(BASE));
     let flusher = || AppliedEvent::Flusher(1.into());
     let follows = |term, index| {
-        let mut miner = GroupMiner::new();
+        let mut miner = unlogged();
         miner.apply(applied_in(2, 5, config())).expect("first");
         miner.apply(applied_in(term, index, flusher()))
     };
@@ -509,7 +540,7 @@ fn template_events_come_with_the_rows_that_need_them() {
         batch("acme", &["a b c d e"]),
         batch("acme", &["a b c d x"]),
     ];
-    let mined = mined_each(GroupMiner::new(), events_of(&entries, 8));
+    let mined = mined_each(miner_of(&entries), events_of(&entries, 8));
     assert!(
         mined[..2]
             .iter()
@@ -556,9 +587,9 @@ fn two_replicas_emit_the_same_audit_events_apart_from_timestamps() {
             })
             .collect()
     };
-    let replica = audit(GroupMiner::new());
+    let replica = audit(miner_of(&entries));
     assert!(replica.iter().filter_map(change_of).count() >= 2);
-    assert_eq!(untimed(replica.clone()), untimed(audit(GroupMiner::new())));
+    assert_eq!(untimed(replica.clone()), untimed(audit(miner_of(&entries))));
 }
 
 fn time(nanos: u64) -> BatchTime {
@@ -582,9 +613,9 @@ fn two_replicas_stamp_every_audit_event_with_its_batchs_time() {
         entries.push(batch_at(at, "acme", lines));
         times.push(Some(at.system_time()));
     }
-    let replica = mined_each(GroupMiner::new(), events_of(&entries, 64));
+    let replica = mined_each(miner_of(&entries), events_of(&entries, 64));
     std::thread::sleep(Duration::from_millis(2));
-    let other = mined_each(GroupMiner::new(), events_of(&entries, 1));
+    let other = mined_each(miner_of(&entries), events_of(&entries, 1));
     assert_eq!(replica, other);
 
     let audited = replica.iter().filter(|m| !m.audit.is_empty()).count();
@@ -610,10 +641,89 @@ fn batches_mined_under_the_first_configuration_keep_their_own_times() {
         configured(0.7),
         batch_at(last, "acme", &["a b c d q"]),
     ];
-    let mined = mined_each(GroupMiner::new(), events_of(&entries, 8));
+    let mined = mined_each(miner_of(&entries), events_of(&entries, 8));
     let at = |t: BatchTime| t.system_time();
     assert!(mined[..3].iter().all(|m| m.audit.is_empty()));
     assert_eq!(stamps(&mined[3]), [at(early), at(later)]);
     assert!(!mined[4].audit.is_empty(), "widened");
     assert!(stamps(&mined[4]).iter().all(|&t| t == at(last)));
+}
+
+/// Run `future` to completion on a runtime of its own.
+fn block_on<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime")
+        .block_on(future)
+}
+
+/// A group log in `dir` holding `entries` from index 1, fsynced.
+async fn group_log(dir: &Path, entries: &[GroupEntry]) -> GroupLog {
+    vote_log::create(dir).expect("create");
+    let votes = VoteLog::open(dir).expect("vote log");
+    let mut log = GroupLog::open(wal_config(&group_dir(dir, 0)), 0, votes).expect("group log");
+    let (tx, rx) = RaftTypes::oneshot();
+    log.append(logged(entries), IOFlushed::signal(tx))
+        .await
+        .expect("append");
+    rx.await.expect("callback").expect("fsynced");
+    log
+}
+
+/// Batches, an id block, the first configuration at index 4, a batch.
+fn configured_at_4() -> Vec<GroupEntry> {
+    vec![
+        batch_at(time(10), "acme", &["a b c d e"]),
+        block(0, 100),
+        batch_at(time(20), "acme", &["a b c d x"]),
+        configured(0.7),
+        batch_at(time(30), "acme", &["a b c d y"]),
+    ]
+}
+
+/// The batches applied before the first configuration are read back from
+/// the group's log when it applies, and mine the rows a log held in
+/// memory gives, each stamped with its own batch's time.
+#[test]
+fn batches_before_the_first_configuration_are_read_back_from_the_groups_log() {
+    let entries = configured_at_4();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reader = block_on(async { group_log(dir.path(), &entries).await.get_log_reader().await });
+    let from_the_wal = mined_each(GroupMiner::new(reader), events_of(&entries, 8));
+    let held = mined_each(miner_of(&entries), events_of(&entries, 8));
+    assert_eq!(from_the_wal, held);
+    let own_times = [time(10), time(20)].map(BatchTime::system_time);
+    assert_eq!(stamps(&from_the_wal[3]), own_times);
+    let seqs = |mined: &Mined| {
+        mined
+            .rows
+            .iter()
+            .map(|r| r.position.seq)
+            .collect::<Vec<_>>()
+    };
+    let per_event: Vec<_> = from_the_wal.iter().map(seqs).collect();
+    assert_eq!(per_event, [vec![], vec![], vec![], vec![1, 3], vec![5]]);
+}
+
+/// A batch applied before the first configuration that the group's log
+/// no longer holds when it applies stops the miner, naming the entry.
+#[test]
+fn a_batch_purged_before_the_first_configuration_applies_stops_the_miner() {
+    let entries = configured_at_4();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reader = block_on(async {
+        let mut log = group_log(dir.path(), &entries).await;
+        log.purge(log_id(1)).await.expect("purge");
+        log.get_log_reader().await
+    });
+    let mut miner = GroupMiner::new(reader);
+    let outcomes: Vec<_> = events_of(&entries, 8)
+        .into_iter()
+        .map(|applied| miner.apply(applied).map(|mined| mined.rows.len()))
+        .collect();
+    let purged = Err(GroupMinerError::Purged {
+        at: log_id(4),
+        index: 1,
+    });
+    assert_eq!(outcomes, [Ok(0), Ok(0), Ok(0), purged.clone(), purged]);
 }

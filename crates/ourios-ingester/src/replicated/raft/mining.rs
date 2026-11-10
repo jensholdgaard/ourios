@@ -35,7 +35,7 @@ use prost::Message as _;
 
 use super::snapshot_record::{GroupMinerConfig, IdBlock};
 use super::state_machine::{Applied, AppliedEvent};
-use super::types::{LogId, TimedBatch};
+use super::types::{Entry, LogId, TimedBatch};
 use crate::receiver::tenant::assign;
 
 /// Where a mined record was ingested: the index of its entry in the
@@ -80,6 +80,9 @@ pub enum GroupMinerError {
     /// A snapshot replaced the log through `at`; the miner state at its
     /// cut is in the checkpoint bundle, not in the events.
     Installed { at: LogId },
+    /// The first configuration applied at `at`, and the group's log no
+    /// longer holds the entry at `index`, applied before it.
+    Purged { at: LogId, index: u64 },
 }
 
 impl fmt::Display for GroupMinerError {
@@ -101,6 +104,11 @@ impl fmt::Display for GroupMinerError {
                     "a snapshot through {at} replaced the log the miner follows"
                 )
             }
+            Self::Purged { at, index } => write!(
+                f,
+                "the log no longer holds entry {index}, to mine under the first \
+                 configuration at {at}"
+            ),
         }
     }
 }
@@ -159,6 +167,13 @@ impl IdReserver for LogBlocks {
             ))
         })
     }
+}
+
+/// The group's log, which the miner reads the batches applied before
+/// the first configuration back from.
+pub trait GroupLogRead: Send {
+    /// The entry at `index`, if the log holds it.
+    fn entry(&self, index: u64) -> Option<Entry>;
 }
 
 /// The time of the batch being mined: the miner's only clock, so every
@@ -242,25 +257,23 @@ enum Stage {
 /// A group's miner, fed its state machine's events in log order.
 pub struct GroupMiner {
     stage: Stage,
+    // A seam until the miner reads its pending batches back from the log.
+    #[allow(dead_code)]
+    log: Box<dyn GroupLogRead>,
     blocks: LogBlocks,
     audit: SharedAuditSink,
     clock: BatchClock,
     last: Option<LogId>,
 }
 
-impl Default for GroupMiner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GroupMiner {
     /// A miner for a group whose log it follows from the start, stamping
     /// each audit event with the time of the batch it mined.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(log: impl GroupLogRead + 'static) -> Self {
         Self {
             stage: Stage::Unconfigured(Vec::new()),
+            log: Box::new(log),
             blocks: LogBlocks::default(),
             audit: SharedAuditSink::new(),
             clock: BatchClock::default(),

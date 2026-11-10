@@ -145,6 +145,15 @@ pub fn load_or_create(wal_root: &Path) -> Result<Identity, ReplicaIdError> {
     Ok(identity)
 }
 
+/// Read this replica's identity from `wal_root` without creating one.
+///
+/// # Errors
+///
+/// As [`load_or_create`] for a file that exists.
+pub fn load_existing(wal_root: &Path) -> Result<Option<ReplicaId>, ReplicaIdError> {
+    load_or_create(wal_root).map(|identity| Some(identity.id()))
+}
+
 fn read(path: &Path) -> Result<Option<ReplicaId>, ReplicaIdError> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -373,5 +382,69 @@ mod tests {
             err.to_string().contains(&path.display().to_string()),
             "{err}"
         );
+    }
+
+    fn entries(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .expect("list")
+            .map(|entry| {
+                let name = entry.expect("entry").file_name();
+                name.to_string_lossy().into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn loading_without_an_identity_creates_nothing() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let root = dir.path().join("wal");
+        assert_eq!(load_existing(&root).expect("absent"), None);
+        assert!(!root.exists(), "wal_root was created");
+        assert_eq!(load_existing(dir.path()).expect("absent"), None);
+        assert!(entries(dir.path()).is_empty(), "{:?}", entries(dir.path()));
+    }
+
+    #[test]
+    fn loading_an_existing_identity_writes_nothing() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let path = dir.path().join(REPLICA_ID_FILE);
+        let id = ReplicaId(Uuid::now_v7());
+        std::fs::write(&path, id.encode()).expect("write");
+        assert_eq!(load_existing(dir.path()).expect("present"), Some(id));
+        assert_eq!(entries(dir.path()), [REPLICA_ID_FILE]);
+    }
+
+    #[test]
+    fn loading_a_malformed_identity_fails_naming_the_file_and_keeps_it() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let path = dir.path().join(REPLICA_ID_FILE);
+        std::fs::write(&path, b"garbage").expect("write");
+        let err = load_existing(dir.path()).expect_err("malformed");
+        assert!(matches!(err, ReplicaIdError::Malformed { .. }), "{err}");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).expect("kept"), b"garbage");
+        assert_eq!(entries(dir.path()), [REPLICA_ID_FILE]);
+    }
+
+    #[test]
+    fn loading_an_unreadable_identity_fails_naming_the_file() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let path = dir.path().join(REPLICA_ID_FILE);
+        std::fs::create_dir(&path).expect("a directory where the file belongs");
+        let err = load_existing(dir.path()).expect_err("unreadable");
+        assert!(
+            matches!(&err, ReplicaIdError::Io { op, .. } if *op == READ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(entries(dir.path()), [REPLICA_ID_FILE]);
     }
 }

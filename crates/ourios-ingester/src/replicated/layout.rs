@@ -277,6 +277,15 @@ pub fn record_or_check(
     }
 }
 
+/// Check `configured` against the recorded layout without recording it.
+///
+/// # Errors
+///
+/// As [`record_or_check`].
+pub fn check_recorded(store: &Store, configured: &VotingLayout) -> Result<(), LayoutError> {
+    record_or_check(store, configured).map(|_| ())
+}
+
 /// Create the record, or check against the one a concurrent first start
 /// created between this start's read and its write.
 fn create(store: &Store, configured: &VotingLayout) -> Result<LayoutCheck, LayoutError> {
@@ -509,5 +518,63 @@ mod tests {
             .expect("put");
         let err = record_or_check(&store, &layout(&["a"], 1, 3)).expect_err("malformed");
         assert!(matches!(err, LayoutError::Malformed { .. }), "{err}");
+    }
+
+    fn keys(store: &Store) -> Vec<String> {
+        store.list_blocking(None).expect("list")
+    }
+
+    #[test]
+    fn checking_without_a_record_records_nothing() {
+        let store = Store::in_memory();
+        check_recorded(&store, &layout(&["a", "b", "c"], 16, 3)).expect("nothing to differ from");
+        assert!(keys(&store).is_empty(), "{:?}", keys(&store));
+    }
+
+    #[test]
+    fn checking_against_a_matching_record_leaves_it() {
+        let store = Store::in_memory();
+        record_or_check(&store, &layout(&["a", "b", "c"], 16, 3)).expect("record");
+        let recorded = store.get_blocking(LAYOUT_KEY).expect("recorded");
+        check_recorded(&store, &layout(&["c", "b", "a"], 16, 3)).expect("matches");
+        assert_eq!(keys(&store), [LAYOUT_KEY]);
+        assert_eq!(store.get_blocking(LAYOUT_KEY).expect("kept"), recorded);
+    }
+
+    #[test]
+    fn checking_against_a_different_record_fails_as_recording_does() {
+        let store = Store::in_memory();
+        record_or_check(&store, &layout(&["a", "b", "c"], 16, 3)).expect("record");
+        let recorded = store.get_blocking(LAYOUT_KEY).expect("recorded");
+        let configured = layout(&["a", "b", "d"], 8, 3);
+        let checked = check_recorded(&store, &configured).expect_err("mismatch");
+        let recording = record_or_check(&store, &configured).expect_err("mismatch");
+        assert_eq!(
+            mismatch_fields(&checked),
+            [LayoutField::Peers, LayoutField::Groups]
+        );
+        assert_eq!(checked.to_string(), recording.to_string());
+        assert_eq!(keys(&store), [LAYOUT_KEY]);
+        assert_eq!(store.get_blocking(LAYOUT_KEY).expect("kept"), recorded);
+    }
+
+    #[test]
+    fn checking_a_malformed_record_fails_and_keeps_it() {
+        let store = Store::in_memory();
+        store
+            .put_blocking(LAYOUT_KEY, b"not json".to_vec())
+            .expect("put");
+        let err = check_recorded(&store, &layout(&["a"], 1, 3)).expect_err("malformed");
+        assert!(matches!(err, LayoutError::Malformed { .. }), "{err}");
+        assert_eq!(store.get_blocking(LAYOUT_KEY).expect("kept"), b"not json");
+    }
+
+    #[test]
+    fn checking_on_a_store_without_conditional_updates_is_refused() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("local store");
+        let err = check_recorded(&store, &layout(&["a", "b", "c"], 16, 3)).expect_err("refused");
+        assert!(matches!(err, LayoutError::NoConditionalUpdate), "{err}");
+        assert!(keys(&store).is_empty(), "{:?}", keys(&store));
     }
 }

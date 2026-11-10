@@ -774,6 +774,31 @@ mod tests {
         assert_eq!(built.snapshot.highest_kind, 4);
     }
 
+    /// Each refusal reason alone refuses a checkpoint, with a miner
+    /// configuration in force at the cut, and with every reason cleared it
+    /// applies.
+    #[tokio::test]
+    async fn each_refusal_reason_refuses_with_a_configuration_in_force() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let cuts = sm.checkpoints();
+        let configured_at_3 = vec![batch(1), assign(2, 7), entry(3, configured(FIRST))];
+        apply(&mut sm, configured_at_3).await;
+        let refused = [
+            (checkpoint(4, 9, (2, 3), 4), "not the flusher"),
+            (checkpoint(5, 7, (2, 6), 4), "a cut not below the entry"),
+            (checkpoint(6, 7, (3, 3), 4), "a cut not in the log"),
+            (
+                checkpoint(7, 7, (2, 3), 1),
+                "a highest kind not the log's at the cut",
+            ),
+        ];
+        refuse_each(&mut sm, &cuts, refused).await;
+
+        apply(&mut sm, vec![checkpoint(8, 7, (2, 3), 4)]).await;
+        assert_eq!(*cuts.borrow(), cut(3), "every reason cleared");
+    }
+
     fn id_block(block: Option<IdBlock>) -> EntryPayload<GroupEntry, Membership> {
         let block = block.expect("a valid block");
         let control = Control::IdBlock {

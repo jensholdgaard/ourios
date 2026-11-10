@@ -282,6 +282,32 @@ mod tests {
         }
     }
 
+    /// Each refusal reason alone refuses a checkpoint, with a configuration
+    /// in force at the cut, and with every reason cleared it applies.
+    #[test]
+    fn each_refusal_reason_refuses_with_a_configuration_in_force() {
+        let flusher = Some(NodeId::from(7));
+        let refused = [
+            (proposal(9, id(2, 3), 4), "not the flusher"),
+            (proposal(7, id(3, 9), 4), "a cut not below the entry"),
+            (
+                proposal(7, id(3, 3), 4),
+                "a cut whose term the log does not hold",
+            ),
+            (proposal(7, id(2, 3), 1), "a highest kind not the log's"),
+        ];
+        for (proposal, why) in refused {
+            let mut history = history_configured_at(Some(2));
+            let held = history.changes.len();
+            assert_eq!(history.apply(id(3, 9), flusher, proposal), None, "{why}");
+            assert_eq!(history.cut(), None, "{why}");
+            assert_eq!(history.changes.len(), held, "{why}");
+        }
+        let mut history = history_configured_at(Some(2));
+        let applied = history.apply(id(3, 9), flusher, proposal(7, id(2, 3), 4));
+        assert_eq!(applied, Some(id(2, 3)), "every reason cleared");
+    }
+
     #[test]
     #[ignore = "superseded: a cut needs a miner configuration in force (RFC 0065 §6.5); see \
                 an_applied_checkpoint_holds_the_configured_group_at_its_cut, #1246"]

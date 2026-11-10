@@ -8,7 +8,7 @@ use ourios_parquet::Store;
 use tokio::sync::mpsc;
 
 use super::bootstrap::{Evidence, LockStart, RaftState, StartError, Started, Waiting, start};
-use super::gated::{pausing_create, with_outage};
+use super::gated::{Point, pausing, with_outage};
 use super::{AllocateError, LOG_IDS_KEY, LockUnreadable, LogIds, Refused, allocate};
 use crate::template_ids::{self, HIGH_WATER_KEY, ScanOptions, Seated, TemplateIdsError};
 
@@ -196,7 +196,7 @@ async fn of_two_racing_starts_only_the_lock_holder_bootstraps() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_paused_before_its_create_never_re_creates_a_deleted_object() {
     let store = Store::in_memory();
-    let (paused_store, paused) = pausing_create(store.clone());
+    let (paused_store, paused) = pausing(store.clone(), Point::CreateLock);
     let (resumed, _) = spawn_start(&paused_store, B);
     tokio::time::timeout(PATIENCE, paused.reached)
         .await
@@ -224,6 +224,74 @@ async fn a_start_paused_before_its_create_never_re_creates_a_deleted_object() {
     assert_high_water_deleted(&resumed.await.expect("joined"));
     assert_eq!(high_water(&store).await, None, "the object was re-created");
     assert_eq!(lock_of(&store).await, Some(lock(A, true, 2)));
+}
+
+/// A start paused before its create of the lock, resumed after the other
+/// has seeded and allocated log ids and the lock (not the object) was
+/// deleted, creates the lock but finds an object it did not create: it
+/// fails with `LogIdsDeleted`, seeds nothing, and leaves no lock behind
+/// that a restart could take for its own crash, so no log id is allocated
+/// twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_paused_before_its_create_never_re_creates_a_deleted_lock() {
+    let store = Store::in_memory();
+    let (paused_store, paused) = pausing(store.clone(), Point::CreateLock);
+    let (resumed, _) = spawn_start(&paused_store, B);
+    tokio::time::timeout(PATIENCE, paused.reached)
+        .await
+        .expect("B reached its create")
+        .expect("B's create is held");
+
+    let outcome = run(&store, A, RaftState::Empty).await;
+    assert_eq!(outcome.ok(), Some(bootstrapped(0)));
+    assert_eq!(
+        (allocate(&store).await.ok(), allocate(&store).await.ok()),
+        (Some(0), Some(1))
+    );
+    store.delete(LOG_IDS_KEY).await.expect("delete the lock");
+
+    paused.release.send(()).expect("B is held");
+    let resumed = resumed.await.expect("joined");
+    assert!(
+        matches!(resumed, Err(StartError::LogIdsDeleted(Evidence::HighWater))),
+        "{resumed:?}"
+    );
+    assert_eq!(root_of(&store).await, (None, Some(0)), "B left a lock");
+    let restarted = run(&store, B, RaftState::Empty).await;
+    assert!(
+        matches!(
+            restarted,
+            Err(StartError::LogIdsDeleted(Evidence::HighWater))
+        ),
+        "{restarted:?}"
+    );
+    let refused = allocate(&store).await.expect_err("deleted");
+    assert!(
+        matches!(refused, AllocateError::Refused(Refused::Deleted)),
+        "{refused}"
+    );
+}
+
+/// A start that read the lock absent while another bootstrapped, and
+/// found the object only after that one had seeded, passes: the lock is
+/// present now, so it was not deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_read_the_lock_absent_before_another_bootstrapped_passes() {
+    let store = Store::in_memory();
+    let (paused_store, paused) = pausing(store.clone(), Point::AfterLockRead);
+    let (resumed, _) = spawn_start(&paused_store, B);
+    tokio::time::timeout(PATIENCE, paused.reached)
+        .await
+        .expect("B read the lock")
+        .expect("B is held after its read");
+
+    let outcome = run(&store, A, RaftState::Empty).await;
+    assert_eq!(outcome.ok(), Some(bootstrapped(0)));
+
+    paused.release.send(()).expect("B is held");
+    let resumed = resumed.await.expect("joined");
+    assert_eq!(resumed.ok(), Some(Started::Seeded));
+    assert_eq!(root_of(&store).await, (Some(lock(A, true, 0)), Some(0)));
 }
 
 /// A bootstrapper killed between the object and `seeded` finishes on its

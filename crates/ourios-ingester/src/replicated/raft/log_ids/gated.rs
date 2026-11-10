@@ -1,5 +1,6 @@
-//! A store a test can take down, or pause at its create of the lock: the
-//! paused start has read the lock absent and resumes only when released.
+//! A store a test can take down, or pause at one call on the lock: at its
+//! create, or just after its first read, so the paused start has read the
+//! lock absent and resumes only when released.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -30,7 +31,8 @@ impl Outage {
     }
 }
 
-/// The first create of the lock through the store returned with it, held.
+/// The first call on the lock at a [`Point`] through the store returned
+/// with it, held.
 pub(super) struct Paused {
     /// Fires once that create has been called.
     pub(super) reached: oneshot::Receiver<()>,
@@ -38,7 +40,40 @@ pub(super) struct Paused {
     pub(super) release: oneshot::Sender<()>,
 }
 
-type Hold = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
+/// Where a start is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Point {
+    /// Before its create of the lock.
+    CreateLock,
+    /// After its first read of the lock has returned.
+    AfterLockRead,
+}
+
+type Channels = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+#[derive(Debug, Default)]
+struct Hold {
+    point: Option<Point>,
+    channels: Mutex<Option<Channels>>,
+}
+
+impl Hold {
+    /// Wait for the release if this call is the first at the held point.
+    async fn at(&self, point: Point, location: &Key) {
+        if self.point != Some(point) || location.as_ref() != LOG_IDS_KEY {
+            return;
+        }
+        let held = self
+            .channels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((reached, release)) = held {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+}
 
 /// `store`, behind a switch that takes it down.
 pub(super) fn with_outage(store: Store) -> (Store, Outage) {
@@ -47,11 +82,14 @@ pub(super) fn with_outage(store: Store) -> (Store, Outage) {
     (wrapped, Outage(down))
 }
 
-/// `store`, pausing its first create of the lock.
-pub(super) fn pausing_create(store: Store) -> (Store, Paused) {
+/// `store`, pausing its first call on the lock at `point`.
+pub(super) fn pausing(store: Store, point: Point) -> (Store, Paused) {
     let (reached_tx, reached) = oneshot::channel();
     let (release, release_rx) = oneshot::channel();
-    let hold = Mutex::new(Some((reached_tx, release_rx)));
+    let hold = Hold {
+        point: Some(point),
+        channels: Mutex::new(Some((reached_tx, release_rx))),
+    };
     let wrapped = wrap(store, Arc::default(), hold);
     (wrapped, Paused { reached, release })
 }
@@ -88,21 +126,6 @@ impl Gated {
             .err()
             .map(|e| futures::stream::once(async move { Err(e) }).boxed())
     }
-
-    async fn pause_if_held(&self, location: &Key, opts: &PutOptions) {
-        if !matches!(opts.mode, PutMode::Create) || location.as_ref() != LOG_IDS_KEY {
-            return;
-        }
-        let held = self
-            .hold
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some((reached, release)) = held {
-            let _ = reached.send(());
-            let _ = release.await;
-        }
-    }
 }
 
 impl std::fmt::Display for Gated {
@@ -120,7 +143,9 @@ impl ObjectStore for Gated {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.reachable()?;
-        self.pause_if_held(location, &opts).await;
+        if matches!(opts.mode, PutMode::Create) {
+            self.hold.at(Point::CreateLock, location).await;
+        }
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -139,7 +164,9 @@ impl ObjectStore for Gated {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         self.reachable()?;
-        self.inner.get_opts(location, options).await
+        let got = self.inner.get_opts(location, options).await;
+        self.hold.at(Point::AfterLockRead, location).await;
+        got
     }
 
     fn delete_stream(

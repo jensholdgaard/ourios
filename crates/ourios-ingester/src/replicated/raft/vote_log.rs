@@ -32,7 +32,7 @@
 //! a time, through an OS lock on `wal_root/votes.lock` that its thread
 //! holds until it exits. The WAL root must be on a local filesystem.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Write};
@@ -46,6 +46,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::gate::SyncGate;
+use super::telemetry::{Component, Storage};
 use super::types::{NodeId, Vote};
 use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership};
 
@@ -72,19 +73,29 @@ struct Options {
     rewrite_bytes: u64,
     owner_wait: Duration,
     gate: Arc<SyncGate>,
+    storage: Storage,
 }
 
-impl Default for Options {
-    fn default() -> Self {
+impl Options {
+    fn storing(storage: Storage) -> Self {
         Self {
             rewrite_bytes: DEFAULT_REWRITE_BYTES,
             owner_wait: OWNER_WAIT,
             gate: Arc::default(),
+            storage,
         }
     }
 }
 
+impl Default for Options {
+    fn default() -> Self {
+        Self::storing(Storage::global())
+    }
+}
+
 type Latest = Arc<Mutex<HashMap<u32, Vote>>>;
+/// The groups whose logs the node opened over this vote log.
+type Hosted = Arc<Mutex<BTreeSet<u32>>>;
 
 struct Request {
     group: u32,
@@ -157,6 +168,7 @@ fn lost(path: &Path) -> io::Error {
 pub struct VoteLog {
     tx: Sender<Request>,
     latest: Latest,
+    hosted: Hosted,
 }
 
 impl VoteLog {
@@ -173,6 +185,32 @@ impl VoteLog {
         Self::open_with(wal_root, Options::default())
     }
 
+    /// [`VoteLog::open`], recording to `storage`.
+    pub(super) fn open_storing(wal_root: &Path, storage: Storage) -> io::Result<Self> {
+        Self::open_with(wal_root, Options::storing(storage))
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_metered(
+        wal_root: &Path,
+        rewrite_bytes: u64,
+        gate: Arc<SyncGate>,
+        storage: Storage,
+    ) -> io::Result<Self> {
+        let options = Options {
+            rewrite_bytes,
+            gate,
+            ..Options::storing(storage)
+        };
+        Self::open_with(wal_root, options)
+    }
+
+    /// Note that `group`'s log is open over this vote log, so a failure
+    /// of the vote log counts as a stop of the group.
+    pub(super) fn host(&self, group: u32) {
+        lock(&self.hosted).insert(group);
+    }
+
     fn open_with(wal_root: &Path, options: Options) -> io::Result<Self> {
         ourios_wal::prepare_root(wal_root)
             .map_err(|e| io::Error::other(format!("prepare {}: {e:?}", wal_root.display())))?;
@@ -184,6 +222,7 @@ impl VoteLog {
         let Options {
             rewrite_bytes,
             gate,
+            storage,
             ..
         } = options;
         let path = wal_root.join(VOTES_FILE);
@@ -196,6 +235,7 @@ impl VoteLog {
         };
         let file = OpenOptions::new().append(true).open(&path)?;
         let latest: Latest = Arc::new(Mutex::new(latest));
+        let hosted = Hosted::default();
         let (tx, rx) = mpsc::channel();
         let writer = Writer {
             file,
@@ -205,12 +245,16 @@ impl VoteLog {
             latest: Arc::clone(&latest),
             failed: None,
             gate,
+            stops: Stops {
+                storage,
+                hosted: Arc::clone(&hosted),
+            },
             _owner: owner,
         };
         std::thread::Builder::new()
             .name("ourios-votes".to_owned())
             .spawn(move || writer.run(&rx))?;
-        Ok(Self { tx, latest })
+        Ok(Self { tx, latest, hosted })
     }
 
     /// The group's latest durable vote.
@@ -426,8 +470,16 @@ struct Writer {
     /// unknown, so every later save fails.
     failed: Option<String>,
     gate: Arc<SyncGate>,
+    stops: Stops,
     /// Released when the thread exits; see [`VoteLog::open`].
     _owner: Owner,
+}
+
+/// Where the vote log reports its writes, and the groups its failure
+/// stops.
+struct Stops {
+    storage: Storage,
+    hosted: Hosted,
 }
 
 impl Writer {

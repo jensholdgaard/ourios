@@ -9,15 +9,20 @@
 //! gauges are registered once per meter provider over a registry of weakly
 //! held hosts, as the miner's are (`ourios-miner`'s `metrics/gauges.rs`):
 //! a closed host stops reporting and frees its watches.
+//!
+//! The storage writers time each write-and-fsync, and count a writer's
+//! first failure as a stop of every group it serves.
 
+use std::io;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use openraft::RaftMetrics;
 use openraft::async_runtime::WatchReceiver as _;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId as _;
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Meter, MeterProvider, ObservableGauge};
+use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider, ObservableGauge};
 use ourios_core::sync::lock_recover;
 use ourios_semconv as semconv;
 
@@ -36,6 +41,7 @@ pub(crate) struct Meters {
     gauges: Arc<Gauges>,
     takeovers: Counter<u64>,
     flusher: FlusherCounts,
+    storage: Storage,
 }
 
 impl Meters {
@@ -62,7 +68,13 @@ impl Meters {
             gauges,
             takeovers,
             flusher,
+            storage: Storage::on(meter),
         }
+    }
+
+    /// What the storage writers record.
+    pub(crate) fn storage(&self) -> Storage {
+        self.storage.clone()
     }
 
     /// The counts of a group leader's flusher pass.
@@ -142,6 +154,73 @@ impl FlusherCounts {
     }
 }
 
+/// The storage writer a signal is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Component {
+    LogStore,
+    VoteLog,
+}
+
+impl Component {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LogStore => "log_store",
+            Self::VoteLog => "vote_log",
+        }
+    }
+}
+
+/// What a storage writer records: each write-and-fsync, and the stops its
+/// first failure causes.
+#[derive(Clone, Debug)]
+pub(crate) struct Storage {
+    syncs: Histogram<f64>,
+    stops: Counter<u64>,
+}
+
+impl Storage {
+    /// The instruments on the installed global provider.
+    pub(crate) fn global() -> Self {
+        Self::on(&scoped(&opentelemetry::global::meter_provider()))
+    }
+
+    fn on(meter: &Meter) -> Self {
+        let (name, description, unit) = SYNCS;
+        let syncs = meter
+            .f64_histogram(name)
+            .with_description(description)
+            .with_unit(unit)
+            .with_boundaries(ourios_core::histogram_buckets::FAST_DURATION_S.to_vec())
+            .build();
+        Self {
+            syncs,
+            stops: counter(meter, STOPS),
+        }
+    }
+
+    /// One write-and-fsync by `component`, of `group` for the log store,
+    /// taking `elapsed` and failing with `failed`.
+    pub(crate) fn synced(
+        &self,
+        component: Component,
+        group: Option<u32>,
+        elapsed: Duration,
+        failed: Option<io::ErrorKind>,
+    ) {
+        let _ = (component, group, elapsed, failed, &self.syncs);
+    }
+
+    /// `component` stopped serving `group` on an error of `kind`.
+    pub(crate) fn stopped(&self, component: Component, group: u32, kind: io::ErrorKind) {
+        let _ = (component, group, kind, &self.stops);
+    }
+}
+
+/// `kind` as `error.type`: its name in snake case.
+pub(super) fn error_type(kind: io::ErrorKind) -> String {
+    format!("{kind:?}")
+}
+
 /// A counter's name, description and unit.
 type Spec = (&'static str, &'static str, &'static str);
 
@@ -161,6 +240,18 @@ const HOLDS: Spec = (
     semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS,
     semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS_DESCRIPTION,
     semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS_UNIT,
+);
+
+const SYNCS: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_SYNC_DURATION,
+    semconv::OURIOS_WAL_REPLICATION_SYNC_DURATION_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_SYNC_DURATION_UNIT,
+);
+
+const STOPS: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_STOPS,
+    semconv::OURIOS_WAL_REPLICATION_STOPS_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_STOPS_UNIT,
 );
 
 fn counter(meter: &Meter, (name, description, unit): Spec) -> Counter<u64> {
@@ -313,5 +404,7 @@ fn lags(metrics: &RaftMetrics<RaftTypes>) -> Vec<(String, u64)> {
         .collect()
 }
 
+#[cfg(test)]
+mod storage_tests;
 #[cfg(test)]
 pub(crate) mod tests;

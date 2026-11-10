@@ -33,7 +33,7 @@ use super::codec::{self, Replayed};
 pub use super::controls::{HeldControls, LogControls};
 use super::gate::SyncGate;
 use super::mining::GroupLogRead;
-use super::telemetry::Takeovers;
+use super::telemetry::{Component, Storage, Takeovers};
 use super::types::{Entry, GroupEntry, LogId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
 use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership, writer_gone};
@@ -370,7 +370,7 @@ impl GroupLog {
     /// The WAL cannot be opened or replayed, or holds a record this
     /// build cannot read or a log with a hole.
     pub fn open(wal: WalConfig, group: u32, votes: VoteLog) -> io::Result<Self> {
-        Self::open_with(wal, group, votes, Arc::default())
+        Self::open_with(wal, group, votes, Arc::default(), Storage::global())
     }
 
     pub(super) fn open_with(
@@ -378,6 +378,7 @@ impl GroupLog {
         group: u32,
         votes: VoteLog,
         gate: Arc<SyncGate>,
+        storage: Storage,
     ) -> io::Result<Self> {
         if votes.latest(group).is_some() && !holds_segments(&wal.root)? {
             return Err(lost(&wal.root));
@@ -727,7 +728,17 @@ pub(super) mod test_hooks {
             votes: VoteLog,
             gate: Arc<SyncGate>,
         ) -> io::Result<Self> {
-            Self::open_with(wal, group, votes, gate)
+            Self::open_with(wal, group, votes, gate, Storage::global())
+        }
+
+        pub(in crate::replicated::raft) fn open_metered(
+            wal: WalConfig,
+            group: u32,
+            votes: VoteLog,
+            gate: Arc<SyncGate>,
+            storage: Storage,
+        ) -> io::Result<Self> {
+            Self::open_with(wal, group, votes, gate, storage)
         }
 
         /// Stop the writer once every command it holds is done; no other

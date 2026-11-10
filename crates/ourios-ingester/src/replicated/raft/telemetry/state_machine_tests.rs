@@ -98,6 +98,7 @@ async fn a_snapshot_it_cannot_record_stops_the_state_machine_once() {
     let stops = reader.points(STOPS);
     assert_eq!(stops.len(), 1, "{stops:?}");
     assert_eq!(stops[0].0[1..], ["5", "state_machine"], "{stops:?}");
+    assert_eq!(stops[0].1, 1, "the build and the install share one stop");
 }
 
 /// Applies that succeed stop nothing.

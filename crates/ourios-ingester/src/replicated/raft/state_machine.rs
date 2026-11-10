@@ -637,17 +637,46 @@ mod tests {
     /// flusher and highest kind there, not those changed after it, and a
     /// reopen starts applied through the cut.
     #[tokio::test]
+    #[ignore = "superseded: a cut needs a miner configuration in force (RFC 0065 §6.5); see \
+                a_built_snapshot_is_the_configured_group_at_the_checkpoints_cut, #1246"]
     async fn a_built_snapshot_is_the_group_at_the_checkpoints_cut() {
+        let expected = GroupState {
+            flusher: Some(NodeId::from(7)),
+            highest_kind: 1,
+            id_block: None,
+            miner_config: None,
+        };
+        snapshot_at_the_checkpoints_cut(batch(3), expected).await;
+    }
+
+    /// As above, with the first miner configuration as the cut's entry.
+    #[tokio::test]
+    async fn a_built_snapshot_is_the_configured_group_at_the_checkpoints_cut() {
+        let expected = GroupState {
+            flusher: Some(NodeId::from(7)),
+            highest_kind: 4,
+            id_block: None,
+            miner_config: Some(in_force(FIRST)),
+        };
+        snapshot_at_the_checkpoints_cut(entry(3, configured(FIRST)), expected).await;
+    }
+
+    /// The group whose third entry is `third` snapshots as `expected`.
+    async fn snapshot_at_the_checkpoints_cut(
+        third: EntryResponder<RaftTypes>,
+        expected: GroupState,
+    ) {
+        let highest_kind = expected.highest_kind;
         let dir = tempfile::tempdir().expect("tempdir");
         let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
         let cuts = sm.checkpoints();
         let entries = vec![
             entry(1, EntryPayload::Membership(voters(&[1, 2]))),
             assign(2, 7),
-            batch(3),
+            third,
             entry(4, EntryPayload::Membership(voters(&[1, 2, 3]))),
             assign(5, 9),
-            checkpoint(6, 9, (2, 3), 1),
+            checkpoint(6, 9, (2, 3), highest_kind),
         ];
         apply(&mut sm, entries).await;
         assert_eq!(*cuts.borrow(), cut(3));
@@ -657,12 +686,6 @@ mod tests {
         let at_cut = StoredMembership::new(cut(1), voters(&[1, 2]));
         assert_eq!(built.meta.last_log_id, cut(3));
         assert_eq!(built.meta.last_membership, at_cut);
-        let expected = GroupState {
-            flusher: Some(NodeId::from(7)),
-            highest_kind: 1,
-            id_block: None,
-            miner_config: None,
-        };
         assert_eq!(built.snapshot, expected);
         let reopened = GroupSm::open(dir.path(), Arc::default()).expect("reopen");
         assert_eq!(reopened.applied(), cut(3));
@@ -675,28 +698,14 @@ mod tests {
     /// highest kind counts them; with no checkpoint applied only a forced
     /// build is offered.
     #[tokio::test]
+    #[ignore = "superseded: a cut needs a miner configuration in force (RFC 0065 §6.5); see \
+                a_checkpoint_every_replica_would_refuse_is_ignored_and_counted, #1246"]
     async fn a_checkpoint_every_replica_would_refuse_is_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
         let cuts = sm.checkpoints();
         apply(&mut sm, vec![batch(1), assign(2, 7), batch(3)]).await;
-        let refused = [
-            (checkpoint(4, 9, (2, 3), 1), "not the flusher"),
-            (checkpoint(5, 7, (2, 6), 1), "a cut not below the entry"),
-            (checkpoint(6, 7, (3, 3), 1), "a cut not in the log"),
-            (
-                checkpoint(7, 7, (2, 3), 2),
-                "a highest kind not the log's at the cut",
-            ),
-        ];
-        for (entry, why) in refused {
-            apply(&mut sm, vec![entry]).await;
-            assert_eq!(*cuts.borrow(), None, "{why}");
-            let builder = sm.try_create_snapshot_builder(false).await;
-            assert!(builder.is_none(), "{why}");
-        }
-        let forced = sm.try_create_snapshot_builder(true).await;
-        assert!(forced.is_some(), "openraft must get a forced builder");
+        refuse_each(&mut sm, &cuts, refused_without_a_configuration()).await;
 
         apply(&mut sm, vec![checkpoint(8, 7, (2, 6), 2)]).await;
         assert_eq!(*cuts.borrow(), cut(6), "kind 2 since the first refused");
@@ -705,6 +714,64 @@ mod tests {
         let built = sm.build_snapshot().await.expect("build");
         assert_eq!(built.meta.last_log_id, cut(6));
         assert_eq!(built.snapshot.highest_kind, 2);
+    }
+
+    /// Checkpoints every replica refuses, one for each reason, at indexes
+    /// 4 to 7 of a log whose highest kind is 1 through index 3.
+    fn refused_without_a_configuration() -> [(EntryResponder<RaftTypes>, &'static str); 4] {
+        [
+            (checkpoint(4, 9, (2, 3), 1), "not the flusher"),
+            (checkpoint(5, 7, (2, 6), 1), "a cut not below the entry"),
+            (checkpoint(6, 7, (3, 3), 1), "a cut not in the log"),
+            (
+                checkpoint(7, 7, (2, 3), 2),
+                "a highest kind not the log's at the cut",
+            ),
+        ]
+    }
+
+    /// Apply each refused checkpoint, checking it changes nothing, then
+    /// that with no checkpoint applied only a forced build is offered.
+    async fn refuse_each(
+        sm: &mut GroupSm,
+        cuts: &watch::Receiver<Option<LogId>>,
+        refused: impl IntoIterator<Item = (EntryResponder<RaftTypes>, &'static str)>,
+    ) {
+        for (entry, why) in refused {
+            apply(sm, vec![entry]).await;
+            assert_eq!(*cuts.borrow(), None, "{why}");
+            let builder = sm.try_create_snapshot_builder(false).await;
+            assert!(builder.is_none(), "{why}");
+        }
+        let forced = sm.try_create_snapshot_builder(true).await;
+        assert!(forced.is_some(), "openraft must get a forced builder");
+    }
+
+    /// Checkpoints every replica refuses change nothing, a cut with no
+    /// miner configuration in force among them, though the log's highest
+    /// kind counts them; once a configuration applies, a cut at it does.
+    #[tokio::test]
+    async fn a_checkpoint_every_replica_would_refuse_is_ignored_and_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        let cuts = sm.checkpoints();
+        apply(&mut sm, vec![batch(1), assign(2, 7), batch(3)]).await;
+        let unconfigured = (
+            checkpoint(8, 7, (2, 6), 2),
+            "no miner configuration in force at the cut",
+        );
+        let refused = refused_without_a_configuration().into_iter();
+        refuse_each(&mut sm, &cuts, refused.chain([unconfigured])).await;
+        assert_eq!(sm.state().group.highest_kind, 2, "the refused counted");
+
+        apply(&mut sm, vec![entry(9, configured(FIRST))]).await;
+        apply(&mut sm, vec![checkpoint(10, 7, (2, 9), 4)]).await;
+        assert_eq!(*cuts.borrow(), cut(9), "at the configuration");
+        apply(&mut sm, vec![checkpoint(11, 7, (2, 6), 4)]).await;
+        assert_eq!(*cuts.borrow(), cut(9), "a cut not above the last");
+        let built = sm.build_snapshot().await.expect("build");
+        assert_eq!(built.meta.last_log_id, cut(9));
+        assert_eq!(built.snapshot.highest_kind, 4);
     }
 
     fn id_block(block: Option<IdBlock>) -> EntryPayload<GroupEntry, Membership> {
@@ -746,16 +813,30 @@ mod tests {
     /// reopen and an install restore it, and the restored block is the one
     /// the next is compared with.
     #[tokio::test]
+    #[ignore = "superseded: a cut needs a miner configuration in force (RFC 0065 §6.5); see \
+                a_snapshot_holds_the_id_block_in_force_at_its_configured_cut, #1246"]
     async fn a_snapshot_holds_the_id_block_in_force_at_its_cut() {
+        id_block_in_force_at_the_cut([batch(3), checkpoint(5, 7, (2, 3), 3)]).await;
+    }
+
+    /// As above, with the first miner configuration as the cut's entry.
+    #[tokio::test]
+    async fn a_snapshot_holds_the_id_block_in_force_at_its_configured_cut() {
+        let configured = entry(3, configured(FIRST));
+        id_block_in_force_at_the_cut([configured, checkpoint(5, 7, (2, 3), 4)]).await;
+    }
+
+    /// The group with `third` and `checkpoint` at indexes 3 and 5.
+    async fn id_block_in_force_at_the_cut([third, checkpoint]: [EntryResponder<RaftTypes>; 2]) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
         let block = IdBlock::new;
         let entries = vec![
             assign(1, 7),
             entry(2, id_block(block(0, 100))),
-            batch(3),
+            third,
             entry(4, id_block(block(100, 200))),
-            checkpoint(5, 7, (2, 3), 3),
+            checkpoint,
         ];
         apply(&mut sm, entries).await;
         assert_eq!(sm.id_block(), block(100, 200), "applied, not built");
@@ -975,7 +1056,38 @@ mod tests {
     /// assignment, applied id block, configuration in force and applied
     /// checkpoint; membership, blank and ignored entries send nothing.
     #[tokio::test]
+    #[ignore = "superseded: a cut needs a miner configuration in force (RFC 0065 §6.5); see \
+                a_mining_replica_receives_what_each_entry_applied_in_order_to_a_configured_cut, \
+                #1246"]
     async fn a_mining_replica_receives_what_each_entry_applied_in_order() {
+        let cut_at = CutAt {
+            index: 2,
+            highest_kind: 0,
+        };
+        receives_in_order(cut_at).await;
+    }
+
+    /// As above, with the checkpoints' cut at the first configuration.
+    #[tokio::test]
+    async fn a_mining_replica_receives_what_each_entry_applied_in_order_to_a_configured_cut() {
+        let cut_at = CutAt {
+            index: 7,
+            highest_kind: 4,
+        };
+        receives_in_order(cut_at).await;
+    }
+
+    /// The index the checkpoints cut at, and the highest kind there.
+    struct CutAt {
+        index: u64,
+        highest_kind: u8,
+    }
+
+    async fn receives_in_order(cut_at: CutAt) {
+        let CutAt {
+            index: cut_at,
+            highest_kind,
+        } = cut_at;
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut sm, mut received) = mining(dir.path(), 64);
         let block = IdBlock::new;
@@ -987,8 +1099,8 @@ mod tests {
             entry(5, id_block(block(0, 50))),
             entry(6, EntryPayload::Blank),
             entry(7, configured(FIRST)),
-            checkpoint(8, 9, (2, 2), 0),
-            checkpoint(9, 7, (2, 2), 0),
+            checkpoint(8, 9, (2, cut_at), highest_kind),
+            checkpoint(9, 7, (2, cut_at), highest_kind),
             entry(10, configured(RAISED)),
             batch(11),
         ];
@@ -998,7 +1110,7 @@ mod tests {
             (3, AppliedEvent::Flusher(NodeId::from(7))),
             (4, AppliedEvent::IdBlock(block(0, 100).expect("valid"))),
             (7, AppliedEvent::MinerConfig(in_force(FIRST))),
-            (9, AppliedEvent::Checkpoint(cut(2).expect("cut"))),
+            (9, AppliedEvent::Checkpoint(cut(cut_at).expect("cut"))),
             (10, AppliedEvent::MinerConfig(in_force(RAISED))),
             (11, AppliedEvent::Batch(batch_bytes())),
         ];

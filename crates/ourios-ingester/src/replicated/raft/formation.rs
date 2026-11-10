@@ -18,6 +18,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::host::GroupRaft;
+use super::log_ids::Refused;
 use super::transport::{IdentifyError, Identity, Peers};
 use super::types::{NodeId, RaftTypes};
 
@@ -36,6 +37,7 @@ pub fn formed_key(group: u32) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Formation {
     group: u32,
+    log: u32,
     members: BTreeMap<String, NodeId>,
 }
 
@@ -63,10 +65,15 @@ impl Formation {
     /// [`Unreadable`] naming why a reader would refuse it.
     pub fn new(
         group: u32,
+        log: u32,
         members: BTreeMap<String, NodeId>,
         voters: &[&str],
     ) -> Result<Self, Unreadable> {
-        let formation = Self { group, members };
+        let formation = Self {
+            group,
+            log,
+            members,
+        };
         formation.check_voters(formation.members.keys().cloned().collect(), voters)?;
         formation.check_replicas()?;
         Ok(formation)
@@ -75,6 +82,12 @@ impl Formation {
     #[must_use]
     pub fn group(&self) -> u32 {
         self.group
+    }
+
+    /// The group's log id (§6.6), allocated from `log_ids.json`.
+    #[must_use]
+    pub fn log(&self) -> u32 {
+        self.log
     }
 
     /// Each voter's `node_id` with its UUID, by `node_id` bytewise.
@@ -146,7 +159,11 @@ impl Formation {
             .into_iter()
             .map(|m| Ok((m.node_id, replica(&m.replica)?)))
             .collect::<Result<BTreeMap<_, _>, Unreadable>>()?;
-        let formation = Self { group, members };
+        let formation = Self {
+            group,
+            log: 0,
+            members,
+        };
         formation.check_voters(recorded, voters)?;
         formation.check_replicas()?;
         Ok(formation)
@@ -303,6 +320,8 @@ pub enum FormError {
         group: u32,
         source: Fatal<RaftTypes>,
     },
+    /// No log id can be allocated for the group's record.
+    LogIds { group: u32, reason: Refused },
 }
 
 impl FormError {
@@ -314,6 +333,7 @@ impl FormError {
             Self::Unreadable { reason, .. } => reason.error_type(),
             Self::Initialize { .. } => "initialize_refused",
             Self::Raft { .. } => "raft_stopped",
+            Self::LogIds { reason, .. } => reason.error_type(),
         }
     }
 }
@@ -331,6 +351,7 @@ impl fmt::Display for FormError {
                 write!(f, "initialize group {group}: {source}")
             }
             Self::Raft { group, source } => write!(f, "group {group}: {source}"),
+            Self::LogIds { group, reason } => write!(f, "group {group}'s log id: {reason}"),
         }
     }
 }
@@ -342,6 +363,7 @@ impl std::error::Error for FormError {
             Self::Unreadable { reason, .. } => Some(reason),
             Self::Initialize { source, .. } => Some(source),
             Self::Raft { source, .. } => Some(source),
+            Self::LogIds { reason, .. } => Some(reason),
         }
     }
 }
@@ -416,6 +438,10 @@ pub enum Waiting {
     Encode(serde_json::Error),
     /// The record could not be written.
     RecordWrite(StoreError),
+    /// `log_ids.json` could not be read or written.
+    LogIdsStore(StoreError),
+    /// The high-water object is not seeded yet, so no log id exists.
+    LogIdsUnseeded { bootstrapper: String },
 }
 
 impl Waiting {
@@ -429,6 +455,8 @@ impl Waiting {
             Self::NotAMembership(_) => "not_a_membership",
             Self::Encode(_) => "encode",
             Self::RecordWrite(_) => "record_write",
+            Self::LogIdsStore(_) => "log_ids_store",
+            Self::LogIdsUnseeded { .. } => "log_ids_unseeded",
         }
     }
 }
@@ -442,6 +470,11 @@ impl fmt::Display for Waiting {
             Self::NotAMembership(reason) => write!(f, "the answers are not a membership: {reason}"),
             Self::Encode(e) => write!(f, "encode the formation record: {e}"),
             Self::RecordWrite(e) => write!(f, "write the formation record: {e}"),
+            Self::LogIdsStore(e) => write!(f, "allocate the group's log id: {e}"),
+            Self::LogIdsUnseeded { bootstrapper } => write!(
+                f,
+                "{bootstrapper} has not seeded the high-water object, so no log id exists yet"
+            ),
         }
     }
 }
@@ -452,6 +485,8 @@ enum Pass {
     /// This voter wrote the record, or lost the race to one: read it now.
     Recorded,
     Wait(Waiting),
+    /// The pass failed closed.
+    Fail(FormError),
 }
 
 /// Form `voter`'s group on its `raft` (§6.1), passing until it has formed: a voter
@@ -484,6 +519,7 @@ pub async fn form<P: Identifier>(
         match pass(voter, raft, reach).await? {
             Pass::Done(formed) => return Ok(formed),
             Pass::Recorded => {}
+            Pass::Fail(e) => return Err(e),
             Pass::Wait(why) => {
                 waiting(&why);
                 tokio::time::sleep(reach.patience.retry).await;
@@ -562,7 +598,7 @@ async fn encoded<P: Identifier>(
 ) -> Result<Vec<u8>, Waiting> {
     let members = answers(voter, replica, reach).await?;
     let formation =
-        Formation::new(voter.group, members, voter.voters).map_err(Waiting::NotAMembership)?;
+        Formation::new(voter.group, 0, members, voter.voters).map_err(Waiting::NotAMembership)?;
     formation.encode().map_err(Waiting::Encode)
 }
 
@@ -606,5 +642,7 @@ async fn read(store: &Store, group: u32) -> Result<Option<Vec<u8>>, StoreError> 
         .unwrap_or_else(|e| Err(StoreError::Runtime(std::io::Error::other(e))))
 }
 
+#[cfg(test)]
+mod format_2_tests;
 #[cfg(test)]
 mod tests;

@@ -228,10 +228,16 @@ impl Storage {
     /// once, and counted once per group.
     pub(crate) fn stopped(&self, component: Component, groups: &[u32], error: &io::Error) {
         let error_type = error_type(error.kind());
+        let group = match component {
+            Component::LogStore(group) => Some(i64::from(group)),
+            Component::VoteLog => None,
+        };
         tracing::error!(
+            name: semconv::EVENT_OURIOS_WAL_REPLICATION_STOPPED,
             {
                 { semconv::OURIOS_WAL_REPLICATION_COMPONENT } = component.as_str(),
                 { crate::metrics::ERROR_TYPE } = error_type.as_str(),
+                { semconv::OURIOS_WAL_GROUP } = group,
             },
             "the replicated WAL's {} stopped groups {groups:?} until the node restarts: {error}",
             component.as_str(),

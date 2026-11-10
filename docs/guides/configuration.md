@@ -156,7 +156,7 @@ auth:
 | `OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS` / `receiver.max_buffer_age_secs` | flush age in seconds, `1`–`300` (RFC 0063; default 300) |
 | `OURIOS_RECEIVER_MAX_REQUEST_BYTES` / `receiver.max_request_bytes` | OTLP request-size limit in bytes for both listeners, `1`–`16773120` (RFC 0061; default 16773120, 16 MiB − 4 KiB) |
 | `OURIOS_RECEIVER_WAL_BACKEND` / `receiver.wal.backend` | `local` (default) or `replicated`; see [the WAL backend](#the-wal-backend) |
-| `OURIOS_RECEIVER_WAL_NODE_ID` / `_LISTEN_ADDR` / `_PEERS` / `_TAIL_PEERS` / `_GROUPS` / `_REPLICATION_FACTOR` / `_TAIL_REPLICAS` / `_TAIL_CLIENTS` | the `receiver.wal.replicated.*` keys of the same names |
+| `OURIOS_RECEIVER_WAL_NODE_ID` / `_LISTEN_ADDR` / `_PEERS` / `_TAIL_PEERS` / `_GROUPS` / `_REPLICATION_FACTOR` / `_TAIL_REPLICAS` / `_TAIL_CLIENTS` / `_HEARTBEAT_INTERVAL_MS` / `_ELECTION_TIMEOUT_MIN_MS` / `_ELECTION_TIMEOUT_MAX_MS` | the `receiver.wal.replicated.*` keys of the same names |
 | `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` / `receiver.template_ids_allow_bootstrap` | authorise the one-time template-id bootstrap over existing data, for the upgrade to RFC 0059 only (default off); see [the bootstrap's cost](#the-template-id-bootstrap) |
 | `OURIOS_QUERIER_ENABLED` / `OURIOS_QUERIER_HTTP_ADDR` / `OURIOS_QUERIER_DEFAULT_WINDOW_SECS` | querier role |
 | `OURIOS_QUERIER_MCP_ENABLED` | the `/mcp` agent surface (RFC 0027) |
@@ -246,6 +246,9 @@ keys, under `receiver.wal.replicated`, are read only when it is selected:
 | `tail_replicas` | tail replicas per group, `1` (default) up to the number of `tail_peers` |
 | `tail_clients` | required; comma-separated querier certificate identities allowed to read the tail |
 | `tls` | required, file-only; a [TLS block](#listener-tls) whose `client_ca_file` is set (peer mTLS) |
+| `heartbeat_interval_ms` | the Raft heartbeat interval, and each append's deadline, in milliseconds (default 50) |
+| `election_timeout_min_ms` | the shortest election timeout in milliseconds (default 150) |
+| `election_timeout_max_ms` | the longest election timeout in milliseconds (default 300) |
 
 ```yaml
 receiver:
@@ -264,7 +267,11 @@ receiver:
 ```
 
 Each invalid value fails startup with an error naming its
-`receiver.wal.*` key. Because `tls` is file-only, `replicated` cannot be
+`receiver.wal.*` key. The three timings are positive integers with
+`heartbeat_interval_ms < election_timeout_min_ms <
+election_timeout_max_ms`, and apply to every group on the node. A node
+whose disk is slow to fsync raises the heartbeat interval, and the
+election timeouts with it, at the cost of a slower failover. Because `tls` is file-only, `replicated` cannot be
 selected from the environment alone.
 
 `replicated` needs S3 or an S3-compatible store: on the local filesystem

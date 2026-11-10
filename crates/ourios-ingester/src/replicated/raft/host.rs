@@ -125,9 +125,10 @@ impl Launch<'_> {
         let probe = probe::Probe::of(&log);
         log.count_takeovers(self.meters.takeovers(self.spec.id, group));
         let gate = Arc::clone(&self.gate);
-        let sm = blocking(move || GroupSm::open(&dir, gate))
+        let mut sm = blocking(move || GroupSm::open(&dir, gate))
             .await
             .map_err(|source| HostError::Snapshot { group, source })?;
+        sm.count_stops(group, self.meters.storage());
         let (id, network) = (self.spec.id, self.spec.peers.network(self.spec.id, group));
         let raft = Raft::new(id, Arc::clone(&self.config), network, log, sm.clone())
             .await

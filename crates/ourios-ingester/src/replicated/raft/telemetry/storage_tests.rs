@@ -238,3 +238,25 @@ async fn a_failed_vote_log_rewrite_is_timed_and_stops_the_groups() {
     assert_eq!(reader.counts(SYNCS), timed);
     assert_eq!(reader.points(STOPS), [point(["other", "4", "vote_log"])]);
 }
+
+/// A state machine's stop is the registered event with its group.
+#[test]
+fn a_state_machine_stop_is_the_registered_event_with_its_group() {
+    let reader = Reader::new();
+    let storage = Meters::on(&reader.meter()).storage();
+    let logged = events(|| {
+        let refused = io::Error::new(io::ErrorKind::InvalidData, "refused");
+        storage.stopped(Component::StateMachine(4), &[4], &refused);
+    });
+
+    let fields = [
+        "error.type=invalid_data",
+        "ourios.wal.group=4",
+        "ourios.wal.replication.component=state_machine",
+    ];
+    let expected = [(
+        semconv::EVENT_OURIOS_WAL_REPLICATION_STOPPED.to_owned(),
+        fields.map(str::to_owned).to_vec(),
+    )];
+    assert_eq!(logged, expected);
+}

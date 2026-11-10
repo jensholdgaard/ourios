@@ -154,11 +154,12 @@ impl FlusherCounts {
     }
 }
 
-/// The storage writer a signal is about: a group's log store, or the
-/// node's vote log.
+/// The part of a group a signal is about: its log store or state machine,
+/// or the node's vote log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Component {
     LogStore(u32),
+    StateMachine(u32),
     VoteLog,
 }
 
@@ -166,6 +167,7 @@ impl Component {
     fn as_str(self) -> &'static str {
         match self {
             Self::LogStore(_) => "log_store",
+            Self::StateMachine(_) => "state_machine",
             Self::VoteLog => "vote_log",
         }
     }
@@ -174,10 +176,10 @@ impl Component {
         KeyValue::new(semconv::OURIOS_WAL_REPLICATION_COMPONENT, self.as_str())
     }
 
-    /// Its attributes on a sync: the log store's group with it.
+    /// Its attributes: with its group, unless it is the node's vote log.
     fn attributes(self) -> Vec<KeyValue> {
         match self {
-            Self::LogStore(group) => vec![self.kv(), group_kv(group)],
+            Self::LogStore(group) | Self::StateMachine(group) => vec![self.kv(), group_kv(group)],
             Self::VoteLog => vec![self.kv()],
         }
     }
@@ -229,7 +231,7 @@ impl Storage {
     pub(crate) fn stopped(&self, component: Component, groups: &[u32], error: &io::Error) {
         let error_type = error_type(error.kind());
         let group = match component {
-            Component::LogStore(group) => Some(i64::from(group)),
+            Component::LogStore(group) | Component::StateMachine(group) => Some(i64::from(group)),
             Component::VoteLog => None,
         };
         tracing::error!(
@@ -455,6 +457,8 @@ fn lags(metrics: &RaftMetrics<RaftTypes>) -> Vec<(String, u64)> {
         .collect()
 }
 
+#[cfg(test)]
+mod state_machine_tests;
 #[cfg(test)]
 mod storage_tests;
 #[cfg(test)]

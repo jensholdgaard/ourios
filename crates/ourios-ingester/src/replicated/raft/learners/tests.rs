@@ -166,6 +166,22 @@ async fn ready_leader(cluster: &Cluster) -> usize {
     leader
 }
 
+/// Wait until node `i`'s metrics show its latest membership committed. A
+/// pass plans nothing while they trail the commit, so a test that runs one
+/// pass right after another's edit waits for this first.
+async fn membership_committed(cluster: &Cluster, i: usize) {
+    cluster
+        .node(i)
+        .raft(0)
+        .wait(WAIT)
+        .metrics(
+            |m| m.committed_membership_config.log_id() == m.membership_config.log_id(),
+            "the membership change is committed in the metrics",
+        )
+        .await
+        .expect("the membership change is committed in the metrics");
+}
+
 fn learners_of(cluster: &Cluster, i: usize) -> BTreeSet<NodeId> {
     let metrics = cluster.node(i).raft(0).metrics().borrow_watched().clone();
     metrics
@@ -203,6 +219,7 @@ async fn the_leader_adds_the_placed_tail_node_and_it_catches_up() {
 
     let index = write(cluster.node(leader).raft(0), 1).await;
     cluster.node(tail).applied_through(0, index).await;
+    membership_committed(&cluster, leader).await;
     let again = reconcile(group(&cluster, leader), reaching(&placed, &cluster)).await;
     assert_eq!(
         again,
@@ -287,6 +304,7 @@ async fn a_shrunk_placement_removes_the_learner_that_left() {
         .await
         .expect("both added");
     assert_eq!(learners_of(&cluster, leader).len(), 2);
+    membership_committed(&cluster, leader).await;
 
     let one = TailPool::new(pool, 1);
     let kept = one.placed(0)[0].to_owned();

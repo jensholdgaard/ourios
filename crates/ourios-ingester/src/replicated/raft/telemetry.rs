@@ -154,8 +154,8 @@ impl FlusherCounts {
     }
 }
 
-/// The storage writer a signal is about: a group's log store, or the
-/// node's vote log.
+/// The part of a group a signal is about: its log store or state machine,
+/// or the node's vote log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Component {
     LogStore(u32),
@@ -176,7 +176,7 @@ impl Component {
         KeyValue::new(semconv::OURIOS_WAL_REPLICATION_COMPONENT, self.as_str())
     }
 
-    /// Its attributes on a sync: the log store's group with it.
+    /// Its attributes: with its group, unless it is the node's vote log.
     fn attributes(self) -> Vec<KeyValue> {
         match self {
             Self::LogStore(group) | Self::StateMachine(group) => vec![self.kv(), group_kv(group)],
@@ -231,8 +231,8 @@ impl Storage {
     pub(crate) fn stopped(&self, component: Component, groups: &[u32], error: &io::Error) {
         let error_type = error_type(error.kind());
         let group = match component {
-            Component::LogStore(group) => Some(i64::from(group)),
-            Component::VoteLog | Component::StateMachine(_) => None,
+            Component::LogStore(group) | Component::StateMachine(group) => Some(i64::from(group)),
+            Component::VoteLog => None,
         };
         tracing::error!(
             name: semconv::EVENT_OURIOS_WAL_REPLICATION_STOPPED,

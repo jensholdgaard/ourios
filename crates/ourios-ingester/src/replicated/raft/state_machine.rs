@@ -35,6 +35,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures_util::TryStreamExt as _;
@@ -51,7 +52,7 @@ use super::gate::SyncGate;
 use super::snapshot_record::{
     self, GroupMinerConfig, GroupSnapshot, GroupState, IdBlock, SnapshotMeta,
 };
-use super::telemetry::Storage;
+use super::telemetry::{Component, Storage};
 use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes, TimedBatch};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
@@ -234,6 +235,13 @@ struct Record {
     publishing: tokio::sync::Mutex<()>,
 }
 
+/// What counts a state machine's first failure: once per group.
+struct Stops {
+    group: u32,
+    storage: Storage,
+    stopped: AtomicBool,
+}
+
 /// Clones share one state.
 #[derive(Clone)]
 pub struct GroupSm {
@@ -243,6 +251,8 @@ pub struct GroupSm {
     cuts: Arc<watch::Sender<Option<LogId>>>,
     /// Where a tail replica's miner receives what each entry applied.
     events: Option<mpsc::Sender<Applied>>,
+    /// Where its first failure is counted as the group stopping.
+    stops: Option<Arc<Stops>>,
 }
 
 impl GroupSm {
@@ -315,6 +325,7 @@ impl GroupSm {
             }),
             cuts: Arc::new(cuts),
             events,
+            stops: None,
         })
     }
 
@@ -340,17 +351,37 @@ impl GroupSm {
     async fn record(&self, snapshot: GroupSnapshot) -> io::Result<()> {
         let record = Arc::clone(&self.record);
         let written = snapshot.clone();
-        tokio::task::spawn_blocking(move || {
+        let recorded = tokio::task::spawn_blocking(move || {
             snapshot_record::write(&record.dir, &written, &record.gate)
         })
         .await
-        .unwrap_or_else(|e| Err(io::Error::other(e)))?;
+        .unwrap_or_else(|e| Err(io::Error::other(e)));
+        self.stopping(recorded)?;
         self.state().snapshot = Some(snapshot);
         Ok(())
     }
 
-    #[allow(clippy::unused_self, clippy::needless_pass_by_value, unused_variables)] // stub
-    pub(super) fn count_stops(&mut self, group: u32, storage: Storage) {}
+    /// Count this state machine's first failure as `group` stopping.
+    pub(super) fn count_stops(&mut self, group: u32, storage: Storage) {
+        self.stops = Some(Arc::new(Stops {
+            group,
+            storage,
+            stopped: AtomicBool::new(false),
+        }));
+    }
+
+    /// `result`, its error counted as the group stopping unless one was:
+    /// `openraft` stops the group on any error a state machine call
+    /// returns.
+    fn stopping<T>(&self, result: io::Result<T>) -> io::Result<T> {
+        if let (Err(e), Some(stops)) = (&result, &self.stops)
+            && !stops.stopped.swap(true, Ordering::Relaxed)
+        {
+            let component = Component::StateMachine(stops.group);
+            stops.storage.stopped(component, &[stops.group], e);
+        }
+        result
+    }
 
     /// The last entry applied.
     #[must_use]
@@ -440,7 +471,7 @@ impl RaftStateMachine<RaftTypes> for GroupSm {
     {
         while let Some((entry, responder)) = entries.try_next().await? {
             let at = entry.log_id;
-            let event = self.state().apply(at, entry.payload)?;
+            let event = self.stopping(self.state().apply(at, entry.payload))?;
             if let Some(event) = event {
                 self.publish(Applied { at, event }).await;
             }

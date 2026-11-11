@@ -80,15 +80,12 @@ impl fmt::Display for Waiting {
     }
 }
 
-/// What shows a lock found absent was deleted.
+/// What shows the lock was deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Evidence {
     /// A `template_ids.v<k>.json` exists, and one is created only under
     /// the lock.
     HighWater,
-    /// The start holds a group's Raft state, and a group exists only under
-    /// a log id the lock allocated.
-    RaftState,
     /// The start found the lock unseeded under its own `node_id` beside the
     /// object before it tried any create: a bootstrapper killed between
     /// the object and `seeded` looks the same as a create that landed over
@@ -132,11 +129,6 @@ impl fmt::Display for StartError {
                 "{LOG_IDS_KEY} is absent beside the high-water object, so it was deleted \
                  (LogIdsDeleted); no node re-creates it"
             ),
-            Self::LogIdsDeleted(Evidence::RaftState) => write!(
-                f,
-                "{LOG_IDS_KEY} is absent while this replica holds a group's Raft state, so it \
-                 was deleted (LogIdsDeleted); no node re-creates it"
-            ),
             Self::LogIdsDeleted(Evidence::UnseededLock) => write!(
                 f,
                 "{LOG_IDS_KEY} is unseeded under this node beside the high-water object, which a \
@@ -168,7 +160,8 @@ impl std::error::Error for StartError {
 /// `template_ids.v<k>.json` are absent, and only the start whose create
 /// succeeds bootstraps the object and sets `seeded`; every other start
 /// waits until `seeded`. A start holding Raft state came after the
-/// bootstrap and passes unless it reads the lock absent.
+/// bootstrap and passes without reading the lock: a deleted one fails its
+/// next log id allocation instead.
 ///
 /// Each pass that waits reports why to `waiting`, which the caller logs.
 ///
@@ -181,7 +174,7 @@ pub async fn start(
     waiting: &mut impl FnMut(&Waiting),
 ) -> Result<Started, StartError> {
     match start.raft_state {
-        RaftState::Held => from_raft_state(start.store).await,
+        RaftState::Held => Ok(Started::FromRaftState),
         RaftState::Empty if !start.store.supports_conditional_update() => {
             Err(StartError::NoConditionalUpdate)
         }
@@ -207,17 +200,6 @@ async fn passed(
     }
 }
 
-/// Only a lock read absent stops a start holding Raft state, since that
-/// lock was deleted. One it cannot read or reach is left to the step that
-/// allocates a log id, so the start still opens its groups and keeps
-/// taking the log.
-async fn from_raft_state(store: &Store) -> Result<Started, StartError> {
-    match store.get(LOG_IDS_KEY).await {
-        Err(e) if e.is_not_found() => Err(StartError::LogIdsDeleted(Evidence::RaftState)),
-        Ok(_) | Err(_) => Ok(Started::FromRaftState),
-    }
-}
-
 /// What one pass left to do.
 enum Pass {
     Done(Started),
@@ -232,7 +214,9 @@ enum Pass {
 enum Claim {
     /// This process has not tried to create the lock, so one under its
     /// `node_id` was created by a run before it that stopped before
-    /// `seeded`, and an object it finds is that run's.
+    /// `seeded`. Without the object, that run stopped before it; with the
+    /// object, nothing on the store tells that run's object from one a
+    /// create over a deleted lock found, so the start fails closed.
     Inherited,
     /// This process tried to create the lock, whatever the create
     /// returned, so an object it finds before it has seen none is not its
@@ -326,8 +310,7 @@ async fn seeded(store: &Store) -> Result<Pass, StartError> {
 
 /// This start holds the lock unseeded, having just created it or crashed
 /// before `seeded`: no log id exists yet, so it creates the object and
-/// sets `seeded`. A lock this process created goes on only with an object
-/// it created itself.
+/// sets `seeded`. It goes on only with an object this process created.
 async fn bootstrap(
     start: &LockStart<'_>,
     (lock, e_tag): (LogIds, &str),
@@ -335,8 +318,8 @@ async fn bootstrap(
 ) -> Result<Pass, StartError> {
     let seated = match *claim {
         Claim::Seated(seated) => seated,
-        Claim::Created => return owned(start.store, claim).await,
-        Claim::Owned | Claim::Inherited => match seat(start).await {
+        Claim::Created | Claim::Inherited => return owned(start.store, claim).await,
+        Claim::Owned => match seat(start).await {
             Ok(seated) => seated,
             Err(e) => return waited_or_failed(e),
         },
@@ -345,10 +328,15 @@ async fn bootstrap(
     seed(start.store, (lock, e_tag), seated).await
 }
 
-/// Under a lock this process created, an object already there is another
-/// start's; once it has seen none, any it finds is its own.
+/// An object already there before this process has seen none is not
+/// one it created: under a lock it created, it withdraws that lock; under
+/// one it inherited, it fails closed and leaves it. Once it has seen none,
+/// any object it finds is its own.
 async fn owned(store: &Store, claim: &mut Claim) -> Result<Pass, StartError> {
     match on_blocking(store, high_water_exists).await {
+        Ok(true) if *claim == Claim::Inherited => {
+            Err(StartError::LogIdsDeleted(Evidence::UnseededLock))
+        }
         Ok(true) => withdrawn(store).await,
         Ok(false) => {
             *claim = Claim::Owned;

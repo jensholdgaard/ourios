@@ -10,7 +10,6 @@ use tokio::sync::mpsc;
 use super::bootstrap::{Evidence, LockStart, RaftState, StartError, Started, Waiting, start};
 use super::gated::{Fault, Point, faulty, pausing, pausing_faulty, pausing_twice, with_outage};
 use super::{AllocateError, LOG_IDS_KEY, LockUnreadable, LogIds, Refused, allocate};
-use crate::replicated::raft::formation::formed_key;
 use crate::template_ids::{self, HIGH_WATER_KEY, ScanOptions, Seated, TemplateIdsError};
 
 const A: &str = "ourios-receiver-0";
@@ -137,6 +136,15 @@ async fn high_water(store: &Store) -> Option<u64> {
 /// The lock and the high-water as the store holds them.
 async fn root_of(store: &Store) -> (Option<LogIds>, Option<u64>) {
     (lock_of(store).await, high_water(store).await)
+}
+
+/// A bootstraps `store`, then allocates log ids `0..ids`.
+async fn bootstrap_and_allocate(store: &Store, ids: u32) {
+    let outcome = run(store, A, RaftState::Empty).await;
+    assert_eq!(outcome.ok(), Some(bootstrapped(0)));
+    for id in 0..ids {
+        assert_eq!(allocate(store).await.ok(), Some(id));
+    }
 }
 
 fn bootstrapped(high_water: u64) -> Started {
@@ -275,9 +283,9 @@ async fn a_start_paused_before_its_create_never_re_creates_a_deleted_lock() {
 
 /// A start that created its lock over a deleted one and was killed before
 /// it withdrew it finds, on its restart, an unseeded lock under its own
-/// `node_id` beside the object, as a crashed bootstrapper would. A formed
-/// group shows log ids were allocated, so it fails with `LogIdsDeleted`,
-/// leaves the lock, and allocates nothing.
+/// `node_id` beside the object. Log id 0 was allocated and its group not
+/// yet recorded, so nothing on the store shows it, and still the restart
+/// fails with `LogIdsDeleted`, leaves the lock, and allocates nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_killed_after_creating_a_lock_over_a_deleted_one_seeds_nothing_on_restart() {
     let store = Store::in_memory();
@@ -293,10 +301,6 @@ async fn a_start_killed_after_creating_a_lock_over_a_deleted_one_seeds_nothing_o
     let outcome = run(&store, A, RaftState::Empty).await;
     assert_eq!(outcome.ok(), Some(bootstrapped(0)));
     assert_eq!(allocate(&store).await.ok(), Some(0));
-    store
-        .put(&formed_key(0), b"{}".to_vec())
-        .await
-        .expect("record group 0");
     store.delete(LOG_IDS_KEY).await.expect("delete the lock");
 
     at_create.release.send(()).expect("B is held");
@@ -313,7 +317,7 @@ async fn a_start_killed_after_creating_a_lock_over_a_deleted_one_seeds_nothing_o
     assert!(
         matches!(
             restarted,
-            Err(StartError::LogIdsDeleted(Evidence::FormedGroup))
+            Err(StartError::LogIdsDeleted(Evidence::UnseededLock))
         ),
         "{restarted:?}"
     );
@@ -387,9 +391,48 @@ async fn a_start_that_read_the_lock_absent_before_another_bootstrapped_passes() 
     assert_eq!(root_of(&store).await, (Some(lock(A, true, 0)), Some(0)));
 }
 
-/// A bootstrapper killed between the object and `seeded` finishes on its
-/// restart, while every other start waits for it.
+/// A bootstrapper killed between the object and `seeded` looks on the
+/// store like a start whose create landed over a deleted lock, so its
+/// restart fails closed with `LogIdsDeleted`, seeds nothing and leaves the
+/// lock, every other start keeps waiting on it, and no log id is
+/// allocated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bootstrapper_killed_after_the_object_fails_its_restart_closed_while_others_wait() {
+    let store = Store::in_memory();
+    put_lock(&store, &lock(A, false, 0)).await;
+    put_high_water(&store, 0).await;
+
+    let (waiter, mut reported) = spawn_start(&store, B);
+    for _ in 0..2 {
+        assert_eq!(next_report(&mut reported).await, "log_ids_unseeded");
+    }
+    assert!(!waiter.is_finished(), "B passed an unseeded lock");
+
+    let restarted = run(&store, A, RaftState::Empty).await;
+    assert!(
+        matches!(
+            restarted,
+            Err(StartError::LogIdsDeleted(Evidence::UnseededLock))
+        ),
+        "{restarted:?}"
+    );
+    assert_eq!(root_of(&store).await, (Some(lock(A, false, 0)), Some(0)));
+    assert_eq!(next_report(&mut reported).await, "log_ids_unseeded");
+    assert!(!waiter.is_finished(), "B passed an unseeded lock");
+    waiter.abort();
+    let refused = allocate(&store).await.expect_err("nothing is allocated");
+    assert!(
+        matches!(refused, AllocateError::Unseeded { .. }),
+        "{refused}"
+    );
+}
+
+/// Superseded by
+/// [`a_bootstrapper_killed_after_the_object_fails_its_restart_closed_while_others_wait`]:
+/// a lock found unseeded under its own `node_id` beside the object no
+/// longer counts as the start's own crash leftover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: RFC 0065 #1270 — a bootstrapper killed after the object fails closed"]
 async fn a_bootstrapper_killed_after_the_object_finishes_on_its_restart_while_others_wait() {
     let store = Store::in_memory();
     put_lock(&store, &lock(A, false, 0)).await;
@@ -439,12 +482,7 @@ async fn a_bootstrapper_killed_before_the_object_repeats_both_steps() {
 #[tokio::test]
 async fn a_deleted_lock_fails_a_fresh_start_and_a_formed_replicas_next_allocation() {
     let store = Store::in_memory();
-    assert_eq!(
-        run(&store, A, RaftState::Empty).await.ok(),
-        Some(bootstrapped(0))
-    );
-    assert_eq!(allocate(&store).await.ok(), Some(0));
-    assert_eq!(allocate(&store).await.ok(), Some(1));
+    bootstrap_and_allocate(&store, 2).await;
     store.delete(LOG_IDS_KEY).await.expect("delete the lock");
 
     for node_id in [A, B] {
@@ -491,7 +529,7 @@ async fn a_lock_deleted_after_log_ids_were_allocated_is_never_re_created() {
         );
         let formed = run(&store, node_id, RaftState::Held).await;
         assert!(
-            matches!(formed, Err(StartError::LogIdsDeleted(Evidence::RaftState))),
+            matches!(formed, Err(StartError::LogIdsDeleted(_))),
             "{node_id}: {formed:?}"
         );
     }

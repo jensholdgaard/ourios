@@ -6,7 +6,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use ourios_parquet::{Store, StoreError};
+use ourios_parquet::{IdMaxError, Store, StoreError};
 
 use super::{LOG_IDS_KEY, LockUnreadable, LogIds};
 use crate::template_ids::{
@@ -132,8 +132,9 @@ impl fmt::Display for StartError {
             Self::LogIdsDeleted(Evidence::UnseededLock) => write!(
                 f,
                 "{LOG_IDS_KEY} is unseeded under this node beside the high-water object, which a \
-                 create over a deleted lock also leaves (LogIdsDeleted); before any group has \
-                 formed, delete both to bootstrap again"
+                 create over a deleted lock also leaves (LogIdsDeleted). To recover, first stop \
+                 every replicated node; then, if no wal/replicated/groups/<group>/formed.json \
+                 exists, delete both objects, and otherwise follow RFC 0065 §9 Q6"
             ),
             Self::Unreadable(reason) => write!(f, "{LOG_IDS_KEY} is unreadable: {reason}"),
             Self::NoConditionalUpdate => {
@@ -317,7 +318,7 @@ async fn bootstrap(
     claim: &mut Claim,
 ) -> Result<Pass, StartError> {
     let seated = match *claim {
-        Claim::Seated(seated) => seated,
+        Claim::Seated(seated) => return reseeded(start.store, (lock, e_tag), seated).await,
         Claim::Created | Claim::Inherited => return owned(start.store, claim).await,
         Claim::Owned => match seat(start).await {
             Ok(seated) => seated,
@@ -326,6 +327,21 @@ async fn bootstrap(
     };
     *claim = Claim::Seated(seated);
     seed(start.store, (lock, e_tag), seated).await
+}
+
+/// A seed retried after a swap that failed: the object may have been
+/// deleted during the wait, and `seeded` over no object would let log ids
+/// be allocated with no high-water.
+async fn reseeded(
+    store: &Store,
+    (lock, e_tag): (LogIds, &str),
+    seated: Seated,
+) -> Result<Pass, StartError> {
+    match on_blocking(store, template_ids::read).await {
+        Ok(Some(_)) => seed(store, (lock, e_tag), seated).await,
+        Ok(None) => Err(StartError::HighWater(TemplateIdsError::HighWaterDeleted)),
+        Err(e) => waited_or_failed(e),
+    }
 }
 
 /// An object already there before this process has seen none is not
@@ -391,11 +407,19 @@ fn encode(lock: &LogIds) -> Result<Vec<u8>, StoreError> {
         .map_err(|e| StoreError::Runtime(std::io::Error::other(e)))
 }
 
-/// A store the high-water could not be reached on is waited out; every
-/// other failure fails the start closed.
+/// A store the high-water or the bootstrap scan could not reach is waited
+/// out, and the scan runs again in full; every other failure fails the
+/// start closed.
 fn waited_or_failed(e: TemplateIdsError) -> Result<Pass, StartError> {
+    let waited = |source: Box<StoreError>| Ok(Pass::Wait(Waiting::Store(*source)));
     match e {
-        TemplateIdsError::Store { source, .. } => Ok(Pass::Wait(Waiting::Store(*source))),
+        TemplateIdsError::Store { source, .. } => waited(source),
+        TemplateIdsError::Scan(scan) => match *scan {
+            IdMaxError::Store { source, .. } => waited(source),
+            decode @ IdMaxError::Decode { .. } => Err(StartError::HighWater(
+                TemplateIdsError::Scan(Box::new(decode)),
+            )),
+        },
         e => Err(StartError::HighWater(e)),
     }
 }

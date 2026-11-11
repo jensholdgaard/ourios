@@ -89,6 +89,10 @@ pub enum Evidence {
     /// The start holds a group's Raft state, and a group exists only under
     /// a log id the lock allocated.
     RaftState,
+    /// A group's `formed.json` exists beside an unseeded lock under this
+    /// start's `node_id`, so log ids were allocated: the lock is not its
+    /// own crash's leftover but a create that landed over a deleted lock.
+    FormedGroup,
 }
 
 /// Why a start fails closed; nothing it found is re-created or replaced.
@@ -131,6 +135,11 @@ impl fmt::Display for StartError {
                 f,
                 "{LOG_IDS_KEY} is absent while this replica holds a group's Raft state, so it \
                  was deleted (LogIdsDeleted); no node re-creates it"
+            ),
+            Self::LogIdsDeleted(Evidence::FormedGroup) => write!(
+                f,
+                "{LOG_IDS_KEY} is unseeded under this node beside the high-water object while a \
+                 group has formed, so the lock it held was deleted (LogIdsDeleted)"
             ),
             Self::Unreadable(reason) => write!(f, "{LOG_IDS_KEY} is unreadable: {reason}"),
             Self::NoConditionalUpdate => {

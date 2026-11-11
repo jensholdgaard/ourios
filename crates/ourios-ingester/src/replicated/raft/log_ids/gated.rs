@@ -48,6 +48,8 @@ pub(super) enum Point {
     CreateLock,
     /// After its first read of the lock has returned.
     AfterLockRead,
+    /// After its create of the lock has committed, before it returns.
+    AfterCreateLock,
 }
 
 /// One write of the lock that fails, once.
@@ -71,23 +73,21 @@ impl Fault {
 
 type Channels = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
+/// The points a start is held at, each once.
 #[derive(Debug, Default)]
-struct Hold {
-    point: Option<Point>,
-    channels: Mutex<Option<Channels>>,
-}
+struct Hold(Mutex<Vec<(Point, Channels)>>);
 
 impl Hold {
-    /// Wait for the release if this call is the first at the held point.
+    /// Wait for the release if this call is the first at a held point.
     async fn at(&self, point: Point, location: &Key) {
-        if self.point != Some(point) || location.as_ref() != LOG_IDS_KEY {
+        if location.as_ref() != LOG_IDS_KEY {
             return;
         }
-        let held = self
-            .channels
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let held = {
+            let mut points = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let at = points.iter().position(|(held, _)| *held == point);
+            at.map(|at| points.remove(at).1)
+        };
         if let Some((reached, release)) = held {
             let _ = reached.send(());
             let _ = release.await;
@@ -114,14 +114,27 @@ pub(super) fn pausing(store: Store, point: Point) -> (Store, Paused) {
 
 /// As [`pausing`], also failing one write of the lock as `fault` says.
 pub(super) fn pausing_faulty(store: Store, point: Point, fault: Option<Fault>) -> (Store, Paused) {
+    let (channels, paused) = paused();
+    let hold = Hold(Mutex::new(vec![(point, channels)]));
+    (wrap(store, Arc::default(), hold, fault), paused)
+}
+
+/// `store`, pausing its first call on the lock at `first`, then at `then`.
+pub(super) fn pausing_twice(store: Store, first: Point, then: Point) -> (Store, [Paused; 2]) {
+    let (first_channels, first_paused) = paused();
+    let (then_channels, then_paused) = paused();
+    let hold = Hold(Mutex::new(vec![
+        (first, first_channels),
+        (then, then_channels),
+    ]));
+    let wrapped = wrap(store, Arc::default(), hold, None);
+    (wrapped, [first_paused, then_paused])
+}
+
+fn paused() -> (Channels, Paused) {
     let (reached_tx, reached) = oneshot::channel();
     let (release, release_rx) = oneshot::channel();
-    let hold = Hold {
-        point: Some(point),
-        channels: Mutex::new(Some((reached_tx, release_rx))),
-    };
-    let wrapped = wrap(store, Arc::default(), hold, fault);
-    (wrapped, Paused { reached, release })
+    ((reached_tx, release_rx), Paused { reached, release })
 }
 
 fn wrap(store: Store, down: Arc<AtomicBool>, hold: Hold, fault: Option<Fault>) -> Store {
@@ -191,17 +204,23 @@ impl ObjectStore for Gated {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.reachable()?;
-        if matches!(opts.mode, PutMode::Create) {
+        let create = matches!(opts.mode, PutMode::Create);
+        if create {
             self.hold.at(Point::CreateLock, location).await;
         }
-        match self.fault_at(location, &opts.mode) {
+        let put = match self.fault_at(location, &opts.mode) {
             Some(Fault::FailFirstSwap) => Err(unreachable()),
-            Some(Fault::LoseCreateReply) => {
-                self.inner.put_opts(location, payload, opts).await?;
-                Err(unreachable())
-            }
+            Some(Fault::LoseCreateReply) => self
+                .inner
+                .put_opts(location, payload, opts)
+                .await
+                .and_then(|_| Err(unreachable())),
             None => self.inner.put_opts(location, payload, opts).await,
+        };
+        if create {
+            self.hold.at(Point::AfterCreateLock, location).await;
         }
+        put
     }
 
     async fn put_multipart_opts(

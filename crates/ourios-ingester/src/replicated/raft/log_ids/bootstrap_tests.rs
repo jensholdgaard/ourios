@@ -8,8 +8,9 @@ use ourios_parquet::Store;
 use tokio::sync::mpsc;
 
 use super::bootstrap::{Evidence, LockStart, RaftState, StartError, Started, Waiting, start};
-use super::gated::{Fault, Point, faulty, pausing, pausing_faulty, with_outage};
+use super::gated::{Fault, Point, faulty, pausing, pausing_faulty, pausing_twice, with_outage};
 use super::{AllocateError, LOG_IDS_KEY, LockUnreadable, LogIds, Refused, allocate};
+use crate::replicated::raft::formation::formed_key;
 use crate::template_ids::{self, HIGH_WATER_KEY, ScanOptions, Seated, TemplateIdsError};
 
 const A: &str = "ourios-receiver-0";
@@ -272,6 +273,58 @@ async fn a_start_paused_before_its_create_never_re_creates_a_deleted_lock() {
     );
 }
 
+/// A start that created its lock over a deleted one and was killed before
+/// it withdrew it finds, on its restart, an unseeded lock under its own
+/// `node_id` beside the object, as a crashed bootstrapper would. A formed
+/// group shows log ids were allocated, so it fails with `LogIdsDeleted`,
+/// leaves the lock, and allocates nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_killed_after_creating_a_lock_over_a_deleted_one_seeds_nothing_on_restart() {
+    let store = Store::in_memory();
+    let points = (Point::CreateLock, Point::AfterCreateLock);
+    let (paused_store, [at_create, after_create]) =
+        pausing_twice(store.clone(), points.0, points.1);
+    let (killed, _) = spawn_start(&paused_store, B);
+    tokio::time::timeout(PATIENCE, at_create.reached)
+        .await
+        .expect("B reached its create")
+        .expect("B's create is held");
+
+    let outcome = run(&store, A, RaftState::Empty).await;
+    assert_eq!(outcome.ok(), Some(bootstrapped(0)));
+    assert_eq!(allocate(&store).await.ok(), Some(0));
+    store
+        .put(&formed_key(0), b"{}".to_vec())
+        .await
+        .expect("record group 0");
+    store.delete(LOG_IDS_KEY).await.expect("delete the lock");
+
+    at_create.release.send(()).expect("B is held");
+    tokio::time::timeout(PATIENCE, after_create.reached)
+        .await
+        .expect("B's create landed")
+        .expect("B is held after its create");
+    killed.abort();
+    assert!(killed.await.expect_err("killed").is_cancelled());
+    drop(after_create.release);
+    assert_eq!(root_of(&store).await, (Some(lock(B, false, 0)), Some(0)));
+
+    let restarted = run(&store, B, RaftState::Empty).await;
+    assert!(
+        matches!(
+            restarted,
+            Err(StartError::LogIdsDeleted(Evidence::FormedGroup))
+        ),
+        "{restarted:?}"
+    );
+    assert_eq!(root_of(&store).await, (Some(lock(B, false, 0)), Some(0)));
+    let refused = allocate(&store).await.expect_err("nothing is allocated");
+    assert!(
+        matches!(refused, AllocateError::Unseeded { .. }),
+        "{refused}"
+    );
+}
+
 /// As above, with the paused start's create of the lock committing but
 /// its reply lost: the start knows it tried to create the lock, so it
 /// takes the lock it then reads for its own, never for a crashed run's,
@@ -379,10 +432,47 @@ async fn a_bootstrapper_killed_before_the_object_repeats_both_steps() {
 }
 
 /// With the lock deleted after log ids were allocated, a start finding
-/// the object present, or holding a group's Raft state, fails with
-/// `LogIdsDeleted` and re-creates nothing, and no log id is allocated
-/// twice.
+/// the object present fails with `LogIdsDeleted`, a start holding a
+/// group's Raft state opens its groups without reading the lock and its
+/// next allocation fails as deleted, nothing is re-created, and no log id
+/// is allocated twice.
 #[tokio::test]
+async fn a_deleted_lock_fails_a_fresh_start_and_a_formed_replicas_next_allocation() {
+    let store = Store::in_memory();
+    assert_eq!(
+        run(&store, A, RaftState::Empty).await.ok(),
+        Some(bootstrapped(0))
+    );
+    assert_eq!(allocate(&store).await.ok(), Some(0));
+    assert_eq!(allocate(&store).await.ok(), Some(1));
+    store.delete(LOG_IDS_KEY).await.expect("delete the lock");
+
+    for node_id in [A, B] {
+        let fresh = run(&store, node_id, RaftState::Empty).await;
+        assert!(
+            matches!(fresh, Err(StartError::LogIdsDeleted(Evidence::HighWater))),
+            "{node_id}: {fresh:?}"
+        );
+        let formed = run(&store, node_id, RaftState::Held).await;
+        assert_eq!(formed.ok(), Some(Started::FromRaftState), "{node_id}");
+        let refused = allocate(&store).await.expect_err("deleted");
+        assert!(
+            matches!(refused, AllocateError::Refused(Refused::Deleted)),
+            "{node_id}: {refused}"
+        );
+    }
+    assert_eq!(
+        root_of(&store).await,
+        (None, Some(0)),
+        "the lock was re-created"
+    );
+}
+
+/// Superseded by
+/// [`a_deleted_lock_fails_a_fresh_start_and_a_formed_replicas_next_allocation`]:
+/// a start holding Raft state no longer reads the lock.
+#[tokio::test]
+#[ignore = "superseded: RFC 0065 #1270 — a formed replica starts without reading log_ids.json"]
 async fn a_lock_deleted_after_log_ids_were_allocated_is_never_re_created() {
     let store = Store::in_memory();
     assert_eq!(

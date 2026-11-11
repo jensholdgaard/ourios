@@ -185,9 +185,8 @@ async fn passed(
 ) -> Result<Started, StartError> {
     let mut claim = Claim::Inherited;
     loop {
-        match pass(start, claim).await? {
+        match pass(start, &mut claim).await? {
             Pass::Done(started) => return Ok(started),
-            Pass::Claimed => claim = Claim::Created,
             Pass::Again => {}
             Pass::Wait(why) => {
                 waiting(&why);
@@ -211,39 +210,45 @@ async fn from_raft_state(store: &Store) -> Result<Started, StartError> {
 /// What one pass left to do.
 enum Pass {
     Done(Started),
-    /// This start's create of the lock landed: read it again now.
-    Claimed,
     /// The lock changed under this pass: read it again now.
     Again,
     Wait(Waiting),
 }
 
-/// How a start came to hold a lock unseeded under its own `node_id`.
+/// How far this process has come with a lock unseeded under its own
+/// `node_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Claim {
-    /// This process created it, so an object it finds is not its own: the
-    /// lock had been deleted after another start bootstrapped.
-    Created,
-    /// A run before this one created it and stopped before `seeded`, so
-    /// an object it finds is that run's.
+    /// This process has not tried to create the lock, so one under its
+    /// `node_id` was created by a run before it that stopped before
+    /// `seeded`, and an object it finds is that run's.
     Inherited,
+    /// This process tried to create the lock, whatever the create
+    /// returned, so an object it finds before it has seen none is not its
+    /// own: the lock had been deleted after another start bootstrapped.
+    Created,
+    /// This process saw no object under the lock it created, so an object
+    /// it finds now is its own.
+    Owned,
+    /// The object stands under the lock; only `seeded` is left to set.
+    Seated(Seated),
 }
 
-async fn pass(start: &LockStart<'_>, claim: Claim) -> Result<Pass, StartError> {
+async fn pass(start: &LockStart<'_>, claim: &mut Claim) -> Result<Pass, StartError> {
     match start.store.get_with_etag(LOG_IDS_KEY).await {
         Ok((bytes, e_tag)) => {
             let lock = LogIds::decode(&bytes).map_err(StartError::Unreadable)?;
             let e_tag = e_tag.ok_or(StartError::NoConditionalUpdate)?;
             held(start, (lock, &e_tag), claim).await
         }
-        Err(e) if e.is_not_found() => create_lock(start).await,
+        Err(e) if e.is_not_found() => create_lock(start, claim).await,
         Err(e) => Ok(Pass::Wait(Waiting::Store(e))),
     }
 }
 
 /// Create the lock under this start, unless an object shows it was
 /// deleted. Whoever's create landed, the next pass reads the lock.
-async fn create_lock(start: &LockStart<'_>) -> Result<Pass, StartError> {
+async fn create_lock(start: &LockStart<'_>, claim: &mut Claim) -> Result<Pass, StartError> {
     match on_blocking(start.store, high_water_exists).await {
         Ok(true) => return created_since(start.store).await,
         Ok(false) => {}
@@ -254,14 +259,15 @@ async fn create_lock(start: &LockStart<'_>) -> Result<Pass, StartError> {
         seeded: false,
         next: 0,
     };
+    // A create whose reply is lost may still have landed.
+    *claim = Claim::Created;
     let created = match encode(&lock) {
         Ok(bytes) => start.store.put_if_absent(LOG_IDS_KEY, bytes).await,
         Err(e) => Err(e),
     };
     match created {
-        Ok(()) => Ok(Pass::Claimed),
-        Err(e) if e.is_already_exists() => Ok(Pass::Again),
-        Err(e) => Ok(Pass::Wait(Waiting::Store(e))),
+        Err(e) if !e.is_already_exists() => Ok(Pass::Wait(Waiting::Store(e))),
+        Ok(()) | Err(_) => Ok(Pass::Again),
     }
 }
 
@@ -289,7 +295,7 @@ fn high_water_exists(store: &Store) -> Result<bool, TemplateIdsError> {
 async fn held(
     start: &LockStart<'_>,
     (lock, e_tag): (LogIds, &str),
-    claim: Claim,
+    claim: &mut Claim,
 ) -> Result<Pass, StartError> {
     match lock {
         LogIds { seeded: true, .. } => seeded(start.store).await,
@@ -309,29 +315,58 @@ async fn seeded(store: &Store) -> Result<Pass, StartError> {
 
 /// This start holds the lock unseeded, having just created it or crashed
 /// before `seeded`: no log id exists yet, so it creates the object and
-/// sets `seeded`. Only a lock a run before this one created goes on with
-/// an object it finds.
+/// sets `seeded`. A lock this process created goes on only with an object
+/// it created itself.
 async fn bootstrap(
     start: &LockStart<'_>,
     (lock, e_tag): (LogIds, &str),
-    claim: Claim,
+    claim: &mut Claim,
 ) -> Result<Pass, StartError> {
+    let seated = match *claim {
+        Claim::Seated(seated) => seated,
+        Claim::Created => return owned(start.store, claim).await,
+        Claim::Owned | Claim::Inherited => match seat(start).await {
+            Ok(seated) => seated,
+            Err(e) => return waited_or_failed(e),
+        },
+    };
+    *claim = Claim::Seated(seated);
+    seed(start.store, (lock, e_tag), seated).await
+}
+
+/// Under a lock this process created, an object already there is another
+/// start's; once it has seen none, any it finds is its own.
+async fn owned(store: &Store, claim: &mut Claim) -> Result<Pass, StartError> {
+    match on_blocking(store, high_water_exists).await {
+        Ok(true) => withdrawn(store).await,
+        Ok(false) => {
+            *claim = Claim::Owned;
+            Ok(Pass::Again)
+        }
+        Err(e) => waited_or_failed(e),
+    }
+}
+
+/// RFC 0059 §3.5 under the lock, going on with an object already there.
+async fn seat(start: &LockStart<'_>) -> Result<Seated, TemplateIdsError> {
     let allow_bootstrap = start.allow_bootstrap;
     let scan = start.scan.clone();
     let seat = move |store: &Store| seat_replicated_root(store, allow_bootstrap, &scan);
-    let seated = match on_blocking(start.store, seat).await {
-        Ok(seated) => seated,
-        Err(e) => return waited_or_failed(e),
-    };
-    if claim == Claim::Created && !seated.bootstrapped {
-        return withdrawn(start.store).await;
-    }
+    on_blocking(start.store, seat).await
+}
+
+/// Set `seeded` on the lock read as `e_tag`, over the object `seated`.
+async fn seed(
+    store: &Store,
+    (lock, e_tag): (LogIds, &str),
+    seated: Seated,
+) -> Result<Pass, StartError> {
     let lock = LogIds {
         seeded: true,
         ..lock
     };
     let swapped = match encode(&lock) {
-        Ok(bytes) => start.store.put_if_match(LOG_IDS_KEY, bytes, e_tag).await,
+        Ok(bytes) => store.put_if_match(LOG_IDS_KEY, bytes, e_tag).await,
         Err(e) => Err(e),
     };
     match swapped {

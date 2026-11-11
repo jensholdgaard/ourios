@@ -1048,10 +1048,14 @@ the mass-failover time and vote-log batching as tuning signals.
 >   does not re-create it; a bootstrapper killed between the
 >   object and `seeded` finishes on its restart while every other start
 >   waits; with `log_ids.json` deleted after log ids were allocated, a
->   start finding the object present, or holding a group's Raft state,
->   fails with `LogIdsDeleted` and re-creates nothing, and no log id is
->   allocated twice; an unreadable `log_ids.json` fails a start that holds no
->   group's Raft state, while a replica holding one, restarted with the
+>   start finding the object present fails with `LogIdsDeleted` and
+>   re-creates nothing, a replica holding a group's Raft state opens
+>   its groups and fails its next log id allocation with
+>   `LogIdsDeleted`, a start paused before its create and resumed after
+>   only `log_ids.json` was deleted, whether its create's reply is lost
+>   or it is killed before it removes the lock it created, seeds nothing,
+>   and no log id is allocated twice; an unreadable `log_ids.json`
+>   fails a start that holds no group's Raft state, while a replica holding one, restarted with the
 >   store unreachable or the lock unreadable, opens its groups and keeps
 >   taking the log; and with the
 >   object deleted after
@@ -1726,9 +1730,11 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     it runs RFC 0059 §3.5 with that section's table, `restored_max = 0`
     (no group holds an id before a log id exists) and its own node's
     `receiver.template_ids_allow_bootstrap`, and creates the object
-    with `put_if_absent`, going on with the object it finds if one is
-    present. It then sets `seeded` to `true` by `put_if_match`, and only
-    then are log ids allocated, by `put_if_match` on `next`.
+    with `put_if_absent`. It goes on with an object it finds only when
+    the object is its own: one this process created, or one under a
+    lock it found unseeded under its own `node_id` before it attempted
+    any create. It then sets `seeded` to `true` by `put_if_match`, and
+    only then are log ids allocated, by `put_if_match` on `next`.
   - **A present lock is never bootstrapped past.** A replicated start
     that finds `log_ids.json` present never creates the object. With
     `seeded` `false` under another `node_id` it waits, reporting why,
@@ -1746,13 +1752,21 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     block, exists before `seeded`, the object's create is
     `put_if_absent`, and a `node_id` runs one start at a time (the
     StatefulSet's pod identity), so no paused start outlives its own
-    restart.
+    restart. If the object is present and any
+    `<bucket>/wal/replicated/groups/<group>/formed.json` exists, log ids
+    were allocated, so the lock is not its own leftover but a create
+    that landed over a deleted lock; it fails closed with
+    `LogIdsDeleted`.
   - **A deleted lock is never re-created.** The object is created only
     under the lock and a group exists only under a log id, so a lock
-    absent beside the object, or from a start that holds a group's Raft
-    state, was deleted: re-creating it at `next` `0` would hand out log
-    ids already in Parquet. The start or step fails closed with
-    `LogIdsDeleted`, reporting why, and no node re-creates it. With
+    absent beside the object, or at a log id allocation, was deleted:
+    re-creating it at `next` `0` would hand out log ids already in
+    Parquet. The start or step fails closed with
+    `LogIdsDeleted`, reporting why, and no node re-creates it. A start
+    whose own create of the lock succeeded, or whose reply was lost,
+    and which then finds the object or loses the object's create, made
+    its lock over a deleted one: it deletes that lock and fails the
+    same way. With
     both the lock and the object deleted nothing on the store tells a
     new bucket from an emptied one, which is §9 Q6's recovery.
   - **A formed replica starts without it.** Log ids exist only after

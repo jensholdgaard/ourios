@@ -1733,8 +1733,10 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     (no group holds an id before a log id exists) and its own node's
     `receiver.template_ids_allow_bootstrap`, and creates the object
     with `put_if_absent`. It goes on with an object it finds only when
-    this process created it, including a create whose reply was lost.
-    It then sets `seeded` to `true` by `put_if_match`, and
+    this process issued the object's create, including a create whose
+    reply was lost. That is known only in the process's memory, never
+    read from the store, so a restarted process never takes an object
+    it finds as its own. It then sets `seeded` to `true` by `put_if_match`, and
     only then are log ids allocated, by `put_if_match` on `next`.
   - **A present lock is never bootstrapped past.** A replicated start
     that finds `log_ids.json` present never creates the object. With
@@ -1757,9 +1759,13 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     `seeded` looks the same on the store as a start whose create landed
     over a deleted lock after log ids were allocated, and a log id is
     allocated before its group's `formed.json` is written (§6.1), so no
-    object on the store proves which. Before any group has formed, an
-    operator recovers by deleting both objects; after, it is §9 Q6's
-    recovery.
+    object on the store proves which. An operator recovers by first
+    stopping every replicated node, so that no paused start can still
+    record an allocation, and then, if no
+    `<bucket>/wal/replicated/groups/<group>/formed.json` exists,
+    deleting both objects: a log id whose allocator is stopped and that
+    no `formed.json` records was never written to a row. Otherwise it is
+    §9 Q6's recovery.
   - **A deleted lock is never re-created.** The object is created only
     under the lock and a group exists only under a log id, so a lock
     absent beside the object, or at a log id allocation, was deleted:
@@ -2731,7 +2737,8 @@ from rows.
 - RFC0065.31's lock arms (two replicated starts, a crashed
   bootstrapper, a deletion with groups holding blocks): the in-process
   cluster on the in-memory store, with failpoints between the lock,
-  the object and `seeded`.
+  the object and `seeded`, and faults that commit a create of the lock
+  or the object but lose its reply.
 - RFC0065.17: `deploy/helm/render-tests.sh`.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process
   cluster (ack latency with and without tail load; tail throughput with

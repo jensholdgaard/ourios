@@ -1,6 +1,7 @@
 //! A store a test can take down, or pause at one call on the lock: at its
 //! create, or just after its first read, so the paused start has read the
-//! lock absent and resumes only when released.
+//! lock absent and resumes only when released. It can also fail one write
+//! of the lock, before or after the write commits.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -49,6 +50,25 @@ pub(super) enum Point {
     AfterLockRead,
 }
 
+/// One write of the lock that fails, once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Fault {
+    /// The first create of the lock commits, and its caller sees an error.
+    LoseCreateReply,
+    /// The first compare-and-swap of the lock fails without committing.
+    FailFirstSwap,
+}
+
+impl Fault {
+    fn hits(self, location: &Key, mode: &PutMode) -> bool {
+        let on_lock = location.as_ref() == LOG_IDS_KEY;
+        match self {
+            Self::LoseCreateReply => on_lock && matches!(mode, PutMode::Create),
+            Self::FailFirstSwap => on_lock && matches!(mode, PutMode::Update(_)),
+        }
+    }
+}
+
 type Channels = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 #[derive(Debug, Default)]
@@ -78,24 +98,42 @@ impl Hold {
 /// `store`, behind a switch that takes it down.
 pub(super) fn with_outage(store: Store) -> (Store, Outage) {
     let down = Arc::new(AtomicBool::new(false));
-    let wrapped = wrap(store, Arc::clone(&down), Hold::default());
+    let wrapped = wrap(store, Arc::clone(&down), Hold::default(), None);
     (wrapped, Outage(down))
+}
+
+/// `store`, failing one write of the lock as `fault` says.
+pub(super) fn faulty(store: Store, fault: Fault) -> Store {
+    wrap(store, Arc::default(), Hold::default(), Some(fault))
 }
 
 /// `store`, pausing its first call on the lock at `point`.
 pub(super) fn pausing(store: Store, point: Point) -> (Store, Paused) {
+    pausing_faulty(store, point, None)
+}
+
+/// As [`pausing`], also failing one write of the lock as `fault` says.
+pub(super) fn pausing_faulty(store: Store, point: Point, fault: Option<Fault>) -> (Store, Paused) {
     let (reached_tx, reached) = oneshot::channel();
     let (release, release_rx) = oneshot::channel();
     let hold = Hold {
         point: Some(point),
         channels: Mutex::new(Some((reached_tx, release_rx))),
     };
-    let wrapped = wrap(store, Arc::default(), hold);
+    let wrapped = wrap(store, Arc::default(), hold, fault);
     (wrapped, Paused { reached, release })
 }
 
-fn wrap(store: Store, down: Arc<AtomicBool>, hold: Hold) -> Store {
-    store.wrap_backend(move |inner| Arc::new(Gated { inner, down, hold }))
+fn wrap(store: Store, down: Arc<AtomicBool>, hold: Hold, fault: Option<Fault>) -> Store {
+    let fault = Mutex::new(fault);
+    store.wrap_backend(move |inner| {
+        Arc::new(Gated {
+            inner,
+            down,
+            hold,
+            fault,
+        })
+    })
 }
 
 #[derive(Debug)]
@@ -103,6 +141,7 @@ struct Gated {
     inner: Arc<dyn ObjectStore>,
     down: Arc<AtomicBool>,
     hold: Hold,
+    fault: Mutex<Option<Fault>>,
 }
 
 fn unreachable() -> object_store::Error {
@@ -118,6 +157,15 @@ impl Gated {
             Err(unreachable())
         } else {
             Ok(())
+        }
+    }
+
+    /// The fault this write hits, if it is the first it hits.
+    fn fault_at(&self, location: &Key, mode: &PutMode) -> Option<Fault> {
+        let mut fault = self.fault.lock().unwrap_or_else(PoisonError::into_inner);
+        match *fault {
+            Some(hit) if hit.hits(location, mode) => fault.take(),
+            _ => None,
         }
     }
 
@@ -146,7 +194,14 @@ impl ObjectStore for Gated {
         if matches!(opts.mode, PutMode::Create) {
             self.hold.at(Point::CreateLock, location).await;
         }
-        self.inner.put_opts(location, payload, opts).await
+        match self.fault_at(location, &opts.mode) {
+            Some(Fault::FailFirstSwap) => Err(unreachable()),
+            Some(Fault::LoseCreateReply) => {
+                self.inner.put_opts(location, payload, opts).await?;
+                Err(unreachable())
+            }
+            None => self.inner.put_opts(location, payload, opts).await,
+        }
     }
 
     async fn put_multipart_opts(

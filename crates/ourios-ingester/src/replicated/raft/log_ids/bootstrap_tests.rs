@@ -8,7 +8,7 @@ use ourios_parquet::Store;
 use tokio::sync::mpsc;
 
 use super::bootstrap::{Evidence, LockStart, RaftState, StartError, Started, Waiting, start};
-use super::gated::{Point, pausing, with_outage};
+use super::gated::{Fault, Point, faulty, pausing, pausing_faulty, with_outage};
 use super::{AllocateError, LOG_IDS_KEY, LockUnreadable, LogIds, Refused, allocate};
 use crate::template_ids::{self, HIGH_WATER_KEY, ScanOptions, Seated, TemplateIdsError};
 
@@ -270,6 +270,46 @@ async fn a_start_paused_before_its_create_never_re_creates_a_deleted_lock() {
         matches!(refused, AllocateError::Refused(Refused::Deleted)),
         "{refused}"
     );
+}
+
+/// As above, with the paused start's create of the lock committing but
+/// its reply lost: the start knows it tried to create the lock, so it
+/// takes the lock it then reads for its own, never for a crashed run's,
+/// and does not seed it over the other start's object.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_whose_create_reply_is_lost_never_seeds_over_another_object() {
+    let store = Store::in_memory();
+    let fault = Some(Fault::LoseCreateReply);
+    let (paused_store, paused) = pausing_faulty(store.clone(), Point::CreateLock, fault);
+    let (resumed, _) = spawn_start(&paused_store, B);
+    tokio::time::timeout(PATIENCE, paused.reached)
+        .await
+        .expect("B reached its create")
+        .expect("B's create is held");
+
+    let outcome = run(&store, A, RaftState::Empty).await;
+    assert_eq!(outcome.ok(), Some(bootstrapped(0)));
+    assert_eq!(allocate(&store).await.ok(), Some(0));
+    store.delete(LOG_IDS_KEY).await.expect("delete the lock");
+
+    paused.release.send(()).expect("B is held");
+    let resumed = resumed.await.expect("joined");
+    assert!(
+        matches!(resumed, Err(StartError::LogIdsDeleted(Evidence::HighWater))),
+        "{resumed:?}"
+    );
+    assert_eq!(root_of(&store).await, (None, Some(0)), "B left a lock");
+}
+
+/// A fresh bootstrap whose first swap to `seeded` fails before it commits
+/// retries only that swap: the object it created is its own.
+#[tokio::test]
+async fn a_fresh_bootstrap_whose_seed_fails_once_retries_only_the_seed() {
+    let store = Store::in_memory();
+    let failing = faulty(store.clone(), Fault::FailFirstSwap);
+    let outcome = run(&failing, A, RaftState::Empty).await;
+    assert_eq!(outcome.ok(), Some(bootstrapped(0)));
+    assert_eq!(root_of(&store).await, (Some(lock(A, true, 0)), Some(0)));
 }
 
 /// A start that read the lock absent while another bootstrapped, and

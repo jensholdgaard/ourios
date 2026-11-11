@@ -369,6 +369,57 @@ async fn a_fresh_bootstrap_whose_seed_fails_once_retries_only_the_seed() {
     assert_eq!(root_of(&store).await, (Some(lock(A, true, 0)), Some(0)));
 }
 
+/// A seed retried after its first swap failed checks the object again:
+/// one deleted during the wait fails the start with `HighWaterDeleted`,
+/// and the lock stays unseeded, so no log id is allocated.
+#[tokio::test]
+async fn a_seed_retried_after_the_object_was_deleted_fails_closed() {
+    let store = Store::in_memory();
+    let failing = faulty(store.clone(), Fault::FailSwapDeletingObject);
+    let outcome = run(&failing, A, RaftState::Empty).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(StartError::HighWater(TemplateIdsError::HighWaterDeleted))
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(root_of(&store).await, (Some(lock(A, false, 0)), None));
+    let refused = allocate(&store).await.expect_err("nothing is allocated");
+    assert!(
+        matches!(refused, AllocateError::Unseeded { .. }),
+        "{refused}"
+    );
+}
+
+/// A store lost during the bootstrap scan is waited out like every other
+/// store read: the start reports why and bootstraps from a full scan once
+/// the store returns, never from a partial one.
+#[tokio::test]
+async fn a_store_lost_during_the_bootstrap_scan_is_waited_out() {
+    let store = Store::in_memory();
+    let failing = faulty(store.clone(), Fault::FailFirstDataListing);
+    let node = Node {
+        allow_bootstrap: true,
+        ..Node::new(A, RaftState::Empty)
+    };
+    let (reports, mut reported) = mpsc::unbounded_channel();
+    let outcome = start_reporting(failing, node, Some(reports)).await;
+    assert_eq!(outcome.ok(), Some(bootstrapped(0)));
+    assert_eq!(reported.try_recv().ok(), Some("log_ids_store"));
+    assert_eq!(root_of(&store).await, (Some(lock(A, true, 0)), Some(0)));
+}
+
+/// The refusal of an inherited lock beside the object tells the operator
+/// to stop every replicated node before deleting anything (RFC 0065
+/// #1270).
+#[test]
+fn an_inherited_lock_refusal_says_to_stop_every_node_first() {
+    let refusal = StartError::LogIdsDeleted(Evidence::UnseededLock).to_string();
+    assert!(refusal.contains("stop every replicated node"), "{refusal}");
+    assert!(refusal.contains("formed.json"), "{refusal}");
+}
+
 /// A start that read the lock absent while another bootstrapped, and
 /// found the object only after that one had seeded, passes: the lock is
 /// present now, so it was not deleted.

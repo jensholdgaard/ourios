@@ -10,12 +10,13 @@ use futures::StreamExt as _;
 use object_store::path::Path as Key;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    ObjectStoreExt as _, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use ourios_parquet::Store;
 use tokio::sync::oneshot;
 
 use super::LOG_IDS_KEY;
+use crate::template_ids::HIGH_WATER_KEY;
 
 type BoxStream<T> = futures::stream::BoxStream<'static, T>;
 
@@ -59,14 +60,30 @@ pub(super) enum Fault {
     LoseCreateReply,
     /// The first compare-and-swap of the lock fails without committing.
     FailFirstSwap,
+    /// As [`Self::FailFirstSwap`], and the high-water object is deleted
+    /// before the caller retries.
+    FailSwapDeletingObject,
+    /// The first delimited listing of `data` fails.
+    FailFirstDataListing,
+}
+
+/// A call a [`Fault`] may hit.
+#[derive(Debug, Clone, Copy)]
+enum Call<'a> {
+    Put(&'a PutMode),
+    ListDelimited,
 }
 
 impl Fault {
-    fn hits(self, location: &Key, mode: &PutMode) -> bool {
+    fn hits(self, location: &Key, call: Call<'_>) -> bool {
         let on_lock = location.as_ref() == LOG_IDS_KEY;
-        match self {
-            Self::LoseCreateReply => on_lock && matches!(mode, PutMode::Create),
-            Self::FailFirstSwap => on_lock && matches!(mode, PutMode::Update(_)),
+        match (self, call) {
+            (Self::LoseCreateReply, Call::Put(PutMode::Create)) => on_lock,
+            (Self::FailFirstSwap | Self::FailSwapDeletingObject, Call::Put(PutMode::Update(_))) => {
+                on_lock
+            }
+            (Self::FailFirstDataListing, Call::ListDelimited) => location.as_ref() == "data",
+            _ => false,
         }
     }
 }
@@ -174,10 +191,10 @@ impl Gated {
     }
 
     /// The fault this write hits, if it is the first it hits.
-    fn fault_at(&self, location: &Key, mode: &PutMode) -> Option<Fault> {
+    fn fault_at(&self, location: &Key, call: Call<'_>) -> Option<Fault> {
         let mut fault = self.fault.lock().unwrap_or_else(PoisonError::into_inner);
         match *fault {
-            Some(hit) if hit.hits(location, mode) => fault.take(),
+            Some(hit) if hit.hits(location, call) => fault.take(),
             _ => None,
         }
     }
@@ -208,8 +225,13 @@ impl ObjectStore for Gated {
         if create {
             self.hold.at(Point::CreateLock, location).await;
         }
-        let put = match self.fault_at(location, &opts.mode) {
-            Some(Fault::FailFirstSwap) => Err(unreachable()),
+        let put = match self.fault_at(location, Call::Put(&opts.mode)) {
+            Some(Fault::FailFirstSwap | Fault::FailFirstDataListing) => Err(unreachable()),
+            Some(Fault::FailSwapDeletingObject) => self
+                .inner
+                .delete(&Key::from(HIGH_WATER_KEY))
+                .await
+                .and_then(|()| Err(unreachable())),
             Some(Fault::LoseCreateReply) => self
                 .inner
                 .put_opts(location, payload, opts)
@@ -257,7 +279,11 @@ impl ObjectStore for Gated {
 
     async fn list_with_delimiter(&self, prefix: Option<&Key>) -> object_store::Result<ListResult> {
         self.reachable()?;
-        self.inner.list_with_delimiter(prefix).await
+        let fault = prefix.and_then(|prefix| self.fault_at(prefix, Call::ListDelimited));
+        match fault {
+            Some(_) => Err(unreachable()),
+            None => self.inner.list_with_delimiter(prefix).await,
+        }
     }
 
     async fn copy_opts(

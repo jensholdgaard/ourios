@@ -639,7 +639,8 @@ fn anomaly_counts(rms: &[ResourceMetrics]) -> BTreeMap<(String, String), u64> {
 /// different templates to one `(template_id, version)` reports it once
 /// per fold-backed acquisition: one named event carrying the key and no
 /// template text, and the anomaly on that lookup. A same-binding re-emit and a widening
-/// stay silent, and a cache hit (no fold) reports nothing.
+/// stay silent. A cache hit on the published artifact announces nothing but
+/// still carries the anomaly (amendment 2026-11-13, #928).
 ///
 /// Act 6 of RFC0033.7, run last: its lookups share the process-global
 /// counter, so it first checks `conflict_free` (the collection from acts
@@ -703,14 +704,16 @@ fn binding_conflict_act(
 
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
-    let expected: BTreeMap<(String, String), u64> =
-        [(("miss".to_string(), "binding_conflict".to_string()), 1)]
-            .into_iter()
-            .collect();
+    let expected: BTreeMap<(String, String), u64> = [
+        (("miss".to_string(), "binding_conflict".to_string()), 1),
+        (("hit".to_string(), "binding_conflict".to_string()), 1),
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(
         anomaly_counts(&rms),
         expected,
-        "the folding miss carries the anomaly; the hit after it does not",
+        "the folding miss and the hit on its artifact both carry the anomaly",
     );
 
     announced_once_act(guard, exporter, capture, bucket.path());
@@ -795,8 +798,8 @@ fn audit_parquet_files(bucket: &Path) -> std::collections::BTreeSet<PathBuf> {
         .collect()
 }
 
-/// `announced_once_act`'s lookups: the conflicting miss and its three
-/// stale refreshes each carry the anomaly.
+/// `announced_once_act`'s lookups: the conflicting miss, the hit after it
+/// and the three stale refreshes each carry the anomaly.
 fn assert_refresh_anomalies(
     guard: &ourios_telemetry::TelemetryGuard,
     exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
@@ -806,6 +809,7 @@ fn assert_refresh_anomalies(
     let rms = std::slice::from_ref(rms.last().expect("a collection"));
     let expected: BTreeMap<(String, String), u64> = [
         (("miss".to_string(), "binding_conflict".to_string()), 1),
+        (("hit".to_string(), "binding_conflict".to_string()), 1),
         (("stale".to_string(), "binding_conflict".to_string()), 3),
     ]
     .into_iter()

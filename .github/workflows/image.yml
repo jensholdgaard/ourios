@@ -109,6 +109,24 @@ jobs:
           REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
         run: docker run --rm "$REF" --help
 
+      - name: Check a fresh volume is writable by the runtime user
+        # #1101: Docker seeds an empty named volume from the image's
+        # /var/lib/ourios, so the volume must come out owned by 65532:65532
+        # with the owner write bit set. Every variant is shell-less, so the
+        # ownership is read from the volume's host path.
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker volume create ourios-state-check
+          docker run --rm -v ourios-state-check:/var/lib/ourios "$REF" --help > /dev/null
+          mountpoint="$(docker volume inspect -f '{{ .Mountpoint }}' ourios-state-check)"
+          got="$(sudo stat -c '%u:%g %A' "$mountpoint")"
+          docker volume rm ourios-state-check
+          case "$got" in
+            '65532:65532 drwx'*) echo "fresh volume: $got" ;;
+            *) echo "::error::a fresh volume at /var/lib/ourios is '$got', want 65532:65532 drwx…"; exit 1 ;;
+          esac
+
       - name: Export digest
         run: |
           mkdir -p /tmp/digests

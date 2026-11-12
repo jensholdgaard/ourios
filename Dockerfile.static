@@ -41,6 +41,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && rustup target add "$triple" \
     && cargo build --release --locked -p ourios-server --target "$triple" \
     && cp "/build/target/$triple/release/ourios-server" /ourios-server
+# Empty state directory for the shell-less runtime stages (see their
+# COPY --chown).
+RUN mkdir -p /var/lib/ourios
 
 # Bare `scratch` runtime (#263's opt-in variant, `-scratch` tags): only
 # the binary + the CA bundle rustls-native-certs needs for TLS to object
@@ -50,10 +53,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM scratch AS runtime-scratch
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-# OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
-# the future query endpoint (RFC 0016) and is intentionally not exposed
-# yet.
-EXPOSE 4317 4318
+# The state root the docs and Helm chart mount (WAL, local store), owned
+# by the runtime user: Docker seeds an empty named volume mounted here
+# from the image, so it starts writable by 65532 instead of root-owned.
+COPY --from=builder --chown=65532:65532 /var/lib/ourios /var/lib/ourios
+# OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003); 4319 = the query API
+# and /mcp (RFC 0016).
+EXPOSE 4317 4318 4319
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/ourios-server"]
 
@@ -64,10 +70,13 @@ ENTRYPOINT ["/usr/local/bin/ourios-server"]
 # so a plain `docker build -f Dockerfile.static` yields this variant.
 FROM gcr.io/distroless/static-debian12@sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2 AS runtime-static
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
-# OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
-# the future query endpoint (RFC 0016) and is intentionally not exposed
-# yet.
-EXPOSE 4317 4318
+# The state root the docs and Helm chart mount (WAL, local store), owned
+# by the runtime user: Docker seeds an empty named volume mounted here
+# from the image, so it starts writable by 65532 instead of root-owned.
+COPY --from=builder --chown=65532:65532 /var/lib/ourios /var/lib/ourios
+# OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003); 4319 = the query API
+# and /mcp (RFC 0016).
+EXPOSE 4317 4318 4319
 # Run as distroless's built-in nonroot user (uid 65532) — the numeric
 # form lets a Kubernetes `runAsNonRoot` securityContext verify it.
 USER 65532:65532

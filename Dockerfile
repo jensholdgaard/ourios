@@ -27,6 +27,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target,id=ourios-target-${TARGETARCH} \
     cargo build --release --locked -p ourios-server \
     && cp /build/target/release/ourios-server /ourios-server
+# Empty state directory for the runtime stage, which has no shell to
+# mkdir one (see the COPY --chown below).
+RUN mkdir -p /var/lib/ourios
 
 # Runtime: distroless `cc` carries glibc (the builder is glibc, not musl)
 # and is published multi-arch, so it works under the QEMU cross-build.
@@ -34,10 +37,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # tag (implicit :latest), so Renovate updates only the digest.
 FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
-# OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
-# the future query endpoint (RFC 0016) and is intentionally not exposed
-# yet.
-EXPOSE 4317 4318
+# The state root the docs and Helm chart mount (WAL, local store), owned
+# by the runtime user: Docker seeds an empty named volume mounted here
+# from the image, so it starts writable by 65532 instead of root-owned.
+COPY --from=builder --chown=65532:65532 /var/lib/ourios /var/lib/ourios
+# OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003); 4319 = the query API
+# and /mcp (RFC 0016).
+EXPOSE 4317 4318 4319
 # Run as distroless's built-in nonroot user (uid 65532) — the numeric
 # form lets a Kubernetes `runAsNonRoot` securityContext verify it.
 USER 65532:65532

@@ -53,11 +53,14 @@ pub(super) enum Point {
     AfterCreateLock,
 }
 
-/// One write of the lock that fails, once.
+/// One call on the lock, the object or `data` that fails, once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Fault {
     /// The first create of the lock commits, and its caller sees an error.
     LoseCreateReply,
+    /// The first create of the high-water object commits, and its caller
+    /// sees an error.
+    LoseObjectCreateReply,
     /// The first compare-and-swap of the lock fails without committing.
     FailFirstSwap,
     /// As [`Self::FailFirstSwap`], and the high-water object is deleted
@@ -79,6 +82,9 @@ impl Fault {
         let on_lock = location.as_ref() == LOG_IDS_KEY;
         match (self, call) {
             (Self::LoseCreateReply, Call::Put(PutMode::Create)) => on_lock,
+            (Self::LoseObjectCreateReply, Call::Put(PutMode::Create)) => {
+                location.as_ref() == HIGH_WATER_KEY
+            }
             (Self::FailFirstSwap | Self::FailSwapDeletingObject, Call::Put(PutMode::Update(_))) => {
                 on_lock
             }
@@ -232,7 +238,7 @@ impl ObjectStore for Gated {
                 .delete(&Key::from(HIGH_WATER_KEY))
                 .await
                 .and_then(|()| Err(unreachable())),
-            Some(Fault::LoseCreateReply) => self
+            Some(Fault::LoseCreateReply | Fault::LoseObjectCreateReply) => self
                 .inner
                 .put_opts(location, payload, opts)
                 .await

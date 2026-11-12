@@ -420,6 +420,35 @@ fn an_inherited_lock_refusal_says_to_stop_every_node_first() {
     assert!(refusal.contains("formed.json"), "{refusal}");
 }
 
+/// A bootstrap whose create of the object commits but whose reply is
+/// lost waits, finds the object it created, and seeds it once without
+/// withdrawing its lock; another start waits until then and passes, and
+/// log id 0 is allocated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bootstrap_whose_object_create_reply_is_lost_seeds_its_own_object() {
+    let store = Store::in_memory();
+    let fault = Some(Fault::LoseObjectCreateReply);
+    let (a_store, paused) = pausing_faulty(store.clone(), Point::AfterCreateLock, fault);
+    let (a, mut a_reported) = spawn_start(&a_store, A);
+    tokio::time::timeout(PATIENCE, paused.reached)
+        .await
+        .expect("A created the lock")
+        .expect("A is held after its create");
+    let (b, mut b_reported) = spawn_start(&store, B);
+    assert_eq!(next_report(&mut b_reported).await, "log_ids_unseeded");
+
+    paused.release.send(()).expect("A is held");
+    let seeded = Started::Bootstrapped(Seated {
+        high_water: 0,
+        bootstrapped: false,
+    });
+    assert_eq!(a.await.expect("joined").ok(), Some(seeded));
+    assert_eq!(next_report(&mut a_reported).await, "log_ids_store");
+    assert_eq!(b.await.expect("joined").ok(), Some(Started::Seeded));
+    assert_eq!(root_of(&store).await, (Some(lock(A, true, 0)), Some(0)));
+    assert_eq!(allocate(&store).await.ok(), Some(0));
+}
+
 /// A start that read the lock absent while another bootstrapped, and
 /// found the object only after that one had seeded, passes: the lock is
 /// present now, so it was not deleted.

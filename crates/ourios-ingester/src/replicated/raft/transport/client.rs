@@ -4,6 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -494,6 +495,8 @@ struct Outbound<S> {
     sent: Arc<Sent>,
     /// Resolves when the replies drop: the stream stays open while its
     /// requests live, and `openraft` may hold its input open and idle.
+    /// Checked before each piece too, so a cancelled split append is not
+    /// sent to the end.
     released: oneshot::Receiver<()>,
 }
 
@@ -503,26 +506,42 @@ where
 {
     async fn next(mut self) -> Option<(AppendRequest, Self)> {
         loop {
-            match self.pieces.as_mut().and_then(Iterator::next) {
-                Some(Ok(_)) if self.sent.link.check().is_err() => return None,
-                Some(Ok(piece)) => {
+            match self.next_piece() {
+                ControlFlow::Break(()) => return None,
+                ControlFlow::Continue(Some(Ok(_))) if self.sent.link.check().is_err() => {
+                    return None;
+                }
+                ControlFlow::Continue(Some(Ok(piece))) => {
                     self.sent.carried.note(&piece);
                     self.sent.unanswered().push_back(Instant::now());
                     return Some((piece, self));
                 }
-                Some(Err(e)) => {
+                ControlFlow::Continue(Some(Err(e))) => {
                     self.sent.refuse(e);
                     return None;
                 }
                 // Every piece is sent: free the append's entries before
                 // waiting, possibly long, for the next one.
-                None => self.pieces = None,
+                ControlFlow::Continue(None) => self.pieces = None,
             }
             let rpc = tokio::select! {
                 rpc = self.input.next() => rpc?,
                 _ = &mut self.released => return None,
             };
             self.pieces = Some(Pieces::new(self.to, rpc));
+        }
+    }
+}
+
+impl<S> Outbound<S> {
+    /// The append's next piece, `None` once all are taken; `Break`, with
+    /// nothing encoded, once the replies have dropped.
+    fn next_piece(&mut self) -> ControlFlow<(), Option<Result<AppendRequest, Malformed>>> {
+        match self.released.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => {
+                ControlFlow::Continue(self.pieces.as_mut().and_then(Iterator::next))
+            }
+            _ => ControlFlow::Break(()),
         }
     }
 }

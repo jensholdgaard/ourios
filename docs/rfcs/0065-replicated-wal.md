@@ -1045,16 +1045,22 @@ the mass-failover time and vote-log batching as tuning signals.
 >   and marks it `seeded` before any log id is allocated; the other,
 >   paused before its create and resumed after the first has seeded,
 >   allocated log ids and reserved a block and the object was deleted,
->   does not re-create it; a bootstrapper killed between the
->   object and `seeded` finishes on its restart while every other start
->   waits; with `log_ids.json` deleted after log ids were allocated, a
->   start finding the object present, or holding a group's Raft state,
->   fails with `LogIdsDeleted` and re-creates nothing, and no log id is
->   allocated twice; an unreadable `log_ids.json` fails a start that holds no
->   group's Raft state, while a replica holding one, restarted with the
->   store unreachable or the lock unreadable, opens its groups and keeps
->   taking the log; and with the
->   object deleted after
+>   does not re-create it; a bootstrapper killed before the object
+>   finishes on its restart while every other start waits, and one
+>   killed between the object and `seeded` fails its restart with
+>   `LogIdsDeleted` and seeds nothing; with `log_ids.json` deleted after log ids were allocated, a
+>   start finding the object present fails with `LogIdsDeleted` and
+>   re-creates nothing, a replica holding a group's Raft state opens
+>   its groups and fails its next log id allocation with
+>   `LogIdsDeleted`, a start paused before its create and resumed after
+>   only `log_ids.json` was deleted, whether its create's reply is lost
+>   or it is killed before it removes the lock it created, seeds
+>   nothing, even with a log id allocated and its group not yet
+>   recorded, and no log id is allocated twice; an unreadable
+>   `log_ids.json` fails a start that holds no group's Raft state,
+>   while a replica holding one, restarted with the store unreachable
+>   or the lock unreadable, opens its groups and keeps taking the log;
+>   and with the object deleted after
 >   group A has applied `(0, 1000]` and published nothing, while group
 >   B has applied no block, neither A's leader nor B's bootstraps or
 >   appends a block, and no id A holds is reserved again; nor does a
@@ -1726,9 +1732,12 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     it runs RFC 0059 §3.5 with that section's table, `restored_max = 0`
     (no group holds an id before a log id exists) and its own node's
     `receiver.template_ids_allow_bootstrap`, and creates the object
-    with `put_if_absent`, going on with the object it finds if one is
-    present. It then sets `seeded` to `true` by `put_if_match`, and only
-    then are log ids allocated, by `put_if_match` on `next`.
+    with `put_if_absent`. It goes on with an object it finds only when
+    this process issued the object's create, including a create whose
+    reply was lost. That is known only in the process's memory, never
+    read from the store, so a restarted process never takes an object
+    it finds as its own. It then sets `seeded` to `true` by `put_if_match`, and
+    only then are log ids allocated, by `put_if_match` on `next`.
   - **A present lock is never bootstrapped past.** A replicated start
     that finds `log_ids.json` present never creates the object. With
     `seeded` `false` under another `node_id` it waits, reporting why,
@@ -1739,20 +1748,34 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
     log id or block exists, or does not, so it never bootstraps: no
     start re-creates a deleted object from a floor below ids a group
     holds, whether or not that group has applied a block.
-  - **A crash between the two steps.** A start that finds `seeded`
-    `false` under its own `node_id` is a bootstrapper that crashed
-    between the object and `seeded`. It repeats them and sets `seeded`.
-    That is safe because no log id, and so no group and no reserved
-    block, exists before `seeded`, the object's create is
-    `put_if_absent`, and a `node_id` runs one start at a time (the
-    StatefulSet's pod identity), so no paused start outlives its own
-    restart.
+  - **A crash between the two steps fails closed.** A start that finds
+    `seeded` `false` under its own `node_id` and no object is a
+    bootstrapper that crashed before the object. It repeats both steps
+    and sets `seeded`, which is safe because no log id exists before
+    `seeded`, the object's create is `put_if_absent`, and a `node_id`
+    runs one start at a time (the StatefulSet's pod identity). With the
+    object present it fails closed with `LogIdsDeleted` and seeds
+    nothing: a bootstrapper that crashed between the object and
+    `seeded` looks the same on the store as a start whose create landed
+    over a deleted lock after log ids were allocated, and a log id is
+    allocated before its group's `formed.json` is written (§6.1), so no
+    object on the store proves which. An operator recovers by first
+    stopping every replicated node, so that no paused start can still
+    record an allocation, and then, if no
+    `<bucket>/wal/replicated/groups/<group>/formed.json` exists,
+    deleting both objects: a log id whose allocator is stopped and that
+    no `formed.json` records was never written to a row. Otherwise it is
+    §9 Q6's recovery.
   - **A deleted lock is never re-created.** The object is created only
     under the lock and a group exists only under a log id, so a lock
-    absent beside the object, or from a start that holds a group's Raft
-    state, was deleted: re-creating it at `next` `0` would hand out log
-    ids already in Parquet. The start or step fails closed with
-    `LogIdsDeleted`, reporting why, and no node re-creates it. With
+    absent beside the object, or at a log id allocation, was deleted:
+    re-creating it at `next` `0` would hand out log ids already in
+    Parquet. The start or step fails closed with
+    `LogIdsDeleted`, reporting why, and no node re-creates it. A start
+    whose own create of the lock succeeded, or whose reply was lost,
+    and which then finds the object or loses the object's create, made
+    its lock over a deleted one: it deletes that lock and fails the
+    same way. With
     both the lock and the object deleted nothing on the store tells a
     new bucket from an emptied one, which is §9 Q6's recovery.
   - **A formed replica starts without it.** Log ids exist only after
@@ -2714,7 +2737,8 @@ from rows.
 - RFC0065.31's lock arms (two replicated starts, a crashed
   bootstrapper, a deletion with groups holding blocks): the in-process
   cluster on the in-memory store, with failpoints between the lock,
-  the object and `seeded`.
+  the object and `seeded`, and faults that commit a create of the lock
+  or the object but lose its reply.
 - RFC0065.17: `deploy/helm/render-tests.sh`.
 - RFC0065.18, .19: `criterion`-style load runs on the in-process
   cluster (ack latency with and without tail load; tail throughput with

@@ -570,6 +570,38 @@ pub fn seat(
     Ok(seated)
 }
 
+/// The high-water object's bootstrap on a replicated root (RFC 0065
+/// §6.6), by the start holding `log_ids.json`'s lock: §3.5's table with no
+/// seated marker and `restored_max = 0`, since no group holds an id before
+/// a log id exists. An object already there, one this start created
+/// before it crashed, is gone on with.
+///
+/// # Errors
+///
+/// [`TemplateIdsError`] when the object cannot be read or bootstrapped.
+pub fn seat_replicated_root(
+    store: &Store,
+    allow_bootstrap: bool,
+    scan: &ScanOptions,
+) -> Result<Seated, TemplateIdsError> {
+    let found = |high_water: HighWater| Seated {
+        high_water: high_water.reserved_through,
+        bootstrapped: false,
+    };
+    match read(store)? {
+        Some(high_water) => Ok(found(high_water)),
+        None if !allow_bootstrap && store_has_data(store)? => {
+            Err(TemplateIdsError::BootstrapNotAuthorized)
+        }
+        None => match bootstrap(store, 0, scan) {
+            Err(TemplateIdsError::BootstrapRaceLost) => read(store)?
+                .map(found)
+                .ok_or(TemplateIdsError::HighWaterDeleted),
+            seated => seated,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

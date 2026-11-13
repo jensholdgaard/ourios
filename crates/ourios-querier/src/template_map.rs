@@ -684,7 +684,7 @@ pub(crate) fn load_or_derive_resolved(
             let len = bytes.len() as u64;
             match TemplateMap::from_artifact_bytes(&bytes, tenant)? {
                 ArtifactRead::Valid(map) if map.folded_files() == resolved.frontier() => {
-                    METRICS.record_lookup(CacheOutcome::Hit, false, trigger);
+                    METRICS.record_lookup(CacheOutcome::Hit, map.has_binding_conflicts(), trigger);
                     return Ok(Loaded {
                         map,
                         bytes: len,
@@ -1136,6 +1136,14 @@ impl TemplateMap {
     #[must_use]
     pub fn fold_state(&self) -> Option<&FoldState> {
         self.fold_state.as_ref()
+    }
+
+    /// Whether the persisted conflict set names any key. An artifact
+    /// without `fold_state` has no set, so it reports none.
+    fn has_binding_conflicts(&self) -> bool {
+        self.fold_state
+            .as_ref()
+            .is_some_and(|state| !state.binding_conflicts().is_empty())
     }
 
     /// The published-object bytes: the canonical JSON body
@@ -1709,6 +1717,18 @@ mod tests {
         assert!(abstains(artifact, folded));
         assert!(abstains(artifact, artifact));
         assert!(!abstains(artifact, artifact + 1));
+    }
+
+    /// RFC0033.8 amendment 2026-11-13 (#928): a hit reports the anomaly
+    /// only when the artifact persists a non-empty conflict set.
+    #[test]
+    fn a_hit_reports_conflicts_only_from_a_persisted_non_empty_set() {
+        let mut map = sample();
+        assert!(!map.has_binding_conflicts(), "no fold_state, no set");
+        map.fold_state = Some(FoldState::new(Some(5), Vec::new(), 0));
+        assert!(!map.has_binding_conflicts(), "an empty set");
+        map.fold_state = Some(FoldState::new(Some(5), vec![(7, 2)], 0));
+        assert!(map.has_binding_conflicts());
     }
 
     #[test]

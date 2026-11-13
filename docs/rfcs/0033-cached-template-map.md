@@ -708,6 +708,8 @@ uncached query identically.
 > separate amendment. Whether a **hit** re-reports `binding_conflicts`
 > stays #928. This amendment persists the set, which #928's option 1
 > needs anyway, but leaves the hit-path report cadence to that issue.
+> *(2026-11-13, #928: settled by the §3.7 amendment of that date. A
+> hit reports the persisted set as its lookup anomaly.)*
 >
 > **Expected effect** (measured on Dash0, scenario RFC0033.14). A
 > stale acquisition's audit IO goes from O(tenant history) to O(files
@@ -923,7 +925,9 @@ the old field pinned to audit-stream-only) is recorded in §4.
 > an adoption riding an existing leaf, which restates the leaf's text
 > exactly. A cache hit runs no fold, so it doesn't re-report a
 > conflict; persisting conflicts in the artifact is #928. The status
-> stays `accepted`. Scenario RFC0033.8 is the criterion.
+> stays `accepted`. Scenario RFC0033.8 is the criterion. *(2026-11-13,
+> #928: a hit now carries the anomaly for a persisted conflict set;
+> see the amendment of that date below.)*
 
 > **Amendment (2026-10-13, #987, maintainer-approved): announce a
 > conflict once per artifact that records it.** With incremental
@@ -962,6 +966,32 @@ the old field pinned to audit-stream-only) is recorded in §4.
 > artifact's set like an incremental fold. The served map is
 > unchanged, and a hit still announces nothing. The status stays
 > `accepted`. Scenario RFC0033.8 gains the criterion below.
+
+> **Amendment (2026-11-13, #928, maintainer-approved): a hit reports
+> the conflicts its artifact records.** A hit runs no fold, so until
+> now its lookup never carried the anomaly. A quiet tenant whose audit
+> frontier doesn't move is served from the artifact on every query,
+> and the lookups counter stopped showing that it lives with
+> conflicts once the fold that found them had published.
+>
+> - **The anomaly.** A hit whose artifact has `fold_state` with a
+>   non-empty `binding_conflicts` records
+>   `ourios.template_map.lookup.anomaly = binding_conflict` on its
+>   lookup data point, like a fold-backed acquisition with the same
+>   set. A hit on an empty set records no anomaly.
+> - **No event.** A hit announces nothing. Every key in the set was
+>   announced when an acquisition first derived it (the #987 cadence
+>   above), and repeating a WARN on every query would bring back the
+>   flood that amendment removed.
+> - **No `fold_state`, no report.** An artifact published before
+>   `fold_state` existed carries no conflict set, so a hit on it
+>   records no anomaly. The next stale acquisition publishes one with
+>   `fold_state`.
+>
+> The artifact format is unchanged: `binding_conflicts` already
+> persists (§3.3 amendment 2026-10-12). No name is new. The served map
+> is unchanged. The status stays `accepted`. Scenario RFC0033.8 gains
+> the criterion below.
 
 > **Amendment (2026-10-11, #924, maintainer-approved): what an
 > acquisition costs.** The lookup counter says a derive happened, not
@@ -1226,6 +1256,13 @@ ambiguity cannot recur.
 >   removed, the `files_removed` full-fold fallback announces no event
 >   for keys in that artifact's `binding_conflicts`, and its lookup
 >   still carries the anomaly.
+>
+> *Amendment (2026-11-13, #928):*
+> - **And** a later query that is a hit on that published artifact
+>   carries `ourios.template_map.lookup.anomaly = binding_conflict` on
+>   its lookup and announces no event
+> - **And** a hit on an artifact whose `binding_conflicts` is empty
+>   carries no anomaly.
 
 > **Scenario RFC0033.9 — Derive cost is observable** (amendment
 > 2026-10-11, #924)

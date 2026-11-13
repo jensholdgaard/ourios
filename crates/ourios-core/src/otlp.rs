@@ -978,8 +978,11 @@ impl Default for TenantId {
 /// untouched for the overwhelmingly common valid input. On failure,
 /// unset-`AnyValue` encodings at the two `Option`-typed positions —
 /// `LogRecord.body` and `KeyValue.value` (including inside
-/// `kvlistValue`) — are rewritten to an **absent field** and the
-/// parse retried once.
+/// `kvlistValue`) — are rewritten to an **absent field**, the repeated
+/// fields proto3-JSON omits when empty (a request's `resourceLogs`, a
+/// `kvlistValue`'s or `arrayValue`'s `values`) are restored as empty
+/// arrays, and the parse is retried once. An empty map or array stays a
+/// typed value.
 ///
 /// **Bounded fidelity concession, by design**: the faithful decode of
 /// a present-but-unset `AnyValue` is `Some(AnyValue { value: None })`
@@ -1029,7 +1032,9 @@ pub mod lenient_json {
                 let Ok(mut tree) = serde_json::from_slice::<serde_json::Value>(bytes) else {
                     return Err(first);
                 };
-                if !strip_unset_any_values(&mut tree) {
+                let stripped = strip_unset_any_values(&mut tree);
+                let filled = fill_omitted_repeated_fields(&mut tree);
+                if !(stripped || filled) {
                     return Err(first);
                 }
                 serde_json::from_value(tree).map(|v| (v, true))
@@ -1099,6 +1104,55 @@ pub mod lenient_json {
             serde_json::Value::Array(items) => {
                 for v in items {
                     changed |= strip_unset_any_values(v);
+                }
+            }
+            _ => {}
+        }
+        changed
+    }
+
+    /// Restore the repeated fields proto3-JSON omits when empty and the
+    /// upstream deserialiser requires: the root's `resourceLogs` (an empty
+    /// request is `{}`) and the `values` of a `kvlistValue` or
+    /// `arrayValue` object (an empty map or array). The empty map or array
+    /// stays a typed value; it is never read as an unset `AnyValue`.
+    /// Returns whether the tree changed. Both callers decode a type whose
+    /// root holds `resourceLogs`.
+    fn fill_omitted_repeated_fields(tree: &mut serde_json::Value) -> bool {
+        let serde_json::Value::Object(root) = &mut *tree else {
+            return false;
+        };
+        let mut changed = false;
+        if !root.contains_key("resourceLogs") {
+            root.insert(
+                "resourceLogs".to_owned(),
+                serde_json::Value::Array(Vec::new()),
+            );
+            changed = true;
+        }
+        changed | fill_empty_collection_values(tree)
+    }
+
+    fn fill_empty_collection_values(tree: &mut serde_json::Value) -> bool {
+        let mut changed = false;
+        match tree {
+            serde_json::Value::Object(map) => {
+                for slot in ["kvlistValue", "arrayValue"] {
+                    if let Some(serde_json::Value::Object(collection)) = map.get_mut(slot)
+                        && !collection.contains_key("values")
+                    {
+                        collection
+                            .insert("values".to_owned(), serde_json::Value::Array(Vec::new()));
+                        changed = true;
+                    }
+                }
+                for v in map.values_mut() {
+                    changed |= fill_empty_collection_values(v);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    changed |= fill_empty_collection_values(v);
                 }
             }
             _ => {}
@@ -1286,6 +1340,31 @@ mod tests {
         assert!(unset(&record.body));
         assert!(unset(&record.attributes[0].value));
         assert!(unset(&record.attributes[1].value));
+    }
+
+    #[test]
+    fn lenient_json_restores_omitted_empty_repeated_fields_as_typed_values() {
+        use opentelemetry_proto::tonic::common::v1::{ArrayValue, KeyValueList};
+        use opentelemetry_proto::tonic::logs::v1::LogsData;
+        let empty: LogsData = lenient_json::from_slice(b"{}").expect("an empty request");
+        assert!(empty.resource_logs.is_empty());
+
+        let doc = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"kvlistValue":{}},"attributes":[{"key":"a","value":{"arrayValue":{}}}]}]}]}]}"#;
+        let parsed: LogsData = lenient_json::from_slice(doc.as_bytes()).expect("parse");
+        let record = &parsed.resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(
+            record.body.as_ref().and_then(|b| b.value.clone()),
+            Some(AvValue::KvlistValue(KeyValueList::default())),
+            "an empty map body stays a kvlist",
+        );
+        assert_eq!(
+            record.attributes[0]
+                .value
+                .as_ref()
+                .and_then(|v| v.value.clone()),
+            Some(AvValue::ArrayValue(ArrayValue::default())),
+            "an empty array value stays an array",
+        );
     }
 
     #[test]

@@ -156,6 +156,39 @@ async fn content_type_and_encoding_are_case_insensitive() {
     );
 }
 
+/// OTLP 1.11.1 *otlphttp-response* Full Success: the server "MUST leave the
+/// `partial_success` field unset", and the proto3 JSON mapping omits an unset
+/// message field, so the JSON body is exactly `{}` — not
+/// `{"partialSuccess":null}`. The protobuf body of the same message is empty.
+#[tokio::test]
+async fn a_full_success_body_leaves_partial_success_unset_in_either_encoding() {
+    for (content_type, payload, expected) in [
+        (
+            "application/json",
+            br#"{"resourceLogs":[]}"#.to_vec(),
+            b"{}".to_vec(),
+        ),
+        (
+            PROTOBUF,
+            ExportLogsServiceRequest::default().encode_to_vec(),
+            Vec::new(),
+        ),
+    ] {
+        let (pipeline, _) = capturing_pipeline();
+        let (status, body) = send(
+            router(pipeline, &HttpConfig::default()),
+            post_request("/v1/logs", Some(content_type), None, payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{content_type}");
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            String::from_utf8_lossy(&expected),
+            "{content_type}: the full-success body",
+        );
+    }
+}
+
 /// The OTLP spec requires a `google.rpc.Status` body on **every** 4xx/5xx.
 /// The body-limit rejection is the one that nearly escaped it: `DefaultBodyLimit`
 /// fires before the handler's body exists, so axum rendered its own generic

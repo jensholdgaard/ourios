@@ -551,7 +551,7 @@ fn success_response(format: WireFormat) -> Response {
             response.encode_to_vec(),
         )
             .into_response(),
-        WireFormat::Json => match serde_json::to_vec(&response) {
+        WireFormat::Json => match proto3_json(&response) {
             Ok(body) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
@@ -567,6 +567,17 @@ fn success_response(format: WireFormat) -> Response {
             ),
         },
     }
+}
+
+/// `response` in the proto3 JSON mapping, which omits an unset message
+/// field. The upstream serde form writes an unset `partial_success` as
+/// `"partialSuccess":null`, so the full-success body would not be `{}`.
+fn proto3_json(response: &ExportLogsServiceResponse) -> serde_json::Result<Vec<u8>> {
+    let mut value = serde_json::to_value(response)?;
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.retain(|_, field| !field.is_null());
+    }
+    serde_json::to_vec(&value)
 }
 
 #[cfg(test)]

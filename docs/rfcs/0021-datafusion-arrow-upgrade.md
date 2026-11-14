@@ -186,7 +186,61 @@ the original phase 2 became available on its own:
   the RFC 0009 manifest plus partition-directory windowing rather than
   from DataFusion's collected file statistics. Revisit when the
   upstream fix ships in a release we depend on — the same three
-  pruning tests are the gate in both directions.
+  pruning tests are the gate in both directions. *(2026-11-14:
+  superseded by §3.2c. Statistics off is now the intended design,
+  and turning them on needs its own amendment.)*
+
+### 3.2c Statistics collection stays off by design (amendment 2026-11-14)
+
+*Maintainer-approved amendment.* §3.2a treated
+`execution.collect_statistics = false` as a workaround to drop once
+apache/datafusion#24769 was fixed. Testing 56.0.0-rc1 showed it is
+protecting more than pruning, so it is now a design decision.
+
+**Why it stays off.** With statistics on, DataFusion replaces a column
+whose file statistics show `min == max` and no nulls with that
+constant. Two upstream bugs sit in that path:
+
+- **Wrong values** (apache/datafusion#26490, open). Parquet float
+  min/max leave NaN out, so a float column of one value plus NaNs looks
+  constant, and the NaN rows read back as that value. Ourios writes
+  OTLP `DoubleValue`s, NaN included, into promoted `Float64` attribute
+  columns (RFC 0042). With statistics on, those rows would read back
+  wrong, which breaks OTLP fidelity. Other projects built on DataFusion
+  have hit this too (nautilus_trader, ltseq, delta-rs).
+- **Lost pruning** (apache/datafusion#27415, open). #24770, in 56.0.0,
+  restores pruning when the folded predicate is a bare constant, but not
+  when it still holds a term statistics can't evaluate. RFC 0044's
+  body-equality rewrite has such terms
+  (`array_element(separators, n) = '…'`), so RFC0044.7 still fails with
+  statistics on.
+
+**What off costs, and what it doesn't.** Row-group pruning from each
+file's footer, the pruning pillar #1 relies on, runs either way. Off
+gives up only plan-time file statistics:
+- constant-column substitution;
+- answering a count from metadata;
+- skipping a whole file before opening it.
+
+It also saves a footer read per file at plan time, which a many-file
+log store would otherwise pay on every query. Ourios gets file-level
+selection from the RFC 0009 manifest and partition windowing instead.
+
+**Turning statistics on** takes a later amendment, not an upstream
+release. It must show:
+1. #26490 and #27415 fixed in a DataFusion release we depend on;
+2. RFC0021.10's NaN behaviour test and the RFC0044.7/.8 and RFC0007.1
+   pruning tests green with statistics on (RFC0007.1's "reads bytes"
+   guard reworded, since a count over a statistics-constant column
+   legitimately reads none);
+3. an indicative B1/B2 run on a many-file corpus where the plan-time
+   footer reads pay for themselves.
+
+That amendment also rewrites RFC0021.10's statistics-off clause and the
+`the_shared_session_disables_statistics_collection` assertion it names,
+which pin the setting itself and would otherwise fail by construction.
+
+Scenario RFC0021.10 is the criterion. The status stays `green`.
 
 ### 3.2b Phase 2b — object_store ≥ 0.14 (still upstream-gated)
 
@@ -298,6 +352,20 @@ back to `red`) the day a released DataFusion accepts object_store
 > Then no `thrift` crate is present (#295 closed).
 > Asserted by `rfc0021_8_thrift_is_absent_from_the_lockfile`.
 
+> **Scenario RFC0021.10 — a statistics constant never replaces data**
+> (amendment 2026-11-14, §3.2c).
+> Given a promoted `Float64` attribute column holding `[1.5, NaN, 1.5]`
+> in one file,
+> When the querier's production session filters `attr.cost_usd < 2.0`
+> and sums the column,
+> Then the filter counts 2 rows and the sum is reported as NULL
+> (non-finite), never 3 rows or a finite 4.5. Read as the `min == max`
+> statistic, the NaN row would count as 1.5. Behaviour test:
+> `nan_promoted_float::a_nan_in_a_promoted_float_column_is_never_read_as_the_statistics_constant`.
+> Until a later amendment turns statistics on (§3.2c), the session also
+> keeps `collect_statistics` off, asserted by
+> `exec::session_tests::the_shared_session_disables_statistics_collection`.
+
 > **Scenario RFC0021.9 (phase 2a half) — supply chain re-cleared.**
 > Given the new transitive set,
 > When `cargo deny check` runs,
@@ -357,6 +425,9 @@ one artefact and changes no test semantics:
 
 ## 8. References
 
+- apache/datafusion#24769 and #24770 (the §3.2a regression and its
+  partial fix), #27415 (the remaining pruning case), #26490 (NaN rows
+  read as the statistics constant) — §3.2c.
 - Epic #314 (this RFC), #310 (object_store 0.14, blocked), #295
   (thrift GHSA-2f9f-gq7v-9h6m), #276 (RFC 0017 dual decoder), #313
   (renovate hold).

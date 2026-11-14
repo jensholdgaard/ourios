@@ -6,7 +6,8 @@
 //! constant and returns the statistic for the NaN rows
 //! (apache/datafusion#26490). The querier keeps statistics collection off;
 //! this test pins the behaviour itself, so a `DataFusion` upgrade or a
-//! session change that brings the substitution back fails here.
+//! session change that brings the substitution back fails here. This is
+//! the behaviour test of RFC0021.10.
 
 use ourios_parquet::{PromotedAttributes, PromotedClass, PromotedKey};
 

@@ -49,9 +49,15 @@ pub(crate) enum SchemaMode<'a> {
 /// fast. Collection also costs a per-file footer read at plan time,
 /// which a many-file log store pays on every query.
 ///
-/// Remove this override once the upstream fix ships in a release we
-/// depend on; the RFC0044.7/.8 and RFC0007.1 pruning tests are the
-/// gate that will catch it either way.
+/// The same constant substitution also returns wrong values: Parquet
+/// float min/max leave NaN out, so a float column of one value plus NaNs
+/// reads back as that value (apache/datafusion#26490), which would break
+/// OTLP fidelity for promoted `Float64` attributes. The
+/// `nan_promoted_float` test pins that.
+///
+/// Keep this override until both upstream bugs are fixed in a release we
+/// depend on (#24769's remaining case is apache/datafusion#27415). The
+/// RFC0044.7/.8 and RFC0007.1 pruning tests and the NaN test are the gate.
 ///
 /// Each session also carries a [`crate::fetch_count::FetchCounter`]: the local
 /// filesystem it reads through is wrapped to count fetched bytes, as is

@@ -1,6 +1,11 @@
-# The `ci` profile is what .github/workflows/ci.yml runs. Its only
-# deviation from default is the JUnit report, which the workflow
-# uploads to Codecov Test Analytics (run times, failure rates, flake
-# detection). Local `cargo nextest run` is unaffected.
+# The `ci` profile is what .github/workflows/ci.yml runs. It deviates
+# from default twice: the JUnit report, which the workflow uploads to
+# Codecov Test Analytics (run times, failure rates, flake detection),
+# and a kill timeout. The slowest test takes about 25 s on a runner, so
+# ten minutes is a hang, which would otherwise hold the job to its
+# six-hour limit. Local `cargo nextest run` is unaffected.
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 [profile.ci.junit]
 path = "junit.xml"

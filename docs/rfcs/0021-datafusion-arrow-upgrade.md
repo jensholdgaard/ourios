@@ -229,11 +229,16 @@ selection from the RFC 0009 manifest and partition windowing instead.
 **Turning statistics on** takes a later amendment, not an upstream
 release. It must show:
 1. #26490 and #27415 fixed in a DataFusion release we depend on;
-2. RFC0021.10 and the RFC0044.7/.8 and RFC0007.1 pruning tests green
-   with statistics on (RFC0007.1's "reads bytes" guard reworded, since a
-   count over a statistics-constant column legitimately reads none);
+2. RFC0021.10's NaN behaviour test and the RFC0044.7/.8 and RFC0007.1
+   pruning tests green with statistics on (RFC0007.1's "reads bytes"
+   guard reworded, since a count over a statistics-constant column
+   legitimately reads none);
 3. an indicative B1/B2 run on a many-file corpus where the plan-time
    footer reads pay for themselves.
+
+That amendment also rewrites RFC0021.10's statistics-off clause and the
+`the_shared_session_disables_statistics_collection` assertion it names,
+which pin the setting itself and would otherwise fail by construction.
 
 Scenario RFC0021.10 is the criterion. The status stays `green`.
 
@@ -355,10 +360,11 @@ back to `red`) the day a released DataFusion accepts object_store
 > and sums the column,
 > Then the filter counts 2 rows and the sum is reported as NULL
 > (non-finite), never 3 rows or a finite 4.5. Read as the `min == max`
-> statistic, the NaN row would count as 1.5. The session keeps
-> `collect_statistics` off. Tests:
-> `nan_promoted_float::a_nan_in_a_promoted_float_column_is_never_read_as_the_statistics_constant`
-> and `exec::session_tests::the_shared_session_disables_statistics_collection`.
+> statistic, the NaN row would count as 1.5. Behaviour test:
+> `nan_promoted_float::a_nan_in_a_promoted_float_column_is_never_read_as_the_statistics_constant`.
+> Until a later amendment turns statistics on (§3.2c), the session also
+> keeps `collect_statistics` off, asserted by
+> `exec::session_tests::the_shared_session_disables_statistics_collection`.
 
 > **Scenario RFC0021.9 (phase 2a half) — supply chain re-cleared.**
 > Given the new transitive set,

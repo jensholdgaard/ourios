@@ -437,6 +437,22 @@ async fn while_reserved<T>(
     tokio::join!(pass, held)
 }
 
+/// A pass that ends without reserving fails at once, though the store
+/// still holds the reservation channel open.
+#[tokio::test]
+#[should_panic(expected = "the pass ended before reserving")]
+async fn a_pass_ending_before_its_reservation_fails_at_once() {
+    let (_store_holds, mut reserved) = mpsc::unbounded_channel();
+    let release = Semaphore::new(0);
+    let ended = async { Pass::default() };
+    let waited = tokio::time::timeout(
+        Duration::from_secs(5),
+        while_reserved(ended, &mut reserved, &release, async {}),
+    )
+    .await;
+    drop(waited);
+}
+
 fn pausing(store: Store) -> (Store, mpsc::UnboundedReceiver<()>, Arc<Semaphore>) {
     let (landed, heard) = mpsc::unbounded_channel();
     let release = Arc::new(Semaphore::new(0));

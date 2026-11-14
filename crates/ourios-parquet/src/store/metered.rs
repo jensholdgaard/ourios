@@ -147,11 +147,13 @@ impl ObjectStore for Metered {
                 meta,
                 range,
                 attributes,
+                extensions,
             }) if op != Operation::Head => Ok(GetResult {
                 payload: GetResultPayload::Stream(Observed::boxed(body, call)),
                 meta,
                 range,
                 attributes,
+                extensions,
             }),
             result => {
                 call.end(&result);

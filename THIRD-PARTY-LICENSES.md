@@ -19,11 +19,11 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 371 |
-| `MIT` | 76 |
+| `Apache-2.0` | 378 |
+| `MIT` | 83 |
 | `Unicode-3.0` | 19 |
-| `BSD-3-Clause` | 12 |
-| `ISC` | 4 |
+| `BSD-3-Clause` | 13 |
+| `ISC` | 6 |
 | `Zlib` | 3 |
 | `CDLA-Permissive-2.0` | 2 |
 | `CC0-1.0` | 1 |
@@ -468,13 +468,6 @@ Used by:
 
 Used by:
 
-- `arrow-arith` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-csv` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-json` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-row` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-string` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `crc32c` 0.6.9 — <https://github.com/zowens/crc32c>
 - `encoding_rs` 0.8.42 — <https://github.com/hsivonen/encoding_rs>
 - `multiversion_no_op` 1.0.0 — <https://github.com/hsivonen/multiversion_no_op>
 - `sse-stream` 0.2.6 — <https://github.com/4t145/sse-stream/>
@@ -697,7 +690,7 @@ Used by:
 
 Used by:
 
-- `object_store` 0.13.2 — <https://github.com/apache/arrow-rs-object-store>
+- `object_store` 0.14.2 — <https://github.com/apache/arrow-rs-object-store>
 
 <details>
 <summary>Full license text</summary>
@@ -916,36 +909,36 @@ Used by:
 
 Used by:
 
-- `datafusion-catalog-listing` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-catalog` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-common-runtime` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-common` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-arrow` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-csv` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-json` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-parquet` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-doc` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-execution` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr-common` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate-common` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-nested` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-table` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window-common` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-macros` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-optimizer` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-adapter` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-common` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-optimizer` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-plan` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-pruning` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion-session` 55.2.0 — <https://github.com/apache/datafusion>
-- `datafusion` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog-listing` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-common-runtime` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-common` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-arrow` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-csv` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-json` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-parquet` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-doc` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-execution` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr-common` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate-common` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-nested` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-table` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window-common` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-macros` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-optimizer` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-adapter` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-common` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-optimizer` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-plan` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-pruning` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-session` 56.0.0 — <https://github.com/apache/datafusion>
 
 <details>
 <summary>Full license text</summary>
@@ -1172,15 +1165,22 @@ License: http://www.apache.org/licenses/LICENSE-2.0
 
 Used by:
 
-- `arrow-array` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-buffer` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-cast` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-data` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-ipc` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-ord` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-schema` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-select` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `parquet` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-arith` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-buffer` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-cast` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-cmp` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-csv` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-data` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ipc` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-json` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ord` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-row` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-schema` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-select` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-string` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `parquet` 60.1.0 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -1411,7 +1411,6 @@ Used by:
 - `windows-result` 0.4.1 — <https://github.com/microsoft/windows-rs>
 - `windows-strings` 0.5.1 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.52.0 — <https://github.com/microsoft/windows-rs>
-- `windows-sys` 0.59.0 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.61.2 — <https://github.com/microsoft/windows-rs>
 - `windows-targets` 0.52.6 — <https://github.com/microsoft/windows-rs>
 - `windows_aarch64_gnullvm` 0.52.6 — <https://github.com/microsoft/windows-rs>
@@ -2074,6 +2073,7 @@ Used by:
 - `anyerror` 0.1.13 — <https://github.com/drmingdrmer/anyerror>
 - `backoff-series` 0.1.1 — <https://github.com/drmingdrmer/backoff-series>
 - `base2histogram` 0.2.3 — <https://github.com/drmingdrmer/base2histogram>
+- `crc-fast` 1.10.0 — <https://github.com/awesomized/crc-fast-rust>
 - `display-more` 0.2.6 — <https://github.com/drmingdrmer/display-more>
 - `opentelemetry-proto` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto>
 - `quorum-set` 0.6.0 — <https://github.com/drmingdrmer/quorum-set>
@@ -5142,6 +5142,7 @@ Used by:
 - `bumpalo` 3.20.3 — <https://github.com/fitzgen/bumpalo>
 - `cc` 1.2.65 — <https://github.com/rust-lang/cc-rs>
 - `cfg-if` 1.0.4 — <https://github.com/rust-lang/cfg-if>
+- `cmake` 0.1.58 — <https://github.com/rust-lang/cmake-rs>
 - `const-random-macro` 0.1.16 — <https://github.com/tkaitchuck/constrandom>
 - `const-random` 0.1.18 — <https://github.com/tkaitchuck/constrandom>
 - `core-foundation-sys` 0.8.7 — <https://github.com/servo/core-foundation-rs>
@@ -5171,7 +5172,6 @@ Used by:
 - `idna` 1.1.0 — <https://github.com/servo/rust-url/>
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
-- `itertools` 0.13.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.15.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
@@ -5179,6 +5179,7 @@ Used by:
 - `lazy_static` 1.5.0 — <https://github.com/rust-lang-nursery/lazy-static.rs>
 - `linux-raw-sys` 0.12.1 — <https://github.com/sunfishcode/linux-raw-sys>
 - `lock_api` 0.4.14 — <https://github.com/Amanieu/parking_lot>
+- `lock_api` 0.5.0 — <https://github.com/Amanieu/parking_lot>
 - `log` 0.4.33 — <https://github.com/rust-lang/log>
 - `maplit` 1.0.2 — <https://github.com/bluss/maplit>
 - `mime` 0.3.17 — <https://github.com/hyperium/mime>
@@ -5192,6 +5193,8 @@ Used by:
 - `once_cell` 1.21.4 — <https://github.com/matklad/once_cell>
 - `openssl-probe` 0.2.1 — <https://github.com/rustls/openssl-probe>
 - `parking_lot` 0.12.5 — <https://github.com/Amanieu/parking_lot>
+- `parking_lot` 0.13.0 — <https://github.com/Amanieu/parking_lot>
+- `parking_lot_core` 0.10.0 — <https://github.com/Amanieu/parking_lot>
 - `parking_lot_core` 0.9.12 — <https://github.com/Amanieu/parking_lot>
 - `percent-encoding` 2.3.2 — <https://github.com/servo/rust-url/>
 - `petgraph` 0.8.3 — <https://github.com/petgraph/petgraph>
@@ -6124,7 +6127,7 @@ Used by:
 - `elliptic-curve` 0.13.8 — <https://github.com/RustCrypto/traits/tree/master/elliptic-curve>
 - `hmac` 0.12.1 — <https://github.com/RustCrypto/MACs>
 - `hybrid-array` 0.4.13 — <https://github.com/RustCrypto/hybrid-array>
-- `md-5` 0.10.6 — <https://github.com/RustCrypto/hashes>
+- `md-5` 0.11.0 — <https://github.com/RustCrypto/hashes>
 - `p256` 0.13.2 — <https://github.com/RustCrypto/elliptic-curves/tree/master/p256>
 - `p384` 0.13.1 — <https://github.com/RustCrypto/elliptic-curves/tree/master/p384>
 - `pem-rfc7468` 0.7.0 — <https://github.com/RustCrypto/formats/tree/master/pem-rfc7468>
@@ -6133,7 +6136,7 @@ Used by:
 - `primeorder` 0.13.6 — <https://github.com/RustCrypto/elliptic-curves/tree/master/primeorder>
 - `sec1` 0.7.3 — <https://github.com/RustCrypto/formats/tree/master/sec1>
 - `sha2` 0.10.9 — <https://github.com/RustCrypto/hashes>
-- `sha2` 0.11.1 — <https://github.com/RustCrypto/hashes>
+- `sha2` 0.11.0 — <https://github.com/RustCrypto/hashes>
 - `signature` 2.2.0 — <https://github.com/RustCrypto/traits/tree/master/signature>
 - `spki` 0.7.3 — <https://github.com/RustCrypto/formats/tree/master/spki>
 
@@ -7229,9 +7232,12 @@ Used by:
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>
 - `arraydeque` 0.5.1 — <https://github.com/andylokandy/arraydeque>
 - `async-trait` 0.1.92 — <https://github.com/dtolnay/async-trait>
+- `aws-lc-sys` 0.46.0 — <https://github.com/aws/aws-lc-rs>
 - `blake3` 1.8.7 — <https://github.com/BLAKE3-team/BLAKE3>
 - `const-hex` 1.19.1 — <https://github.com/danipopes/const-hex>
 - `constant_time_eq` 0.4.2 — <https://github.com/cesarb/constant_time_eq>
+- `crc32c` 0.6.8 — <https://github.com/zowens/crc32c>
+- `dunce` 1.0.5 — <https://gitlab.com/kornelski/dunce>
 - `dyn-clone` 1.0.20 — <https://github.com/dtolnay/dyn-clone>
 - `fiat-crypto` 0.2.9 — <https://github.com/mit-plv/fiat-crypto>
 - `flatbuffers` 25.12.19 — <https://github.com/google/flatbuffers>
@@ -7293,7 +7299,8 @@ Used by:
 - `time` 0.3.53 — <https://github.com/time-rs/time>
 - `unicode-ident` 1.0.24 — <https://github.com/dtolnay/unicode-ident>
 - `utf8parse` 0.2.2 — <https://github.com/alacritty/vte>
-- `wasm-streams` 0.4.2 — <https://github.com/MattiasBuelens/wasm-streams/>
+- `wasm-streams` 0.5.0 — <https://github.com/MattiasBuelens/wasm-streams/>
+- `zstd-safe` 7.2.4 — <https://github.com/gyscos/zstd-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -8166,9 +8173,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- `zstd-safe` 7.4.0 — <https://github.com/gyscos/zstd-rs>
+- `zstd-safe` 8.2.0 — <https://github.com/gyscos/zstd-rs>
 - `zstd-sys` 2.1.2+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
-- `zstd` 0.13.4 — <https://github.com/gyscos/zstd-rs>
+- `zstd` 0.14.3 — <https://github.com/gyscos/zstd-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -8211,8 +8218,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- `alloc-no-stdlib` 2.0.4 — <https://github.com/dropbox/rust-alloc-no-stdlib>
-- `brotli` 8.0.4 — <https://github.com/dropbox/rust-brotli>
+- `alloc-no-stdlib` 3.0.0 — <https://github.com/dropbox/rust-alloc-no-stdlib>
+- `brotli` 9.0.0 — <https://github.com/dropbox/rust-brotli>
 
 <details>
 <summary>Full license text</summary>
@@ -8326,7 +8333,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- `alloc-stdlib` 0.2.4 — <https://github.com/dropbox/rust-alloc-no-stdlib>
+- `alloc-stdlib` 0.3.0 — <https://github.com/dropbox/rust-alloc-no-stdlib>
+- `aws-lc-sys` 0.46.0 — <https://github.com/aws/aws-lc-rs>
 - `curve25519-dalek` 4.1.3 — <https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek>
 
 <details>
@@ -8763,71 +8771,25 @@ third-party/chromium/LICENSE.
 
 </details>
 
-### MIT License (`MIT`)
+### ISC License (`ISC`)
 
 Used by:
 
-- `tonic-prost` 0.14.9 — <https://github.com/grpc/grpc-rust>
+- `aws-lc-rs` 1.18.2 — <https://github.com/aws/aws-lc-rs>
+- `aws-lc-sys` 0.46.0 — <https://github.com/aws/aws-lc-rs>
 
 <details>
 <summary>Full license text</summary>
 
 ```text
-/*
- *
- * Copyright 2025 gRPC authors.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to
- * deal in the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
- * sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
- *
- */
+ISC License:
 
-//! Prost codec implementation for tonic.
-//!
-//! This crate provides the [`ProstCodec`] for encoding and decoding protobuf
-//! messages using the [`prost`] library.
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use tonic_prost::ProstCodec;
-//!
-//! let codec = ProstCodec::<Message, Message>::default();
-//! ```
+Copyright (c) 2004-2010 by Internet Systems Consortium, Inc. ("ISC")
+Copyright (c) 1995-2003 by Internet Software Consortium
 
-#![warn(
-    missing_docs,
-    missing_debug_implementations,
-    rust_2018_idioms,
-    unreachable_pub
-)]
-#![doc(
-    html_logo_url = "https://raw.githubusercontent.com/tokio-rs/website/master/public/img/icons/tonic.svg"
-)]
-#![doc(html_root_url = "https://docs.rs/tonic-prost/0.13.1")]
-#![doc(issue_tracker_base_url = "https://github.com/grpc/grpc-rust/issues/")]
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
 
-mod codec;
-
-pub use codec::{ProstCodec, ProstDecoder, ProstEncoder};
-
-// Re-export prost types that users might need
-pub use prost;
+THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL ISC BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ```
 
@@ -8837,7 +8799,7 @@ pub use prost;
 
 Used by:
 
-- `brotli` 8.0.4 — <https://github.com/dropbox/rust-brotli>
+- `brotli` 9.0.0 — <https://github.com/dropbox/rust-brotli>
 
 <details>
 <summary>Full license text</summary>
@@ -8962,6 +8924,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 Used by:
 
 - `redox_syscall` 0.5.18 — <https://gitlab.redox-os.org/redox-os/syscall>
+- `redox_syscall` 0.9.5 — <https://gitlab.redox-os.org/redox-os/kernel>
 
 <details>
 <summary>Full license text</summary>
@@ -9423,13 +9386,13 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `http-body-util` 0.1.3 — <https://github.com/hyperium/http-body>
+- `http-body` 1.0.1 — <https://github.com/hyperium/http-body>
 
 <details>
 <summary>Full license text</summary>
 
 ```text
-Copyright (c) 2019-2025 Sean McArthur & Hyper Contributors
+Copyright (c) 2019-2024 Sean McArthur & Hyper Contributors
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -9463,13 +9426,13 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `http-body` 1.1.0 — <https://github.com/hyperium/http-body>
+- `http-body-util` 0.1.3 — <https://github.com/hyperium/http-body>
 
 <details>
 <summary>Full license text</summary>
 
 ```text
-Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
+Copyright (c) 2019-2025 Sean McArthur & Hyper Contributors
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -9537,6 +9500,40 @@ THE SOFTWARE.
 
 Used by:
 
+- `tonic-types` 0.14.6 — <https://github.com/hyperium/tonic>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+Copyright (c) 2025 Lucio Franco
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
 - `synstructure` 0.13.2 — <https://github.com/mystor/synstructure>
 
 <details>
@@ -9559,7 +9556,6 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Used by:
 
-- `tonic-types` 0.14.9 — <https://github.com/grpc/grpc-rust>
 - `tonic` 0.14.9 — <https://github.com/grpc/grpc-rust>
 
 <details>
@@ -9594,7 +9590,7 @@ THE SOFTWARE.
 
 Used by:
 
-- `atoi` 2.0.0 — <https://github.com/pacman82/atoi-rs>
+- `atoi` 3.1.1 — <https://github.com/pacman82/atoi-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -9603,6 +9599,42 @@ Used by:
 MIT License
 
 Copyright (c) 2017 
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
+- `fs_extra` 1.3.0 — <https://github.com/webdesus/fs_extra>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+MIT License
+
+Copyright (c) 2017 Denis Kurilenko
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9704,7 +9736,7 @@ SOFTWARE.
 
 Used by:
 
-- `comfy-table` 7.2.2 — <https://github.com/nukesor/comfy-table>
+- `comfy-table` 8.0.1 — <https://github.com/nukesor/comfy-table>
 
 <details>
 <summary>Full license text</summary>
@@ -9740,8 +9772,8 @@ SOFTWARE.
 
 Used by:
 
-- `schemars` 1.2.3 — <https://github.com/GREsau/schemars>
-- `schemars_derive` 1.2.3 — <https://github.com/GREsau/schemars>
+- `schemars` 1.2.2 — <https://github.com/GREsau/schemars>
+- `schemars_derive` 1.2.2 — <https://github.com/GREsau/schemars>
 
 <details>
 <summary>Full license text</summary>
@@ -9855,7 +9887,31 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `arrow-array` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `cfg_aliases` 0.2.1 — <https://github.com/katharostech/cfg_aliases>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+MIT License
+
+Copyright (c) 2020 Katharos Technology
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
+- `arrow-array` 60.1.0 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -9998,9 +10054,10 @@ SOFTWARE.
 
 Used by:
 
-- `brotli-decompressor` 5.0.3 — <https://github.com/dropbox/rust-brotli-decompressor>
+- `brotli-decompressor` 6.0.1 — <https://github.com/dropbox/rust-brotli-decompressor>
 - `libm` 0.2.16 — <https://github.com/rust-lang/compiler-builtins>
 - `parse-zoneinfo` 0.3.1 — <https://github.com/chronotope/chrono-tz>
+- `tonic-prost` 0.14.6 — <https://github.com/hyperium/tonic>
 
 <details>
 <summary>Full license text</summary>
@@ -10145,6 +10202,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- `spin` 0.10.1 — <https://github.com/mvdnes/spin-rs.git>
 - `spin` 0.9.9 — <https://github.com/mvdnes/spin-rs.git>
 
 <details>
@@ -10260,6 +10318,42 @@ THE SOFTWARE.
 
 Used by:
 
+- `nix` 0.31.3 — <https://github.com/nix-rust/nix>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Carl Lerche + nix-rust Authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
 - `strsim` 0.11.1 — <https://github.com/rapidfuzz/strsim-rs>
 
 <details>
@@ -10298,7 +10392,7 @@ SOFTWARE.
 
 Used by:
 
-- `twox-hash` 2.1.5 — <https://github.com/shepmaster/twox-hash>
+- `twox-hash` 2.1.2 — <https://github.com/shepmaster/twox-hash>
 
 <details>
 <summary>Full license text</summary>
@@ -10380,6 +10474,43 @@ Used by:
 The MIT License (MIT)
 
 Copyright (c) 2015 Vincent Prouillet
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
+- `aws-lc-sys` 0.46.0 — <https://github.com/aws/aws-lc-rs>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015-2020 the fiat-crypto authors (see
+https://github.com/mit-plv/fiat-crypto/blob/master/AUTHORS).
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -10588,6 +10719,29 @@ SOFTWARE.
 
 Used by:
 
+- `zstd` 0.13.3 — <https://github.com/gyscos/zstd-rs>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+The MIT License (MIT)
+Copyright (c) 2016 Alexandre Bury
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
 - `generic-array` 0.14.7 — <https://github.com/fizyk20/generic-array.git>
 
 <details>
@@ -10623,7 +10777,7 @@ SOFTWARE.
 
 Used by:
 
-- `quick-xml` 0.39.4 — <https://github.com/tafia/quick-xml>
+- `quick-xml` 0.41.0 — <https://github.com/tafia/quick-xml>
 
 <details>
 <summary>Full license text</summary>

@@ -18,6 +18,7 @@ mod drift;
 mod execution;
 mod forward_compat;
 mod manifest;
+mod nan_promoted_float;
 mod query_read_accounting;
 mod rfc0001_otlp_fidelity;
 mod rfc0001_query_semantics;

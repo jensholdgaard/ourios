@@ -363,3 +363,56 @@ fn rfc0003_6_null_valued_anyvalue_field_decodes_via_lenient_shim() {
         "a null doubleValue field decodes to an absent value",
     );
 }
+
+/// proto3-JSON omits an empty repeated field, so an empty request is `{}`
+/// and an empty map or array value is `{"kvlistValue":{}}` /
+/// `{"arrayValue":{}}`. Each must decode to exactly what protobuf yields
+/// for the same request: the empty map and array stay typed values, never
+/// an unset `AnyValue`. Upstream `with-serde` requires `resourceLogs` and
+/// `values`, so these parse only via the lenient retry today.
+#[test]
+fn rfc0003_6_omitted_empty_repeated_fields_decode_equivalently_across_transports() {
+    use opentelemetry_proto::tonic::common::v1::{ArrayValue, KeyValue, KeyValueList};
+
+    let (empty, lenient) = decode_json(b"{}").expect("an empty request is valid OTLP/JSON");
+    assert!(
+        lenient,
+        "the direct parse rejects a missing resourceLogs today"
+    );
+    assert_eq!(empty, ExportLogsServiceRequest::default());
+
+    let kvlist = || AnyValue {
+        value: Some(Value::KvlistValue(KeyValueList::default())),
+    };
+    let array = || AnyValue {
+        value: Some(Value::ArrayValue(ArrayValue::default())),
+    };
+    let record = LogRecord {
+        body: Some(kvlist()),
+        attributes: vec![KeyValue {
+            key: "items".to_owned(),
+            value: Some(AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![array(), kvlist()],
+                })),
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![record],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let from_protobuf = decode_protobuf(&request.encode_to_vec()).expect("protobuf decodes");
+
+    let json = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"kvlistValue":{}},"attributes":[{"key":"items","value":{"arrayValue":{"values":[{"arrayValue":{}},{"kvlistValue":{}}]}}}]}]}]}]}"#;
+    let (from_json, lenient) = decode_json(json).expect("empty map and array values are valid");
+    assert!(lenient, "the direct parse rejects a missing values today");
+    assert_eq!(from_json, from_protobuf);
+}

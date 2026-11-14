@@ -86,14 +86,17 @@ async fn the_block_is_reserved_before_its_entry_exists() {
     let mut steward = steward(store.clone());
 
     let watch = async {
-        reserved.recv().await.expect("a reservation");
         let reserved_through = high_water(&store).await;
         let held = Ahead::of(group(&cluster, leader));
-        release.add_permits(1);
         (reserved_through, held)
     };
-    let (topped, (reserved_through, held)) =
-        tokio::join!(pass(&mut steward, &cluster, leader, &[]), watch);
+    let (topped, (reserved_through, held)) = while_reserved(
+        pass(&mut steward, &cluster, leader, &[]),
+        &mut reserved,
+        &release,
+        watch,
+    )
+    .await;
 
     assert_eq!(held.blocks, 0, "no entry before the reservation is durable");
     assert_eq!(topped.id_block, Some(TopUp::Appended(block(0))));
@@ -115,14 +118,18 @@ async fn a_reservation_outliving_its_membership_appends_nothing() {
     let mut steward = steward(store.clone());
 
     let admit_below = async {
-        reserved.recv().await.expect("a reservation");
         let learner = cluster.id(below);
         let add = ChangeMembers::AddNodes(BTreeMap::from([(learner, name(learner))]));
         let raft = cluster.node(leader).raft(0);
         raft.change_membership(add, false).await.expect("admitted");
-        release.add_permits(1);
     };
-    let (passed, ()) = tokio::join!(pass(&mut steward, &cluster, leader, &[]), admit_below);
+    let (passed, ()) = while_reserved(
+        pass(&mut steward, &cluster, leader, &[]),
+        &mut reserved,
+        &release,
+        admit_below,
+    )
+    .await;
 
     assert_eq!(passed.id_block, None, "admitted under another membership");
     held_back_after_reserving(&cluster, leader, &store).await;
@@ -139,7 +146,6 @@ async fn a_reservation_outliving_its_term_appends_nothing() {
     let mut steward = steward(store.clone());
 
     let next_term = async {
-        reserved.recv().await.expect("a reservation");
         let term = cluster
             .node(leader)
             .raft(0)
@@ -147,9 +153,14 @@ async fn a_reservation_outliving_its_term_appends_nothing() {
             .borrow_watched()
             .current_term;
         lead_a_later_term(&cluster, leader, term).await;
-        release.add_permits(1);
     };
-    let (passed, ()) = tokio::join!(pass(&mut steward, &cluster, leader, &[]), next_term);
+    let (passed, ()) = while_reserved(
+        pass(&mut steward, &cluster, leader, &[]),
+        &mut reserved,
+        &release,
+        next_term,
+    )
+    .await;
 
     assert_eq!(passed.id_block, None, "admitted under another term");
     held_back_after_reserving(&cluster, leader, &store).await;
@@ -402,6 +413,46 @@ async fn every_held_kind_and_committed_assignment_is_counted() {
 
 /// `store`, holding each high-water write once it lands: the receiver
 /// hears of it, and the write returns once a permit is added.
+/// Drive `pass` until its reservation lands in a [`pausing`] store, run
+/// `meanwhile` while the reservation is held, then let it go. A pass the
+/// kind gate holds back never reserves, and `reserved` stays open while
+/// the steward holds the store, so a pass that ends first fails the test
+/// rather than leaving it waiting for a reservation that cannot come.
+async fn while_reserved<T>(
+    pass: impl Future<Output = Pass>,
+    reserved: &mut mpsc::UnboundedReceiver<()>,
+    release: &Semaphore,
+    meanwhile: impl Future<Output = T>,
+) -> (Pass, T) {
+    tokio::pin!(pass);
+    tokio::select! {
+        passed = &mut pass => panic!("the pass ended before reserving: {passed:?}"),
+        landed = reserved.recv() => landed.expect("a reservation"),
+    }
+    let held = async {
+        let out = meanwhile.await;
+        release.add_permits(1);
+        out
+    };
+    tokio::join!(pass, held)
+}
+
+/// A pass that ends without reserving fails at once, though the store
+/// still holds the reservation channel open.
+#[tokio::test]
+#[should_panic(expected = "the pass ended before reserving")]
+async fn a_pass_ending_before_its_reservation_fails_at_once() {
+    let (_store_holds, mut reserved) = mpsc::unbounded_channel();
+    let release = Semaphore::new(0);
+    let ended = async { Pass::default() };
+    let waited = tokio::time::timeout(
+        Duration::from_secs(5),
+        while_reserved(ended, &mut reserved, &release, async {}),
+    )
+    .await;
+    drop(waited);
+}
+
 fn pausing(store: Store) -> (Store, mpsc::UnboundedReceiver<()>, Arc<Semaphore>) {
     let (landed, heard) = mpsc::unbounded_channel();
     let release = Arc::new(Semaphore::new(0));

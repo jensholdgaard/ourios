@@ -16,7 +16,7 @@ use openraft::async_runtime::WatchReceiver as _;
 use ourios_parquet::Store;
 use ourios_semconv as semconv;
 use ourios_wal::Control;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use super::{
     PATIENCE, Pass, admit, counted, counted_as, group, heard_from, log,
@@ -449,9 +449,8 @@ async fn while_reserved<S, T>(
             landed = reservation.reserved.recv() => {
                 landed.expect("a reservation");
                 let held = async {
-                    let out = meanwhile.await;
-                    reservation.release.add_permits(1);
-                    out
+                    let _release = Release(&reservation.release);
+                    meanwhile.await
                 };
                 return tokio::join!(running, held);
             }
@@ -512,6 +511,55 @@ async fn a_held_pass_is_retried_until_it_reserves() {
     .await;
     assert_eq!(waited.expect("reserved on the retry"), (Pass::default(), 7));
     assert_eq!(held_once.0, 2, "held back once, then reserved");
+}
+
+/// A panic while the reservation is held still lets the held write
+/// return, so the failing test reports instead of waiting on the write.
+#[tokio::test]
+async fn a_panic_while_held_still_releases_the_write() {
+    type Writing = (
+        mpsc::UnboundedSender<()>,
+        Arc<Semaphore>,
+        Option<oneshot::Sender<()>>,
+    );
+    fn writing(at: &mut Writing) -> BoxFuture<'_, Pass> {
+        let (landed, release, returned) = at;
+        landed.send(()).expect("open");
+        let release = Arc::clone(release);
+        let returned = returned.take().expect("one pass");
+        let write = tokio::spawn(async move {
+            release.acquire().await.expect("open").forget();
+            let _ = returned.send(());
+        });
+        Box::pin(async move {
+            write.await.expect("the write");
+            Pass::default()
+        })
+    }
+    let (landed, reserved) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let (returned, write_returned) = oneshot::channel();
+    let mut writes = (landed, Arc::clone(&release), Some(returned));
+    let mut reservation = Paused { reserved, release };
+    let failed = tokio::spawn(async move {
+        let meanwhile = async { panic!("an election wait timed out") };
+        while_reserved(&mut writes, writing, &mut reservation, meanwhile).await
+    });
+    assert!(failed.await.is_err(), "the panic reaches the test");
+    tokio::time::timeout(Duration::from_secs(5), write_returned)
+        .await
+        .expect("the held write returns")
+        .expect("sent");
+}
+
+/// Lets a held write return when dropped: once `meanwhile` ends, or
+/// while a panic in it unwinds, so the write never outlives the test.
+struct Release<'a>(&'a Semaphore);
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.0.add_permits(1);
+    }
 }
 
 /// A [`pausing`] store's side: `reserved` hears of each high-water write

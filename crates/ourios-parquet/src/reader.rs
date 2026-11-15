@@ -64,6 +64,8 @@ pub struct Reader {
     /// diagnostics report stable indices across [`Reader::next_batch`]
     /// calls.
     row_offset: usize,
+    /// Whether the file declares the RFC 0065 §6.6 ingest columns.
+    positioned: bool,
 }
 
 impl Reader {
@@ -148,10 +150,11 @@ impl Reader {
     /// [`Self::open_partition`] seam, a sentinel on [`Self::open_bytes`]).
     /// Applies the §3.9 baseline-column check; leaves `partition` unset.
     fn from_bytes(bytes: bytes::Bytes, file_path: PathBuf) -> Result<Self, ReaderError> {
-        let inner = guard_decode(&file_path, || {
+        let (inner, positioned) = guard_decode(&file_path, || {
             let builder = arrow_reader_builder(bytes).map_err(ReaderError::Parquet)?;
             require_baseline_columns(builder.schema(), &crate::data_schema())?;
-            builder.build().map_err(ReaderError::Parquet)
+            let positioned = declares_ingest_columns(builder.schema());
+            Ok((builder.build().map_err(ReaderError::Parquet)?, positioned))
         })?;
 
         Ok(Self {
@@ -159,6 +162,7 @@ impl Reader {
             partition: None,
             file_path,
             row_offset: 0,
+            positioned,
         })
     }
 
@@ -175,20 +179,29 @@ impl Reader {
             path: path.to_path_buf(),
             source,
         })?;
-        let inner = guard_decode(path, || {
+        let (inner, positioned) = guard_decode(path, || {
             let builder = arrow_reader_builder(file).map_err(ReaderError::Parquet)?;
             require_baseline_columns(builder.schema(), &crate::data_schema())?;
-            builder
+            let positioned = declares_ingest_columns(builder.schema());
+            let inner = builder
                 .with_batch_size(batch_rows)
                 .build()
-                .map_err(ReaderError::Parquet)
+                .map_err(ReaderError::Parquet)?;
+            Ok((inner, positioned))
         })?;
         Ok(Self {
             inner: Batches::new(inner),
             partition: None,
             file_path: path.to_path_buf(),
             row_offset: 0,
+            positioned,
         })
+    }
+
+    /// Whether the file declares the RFC 0065 §6.6 ingest columns, whatever
+    /// its rows hold in them.
+    pub(crate) fn declares_ingest_columns(&self) -> bool {
+        self.positioned
     }
 
     /// Read the next decoded batch of rows, or `Ok(None)` at end of
@@ -630,6 +643,12 @@ fn unix_nanos(column: &'static str, value: i64) -> Result<u64, ReaderError> {
         column,
         detail: "negative i64 timestamp can't be a u64 nanos-since-epoch".to_string(),
     })
+}
+
+/// Whether `schema` holds the RFC 0065 §6.6 ingest columns; the writer
+/// declares all three or none.
+fn declares_ingest_columns(schema: &arrow_schema::Schema) -> bool {
+    schema.field_with_name(columns::INGEST_GROUP).is_ok()
 }
 
 /// The RFC 0065 §6.6 ingest position of every row; `None` throughout

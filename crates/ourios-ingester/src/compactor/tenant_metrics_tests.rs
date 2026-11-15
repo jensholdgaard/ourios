@@ -134,3 +134,74 @@ async fn each_partitions_compaction_metrics_carry_its_tenant() {
     assert!(read["a"] > 0 && read["b"] > 0, "{read:?}");
     assert_eq!(read.values().sum::<u64>(), report.bytes_read);
 }
+
+/// Write `records`, each with an ingest position, as one committed file.
+fn write_positioned(store: &ourios_parquet::Store, records: &[ourios_core::record::MinedRecord]) {
+    let partition = ourios_parquet::PartitionKey::derive(&records[0]).expect("derive");
+    let mut w = ourios_parquet::Writer::open_in_with_ingest_positions(
+        store,
+        partition,
+        ourios_parquet::DEFAULT_ZSTD_LEVEL,
+        ourios_parquet::PromotedAttributes::default(),
+    )
+    .expect("open writer");
+    w.append_records(records).expect("append");
+    w.close().expect("close");
+}
+
+/// RFC 0065 §6.6: the rows a compaction drops for repeating an ingest
+/// position are counted per tenant on `ourios.compaction.row.deduplicated`,
+/// and a partition without positions counts none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_partitions_deduplicated_rows_carry_its_tenant() {
+    use super::tests::{TS0, rec};
+    use ourios_core::record::IngestPosition;
+
+    // Arrange: tenant `a` holds two flushers' copies of two rows, tenant
+    // `b` a local-backend candidate.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    let flushed: Vec<_> = (0..2)
+        .map(|index| ourios_core::record::MinedRecord {
+            ingest_position: Some(IngestPosition {
+                group: 3,
+                seq: 40,
+                index,
+            }),
+            ..rec("a", 1, TS0 + u64::from(index))
+        })
+        .collect();
+    write_positioned(&store, &flushed);
+    write_positioned(&store, &flushed);
+    write_sealed_candidate(&store, "b");
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    let metrics = Arc::new(CompactionMetrics::from_meter(
+        &provider.meter_with_scope(ourios_core::telemetry::scope("ourios.compaction")),
+    ));
+
+    // Act
+    let (result, _, _) =
+        sweep_recorded(target(&store), Box::new(NoOpAuditSink), Some(metrics)).await;
+    provider.force_flush().expect("flush");
+    let rms = exporter.get_finished_metrics().expect("collect");
+
+    // Assert
+    let report = result.expect("sweep");
+    assert_eq!(report.partitions_compacted, 2, "{report:?}");
+    assert_eq!(
+        by_tenant(
+            &rms,
+            ourios_semconv::OURIOS_COMPACTION_ROW_DEDUPLICATED,
+            None
+        ),
+        tenants(&[("a", 2), ("b", 0)])
+    );
+    assert_eq!(
+        by_tenant(&rms, ourios_semconv::OURIOS_COMPACTION_ROWS, None),
+        tenants(&[("", 0), ("a", 2), ("b", 2)]),
+        "the repeats are not counted as rows rewritten"
+    );
+}

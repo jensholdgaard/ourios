@@ -13,6 +13,10 @@ use std::cell::Cell;
 use ourios_core::otlp::{AnyValue, KeyValue, any_value};
 use ourios_core::record::Param;
 
+use super::repeats::Repeats;
+
+use crate::record_batch::{IngestColumns, mined_records_to_batch_in};
+
 /// The fixed inputs of one RFC 0036 §3.2 sort of a partition.
 #[derive(Clone, Copy)]
 pub(super) struct SortPlan<'a> {
@@ -31,12 +35,17 @@ pub(super) struct SortTotals {
     pub(super) rows: u64,
     pub(super) bytes_read: u64,
     pub(super) rows_dropped: u64,
+    pub(super) rows_deduplicated: u64,
     pub(super) decoded_bytes: u64,
 }
 
 /// Phases 1–2 of the RFC 0036 §3.2 external merge sort: stream
 /// `inputs` (already in sorted-basename order) batch by batch, sort by
-/// the §3.1 key, and emit every row into `writer` in that key order.
+/// the §3.1 key, and emit every row into the writer `open` returns, in
+/// that key order, less the repeats of an ingest position. The writer
+/// opens once phase 1 has read every input, nothing having been written
+/// before, with the ingest columns if any input declares them
+/// (RFC 0065 §6.6).
 ///
 /// Decoded rows buffer until their [`decoded_footprint`] exceeds
 /// [`SortTuning::in_memory_max_bytes`]; a partition that never crosses
@@ -50,12 +59,12 @@ pub(super) struct SortTotals {
 /// chunk; independent of how many inputs the partition holds or how
 /// well they compress.
 pub(super) fn sort_inputs_into(
-    writer: &mut Writer,
+    open: impl FnOnce(IngestColumns) -> Result<Writer, CompactionError>,
     plan: SortPlan<'_>,
     inputs: &[String],
     hooks: &mut RowHooks<'_>,
-) -> Result<SortTotals, CompactionError> {
-    set_limits(plan, writer);
+) -> Result<(SortTotals, Writer), CompactionError> {
+    set_sort_limits(plan);
     let mut formation = RunFormation::new(plan);
     let mut totals = SortTotals::default();
     for input in inputs {
@@ -63,17 +72,91 @@ pub(super) fn sort_inputs_into(
         formation.end_input()?;
     }
     totals.decoded_bytes = formation.decoded_total;
-    formation.finish(writer)?;
-    Ok(totals)
+    let ingest = if formation.positioned {
+        IngestColumns::Optional
+    } else {
+        IngestColumns::Omitted
+    };
+    let mut writer = open(ingest)?;
+    plan.gauges
+        .set_limit(MemoryPhase::Write, widen(writer.flush_bytes()));
+    let charge = WriteCharge::new(plan.gauges);
+    let mut output = Output {
+        writer: &mut writer,
+        repeats: Repeats::new(plan, &charge),
+        charge: &charge,
+    };
+    formation.finish(&mut output)?;
+    totals.rows_deduplicated = output.repeats.dropped;
+    totals.rows = totals.rows.saturating_sub(totals.rows_deduplicated);
+    Ok((totals, writer))
 }
 
-/// Publish the budgets this sort runs under (see [`MemoryPhase`]).
-fn set_limits(plan: SortPlan<'_>, writer: &Writer) {
+/// Publish the budgets the sort and merge run under (see [`MemoryPhase`]).
+fn set_sort_limits(plan: SortPlan<'_>) {
     let budget = plan.tuning.in_memory_max_bytes;
     plan.gauges.set_limit(MemoryPhase::Sort, budget);
     plan.gauges.set_limit(MemoryPhase::Merge, budget);
-    plan.gauges
-        .set_limit(MemoryPhase::Write, widen(writer.flush_bytes()));
+}
+
+/// The write phase's charge: the consolidated writer's in-progress row
+/// group, plus the positions [`Repeats`] holds, each updated as it
+/// changes.
+pub(super) struct WriteCharge<'a> {
+    gauges: Gauges<'a>,
+    in_progress: Cell<u64>,
+    positions: Cell<u64>,
+}
+
+impl<'a> WriteCharge<'a> {
+    pub(super) fn new(gauges: Gauges<'a>) -> Self {
+        Self {
+            gauges,
+            in_progress: Cell::new(0),
+            positions: Cell::new(0),
+        }
+    }
+
+    pub(super) fn gauges(&self) -> Gauges<'a> {
+        self.gauges
+    }
+
+    fn writer(&self, bytes: u64) {
+        self.in_progress.set(bytes);
+        self.publish();
+    }
+
+    pub(super) fn positions(&self, bytes: u64) {
+        self.positions.set(bytes);
+        self.publish();
+    }
+
+    fn publish(&self) {
+        let total = self.in_progress.get().saturating_add(self.positions.get());
+        self.gauges.set(MemoryPhase::Write, total);
+    }
+}
+
+/// Where the sorted rows go: the consolidated file, less each repeat of
+/// an ingest position. Repeats are dropped before a row joins a chunk, so
+/// the writer gets the survivors in the same [`SUB_BATCH_ROWS`] chunks on
+/// the in-memory and the spilled path, and its row groups and bytes are
+/// the same (RFC 0036 §3.2).
+struct Output<'w, 'c> {
+    writer: &'w mut Writer,
+    repeats: Repeats<'c>,
+    charge: &'c WriteCharge<'c>,
+}
+
+/// Append `rows` to `writer`, charging its in-progress row group.
+fn append(
+    writer: &mut Writer,
+    rows: &[MinedRecord],
+    charge: &WriteCharge<'_>,
+) -> Result<(), CompactionError> {
+    writer
+        .append_records_observed(rows, &mut |in_progress| charge.writer(widen(in_progress)))
+        .map_err(CompactionError::Write)
 }
 
 /// Decode `input` batch by batch into `formation`. Its encoded bytes are
@@ -86,6 +169,7 @@ fn read_input(
 ) -> Result<(), CompactionError> {
     let gauges = formation.plan.gauges;
     let mut reader = open_input(formation.plan, input, totals)?;
+    formation.positioned |= reader.declares_ingest_columns();
     while let Some(batch) = reader.next_batch().map_err(CompactionError::Read)? {
         formation.push(apply_hooks(hooks, batch, totals));
     }
@@ -160,6 +244,8 @@ struct RunFormation<'a> {
     /// Every pushed row's [`decoded_footprint`], spilled or not.
     decoded_total: u64,
     spill: Option<Spill>,
+    /// Whether any input read so far declares the ingest columns.
+    positioned: bool,
 }
 
 impl<'a> RunFormation<'a> {
@@ -171,6 +257,7 @@ impl<'a> RunFormation<'a> {
             widest_row: 0,
             decoded_total: 0,
             spill: None,
+            positioned: false,
         }
     }
 
@@ -233,7 +320,7 @@ impl<'a> RunFormation<'a> {
     /// partition never left memory, else merged from the spilled runs.
     /// Both drive the writer with the same [`SUB_BATCH_ROWS`] chunking,
     /// so the output is byte-identical either way (§3.5).
-    fn finish(mut self, writer: &mut Writer) -> Result<(), CompactionError> {
+    fn finish(mut self, output: &mut Output<'_, '_>) -> Result<(), CompactionError> {
         if self.spill.is_some() && !self.buffer.is_empty() {
             self.spill_buffer()?;
         }
@@ -244,12 +331,12 @@ impl<'a> RunFormation<'a> {
             ..
         } = self;
         match spill {
-            None => emit_in_memory(plan, buffer, writer),
+            None => emit_in_memory(plan, buffer, output),
             Some(spill) => {
                 // `clear()` kept the phase-1 allocation; release it before
                 // the merge so phase 2 holds only (F + 1) × one batch.
                 drop(buffer);
-                spill.merge_into(writer, plan)
+                spill.merge_into(output, plan)
             }
         }
     }
@@ -258,31 +345,18 @@ impl<'a> RunFormation<'a> {
 fn emit_in_memory(
     plan: SortPlan<'_>,
     mut rows: Vec<MinedRecord>,
-    writer: &mut Writer,
+    output: &mut Output<'_, '_>,
 ) -> Result<(), CompactionError> {
     sort_records(plan.keys, &mut rows);
-    write_rows(writer, &rows, plan.gauges)?;
-    plan.gauges.set(MemoryPhase::Sort, 0);
     #[cfg(test)]
     {
         residency::sub(rows.len());
         residency::sub_bytes(rows.iter().map(decoded_footprint).sum());
     }
+    output.repeats.drop_from(&mut rows)?;
+    append(output.writer, &rows, output.charge)?;
+    plan.gauges.set(MemoryPhase::Sort, 0);
     Ok(())
-}
-
-/// Append `rows` to the consolidated `writer`, charging its in-progress
-/// row group to the write phase as each sub-batch lands.
-fn write_rows(
-    writer: &mut Writer,
-    rows: &[MinedRecord],
-    gauges: Gauges<'_>,
-) -> Result<(), CompactionError> {
-    writer
-        .append_records_observed(rows, &mut |in_progress| {
-            gauges.set(MemoryPhase::Write, widen(in_progress));
-        })
-        .map_err(CompactionError::Write)
 }
 
 /// Sorted runs on local scratch, in spill order.
@@ -327,9 +401,19 @@ impl Spill {
         })
     }
 
-    fn merge_into(self, writer: &mut Writer, plan: SortPlan<'_>) -> Result<(), CompactionError> {
+    fn merge_into(
+        self,
+        output: &mut Output<'_, '_>,
+        plan: SortPlan<'_>,
+    ) -> Result<(), CompactionError> {
         let runs = reduce_runs(self.scratch.path(), self.runs, plan)?;
-        merge_runs(&runs, plan, |chunk| write_rows(writer, chunk, plan.gauges))
+        let Output {
+            writer,
+            repeats,
+            charge,
+        } = output;
+        let keep = |row: &MinedRecord| repeats.keep(row);
+        merge_runs(&runs, plan, keep, |chunk| append(writer, chunk, charge))
     }
 }
 
@@ -441,9 +525,13 @@ impl<'a> RunWriter<'a> {
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::None)
             .build();
-        let inner =
-            ArrowWriter::try_new(file, data_schema_with_promoted(plan.promoted), Some(props))
-                .map_err(parquet_write)?;
+        // Every run can hold rows with and without a position, whatever
+        // the output declares.
+        let schema = with_ingest_columns(
+            data_schema_with_promoted(plan.promoted),
+            IngestColumns::Optional,
+        );
+        let inner = ArrowWriter::try_new(file, schema, Some(props)).map_err(parquet_write)?;
         Ok(Self {
             inner,
             promoted: plan.promoted,
@@ -461,7 +549,7 @@ impl<'a> RunWriter<'a> {
             if self.inner.in_progress_size() >= MAX_COMPACTED_RG_BYTES {
                 self.inner.flush().map_err(parquet_write)?;
             }
-            let batch = mined_records_to_batch_with_promoted(chunk, self.promoted)
+            let batch = mined_records_to_batch_in(chunk, self.promoted, IngestColumns::Optional)
                 .map_err(|e| CompactionError::Write(WriterError::Batch(e)))?;
             self.inner.write(&batch).map_err(parquet_write)?;
         }
@@ -515,7 +603,7 @@ pub(super) fn reduce_runs(
             let path = scratch.join(format!("run-{next_index:06}.parquet"));
             next_index += 1;
             let mut out = RunWriter::create(&path, plan)?;
-            merge_runs(group, plan, |chunk| out.append(chunk))?;
+            merge_runs(group, plan, |_| Ok(true), |chunk| out.append(chunk))?;
             out.finish()?;
             let widest_row = group.iter().map(|run| run.widest_row).max().unwrap_or(0);
             merged.push(Run { path, widest_row });
@@ -530,8 +618,8 @@ pub(super) fn reduce_runs(
     Ok(runs)
 }
 
-/// K-way merge of sorted `runs` in §3.1 key order, emitting
-/// [`SUB_BATCH_ROWS`]-sized chunks to `emit` — exactly the
+/// K-way merge of sorted `runs` in §3.1 key order, emitting the rows
+/// `keep` accepts in [`SUB_BATCH_ROWS`]-sized chunks to `emit` — exactly the
 /// sub-batching `Writer::append_records` applies itself, so the spill
 /// path and the in-memory path drive the Parquet writer with an
 /// identical call sequence (§3.5).
@@ -543,12 +631,14 @@ pub(super) fn reduce_runs(
 /// and the chunk holds at most
 /// [`SUB_BATCH_ROWS`] rows — no matter how many inputs the partition
 /// accrued.
-pub(super) fn merge_runs<F>(
+pub(super) fn merge_runs<K, F>(
     runs: &[Run],
     plan: SortPlan<'_>,
+    mut keep: K,
     mut emit: F,
 ) -> Result<(), CompactionError>
 where
+    K: FnMut(&MinedRecord) -> Result<bool, CompactionError>,
     F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
 {
     let (keys, budget) = (plan.keys, plan.tuning.in_memory_max_bytes);
@@ -560,29 +650,54 @@ where
     }
     let mut heap = BinaryHeap::with_capacity(cursors.len());
     for (run, cursor) in cursors.iter_mut().enumerate() {
-        if let Some(record) = cursor.next_record()? {
-            heap.push(Reverse(MergeEntry::new(keys, run, record)));
-        }
+        refill(cursor, run, keys, &mut heap)?;
     }
     let mut out: Vec<MinedRecord> = Vec::with_capacity(SUB_BATCH_ROWS);
     while let Some(Reverse(entry)) = heap.pop() {
         let run = entry.run;
-        #[cfg(test)]
-        {
-            residency::add(1);
-            residency::add_bytes(decoded_footprint(&entry.record));
+        if keep(&entry.record)? {
+            collect(&mut out, entry.record, &mut emit, &charge)?;
         }
-        out.push(entry.record);
-        charge.fill(out.len());
-        if out.len() == SUB_BATCH_ROWS {
-            emit_chunk(&mut out, &mut emit, &charge)?;
-        }
-        if let Some(record) = cursors[run].next_record()? {
-            heap.push(Reverse(MergeEntry::new(keys, run, record)));
-        }
+        refill(&mut cursors[run], run, keys, &mut heap)?;
     }
     if !out.is_empty() {
         emit_chunk(&mut out, &mut emit, &charge)?;
+    }
+    Ok(())
+}
+
+/// Push run `run`'s next row, if any, onto the merge heap.
+fn refill(
+    cursor: &mut RunCursor<'_>,
+    run: usize,
+    keys: ClusterKeys,
+    heap: &mut BinaryHeap<Reverse<MergeEntry>>,
+) -> Result<(), CompactionError> {
+    if let Some(record) = cursor.next_record()? {
+        heap.push(Reverse(MergeEntry::new(keys, run, record)));
+    }
+    Ok(())
+}
+
+/// Add `record` to the output chunk, emitting the chunk once it is full.
+fn collect<F>(
+    out: &mut Vec<MinedRecord>,
+    record: MinedRecord,
+    emit: &mut F,
+    charge: &MergeCharge<'_>,
+) -> Result<(), CompactionError>
+where
+    F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
+{
+    #[cfg(test)]
+    {
+        residency::add(1);
+        residency::add_bytes(decoded_footprint(&record));
+    }
+    out.push(record);
+    charge.fill(out.len());
+    if out.len() == SUB_BATCH_ROWS {
+        emit_chunk(out, emit, charge)?;
     }
     Ok(())
 }
@@ -597,14 +712,14 @@ where
 {
     charge.fill(out.len());
     charge.publish();
-    emit(out)?;
-    charge.fill(0);
-    charge.publish();
     #[cfg(test)]
     {
         residency::sub(out.len());
         residency::sub_bytes(out.iter().map(decoded_footprint).sum());
     }
+    emit(out)?;
+    charge.fill(0);
+    charge.publish();
     out.clear();
     Ok(())
 }

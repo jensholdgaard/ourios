@@ -44,8 +44,9 @@ use crate::manifest::{
 use crate::partition::{PartitionKey, percent_encode_tenant};
 use crate::promoted::{PromotedAttributes, SERVICE_NAME_KEY, project_string_value};
 use crate::reader::{Reader, ReaderError};
-use crate::record_batch::mined_records_to_batch_with_promoted;
+use crate::record_batch::IngestColumns;
 use crate::store::{Store, StoreError};
+use crate::with_ingest_columns;
 use crate::writer::{
     ClusterKeys, CompactedOutput, MAX_COMPACTED_RG_BYTES, SUB_BATCH_ROWS, Writer, WriterError,
 };
@@ -56,6 +57,7 @@ const HOUR_NANOS: u64 = 3_600_000_000_000;
 mod commit;
 mod keys;
 mod plan;
+mod repeats;
 mod sort;
 mod stats;
 #[cfg(test)]
@@ -95,6 +97,9 @@ pub struct CompactionOutcome {
     pub rows: u64,
     /// Rows an erasure filter removed (RFC 0047 §3.6); `0` without one.
     pub rows_dropped: u64,
+    /// Rows dropped because they repeat a kept row's RFC 0065 §6.6
+    /// ingest position.
+    pub rows_deduplicated: u64,
     /// The commit, or `None` when nothing was committed: too few live files
     /// (fewer than two to consolidate; none for an erasure), or a manifest
     /// commit lost to a concurrent compactor after the rewrite.
@@ -499,14 +504,17 @@ fn compact_sorted_hooked(
     // silently merged. Row groups rotate at the §3.3 compacted
     // threshold and the file declares the §3.4 `sorting_columns`.
     let generation = base_generation.saturating_add(1);
-    let output = CompactedOutput {
-        keys,
-        flush_override: tuning.compacted_flush_bytes,
-        estimated_output_bytes,
-        generation,
+    let open = |ingest| {
+        let output = CompactedOutput {
+            keys,
+            flush_override: tuning.compacted_flush_bytes,
+            estimated_output_bytes,
+            generation,
+            ingest,
+        };
+        Writer::open_in_compacted(store, partition.clone(), promoted.clone(), output)
+            .map_err(CompactionError::Write)
     };
-    let writer = Writer::open_in_compacted(store, partition.clone(), promoted.clone(), output)
-        .map_err(CompactionError::Write)?;
     let plan = SortPlan {
         store,
         partition,
@@ -515,7 +523,7 @@ fn compact_sorted_hooked(
         tuning,
         gauges: Gauges(hooks.stats),
     };
-    let (totals, written) = sort_and_close(writer, plan, &inputs, hooks)?;
+    let (totals, written) = sort_and_close(open, plan, &inputs, hooks)?;
     let bytes_written = written.bytes_written;
     let consolidated = basename(&written.key).to_owned();
 
@@ -568,16 +576,16 @@ fn next_manifest(
     Manifest::new(generation, vec![output.to_owned()], consumed)
 }
 
-/// Sort `inputs` into `writer` and close it, leaving no phase's memory
-/// usage behind however it ends.
+/// Sort `inputs` into the writer `open` returns and close it, leaving no
+/// phase's memory usage behind however it ends.
 fn sort_and_close(
-    mut writer: Writer,
+    open: impl FnOnce(IngestColumns) -> Result<Writer, CompactionError>,
     plan: SortPlan<'_>,
     inputs: &[String],
     hooks: &mut RowHooks<'_>,
 ) -> Result<(SortTotals, crate::WrittenFile), CompactionError> {
     let _reset = UsageReset(plan.gauges);
-    let totals = sort_inputs_into(&mut writer, plan, inputs, hooks)?;
+    let (totals, writer) = sort_inputs_into(open, plan, inputs, hooks)?;
     let written = writer.close().map_err(CompactionError::Write)?;
     Ok((totals, written))
 }
@@ -593,6 +601,7 @@ fn committed_outcome(
         files_before: inputs.len(),
         rows: totals.rows,
         rows_dropped: totals.rows_dropped,
+        rows_deduplicated: totals.rows_deduplicated,
         committed: Some(committed),
         commit_lost: false,
         gc_failures: 0,

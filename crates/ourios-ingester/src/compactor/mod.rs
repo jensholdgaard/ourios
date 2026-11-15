@@ -500,6 +500,9 @@ pub struct PartitionCommitted<'a> {
     pub files: u64,
     /// Rows rewritten.
     pub rows: u64,
+    /// Rows dropped for repeating a kept row's ingest position (RFC 0065
+    /// §6.6).
+    pub rows_deduplicated: u64,
     /// Input bytes read: the inputs' stored (encoded) size.
     pub bytes_read: u64,
     /// The inputs' decoded size as the RFC 0036 §3.2 budget estimates it.
@@ -869,6 +872,7 @@ fn record_commit(
         tenant,
         files,
         rows: outcome.rows,
+        rows_deduplicated: outcome.rows_deduplicated,
         bytes_read: outcome.bytes_read,
         decoded_bytes_estimate: outcome.decoded_bytes_estimate,
         bytes_written: outcome.bytes_written,

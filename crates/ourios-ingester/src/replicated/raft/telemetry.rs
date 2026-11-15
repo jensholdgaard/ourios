@@ -22,7 +22,7 @@ use openraft::async_runtime::WatchReceiver as _;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId as _;
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, MeterProvider, ObservableGauge};
+use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider, ObservableGauge};
 use ourios_core::sync::lock_recover;
 use ourios_semconv as semconv;
 
@@ -44,7 +44,7 @@ pub(crate) struct Meters {
     takeovers: Counter<u64>,
     flusher: FlusherCounts,
     storage: Storage,
-    kept: KeptMeters,
+    kept: KeptDrops,
 }
 
 impl Meters {
@@ -72,13 +72,18 @@ impl Meters {
             takeovers,
             flusher,
             storage: Storage::on(meter),
-            kept: KeptMeters::on(meter),
+            kept: KeptDrops::on(meter),
         }
     }
 
-    /// What a tail replica records of the output it keeps.
-    pub(crate) fn kept(&self) -> KeptMeters {
+    /// What a tail replica counts of the output it drops.
+    pub(crate) fn kept(&self) -> KeptDrops {
         self.kept.clone()
+    }
+
+    /// Report `group`'s kept output from `kept` for as long as it lives.
+    pub(crate) fn keep(&self, group: u32, kept: &Arc<Mutex<Kept>>) {
+        self.gauges.keep(group, kept);
     }
 
     /// What the storage writers record.
@@ -326,54 +331,31 @@ pub(super) fn error_type(kind: io::ErrorKind) -> String {
     snake
 }
 
-/// What a tail replica records of the output it keeps for a takeover
-/// (§6.7): the audit bytes it keeps, the gap's reach, and its drops.
+/// What a tail replica counts of the output it drops from what it keeps
+/// for a takeover (§6.7). The audit bytes it keeps and its gap are gauges
+/// read from the live [`Kept`] each group registers.
 #[derive(Clone, Debug)]
-pub(crate) struct KeptMeters {
-    audit_usage: Gauge<u64>,
-    gap: Gauge<u64>,
-    audit_dropped: Counter<u64>,
-    row_dropped: Counter<u64>,
+pub(crate) struct KeptDrops {
+    audit: Counter<u64>,
+    rows: Counter<u64>,
 }
 
-impl KeptMeters {
-    /// The instruments on the installed global provider.
-    #[cfg(test)]
-    pub(crate) fn global() -> Self {
-        Self::on(&scoped(&opentelemetry::global::meter_provider()))
-    }
-
+impl KeptDrops {
     fn on(meter: &Meter) -> Self {
-        let gauge = |(name, description, unit): Spec| {
-            meter
-                .u64_gauge(name)
-                .with_description(description)
-                .with_unit(unit)
-                .build()
-        };
         Self {
-            audit_usage: gauge(KEPT_AUDIT_USAGE),
-            gap: gauge(KEPT_GAP),
-            audit_dropped: counter(meter, KEPT_AUDIT_DROPPED),
-            row_dropped: counter(meter, KEPT_ROW_DROPPED),
+            audit: counter(meter, KEPT_AUDIT_DROPPED),
+            rows: counter(meter, KEPT_ROW_DROPPED),
         }
     }
 
-    /// `group`'s `kept` as it now stands, having dropped `before` until
-    /// the step just taken.
-    pub(crate) fn kept(&self, group: u32, kept: &Kept, before: Dropped) {
+    /// `group` has dropped `now` in all, `before` of it until this step.
+    pub(crate) fn dropped(&self, group: u32, now: Dropped, before: Dropped) {
         let attributes = [group_kv(group)];
-        let audit = u64::try_from(kept.audit_bytes()).unwrap_or(u64::MAX);
-        self.audit_usage.record(audit, &attributes);
-        self.gap.record(kept.gap_reach(), &attributes);
-        let dropped = kept.dropped();
-        if dropped.audit > before.audit {
-            self.audit_dropped
-                .add(dropped.audit - before.audit, &attributes);
+        if now.audit > before.audit {
+            self.audit.add(now.audit - before.audit, &attributes);
         }
-        if dropped.rows > before.rows {
-            self.row_dropped
-                .add(dropped.rows - before.rows, &attributes);
+        if now.rows > before.rows {
+            self.rows.add(now.rows - before.rows, &attributes);
         }
     }
 }
@@ -405,18 +387,6 @@ const SYNCS: Spec = (
     semconv::OURIOS_WAL_REPLICATION_SYNC_DURATION_UNIT,
 );
 
-const KEPT_AUDIT_USAGE: Spec = (
-    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE,
-    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_DESCRIPTION,
-    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_UNIT,
-);
-
-const KEPT_GAP: Spec = (
-    semconv::OURIOS_WAL_REPLICATION_KEPT_GAP,
-    semconv::OURIOS_WAL_REPLICATION_KEPT_GAP_DESCRIPTION,
-    semconv::OURIOS_WAL_REPLICATION_KEPT_GAP_UNIT,
-);
-
 const KEPT_AUDIT_DROPPED: Spec = (
     semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED,
     semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED_DESCRIPTION,
@@ -443,20 +413,35 @@ fn counter(meter: &Meter, (name, description, unit): Spec) -> Counter<u64> {
         .build()
 }
 
-/// One provider's gauges and the live hosts they read.
+/// Each tail-replica group's kept output, held weakly.
+type KeptGroups = Arc<Mutex<Vec<(u32, Weak<Mutex<Kept>>)>>>;
+
+/// One provider's gauges and the live hosts and kept outputs they read.
 struct Gauges {
     hosts: Hosts,
+    kept: KeptGroups,
     _instruments: [ObservableGauge<u64>; 2],
+    _kept: [ObservableGauge<u64>; 2],
 }
 
 impl Gauges {
     fn register(meter: &Meter) -> Self {
         let hosts = Hosts::default();
         let instruments = GAUGES.map(|spec| gauge(meter, spec, Arc::clone(&hosts)));
+        let kept = KeptGroups::default();
+        let kept_gauges = KEPT_GAUGES.map(|spec| kept_gauge(meter, spec, Arc::clone(&kept)));
         Self {
             hosts,
+            kept,
             _instruments: instruments,
+            _kept: kept_gauges,
         }
+    }
+
+    fn keep(&self, group: u32, kept: &Arc<Mutex<Kept>>) {
+        let mut groups = lock_recover(&self.kept);
+        groups.retain(|(_, kept)| kept.strong_count() > 0);
+        groups.push((group, Arc::downgrade(kept)));
     }
 
     fn add(&self, watches: &Arc<Watches>) {
@@ -547,6 +532,46 @@ fn gauge(
             for (value, attributes) in points {
                 observer.observe(value, &attributes);
             }
+        })
+        .build()
+}
+
+/// A kept-output gauge: its name, description, unit and value.
+type KeptSpec = (&'static str, &'static str, &'static str, fn(&Kept) -> u64);
+
+const KEPT_GAUGES: [KeptSpec; 2] = [
+    (
+        semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE,
+        semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_DESCRIPTION,
+        semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_UNIT,
+        |kept| u64::try_from(kept.audit_bytes()).unwrap_or(u64::MAX),
+    ),
+    (
+        semconv::OURIOS_WAL_REPLICATION_KEPT_GAP,
+        semconv::OURIOS_WAL_REPLICATION_KEPT_GAP_DESCRIPTION,
+        semconv::OURIOS_WAL_REPLICATION_KEPT_GAP_UNIT,
+        Kept::gap_reach,
+    ),
+];
+
+fn kept_gauge(
+    meter: &Meter,
+    (name, description, unit, read): KeptSpec,
+    groups: KeptGroups,
+) -> ObservableGauge<u64> {
+    meter
+        .u64_observable_gauge(name)
+        .with_description(description)
+        .with_unit(unit)
+        .with_callback(move |observer| {
+            let mut groups = lock_recover(&groups);
+            groups.retain(|(group, kept)| {
+                let Some(kept) = kept.upgrade() else {
+                    return false;
+                };
+                observer.observe(read(&lock_recover(&kept)), &[group_kv(*group)]);
+                true
+            });
         })
         .build()
 }

@@ -171,13 +171,27 @@ async fn a_reservation_outliving_its_term_appends_nothing() {
 /// Depose `leader` and elect it again in a term after `term`: a second
 /// node leads while it is cut off, then is cut off itself once `leader`
 /// has caught up. The third node never stands, so each election has one
-/// candidate.
+/// candidate, and the second holds `leader`'s log before the cut, since
+/// the third refuses its vote to a candidate behind it.
 async fn lead_a_later_term(cluster: &Cluster, leader: usize, term: u64) {
     let mut others = (0..3).filter(|&i| i != leader);
     let (interim, third) = (
         others.next().expect("a node"),
         others.next().expect("a node"),
     );
+    let logged = cluster
+        .node(leader)
+        .raft(0)
+        .metrics()
+        .borrow_watched()
+        .last_log_index;
+    cluster
+        .node(interim)
+        .raft(0)
+        .wait(WAIT)
+        .metrics(|m| m.last_log_index >= logged, "holds the leader's log")
+        .await
+        .expect("holds the leader's log");
     let elects = |i: usize, enabled: bool| cluster.node(i).raft(0).runtime_config().elect(enabled);
     elects(third, false);
     elects(leader, false);

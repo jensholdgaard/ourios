@@ -1135,8 +1135,10 @@ the mass-failover time and vote-log batching as tuning signals.
 >   `ourios.compaction.row.deduplicated`
 > - **And** a partition whose files all lack the columns compacts to a
 >   file without them, with nothing counted; the erasure rewrite keeps
->   every surviving row's position; and a query over the partition
->   returns the same rows before and after both
+>   every surviving row's position; a query over the partition returns
+>   the same rows before and after the compaction, and after an erasure
+>   that matches at least one row, exactly those rows less the ones it
+>   matched
 
 ## 6. Proposed design
 

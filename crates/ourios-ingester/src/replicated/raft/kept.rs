@@ -205,4 +205,4 @@ fn audit_bytes(event: &AuditEvent) -> usize {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -19,6 +19,7 @@ pub mod log_ids;
 pub mod log_store;
 mod miner_config;
 pub mod mining;
+pub mod publication;
 mod snapshot_record;
 pub mod state_machine;
 mod telemetry;

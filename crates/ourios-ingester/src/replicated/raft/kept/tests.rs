@@ -4,7 +4,7 @@ use super::*;
 
 /// A configuration, an id block and `batches` batches of five corpus
 /// lines from index 3, alternating two tenants.
-fn entries(batches: usize) -> Vec<GroupEntry> {
+pub(in crate::replicated::raft) fn entries(batches: usize) -> Vec<GroupEntry> {
     let lines = corpus();
     let mut entries = vec![configured(0.7), block(0, 10_000)];
     for (n, chunk) in (1..).zip(lines.chunks(5).take(batches)) {
@@ -16,7 +16,7 @@ fn entries(batches: usize) -> Vec<GroupEntry> {
 
 /// What a tail replica mines from `entries`, with the index of each
 /// entry.
-fn mined_log(entries: &[GroupEntry]) -> Vec<(u64, Mined)> {
+pub(in crate::replicated::raft) fn mined_log(entries: &[GroupEntry]) -> Vec<(u64, Mined)> {
     let mut miner = miner_of(entries);
     events_of(entries, 64)
         .into_iter()

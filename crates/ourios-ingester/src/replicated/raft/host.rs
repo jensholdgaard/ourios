@@ -1,7 +1,8 @@
-//! Every group a node votes in, open and running (RFC 0065 §6.1): one
-//! `Raft` per group over its group log, all served by one
-//! [`ReplicationServer`] and reaching their peers through one [`Peers`]
-//! pool.
+//! Every group a node votes in or is a tail replica of, open and running
+//! (RFC 0065 §6.1): one `Raft` per group over its group log, all served by
+//! one [`ReplicationServer`] and reaching their peers through one
+//! [`Peers`] pool. On a tail replica each group's [`GroupMiner`] mines the
+//! entries its state machine applies (§6.5).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -14,19 +15,43 @@ use openraft::storage::RaftLogStorage as _;
 use openraft::type_config::alias::{JoinErrorOf, WatchReceiverOf};
 use openraft::{Raft, RaftMetrics};
 use ourios_wal::WalConfig;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use super::gate::SyncGate;
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
-use super::state_machine::GroupSm;
-use super::telemetry::{Meters, ReplicationTelemetry};
+use super::mining::{GroupMiner, Mined};
+use super::state_machine::{Applied, GroupSm};
+use super::telemetry::{Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
 use super::types::{LogId, NodeId, RaftTypes};
 use super::vote_log::VoteLog;
 use super::{RaftTimings, group_config};
 
 pub type GroupRaft = Raft<RaftTypes, GroupSm>;
+
+/// What a node is to the groups it hosts (RFC 0065 §3.8): it votes in
+/// them or is a tail replica of them, never both.
+#[derive(Debug, Clone)]
+pub enum HostRole {
+    /// Votes in its groups and mines none of them: the leader acknowledges
+    /// and replicates, and mining never sits on the ack path (§6.5).
+    Voter,
+    /// A tail replica of its groups: mines each one's entries as its state
+    /// machine applies them and hands what it mined to `mined`, in log
+    /// order per group, waiting while the channel is full. Opening the
+    /// host replays the committed log through the miner, so `mined` must
+    /// be read while it opens.
+    Tail { mined: mpsc::Sender<GroupMined> },
+}
+
+/// What a tail replica's miner mined from one of `group`'s entries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupMined {
+    pub group: u32,
+    pub mined: Mined,
+}
 
 /// What a node hosts.
 pub struct HostSpec {
@@ -36,8 +61,10 @@ pub struct HostSpec {
     /// WAL takes them with its root at [`group_dir`].
     pub wal: WalConfig,
     /// The groups the node votes in
-    /// ([`VotingLayout::groups_of`](crate::replicated::layout::VotingLayout::groups_of)).
+    /// ([`VotingLayout::groups_of`](crate::replicated::layout::VotingLayout::groups_of))
+    /// or, as a tail replica, is placed in.
     pub groups: Vec<u32>,
+    pub role: HostRole,
     pub peers: Peers,
     /// The Raft timings every group runs on.
     pub timings: RaftTimings,
@@ -92,6 +119,8 @@ struct Hosted {
     raft: GroupRaft,
     sm: GroupSm,
     log: GroupLogReader,
+    /// The task feeding a tail replica's miner.
+    mining: Option<Mining>,
     #[cfg(test)]
     probe: probe::Probe,
 }
@@ -125,14 +154,38 @@ impl Launch<'_> {
         let probe = probe::Probe::of(&log);
         log.count_takeovers(self.meters.takeovers(self.spec.id, group));
         let gate = Arc::clone(&self.gate);
-        let mut sm = blocking(move || GroupSm::open(&dir, gate))
-            .await
-            .map_err(|source| HostError::Snapshot { group, source })?;
+        let (sm, applied) = match &self.spec.role {
+            HostRole::Voter => (blocking(move || GroupSm::open(&dir, gate)).await, None),
+            HostRole::Tail { mined } => {
+                let (events, applied) = mpsc::channel(APPLIED_CAPACITY);
+                let sm = blocking(move || GroupSm::open_mining(&dir, gate, events)).await;
+                (sm, Some((applied, mined.clone())))
+            }
+        };
+        let mut sm = sm.map_err(|source| HostError::Snapshot { group, source })?;
         sm.count_stops(group, self.meters.storage());
+        // `Raft::new` applies the committed entries the log replays before
+        // it returns, so the miner must already be taking them.
+        let mining = applied.map(|(applied, mined)| {
+            let miner = GroupMiner::new(reader.clone());
+            let follow = Follow {
+                group,
+                mined,
+                storage: self.meters.storage(),
+            };
+            Mining::start(follow, miner, applied)
+        });
         let (id, network) = (self.spec.id, self.spec.peers.network(self.spec.id, group));
-        let raft = Raft::new(id, Arc::clone(&self.config), network, log, sm.clone())
-            .await
-            .map_err(|source| HostError::Raft { group, source })?;
+        let opened = Raft::new(id, Arc::clone(&self.config), network, log, sm.clone()).await;
+        let raft = match opened {
+            Ok(raft) => raft,
+            Err(source) => {
+                if let Some(mining) = &mining {
+                    mining.stop().await;
+                }
+                return Err(HostError::Raft { group, source });
+            }
+        };
         let builds = RaftBuilds {
             raft: raft.clone(),
             metrics: raft.metrics(),
@@ -142,9 +195,132 @@ impl Launch<'_> {
             raft,
             sm,
             log: reader,
+            mining,
             #[cfg(test)]
             probe,
         })
+    }
+}
+
+/// How many applied entries a tail replica's state machine hands its
+/// miner ahead of what it has mined, before applying waits for it.
+const APPLIED_CAPACITY: usize = 64;
+
+/// A tail replica's running miner.
+struct Mining {
+    stop: watch::Sender<bool>,
+    /// Cleared only once the task has ended, so every stop, a concurrent
+    /// one or one retried after a cancelled one, waits for it.
+    task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Mining {
+    fn start(follow: Follow, miner: GroupMiner, applied: mpsc::Receiver<Applied>) -> Self {
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(follow.run(miner, applied, stopped));
+        Self {
+            stop,
+            task: tokio::sync::Mutex::new(Some(task)),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        self.task
+            .try_lock()
+            .map_or(true, |task| task.as_ref().is_some_and(|t| !t.is_finished()))
+    }
+
+    /// Stop it and wait until it has: a step already mining runs to its
+    /// end, so nothing the miner holds, the group's log reader among
+    /// them, outlives the stop.
+    async fn stop(&self) {
+        self.stop.send_replace(true);
+        let mut task = self.task.lock().await;
+        if let Some(running) = task.as_mut() {
+            // A miner that panicked has ended too.
+            running.await.ok();
+        }
+        *task = None;
+    }
+}
+
+/// The next applied event, or `None` once the group has ended or the host
+/// stops the miner.
+async fn next(
+    applied: &mut mpsc::Receiver<Applied>,
+    stop: &mut watch::Receiver<bool>,
+) -> Option<Applied> {
+    tokio::select! {
+        biased;
+        () = stopped(stop) => None,
+        event = applied.recv() => event,
+    }
+}
+
+/// Resolves once the host stops the miner, or drops the means to.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    stop.wait_for(|stopped| *stopped).await.ok();
+}
+
+/// Where a tail replica's miner for `group` hands what it mined, and
+/// reports its stop.
+struct Follow {
+    group: u32,
+    mined: mpsc::Sender<GroupMined>,
+    storage: Storage,
+}
+
+impl Follow {
+    /// Feed `miner` each event `applied` carries, off the runtime's
+    /// workers, and hand on whatever an event mined. A miner that stops is
+    /// reported and dropped with `applied`, and the replica applies on
+    /// without it. Ends with the group or once `stop` says so, never in
+    /// the middle of a step.
+    async fn run(
+        self,
+        mut miner: GroupMiner,
+        mut applied: mpsc::Receiver<Applied>,
+        mut stop: watch::Receiver<bool>,
+    ) {
+        while let Some(event) = next(&mut applied, &mut stop).await {
+            let mining = tokio::task::spawn_blocking(move || {
+                let followed = miner.apply(event);
+                (miner, followed)
+            });
+            // A miner that panicked is gone; the panic is reported where it happened.
+            let Ok((back, followed)) = mining.await else {
+                return;
+            };
+            miner = back;
+            let handed_on = match followed {
+                Ok(out) => self.hand_on(out, &mut stop).await,
+                Err(error) => {
+                    self.storage.miner_stopped(self.group, &error);
+                    false
+                }
+            };
+            if !handed_on {
+                return;
+            }
+        }
+    }
+
+    /// Send `out` on, unless it is empty; `false` once told to stop. With
+    /// no one reading, the miner still mines, so a stop is still reported.
+    async fn hand_on(&self, out: Mined, stop: &mut watch::Receiver<bool>) -> bool {
+        if out.audit.is_empty() && out.rows.is_empty() {
+            return true;
+        }
+        let sent = self.mined.send(GroupMined {
+            group: self.group,
+            mined: out,
+        });
+        tokio::select! {
+            biased;
+            () = stopped(stop) => false,
+            _ = sent => true,
+        }
     }
 }
 
@@ -337,6 +513,11 @@ impl GroupHost {
     /// A group's core task could not be joined.
     pub async fn shutdown(&self) -> Result<(), JoinErrorOf<RaftTypes>> {
         for hosted in self.groups.values() {
+            // First, so a miner waiting on unread output cannot hold up
+            // the state machine `Raft` waits for.
+            if let Some(mining) = &hosted.mining {
+                mining.stop().await;
+            }
             hosted.raft.shutdown().await?;
         }
         Ok(())
@@ -348,7 +529,13 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use openraft::vote::leader_id_std::CommittedLeaderId;
+    use ourios_wal::Control;
 
+    use super::super::mining::GroupLogRead;
+    use super::super::mining::tests::{batch_at, configured, time};
+    use super::super::snapshot_record::GroupMinerConfig;
+    use super::super::state_machine::AppliedEvent;
+    use super::super::types::{Entry, GroupEntry};
     use super::*;
 
     /// A group whose build never ends, counting the triggers it gets.
@@ -377,6 +564,158 @@ mod tests {
             tokio::task::yield_now().await;
             true
         }
+    }
+
+    /// A log that takes `pause` to read an entry, holds none, and records
+    /// A log whose read of an entry says it has started, then holds until
+    /// the test releases it; it holds none, and records when it is
+    /// dropped.
+    struct HeldLog {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl GroupLogRead for HeldLog {
+        fn entry(&self, _: u64) -> Option<Entry> {
+            let started = self.started.lock().expect("started").take();
+            started.map(|started| started.send(()));
+            // A dropped sender releases it too.
+            let _ = self.release.lock().expect("release").recv();
+            None
+        }
+    }
+
+    impl Drop for HeldLog {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A miner mid-way through reading a batch back from its log, once
+    /// the read has started: it holds until `release` sends or drops, and
+    /// `dropped` turns true when the miner lets go of the log.
+    struct ReadingBack {
+        mining: Mining,
+        release: std::sync::mpsc::Sender<()>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn reading_back() -> ReadingBack {
+        let (started, read_started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let dropped: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let log = HeldLog {
+            started: std::sync::Mutex::new(Some(started)),
+            release: std::sync::Mutex::new(held),
+            dropped: Arc::clone(&dropped),
+        };
+        let (events, applied) = mpsc::channel(4);
+        let (mined, _unread) = mpsc::channel(4);
+        let follow = Follow {
+            group: 0,
+            mined,
+            storage: Storage::global(),
+        };
+        let mining = Mining::start(follow, GroupMiner::new(log), applied);
+        let GroupEntry::Batch(batch) = batch_at(time(1), "acme", &["a b c"]) else {
+            unreachable!("a batch");
+        };
+        let GroupEntry::Control(Control::MinerConfig(body)) = configured(0.7) else {
+            unreachable!("a configuration");
+        };
+        let config = GroupMinerConfig::new(body).expect("valid");
+        for (index, event) in [
+            (1, AppliedEvent::Batch(batch)),
+            (2, AppliedEvent::MinerConfig(config)),
+        ] {
+            let at = log_id(index);
+            events.send(Applied { at, event }).await.expect("sent");
+        }
+        // The configuration reads the batch back from the log.
+        read_started.await.expect("the read back started");
+        ReadingBack {
+            mining,
+            release,
+            dropped,
+        }
+    }
+
+    /// How long a held stop is given to return early before the test
+    /// takes it as waiting.
+    const HELD: Duration = Duration::from_millis(100);
+
+    /// Stopping a miner waits for the step it is running, so nothing it
+    /// holds, the group's log reader among them, outlives the stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_a_miner_waits_for_its_running_step() {
+        let ReadingBack {
+            mining,
+            release,
+            dropped,
+        } = reading_back().await;
+        let mining = Arc::new(mining);
+        let stopping = tokio::spawn({
+            let mining = Arc::clone(&mining);
+            async move { mining.stop().await }
+        });
+        tokio::time::sleep(HELD).await;
+        assert!(!stopping.is_finished(), "the stop returned mid-step");
+
+        release.send(()).expect("released");
+        stopping.await.expect("join");
+        assert!(dropped.load(Ordering::SeqCst), "the log outlived the stop");
+        assert!(!mining.is_running());
+    }
+
+    /// Two stops at once, and a stop retried after one was cancelled,
+    /// each return only once the running step has released the log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_stop_waits_for_the_running_step() {
+        let ReadingBack {
+            mining,
+            release,
+            dropped,
+        } = reading_back().await;
+        let mining = Arc::new(mining);
+        let stops: Vec<_> = (0..2)
+            .map(|_| {
+                let (mining, dropped) = (Arc::clone(&mining), Arc::clone(&dropped));
+                tokio::spawn(async move {
+                    mining.stop().await;
+                    dropped.load(Ordering::SeqCst)
+                })
+            })
+            .collect();
+        tokio::time::sleep(HELD).await;
+        assert!(
+            stops.iter().all(|stop| !stop.is_finished()),
+            "a stop returned mid-step"
+        );
+        release.send(()).expect("released");
+        for stop in stops {
+            assert!(
+                stop.await.expect("join"),
+                "a stop returned before the log was let go"
+            );
+        }
+
+        let ReadingBack {
+            mining,
+            release,
+            dropped,
+        } = reading_back().await;
+        let cancelled = tokio::time::timeout(HELD, mining.stop()).await;
+        assert!(cancelled.is_err(), "the first stop returned mid-step");
+        let retried = tokio::spawn(async move { mining.stop().await });
+        tokio::time::sleep(HELD).await;
+        assert!(!retried.is_finished(), "the retried stop returned mid-step");
+        release.send(()).expect("released");
+        retried.await.expect("join");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the log outlived the retried stop"
+        );
     }
 
     fn log_id(index: u64) -> LogId {
@@ -463,6 +802,16 @@ mod probe {
 
         pub(in crate::replicated::raft) fn log_hooks(&self, group: u32) -> Option<Arc<Hooks>> {
             self.probe(group).map(|probe| Arc::clone(&probe.hooks))
+        }
+
+        /// Whether a miner follows `group` on this node.
+        pub(in crate::replicated::raft) fn mines(&self, group: u32) -> bool {
+            self.groups.get(&group).is_some_and(|hosted| {
+                hosted
+                    .mining
+                    .as_ref()
+                    .is_some_and(super::Mining::is_running)
+            })
         }
     }
 }

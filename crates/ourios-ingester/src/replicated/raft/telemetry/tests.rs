@@ -94,7 +94,11 @@ fn values<'a>(attributes: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> 
 }
 
 /// Collect `name` from `reader` until `done` holds of its points.
-async fn until(reader: &Reader, name: &str, done: impl Fn(&[(Vec<String>, u64)]) -> bool) {
+pub(crate) async fn until(
+    reader: &Reader,
+    name: &str,
+    done: impl Fn(&[(Vec<String>, u64)]) -> bool,
+) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let points = reader.points(name);

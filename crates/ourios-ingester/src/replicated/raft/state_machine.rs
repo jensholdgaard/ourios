@@ -275,10 +275,6 @@ impl GroupSm {
     ///
     /// As [`Self::open`], or `events` has no room for the snapshot's
     /// event.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no host opens a tail replica's group yet")
-    )]
     pub(super) fn open_mining(
         dir: &Path,
         gate: Arc<SyncGate>,

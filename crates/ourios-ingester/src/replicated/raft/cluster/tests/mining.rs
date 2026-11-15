@@ -14,6 +14,7 @@ use super::super::super::mining::tests::{batch_at, block, configured, corpus, ti
 use super::super::super::telemetry::Meters;
 use super::super::super::telemetry::tests::{Reader, until};
 use super::super::super::types::GroupEntry;
+use super::super::Shape;
 use super::{Cluster, GROUP, name, propose, write};
 
 /// Commit the group's first miner configuration, which also waits until
@@ -139,4 +140,65 @@ async fn an_undecodable_batch_stops_the_miner_and_its_replica_applies_on() {
     until(&reader, stops, |points| points == [expected.clone()]).await;
     assert!(mined[0].try_recv().is_err(), "nothing mined past the stop");
     cluster.shutdown().await;
+}
+
+/// One single-line batch per corpus line in `range`, as the leader
+/// would time them.
+fn single_lines(range: std::ops::Range<usize>) -> Vec<GroupEntry> {
+    let lines = corpus();
+    range
+        .map(|n| {
+            let line = lines[n % lines.len()];
+            batch_at(time(n as u64 + 1), "acme", &[line])
+        })
+        .collect()
+}
+
+/// A tail replica that restarts replays more committed entries than its
+/// miner's event buffer holds before its group's `Raft` has opened, and
+/// mines them again rather than hanging the open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_tail_replica_reopens_past_a_full_event_buffer() {
+    let (mut cluster, mut mined) =
+        Cluster::start_mining((3, 1), &[GROUP], |_| Meters::global()).await;
+    let leader = with_learners(&cluster, 3..4).await;
+    let mut entries = vec![block(0, 10_000)];
+    entries.extend(single_lines(0..100));
+    let last = commit_all(&cluster, leader, &entries).await;
+    let first = mined_rows(&mut mined[0], 100).await;
+    cluster.node(3).applied_through(GROUP, last).await;
+
+    cluster.kill(3).await;
+    tokio::time::timeout(Duration::from_secs(20), cluster.restart(3))
+        .await
+        .expect("the tail replica reopens");
+    let again = mined_rows(&mut mined[0], 100).await;
+    assert_eq!(again, first, "the replayed log mines the same rows");
+    cluster.shutdown().await;
+}
+
+/// A tail replica whose mined output nobody reads fills the output
+/// channel and the event buffer behind it, and still shuts down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tail_replica_with_unread_output_still_shuts_down() {
+    let shape = Shape {
+        capacity: 1,
+        ..Shape::from((3, 1))
+    };
+    let (cluster, mined) = Cluster::start_mining(shape, &[GROUP], |_| Meters::global()).await;
+    let leader = with_learners(&cluster, 3..4).await;
+    let mut entries = vec![block(0, 10_000)];
+    entries.extend(single_lines(0..100));
+    commit_all(&cluster, leader, &entries).await;
+    let stalled = cluster
+        .node(3)
+        .raft(GROUP)
+        .wait(Some(Duration::from_secs(2)));
+    let applied = stalled.applied_index_at_least(Some(100), "stalled").await;
+    assert!(applied.is_err(), "unread output holds the tail back");
+
+    tokio::time::timeout(Duration::from_secs(20), cluster.shutdown())
+        .await
+        .expect("the cluster shuts down with output unread");
+    drop(mined);
 }

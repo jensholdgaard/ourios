@@ -40,7 +40,9 @@ pub enum HostRole {
     Voter,
     /// A tail replica of its groups: mines each one's entries as its state
     /// machine applies them and hands what it mined to `mined`, in log
-    /// order per group, waiting while the channel is full.
+    /// order per group, waiting while the channel is full. Opening the
+    /// host replays the committed log through the miner, so `mined` must
+    /// be read while it opens.
     Tail { mined: mpsc::Sender<GroupMined> },
 }
 
@@ -162,15 +164,8 @@ impl Launch<'_> {
         };
         let mut sm = sm.map_err(|source| HostError::Snapshot { group, source })?;
         sm.count_stops(group, self.meters.storage());
-        let (id, network) = (self.spec.id, self.spec.peers.network(self.spec.id, group));
-        let raft = Raft::new(id, Arc::clone(&self.config), network, log, sm.clone())
-            .await
-            .map_err(|source| HostError::Raft { group, source })?;
-        let builds = RaftBuilds {
-            raft: raft.clone(),
-            metrics: raft.metrics(),
-        };
-        tokio::spawn(snapshot_at_checkpoints(builds, sm.checkpoints()));
+        // `Raft::new` applies the committed entries the log replays before
+        // it returns, so the miner must already be taking them.
         let mining = applied.map(|(applied, mined)| {
             let miner = GroupMiner::new(reader.clone());
             let follow = Follow {
@@ -180,6 +175,20 @@ impl Launch<'_> {
             };
             tokio::spawn(follow.run(miner, applied))
         });
+        let (id, network) = (self.spec.id, self.spec.peers.network(self.spec.id, group));
+        let opened = Raft::new(id, Arc::clone(&self.config), network, log, sm.clone()).await;
+        let raft = match opened {
+            Ok(raft) => raft,
+            Err(source) => {
+                mining.inspect(JoinHandle::abort);
+                return Err(HostError::Raft { group, source });
+            }
+        };
+        let builds = RaftBuilds {
+            raft: raft.clone(),
+            metrics: raft.metrics(),
+        };
+        tokio::spawn(snapshot_at_checkpoints(builds, sm.checkpoints()));
         Ok(Hosted {
             raft,
             sm,
@@ -425,10 +434,12 @@ impl GroupHost {
     /// A group's core task could not be joined.
     pub async fn shutdown(&self) -> Result<(), JoinErrorOf<RaftTypes>> {
         for hosted in self.groups.values() {
-            hosted.raft.shutdown().await?;
+            // First, so a miner waiting on unread output cannot hold up
+            // the state machine `Raft` waits for.
             if let Some(mining) = &hosted.mining {
                 mining.abort();
             }
+            hosted.raft.shutdown().await?;
         }
         Ok(())
     }

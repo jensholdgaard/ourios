@@ -342,14 +342,16 @@ pub(crate) struct Cluster {
     slots: Vec<Slot>,
 }
 
-/// How many nodes a cluster starts with, the timings they run on, and
-/// where the first tail nodes hand what they mine, one sender each; a
-/// tail node without one hosts its groups as a voter would.
+/// How many nodes a cluster starts with, the timings they run on, where
+/// the first tail nodes hand what they mine, one sender each, and how
+/// much mined output [`Cluster::start_mining`] buffers per node; a tail
+/// node without a sender hosts its groups as a voter would.
 pub(crate) struct Shape {
     voters: u64,
     tail: u64,
     timings: RaftTimings,
     mined: Vec<mpsc::Sender<GroupMined>>,
+    capacity: usize,
 }
 
 /// `(voters, tail)` nodes on [`test_timings`], none of them mining.
@@ -360,6 +362,7 @@ impl From<(u64, u64)> for Shape {
             tail,
             timings: test_timings(),
             mined: Vec::new(),
+            capacity: MINED_CAPACITY,
         }
     }
 }
@@ -410,7 +413,7 @@ impl Cluster {
     ) -> (Self, Vec<mpsc::Receiver<GroupMined>>) {
         let shape = shape.into();
         let (mined, receivers) = (0..shape.tail)
-            .map(|_| mpsc::channel(MINED_CAPACITY))
+            .map(|_| mpsc::channel(shape.capacity))
             .unzip();
         let shape = Shape { mined, ..shape };
         (Self::open(shape, groups, meters).await, receivers)
@@ -439,6 +442,7 @@ impl Cluster {
             tail,
             timings,
             mined,
+            capacity: _,
         }: Shape,
         groups: &[u32],
         meters: impl Fn(usize) -> Meters,
@@ -568,6 +572,7 @@ impl Cluster {
         };
         let replica = Replica {
             node_id: old.node_id.clone(),
+            role: old.role.clone(),
             timings: old.timings,
             ..Replica::new(n, &old.groups)
         };

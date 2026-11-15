@@ -567,46 +567,49 @@ mod tests {
     }
 
     /// A log that takes `pause` to read an entry, holds none, and records
-    /// when it is dropped.
-    struct SlowLog {
-        pause: Duration,
+    /// A log whose read of an entry says it has started, then holds until
+    /// the test releases it; it holds none, and records when it is
+    /// dropped.
+    struct HeldLog {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
         dropped: Arc<std::sync::atomic::AtomicBool>,
     }
 
-    impl GroupLogRead for SlowLog {
+    impl GroupLogRead for HeldLog {
         fn entry(&self, _: u64) -> Option<Entry> {
-            std::thread::sleep(self.pause);
+            let started = self.started.lock().expect("started").take();
+            started.map(|started| started.send(()));
+            // A dropped sender releases it too.
+            let _ = self.release.lock().expect("release").recv();
             None
         }
     }
 
-    impl Drop for SlowLog {
+    impl Drop for HeldLog {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::SeqCst);
         }
     }
 
-    /// Stopping a miner waits for the step it is running, so nothing it
-    /// holds, the group's log reader among them, outlives the stop.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stopping_a_miner_waits_for_its_running_step() {
-        let dropped = Arc::default();
-        let log = SlowLog {
-            pause: Duration::from_millis(500),
-            dropped: Arc::clone(&dropped),
-        };
-        let mining = reading_back(log).await;
-
-        mining.stop().await;
-        assert!(
-            dropped.load(Ordering::SeqCst),
-            "the running step ended and released the log before the stop returned"
-        );
-        assert!(!mining.is_running());
+    /// A miner mid-way through reading a batch back from its log, once
+    /// the read has started: it holds until `release` sends or drops, and
+    /// `dropped` turns true when the miner lets go of the log.
+    struct ReadingBack {
+        mining: Mining,
+        release: std::sync::mpsc::Sender<()>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
     }
 
-    /// A miner mid-way through reading a batch back from `log`.
-    async fn reading_back(log: SlowLog) -> Mining {
+    async fn reading_back() -> ReadingBack {
+        let (started, read_started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let dropped: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let log = HeldLog {
+            started: std::sync::Mutex::new(Some(started)),
+            release: std::sync::Mutex::new(held),
+            dropped: Arc::clone(&dropped),
+        };
         let (events, applied) = mpsc::channel(4);
         let (mined, _unread) = mpsc::channel(4);
         let follow = Follow {
@@ -629,44 +632,89 @@ mod tests {
             let at = log_id(index);
             events.send(Applied { at, event }).await.expect("sent");
         }
-        // The configuration reads the batch back from the log, which sleeps.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        mining
+        // The configuration reads the batch back from the log.
+        read_started.await.expect("the read back started");
+        ReadingBack {
+            mining,
+            release,
+            dropped,
+        }
+    }
+
+    /// How long a held stop is given to return early before the test
+    /// takes it as waiting.
+    const HELD: Duration = Duration::from_millis(100);
+
+    /// Stopping a miner waits for the step it is running, so nothing it
+    /// holds, the group's log reader among them, outlives the stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_a_miner_waits_for_its_running_step() {
+        let ReadingBack {
+            mining,
+            release,
+            dropped,
+        } = reading_back().await;
+        let mining = Arc::new(mining);
+        let stopping = tokio::spawn({
+            let mining = Arc::clone(&mining);
+            async move { mining.stop().await }
+        });
+        tokio::time::sleep(HELD).await;
+        assert!(!stopping.is_finished(), "the stop returned mid-step");
+
+        release.send(()).expect("released");
+        stopping.await.expect("join");
+        assert!(dropped.load(Ordering::SeqCst), "the log outlived the stop");
+        assert!(!mining.is_running());
     }
 
     /// Two stops at once, and a stop retried after one was cancelled,
     /// each return only once the running step has released the log.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn every_stop_waits_for_the_running_step() {
-        let dropped: Arc<std::sync::atomic::AtomicBool> = Arc::default();
-        let log = SlowLog {
-            pause: Duration::from_millis(500),
-            dropped: Arc::clone(&dropped),
-        };
-        let mining = Arc::new(reading_back(log).await);
-        let stops = (0..2).map(|_| {
-            let (mining, dropped) = (Arc::clone(&mining), Arc::clone(&dropped));
-            tokio::spawn(async move {
-                mining.stop().await;
-                dropped.load(Ordering::SeqCst)
+        let ReadingBack {
+            mining,
+            release,
+            dropped,
+        } = reading_back().await;
+        let mining = Arc::new(mining);
+        let stops: Vec<_> = (0..2)
+            .map(|_| {
+                let (mining, dropped) = (Arc::clone(&mining), Arc::clone(&dropped));
+                tokio::spawn(async move {
+                    mining.stop().await;
+                    dropped.load(Ordering::SeqCst)
+                })
             })
-        });
-        for stop in stops.collect::<Vec<_>>() {
-            assert!(stop.await.expect("join"), "a stop returned mid-step");
+            .collect();
+        tokio::time::sleep(HELD).await;
+        assert!(
+            stops.iter().all(|stop| !stop.is_finished()),
+            "a stop returned mid-step"
+        );
+        release.send(()).expect("released");
+        for stop in stops {
+            assert!(
+                stop.await.expect("join"),
+                "a stop returned before the log was let go"
+            );
         }
 
-        let dropped: Arc<std::sync::atomic::AtomicBool> = Arc::default();
-        let log = SlowLog {
-            pause: Duration::from_millis(500),
-            dropped: Arc::clone(&dropped),
-        };
-        let mining = reading_back(log).await;
-        let cancelled = tokio::time::timeout(Duration::from_millis(50), mining.stop()).await;
-        assert!(cancelled.is_err(), "the first stop was cancelled mid-step");
-        mining.stop().await;
+        let ReadingBack {
+            mining,
+            release,
+            dropped,
+        } = reading_back().await;
+        let cancelled = tokio::time::timeout(HELD, mining.stop()).await;
+        assert!(cancelled.is_err(), "the first stop returned mid-step");
+        let retried = tokio::spawn(async move { mining.stop().await });
+        tokio::time::sleep(HELD).await;
+        assert!(!retried.is_finished(), "the retried stop returned mid-step");
+        release.send(()).expect("released");
+        retried.await.expect("join");
         assert!(
             dropped.load(Ordering::SeqCst),
-            "the retried stop returned mid-step"
+            "the log outlived the retried stop"
         );
     }
 

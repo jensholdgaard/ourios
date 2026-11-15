@@ -192,6 +192,16 @@ pub const OURIOS_COMPACTION_PARTITIONS_DESCRIPTION: &str = "Number of partitions
 /// `ourios.compaction.partitions` unit (UCUM).
 pub const OURIOS_COMPACTION_PARTITIONS_UNIT: &str = "{partition}";
 
+/// `ourios.compaction.row.deduplicated` (counter, unit `{row}`).
+pub const OURIOS_COMPACTION_ROW_DEDUPLICATED: &str = "ourios.compaction.row.deduplicated";
+
+/// `ourios.compaction.row.deduplicated` description (the registry `brief`).
+pub const OURIOS_COMPACTION_ROW_DEDUPLICATED_DESCRIPTION: &str =
+    "Rows a compaction dropped because they repeat a kept row's ingest position.";
+
+/// `ourios.compaction.row.deduplicated` unit (UCUM).
+pub const OURIOS_COMPACTION_ROW_DEDUPLICATED_UNIT: &str = "{row}";
+
 /// `ourios.compaction.rows` (counter, unit `{row}`).
 pub const OURIOS_COMPACTION_ROWS: &str = "ourios.compaction.rows";
 

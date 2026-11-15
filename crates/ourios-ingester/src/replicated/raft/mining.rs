@@ -116,6 +116,21 @@ impl fmt::Display for GroupMinerError {
     }
 }
 
+impl GroupMinerError {
+    /// Its `error.type`, as the registry lists the miner's.
+    #[must_use]
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::Undecodable { .. } => "undecodable",
+            Self::Uncaptured { .. } => "uncaptured",
+            Self::ShapeChanged { .. } => "shape_changed",
+            Self::OutOfOrder { .. } => "out_of_order",
+            Self::Installed { .. } => "installed",
+            Self::Purged { .. } => "purged",
+        }
+    }
+}
+
 impl std::error::Error for GroupMinerError {}
 
 /// The id blocks a group applied that its miner has not drawn yet, in
@@ -400,4 +415,4 @@ impl GroupMiner {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

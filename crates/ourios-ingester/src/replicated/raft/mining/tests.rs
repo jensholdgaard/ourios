@@ -40,7 +40,7 @@ const BASE: MinerConfigV1 = MinerConfigV1 {
     upstream_association_limit: 4,
 };
 
-fn corpus() -> Vec<&'static str> {
+pub(in crate::replicated::raft) fn corpus() -> Vec<&'static str> {
     CORPUS
         .iter()
         .flat_map(|text| text.lines())
@@ -90,11 +90,15 @@ fn batch(tenant: &str, lines: &[&str]) -> GroupEntry {
     framed(tenant, &export(lines))
 }
 
-fn batch_at(time: BatchTime, tenant: &str, lines: &[&str]) -> GroupEntry {
+pub(in crate::replicated::raft) fn batch_at(
+    time: BatchTime,
+    tenant: &str,
+    lines: &[&str],
+) -> GroupEntry {
     framed_at(time, tenant, &export(lines))
 }
 
-fn block(after: u64, through: u64) -> GroupEntry {
+pub(in crate::replicated::raft) fn block(after: u64, through: u64) -> GroupEntry {
     GroupEntry::Control(Control::IdBlock { after, through })
 }
 
@@ -105,7 +109,7 @@ fn with_threshold(similarity_threshold: f32) -> MinerConfigV1 {
     }
 }
 
-fn configured(similarity_threshold: f32) -> GroupEntry {
+pub(in crate::replicated::raft) fn configured(similarity_threshold: f32) -> GroupEntry {
     GroupEntry::Control(Control::MinerConfig(with_threshold(similarity_threshold)))
 }
 
@@ -592,7 +596,7 @@ fn two_replicas_emit_the_same_audit_events_apart_from_timestamps() {
     assert_eq!(untimed(replica.clone()), untimed(audit(miner_of(&entries))));
 }
 
-fn time(nanos: u64) -> BatchTime {
+pub(in crate::replicated::raft) fn time(nanos: u64) -> BatchTime {
     BatchTime::from_nanos(nanos).expect("in range")
 }
 

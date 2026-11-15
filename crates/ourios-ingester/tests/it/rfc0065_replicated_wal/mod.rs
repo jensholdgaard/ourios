@@ -16,6 +16,7 @@
 //! `replicated::raft::formation::tests` and `replicated::raft::flusher::tests`.
 
 mod checkpoints;
+mod compaction;
 mod formation;
 mod local_backend;
 mod log_entries;

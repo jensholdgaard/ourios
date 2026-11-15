@@ -272,7 +272,7 @@ pub fn data_schema_with_promoted(promoted: &PromotedAttributes) -> SchemaRef {
 }
 
 /// `schema` plus the RFC 0065 §6.6 ingest-position columns when
-/// `ingest` is [`IngestColumns::Written`], appended after every other
+/// `ingest` is [`IngestColumns::Written`] or [`IngestColumns::Optional`], appended after every other
 /// column so no existing leaf index moves. [`IngestColumns::Omitted`]
 /// returns `schema` unchanged, which keeps local-backend files exactly
 /// as they were.
@@ -280,7 +280,7 @@ pub fn data_schema_with_promoted(promoted: &PromotedAttributes) -> SchemaRef {
 pub fn with_ingest_columns(schema: SchemaRef, ingest: IngestColumns) -> SchemaRef {
     match ingest {
         IngestColumns::Omitted => schema,
-        IngestColumns::Written => {
+        IngestColumns::Written | IngestColumns::Optional => {
             let mut fields: Vec<Field> =
                 schema.fields().iter().map(|f| f.as_ref().clone()).collect();
             fields.extend([

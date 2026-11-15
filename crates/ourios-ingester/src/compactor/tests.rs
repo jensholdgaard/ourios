@@ -414,6 +414,7 @@ fn outcome(files_before: usize, commit_lost: bool) -> CompactionOutcome {
         files_before,
         rows: 0,
         rows_dropped: 0,
+        rows_deduplicated: 0,
         committed: None,
         commit_lost,
         gc_failures: 0,

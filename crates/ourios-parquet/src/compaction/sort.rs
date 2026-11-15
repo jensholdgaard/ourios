@@ -11,7 +11,9 @@ use super::*;
 use std::cell::Cell;
 
 use ourios_core::otlp::{AnyValue, KeyValue, any_value};
-use ourios_core::record::Param;
+use ourios_core::record::{IngestPosition, Param};
+
+use crate::record_batch::{IngestColumns, mined_records_to_batch_in};
 
 /// The fixed inputs of one RFC 0036 §3.2 sort of a partition.
 #[derive(Clone, Copy)]
@@ -31,12 +33,17 @@ pub(super) struct SortTotals {
     pub(super) rows: u64,
     pub(super) bytes_read: u64,
     pub(super) rows_dropped: u64,
+    pub(super) rows_deduplicated: u64,
     pub(super) decoded_bytes: u64,
 }
 
 /// Phases 1–2 of the RFC 0036 §3.2 external merge sort: stream
 /// `inputs` (already in sorted-basename order) batch by batch, sort by
-/// the §3.1 key, and emit every row into `writer` in that key order.
+/// the §3.1 key, and emit every row into the writer `open` returns, in
+/// that key order, less the repeats of an ingest position. The writer
+/// opens once phase 1 has read every input, nothing having been written
+/// before, with the ingest columns if any input declares them
+/// (RFC 0065 §6.6).
 ///
 /// Decoded rows buffer until their [`decoded_footprint`] exceeds
 /// [`SortTuning::in_memory_max_bytes`]; a partition that never crosses
@@ -50,12 +57,12 @@ pub(super) struct SortTotals {
 /// chunk; independent of how many inputs the partition holds or how
 /// well they compress.
 pub(super) fn sort_inputs_into(
-    writer: &mut Writer,
+    open: impl FnOnce(IngestColumns) -> Result<Writer, CompactionError>,
     plan: SortPlan<'_>,
     inputs: &[String],
     hooks: &mut RowHooks<'_>,
-) -> Result<SortTotals, CompactionError> {
-    set_limits(plan, writer);
+) -> Result<(SortTotals, Writer), CompactionError> {
+    set_sort_limits(plan);
     let mut formation = RunFormation::new(plan);
     let mut totals = SortTotals::default();
     for input in inputs {
@@ -63,17 +70,96 @@ pub(super) fn sort_inputs_into(
         formation.end_input()?;
     }
     totals.decoded_bytes = formation.decoded_total;
-    formation.finish(writer)?;
-    Ok(totals)
+    let ingest = if formation.positioned {
+        IngestColumns::Optional
+    } else {
+        IngestColumns::Omitted
+    };
+    let mut writer = open(ingest)?;
+    plan.gauges
+        .set_limit(MemoryPhase::Write, widen(writer.flush_bytes()));
+    let mut output = Output {
+        writer: &mut writer,
+        repeats: Repeats::new(plan.keys),
+        gauges: plan.gauges,
+    };
+    formation.finish(&mut output)?;
+    totals.rows_deduplicated = output.repeats.dropped;
+    totals.rows = totals.rows.saturating_sub(totals.rows_deduplicated);
+    Ok((totals, writer))
 }
 
-/// Publish the budgets this sort runs under (see [`MemoryPhase`]).
-fn set_limits(plan: SortPlan<'_>, writer: &Writer) {
+/// Publish the budgets the sort and merge run under (see [`MemoryPhase`]).
+fn set_sort_limits(plan: SortPlan<'_>) {
     let budget = plan.tuning.in_memory_max_bytes;
     plan.gauges.set_limit(MemoryPhase::Sort, budget);
     plan.gauges.set_limit(MemoryPhase::Merge, budget);
-    plan.gauges
-        .set_limit(MemoryPhase::Write, widen(writer.flush_bytes()));
+}
+
+/// Where the sorted rows go: the consolidated file, less each repeat of
+/// an ingest position.
+struct Output<'w, 'a> {
+    writer: &'w mut Writer,
+    repeats: Repeats,
+    gauges: Gauges<'a>,
+}
+
+impl Output<'_, '_> {
+    fn write(&mut self, rows: &mut Vec<MinedRecord>) -> Result<(), CompactionError> {
+        self.repeats.drop_from(rows);
+        write_rows(self.writer, rows, self.gauges)
+    }
+}
+
+/// Drops each row that repeats the ingest position of a row already
+/// written (RFC 0065 §6.6). A repeat is the same row (§6.5), so it has
+/// the same §3.1 key and arrives among the rows of equal key; only their
+/// positions are held, so memory follows the widest run of equal keys,
+/// never the partition. A row without a position is never a repeat.
+pub(super) struct Repeats {
+    keys: ClusterKeys,
+    key: Option<(Option<String>, u64)>,
+    pub(super) seen: HashSet<IngestPosition>,
+    pub(super) dropped: u64,
+}
+
+impl Repeats {
+    pub(super) fn new(keys: ClusterKeys) -> Self {
+        Self {
+            keys,
+            key: None,
+            seen: HashSet::new(),
+            dropped: 0,
+        }
+    }
+
+    pub(super) fn drop_from(&mut self, rows: &mut Vec<MinedRecord>) {
+        rows.retain(|row| self.keep(row));
+    }
+
+    fn keep(&mut self, row: &MinedRecord) -> bool {
+        let service = match self.keys {
+            ClusterKeys::ServiceThenTime => {
+                project_string_value(&row.resource_attributes, SERVICE_NAME_KEY)
+            }
+            ClusterKeys::TimeOnly => None,
+        };
+        let same_key = self
+            .key
+            .as_ref()
+            .is_some_and(|(s, time)| *time == row.time_unix_nano && s.as_deref() == service);
+        if !same_key {
+            self.key = Some((service.map(str::to_owned), row.time_unix_nano));
+            self.seen.clear();
+        }
+        match row.ingest_position {
+            Some(position) if !self.seen.insert(position) => {
+                self.dropped = self.dropped.saturating_add(1);
+                false
+            }
+            Some(_) | None => true,
+        }
+    }
 }
 
 /// Decode `input` batch by batch into `formation`. Its encoded bytes are
@@ -86,6 +172,7 @@ fn read_input(
 ) -> Result<(), CompactionError> {
     let gauges = formation.plan.gauges;
     let mut reader = open_input(formation.plan, input, totals)?;
+    formation.positioned |= reader.declares_ingest_columns();
     while let Some(batch) = reader.next_batch().map_err(CompactionError::Read)? {
         formation.push(apply_hooks(hooks, batch, totals));
     }
@@ -160,6 +247,8 @@ struct RunFormation<'a> {
     /// Every pushed row's [`decoded_footprint`], spilled or not.
     decoded_total: u64,
     spill: Option<Spill>,
+    /// Whether any input read so far declares the ingest columns.
+    positioned: bool,
 }
 
 impl<'a> RunFormation<'a> {
@@ -171,6 +260,7 @@ impl<'a> RunFormation<'a> {
             widest_row: 0,
             decoded_total: 0,
             spill: None,
+            positioned: false,
         }
     }
 
@@ -233,7 +323,7 @@ impl<'a> RunFormation<'a> {
     /// partition never left memory, else merged from the spilled runs.
     /// Both drive the writer with the same [`SUB_BATCH_ROWS`] chunking,
     /// so the output is byte-identical either way (§3.5).
-    fn finish(mut self, writer: &mut Writer) -> Result<(), CompactionError> {
+    fn finish(mut self, output: &mut Output<'_, '_>) -> Result<(), CompactionError> {
         if self.spill.is_some() && !self.buffer.is_empty() {
             self.spill_buffer()?;
         }
@@ -244,12 +334,12 @@ impl<'a> RunFormation<'a> {
             ..
         } = self;
         match spill {
-            None => emit_in_memory(plan, buffer, writer),
+            None => emit_in_memory(plan, buffer, output),
             Some(spill) => {
                 // `clear()` kept the phase-1 allocation; release it before
                 // the merge so phase 2 holds only (F + 1) × one batch.
                 drop(buffer);
-                spill.merge_into(writer, plan)
+                spill.merge_into(output, plan)
             }
         }
     }
@@ -258,16 +348,16 @@ impl<'a> RunFormation<'a> {
 fn emit_in_memory(
     plan: SortPlan<'_>,
     mut rows: Vec<MinedRecord>,
-    writer: &mut Writer,
+    output: &mut Output<'_, '_>,
 ) -> Result<(), CompactionError> {
     sort_records(plan.keys, &mut rows);
-    write_rows(writer, &rows, plan.gauges)?;
-    plan.gauges.set(MemoryPhase::Sort, 0);
     #[cfg(test)]
     {
         residency::sub(rows.len());
         residency::sub_bytes(rows.iter().map(decoded_footprint).sum());
     }
+    output.write(&mut rows)?;
+    plan.gauges.set(MemoryPhase::Sort, 0);
     Ok(())
 }
 
@@ -327,9 +417,13 @@ impl Spill {
         })
     }
 
-    fn merge_into(self, writer: &mut Writer, plan: SortPlan<'_>) -> Result<(), CompactionError> {
+    fn merge_into(
+        self,
+        output: &mut Output<'_, '_>,
+        plan: SortPlan<'_>,
+    ) -> Result<(), CompactionError> {
         let runs = reduce_runs(self.scratch.path(), self.runs, plan)?;
-        merge_runs(&runs, plan, |chunk| write_rows(writer, chunk, plan.gauges))
+        merge_runs(&runs, plan, |chunk| output.write(chunk))
     }
 }
 
@@ -441,9 +535,13 @@ impl<'a> RunWriter<'a> {
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::None)
             .build();
-        let inner =
-            ArrowWriter::try_new(file, data_schema_with_promoted(plan.promoted), Some(props))
-                .map_err(parquet_write)?;
+        // Every run can hold rows with and without a position, whatever
+        // the output declares.
+        let schema = with_ingest_columns(
+            data_schema_with_promoted(plan.promoted),
+            IngestColumns::Optional,
+        );
+        let inner = ArrowWriter::try_new(file, schema, Some(props)).map_err(parquet_write)?;
         Ok(Self {
             inner,
             promoted: plan.promoted,
@@ -461,7 +559,7 @@ impl<'a> RunWriter<'a> {
             if self.inner.in_progress_size() >= MAX_COMPACTED_RG_BYTES {
                 self.inner.flush().map_err(parquet_write)?;
             }
-            let batch = mined_records_to_batch_with_promoted(chunk, self.promoted)
+            let batch = mined_records_to_batch_in(chunk, self.promoted, IngestColumns::Optional)
                 .map_err(|e| CompactionError::Write(WriterError::Batch(e)))?;
             self.inner.write(&batch).map_err(parquet_write)?;
         }
@@ -549,7 +647,7 @@ pub(super) fn merge_runs<F>(
     mut emit: F,
 ) -> Result<(), CompactionError>
 where
-    F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
+    F: FnMut(&mut Vec<MinedRecord>) -> Result<(), CompactionError>,
 {
     let (keys, budget) = (plan.keys, plan.tuning.in_memory_max_bytes);
     let charge = MergeCharge::new(plan.gauges, runs);
@@ -593,18 +691,18 @@ fn emit_chunk<F>(
     charge: &MergeCharge<'_>,
 ) -> Result<(), CompactionError>
 where
-    F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
+    F: FnMut(&mut Vec<MinedRecord>) -> Result<(), CompactionError>,
 {
     charge.fill(out.len());
-    charge.publish();
-    emit(out)?;
-    charge.fill(0);
     charge.publish();
     #[cfg(test)]
     {
         residency::sub(out.len());
         residency::sub_bytes(out.iter().map(decoded_footprint).sum());
     }
+    emit(out)?;
+    charge.fill(0);
+    charge.publish();
     out.clear();
     Ok(())
 }

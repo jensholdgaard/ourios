@@ -76,7 +76,17 @@ pub fn mined_records_to_batch_with_promoted(
     records: &[MinedRecord],
     promoted: &PromotedAttributes,
 ) -> Result<RecordBatch, BatchError> {
-    let ingest = IngestColumns::of(records)?;
+    mined_records_to_batch_in(records, promoted, IngestColumns::of(records)?)
+}
+
+/// [`mined_records_to_batch_with_promoted`] in a layout the caller
+/// declares rather than one derived from `records`, which must each be
+/// one [`IngestColumns::admits`].
+pub(crate) fn mined_records_to_batch_in(
+    records: &[MinedRecord],
+    promoted: &PromotedAttributes,
+    ingest: IngestColumns,
+) -> Result<RecordBatch, BatchError> {
     let mut arrays = base_columns(records)?;
     arrays.extend(project_promoted_columns(
         records,
@@ -106,7 +116,8 @@ fn base_columns(records: &[MinedRecord]) -> Result<Vec<ArrayRef>, BatchError> {
 
 /// Whether a file carries the RFC 0065 §6.6 ingest-position columns.
 /// Records mined from a replicated log all carry a position; records on
-/// the local backend carry none, and their files have no such columns.
+/// the local backend carry none, and their files have no such columns. A
+/// compaction's output holds whatever its inputs held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestColumns {
     /// No `ingest_*` columns: the local backend and every file written
@@ -115,6 +126,10 @@ pub enum IngestColumns {
     /// `ingest_group`, `ingest_seq` and `ingest_index`, one value each
     /// per row.
     Written,
+    /// The same three columns, null in a row without a position: only a
+    /// compaction's output, whose inputs may mix both kinds of row
+    /// (RFC 0065 §6.6).
+    Optional,
 }
 
 impl IngestColumns {
@@ -124,6 +139,16 @@ impl IngestColumns {
         match record.ingest_position {
             Some(_) => Self::Written,
             None => Self::Omitted,
+        }
+    }
+
+    /// Whether a file in this layout can hold `record`.
+    #[must_use]
+    pub fn admits(self, record: &MinedRecord) -> bool {
+        match self {
+            Self::Omitted => record.ingest_position.is_none(),
+            Self::Written => record.ingest_position.is_some(),
+            Self::Optional => true,
         }
     }
 
@@ -153,7 +178,7 @@ impl IngestColumns {
 fn ingest_position_columns(records: &[MinedRecord], ingest: IngestColumns) -> Vec<ArrayRef> {
     match ingest {
         IngestColumns::Omitted => Vec::new(),
-        IngestColumns::Written => {
+        IngestColumns::Written | IngestColumns::Optional => {
             let positions = || records.iter().map(|r| r.ingest_position);
             let group: UInt32Array = positions().map(|p| p.map(|p| p.group)).collect();
             let seq: UInt64Array = positions().map(|p| p.map(|p| p.seq)).collect();

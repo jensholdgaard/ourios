@@ -24,7 +24,7 @@ use super::kept::{Bounds, Kept};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
 use super::mining::{GroupMiner, Mined};
 use super::state_machine::{Applied, AppliedEvent, GroupSm};
-use super::telemetry::{Meters, ReplicationTelemetry, Storage};
+use super::telemetry::{KeptMeters, Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
 use super::types::{LogId, NodeId, RaftTypes};
 use super::vote_log::VoteLog;
@@ -177,6 +177,7 @@ impl Launch<'_> {
                 group,
                 mined,
                 kept: Arc::new(Mutex::new(Kept::new(kept))),
+                report: self.meters.kept(),
                 storage: self.meters.storage(),
             };
             Mining::start(follow, miner, applied)
@@ -275,6 +276,7 @@ struct Follow {
     group: u32,
     mined: mpsc::Sender<GroupMined>,
     kept: Arc<Mutex<Kept>>,
+    report: KeptMeters,
     storage: Storage,
 }
 
@@ -325,12 +327,14 @@ impl Follow {
     /// checkpoint's `cut` passes.
     fn keep(&self, index: u64, out: &Mined, cut: Option<u64>) {
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = kept.dropped();
         if !(out.audit.is_empty() && out.rows.is_empty()) {
             kept.keep(index, out.clone());
         }
         if let Some(cut) = cut {
             kept.checkpoint(cut);
         }
+        self.report.kept(self.group, &kept, before);
     }
 
     /// Send `out` on, unless it is empty; `false` once told to stop. With
@@ -562,8 +566,10 @@ mod tests {
     use super::super::mining::tests::{batch_at, block, configured, corpus, time};
     use super::super::snapshot_record::{GroupMinerConfig, IdBlock};
     use super::super::state_machine::AppliedEvent;
+    use super::super::telemetry::tests::Reader;
     use super::super::types::{Entry, GroupEntry};
     use super::*;
+    use ourios_semconv as semconv;
 
     /// A group whose build never ends, counting the triggers it gets.
     struct Held {
@@ -643,6 +649,7 @@ mod tests {
             group: 0,
             mined,
             kept: Arc::default(),
+            report: KeptMeters::global(),
             storage: Storage::global(),
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
@@ -767,51 +774,51 @@ mod tests {
         }
     }
 
-    /// RFC 0065 §6.7: a tail replica keeps what its miner mined, hands the
-    /// same on, and drops what an applied checkpoint's cut passes.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_tail_replica_keeps_its_output_until_a_checkpoint_passes_it() {
+    /// Six batches of five corpus lines at indexes 3 to 8 after a
+    /// configuration and an id block, then a checkpoint at 9 cut at 5, fed
+    /// to a tail replica's mining task keeping within `bounds`: what it
+    /// kept, and everything it handed on.
+    async fn follow_through_a_cut(bounds: Bounds, report: KeptMeters) -> (Kept, Vec<Mined>) {
         let lines = corpus();
         let mut entries = vec![configured(0.7), block(0, 10_000)];
         let chunks = (1..).zip(lines.chunks(5).skip(1).take(6));
         entries.extend(chunks.map(|(n, chunk)| batch_at(time(n), "acme", chunk)));
         let (events, applied) = mpsc::channel(16);
         let (mined, mut handed) = mpsc::channel(16);
-        let kept: Arc<Mutex<Kept>> = Arc::default();
+        let kept = Arc::new(Mutex::new(Kept::new(bounds)));
         let follow = Follow {
             group: 0,
             mined,
             kept: Arc::clone(&kept),
+            report,
             storage: Storage::global(),
         };
         let mining = Mining::start(follow, GroupMiner::new(EmptyLog), applied);
         for (index, entry) in (1..).zip(entries) {
             let event = event_of(entry);
-            events
-                .send(Applied {
-                    at: log_id(index),
-                    event,
-                })
-                .await
-                .expect("sent");
+            let at = log_id(index);
+            events.send(Applied { at, event }).await.expect("sent");
         }
         let cut = AppliedEvent::Checkpoint(log_id(5));
-        events
-            .send(Applied {
-                at: log_id(9),
-                event: cut,
-            })
-            .await
-            .expect("sent");
+        let at = log_id(9);
+        events.send(Applied { at, event: cut }).await.expect("sent");
         drop(events);
-        let mut rows = Vec::new();
+        let mut out = Vec::new();
         while let Some(GroupMined { mined, .. }) = handed.recv().await {
-            rows.extend(mined.rows);
+            out.push(mined);
         }
         mining.stop().await;
+        let kept = Arc::into_inner(kept).expect("the task let go");
+        (kept.into_inner().expect("kept"), out)
+    }
 
+    /// RFC 0065 §6.7: a tail replica keeps what its miner mined, hands the
+    /// same on, and drops what an applied checkpoint's cut passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tail_replica_keeps_its_output_until_a_checkpoint_passes_it() {
+        let (kept, out) = follow_through_a_cut(Bounds::default(), KeptMeters::global()).await;
+        let rows: Vec<_> = out.into_iter().flat_map(|mined| mined.rows).collect();
         assert_eq!(rows.len(), 30, "every row handed on");
-        let kept = kept.lock().expect("kept");
         let above: Vec<_> = rows
             .into_iter()
             .filter(|row| row.position.seq > 5)
@@ -819,6 +826,42 @@ mod tests {
         assert_eq!(kept.rows().cloned().collect::<Vec<_>>(), above);
         assert_eq!(above.len(), 15, "three batches above the cut");
         assert_eq!(kept.gap(), None);
+    }
+
+    /// What a tail replica drops past its bounds is counted per group, and
+    /// the gauges show the audit bytes it keeps and the gap's reach past
+    /// the applied cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tail_replica_reports_what_it_keeps_and_drops() {
+        let reader = Reader::new();
+        let report = Meters::on(&reader.meter()).kept();
+        let bounds = Bounds { audit: 1, rows: 1 };
+        let (kept, out) = follow_through_a_cut(bounds, report).await;
+        let events = out
+            .iter()
+            .map(|mined| mined.audit.len() as u64)
+            .sum::<u64>();
+        let gap = kept.gap().expect("everything dropped");
+        assert!(events > 0 && gap > 5);
+
+        let group = || vec!["0".to_owned()];
+        let points = |name| reader.points(name);
+        assert_eq!(
+            points(semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED),
+            [(group(), events)]
+        );
+        assert_eq!(
+            points(semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED),
+            [(group(), 30)]
+        );
+        assert_eq!(
+            points(semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE),
+            [(group(), 0)]
+        );
+        assert_eq!(
+            points(semconv::OURIOS_WAL_REPLICATION_KEPT_GAP),
+            [(group(), gap - 5)]
+        );
     }
 
     /// A log that holds no entry.

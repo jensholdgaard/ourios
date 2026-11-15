@@ -22,12 +22,13 @@ use openraft::async_runtime::WatchReceiver as _;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId as _;
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider, ObservableGauge};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, MeterProvider, ObservableGauge};
 use ourios_core::sync::lock_recover;
 use ourios_semconv as semconv;
 
 use super::flusher::{Hold, Reason};
 use super::host::GroupRaft;
+use super::kept::{Dropped, Kept};
 use super::mining::GroupMinerError;
 use super::types::{NodeId, RaftTypes, Vote};
 
@@ -43,6 +44,7 @@ pub(crate) struct Meters {
     takeovers: Counter<u64>,
     flusher: FlusherCounts,
     storage: Storage,
+    kept: KeptMeters,
 }
 
 impl Meters {
@@ -70,7 +72,13 @@ impl Meters {
             takeovers,
             flusher,
             storage: Storage::on(meter),
+            kept: KeptMeters::on(meter),
         }
+    }
+
+    /// What a tail replica records of the output it keeps.
+    pub(crate) fn kept(&self) -> KeptMeters {
+        self.kept.clone()
     }
 
     /// What the storage writers record.
@@ -318,6 +326,58 @@ pub(super) fn error_type(kind: io::ErrorKind) -> String {
     snake
 }
 
+/// What a tail replica records of the output it keeps for a takeover
+/// (§6.7): the audit bytes it keeps, the gap's reach, and its drops.
+#[derive(Clone, Debug)]
+pub(crate) struct KeptMeters {
+    audit_usage: Gauge<u64>,
+    gap: Gauge<u64>,
+    audit_dropped: Counter<u64>,
+    row_dropped: Counter<u64>,
+}
+
+impl KeptMeters {
+    /// The instruments on the installed global provider.
+    #[cfg(test)]
+    pub(crate) fn global() -> Self {
+        Self::on(&scoped(&opentelemetry::global::meter_provider()))
+    }
+
+    fn on(meter: &Meter) -> Self {
+        let gauge = |(name, description, unit): Spec| {
+            meter
+                .u64_gauge(name)
+                .with_description(description)
+                .with_unit(unit)
+                .build()
+        };
+        Self {
+            audit_usage: gauge(KEPT_AUDIT_USAGE),
+            gap: gauge(KEPT_GAP),
+            audit_dropped: counter(meter, KEPT_AUDIT_DROPPED),
+            row_dropped: counter(meter, KEPT_ROW_DROPPED),
+        }
+    }
+
+    /// `group`'s `kept` as it now stands, having dropped `before` until
+    /// the step just taken.
+    pub(crate) fn kept(&self, group: u32, kept: &Kept, before: Dropped) {
+        let attributes = [group_kv(group)];
+        let audit = u64::try_from(kept.audit_bytes()).unwrap_or(u64::MAX);
+        self.audit_usage.record(audit, &attributes);
+        self.gap.record(kept.gap_reach(), &attributes);
+        let dropped = kept.dropped();
+        if dropped.audit > before.audit {
+            self.audit_dropped
+                .add(dropped.audit - before.audit, &attributes);
+        }
+        if dropped.rows > before.rows {
+            self.row_dropped
+                .add(dropped.rows - before.rows, &attributes);
+        }
+    }
+}
+
 /// A counter's name, description and unit.
 type Spec = (&'static str, &'static str, &'static str);
 
@@ -343,6 +403,30 @@ const SYNCS: Spec = (
     semconv::OURIOS_WAL_REPLICATION_SYNC_DURATION,
     semconv::OURIOS_WAL_REPLICATION_SYNC_DURATION_DESCRIPTION,
     semconv::OURIOS_WAL_REPLICATION_SYNC_DURATION_UNIT,
+);
+
+const KEPT_AUDIT_USAGE: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_UNIT,
+);
+
+const KEPT_GAP: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_KEPT_GAP,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_GAP_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_GAP_UNIT,
+);
+
+const KEPT_AUDIT_DROPPED: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED_UNIT,
+);
+
+const KEPT_ROW_DROPPED: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_UNIT,
 );
 
 const STOPS: Spec = (

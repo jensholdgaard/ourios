@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::async_runtime::WatchReceiver as _;
@@ -209,7 +209,9 @@ const APPLIED_CAPACITY: usize = 64;
 /// A tail replica's running miner.
 struct Mining {
     stop: watch::Sender<bool>,
-    task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Cleared only once the task has ended, so every stop, a concurrent
+    /// one or one retried after a cancelled one, waits for it.
+    task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Mining {
@@ -218,17 +220,15 @@ impl Mining {
         let task = tokio::spawn(follow.run(miner, applied, stopped));
         Self {
             stop,
-            task: std::sync::Mutex::new(Some(task)),
+            task: tokio::sync::Mutex::new(Some(task)),
         }
     }
 
     #[cfg(test)]
     fn is_running(&self) -> bool {
         self.task
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|task| !task.is_finished())
+            .try_lock()
+            .map_or(true, |task| task.as_ref().is_some_and(|t| !t.is_finished()))
     }
 
     /// Stop it and wait until it has: a step already mining runs to its
@@ -236,15 +236,12 @@ impl Mining {
     /// them, outlives the stop.
     async fn stop(&self) {
         self.stop.send_replace(true);
-        let task = self
-            .task
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(task) = task {
+        let mut task = self.task.lock().await;
+        if let Some(running) = task.as_mut() {
             // A miner that panicked has ended too.
-            task.await.ok();
+            running.await.ok();
         }
+        *task = None;
     }
 }
 
@@ -598,6 +595,18 @@ mod tests {
             pause: Duration::from_millis(500),
             dropped: Arc::clone(&dropped),
         };
+        let mining = reading_back(log).await;
+
+        mining.stop().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the running step ended and released the log before the stop returned"
+        );
+        assert!(!mining.is_running());
+    }
+
+    /// A miner mid-way through reading a batch back from `log`.
+    async fn reading_back(log: SlowLog) -> Mining {
         let (events, applied) = mpsc::channel(4);
         let (mined, _unread) = mpsc::channel(4);
         let follow = Follow {
@@ -622,13 +631,43 @@ mod tests {
         }
         // The configuration reads the batch back from the log, which sleeps.
         tokio::time::sleep(Duration::from_millis(100)).await;
+        mining
+    }
 
+    /// Two stops at once, and a stop retried after one was cancelled,
+    /// each return only once the running step has released the log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_stop_waits_for_the_running_step() {
+        let dropped: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let log = SlowLog {
+            pause: Duration::from_millis(500),
+            dropped: Arc::clone(&dropped),
+        };
+        let mining = Arc::new(reading_back(log).await);
+        let stops = (0..2).map(|_| {
+            let (mining, dropped) = (Arc::clone(&mining), Arc::clone(&dropped));
+            tokio::spawn(async move {
+                mining.stop().await;
+                dropped.load(Ordering::SeqCst)
+            })
+        });
+        for stop in stops.collect::<Vec<_>>() {
+            assert!(stop.await.expect("join"), "a stop returned mid-step");
+        }
+
+        let dropped: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let log = SlowLog {
+            pause: Duration::from_millis(500),
+            dropped: Arc::clone(&dropped),
+        };
+        let mining = reading_back(log).await;
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), mining.stop()).await;
+        assert!(cancelled.is_err(), "the first stop was cancelled mid-step");
         mining.stop().await;
         assert!(
             dropped.load(Ordering::SeqCst),
-            "the running step ended and released the log before the stop returned"
+            "the retried stop returned mid-step"
         );
-        assert!(!mining.is_running());
     }
 
     fn log_id(index: u64) -> LogId {

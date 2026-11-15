@@ -6,8 +6,10 @@
 //! run of equal keys are all that need remembering. Rows without a
 //! timestamp all sort at `(service, 0)`, so one run can span a partition:
 //! past its share of the budget, the run's positions spill to local
-//! scratch as sorted runs of fixed-width records, searched by bisection
-//! and merged once there are more than the fan-in.
+//! scratch as sorted runs of fixed-width records. A lookup skips every
+//! run whose range cannot hold the position and bisects the rest. Runs
+//! merge in tiers of [`POSITION_FAN_IN`], so a position is rewritten once
+//! per tier and fewer than `POSITION_FAN_IN` runs are open per tier.
 
 // The parent scope is this module's import surface, as for its siblings.
 #[allow(clippy::wildcard_imports)]
@@ -23,9 +25,18 @@ use ourios_core::record::IngestPosition;
 /// big-endian, so the bytes order as the positions do.
 const RECORD: usize = 16;
 
-/// Bytes one position held in memory is charged: the key and the hash
+/// Bytes one slot of the in-memory set is charged: the key and the hash
 /// table's share around it.
-pub(super) const HELD_BYTES: u64 = 32;
+const HELD_BYTES: u64 = 32;
+
+/// Runs of one tier merged into one of the next. Small, so the runs a
+/// lookup searches and the files held open stay few beside the sort's
+/// own merge cursors.
+const POSITION_FAN_IN: usize = 8;
+
+/// A set holding more slots than this is released, not cleared, when the
+/// key moves on, so one wide run of keys does not keep its allocation.
+const KEPT_SLOTS: usize = 1024;
 
 type Record = [u8; RECORD];
 
@@ -45,19 +56,35 @@ fn io_error(op: &'static str, path: &Path, source: std::io::Error) -> Compaction
     }
 }
 
-/// A sorted run of positions on scratch.
+fn widen(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// A sorted run of positions on scratch, its tier and its range.
 struct PositionRun {
     path: PathBuf,
     file: File,
     records: u64,
+    tier: usize,
+    first: Record,
+    last: Record,
 }
 
 impl PositionRun {
-    fn write(path: PathBuf, sorted: impl Iterator<Item = Record>) -> Result<Self, CompactionError> {
+    /// Write `sorted`, which is ascending.
+    fn write(
+        path: PathBuf,
+        tier: usize,
+        sorted: impl Iterator<Item = Record>,
+    ) -> Result<Self, CompactionError> {
         let created = File::create(&path).map_err(|e| io_error("create position run", &path, e))?;
         let mut out = BufWriter::new(created);
-        let mut records = 0_u64;
+        let (mut records, mut first, mut last) = (0_u64, [0; RECORD], [0; RECORD]);
         for record in sorted {
+            if records == 0 {
+                first = record;
+            }
+            last = record;
             out.write_all(&record)
                 .map_err(|e| io_error("write position run", &path, e))?;
             records += 1;
@@ -69,19 +96,34 @@ impl PositionRun {
             path,
             file,
             records,
+            tier,
+            first,
+            last,
         })
+    }
+
+    fn bytes(&self) -> u64 {
+        self.records.saturating_mul(widen(RECORD))
     }
 
     fn record_at(&self, i: u64) -> Result<Record, CompactionError> {
         let mut record = [0; RECORD];
         let mut file = &self.file;
-        file.seek(SeekFrom::Start(i * RECORD as u64))
+        file.seek(SeekFrom::Start(i.saturating_mul(widen(RECORD))))
             .and_then(|_| file.read_exact(&mut record))
             .map_err(|e| io_error("read position run", &self.path, e))?;
         Ok(record)
     }
 
+    /// Whether `wanted` falls within the run's range.
+    fn may_hold(&self, wanted: &Record) -> bool {
+        self.records > 0 && (self.first..=self.last).contains(wanted)
+    }
+
     fn contains(&self, wanted: &Record) -> Result<bool, CompactionError> {
+        if !self.may_hold(wanted) {
+            return Ok(false);
+        }
         let (mut low, mut high) = (0, self.records);
         while low < high {
             let mid = low + (high - low) / 2;
@@ -94,11 +136,13 @@ impl PositionRun {
         Ok(false)
     }
 
-    fn reader(
+    /// Its records in order, read through the handle lookups use.
+    fn records(
         &self,
-    ) -> Result<impl Iterator<Item = std::io::Result<Record>> + use<>, CompactionError> {
-        let file =
-            File::open(&self.path).map_err(|e| io_error("open position run", &self.path, e))?;
+    ) -> Result<impl Iterator<Item = std::io::Result<Record>> + '_, CompactionError> {
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| io_error("read position run", &self.path, e))?;
         let mut reader = BufReader::new(file);
         Ok(std::iter::from_fn(move || {
             let mut record = [0; RECORD];
@@ -120,30 +164,29 @@ impl Drop for PositionRun {
 
 /// The positions of the current run of equal keys, and how many rows
 /// repeated one of them.
-pub(super) struct Repeats<'a> {
+pub(super) struct Repeats<'c> {
     keys: ClusterKeys,
     key: Option<(Option<String>, u64)>,
     held: HashSet<IngestPosition>,
     held_max: usize,
-    fan_in: usize,
     runs: Vec<PositionRun>,
     scratch: Option<tempfile::TempDir>,
     spilled: usize,
-    gauges: Gauges<'a>,
+    charge: &'c WriteCharge<'c>,
     pub(super) dropped: u64,
 }
 
-impl<'a> Repeats<'a> {
+impl<'c> Repeats<'c> {
     /// Positions are held up to one open run's share of the sort budget,
-    /// the share [`cursor_batch_rows`] gives each run in the merge.
-    pub(super) fn new(plan: SortPlan<'a>) -> Self {
+    /// the share [`cursor_batch_rows`] gives each run in the merge, and
+    /// charged to `charge` as the set grows and shrinks.
+    pub(super) fn new(plan: SortPlan<'_>, charge: &'c WriteCharge<'c>) -> Self {
         let SortTuning {
             in_memory_max_bytes,
             fan_in,
             ..
         } = plan.tuning;
-        let share =
-            in_memory_max_bytes / u64::try_from(fan_in.saturating_add(1)).unwrap_or(u64::MAX);
+        let share = in_memory_max_bytes / widen(fan_in.saturating_add(1));
         let held_max = usize::try_from(share / HELD_BYTES)
             .unwrap_or(usize::MAX)
             .max(1);
@@ -152,20 +195,12 @@ impl<'a> Repeats<'a> {
             key: None,
             held: HashSet::new(),
             held_max,
-            fan_in: fan_in.max(2),
             runs: Vec::new(),
             scratch: None,
             spilled: 0,
-            gauges: plan.gauges,
+            charge,
             dropped: 0,
         }
-    }
-
-    /// The bytes the positions held in memory are charged.
-    pub(super) fn held_bytes(&self) -> u64 {
-        u64::try_from(self.held.len())
-            .unwrap_or(u64::MAX)
-            .saturating_mul(HELD_BYTES)
     }
 
     /// How many positions are held in memory.
@@ -174,19 +209,24 @@ impl<'a> Repeats<'a> {
         self.held.len()
     }
 
-    /// Drop from `rows` each one that repeats a position already seen.
+    /// Drop from `rows`, in place, each one that repeats a position
+    /// already seen.
     pub(super) fn drop_from(&mut self, rows: &mut Vec<MinedRecord>) -> Result<(), CompactionError> {
-        let mut kept = Vec::with_capacity(rows.len());
-        for row in rows.drain(..) {
-            if self.keep(&row)? {
-                kept.push(row);
+        let mut failed = None;
+        rows.retain(|row| {
+            if failed.is_some() {
+                return true;
             }
-        }
-        *rows = kept;
-        Ok(())
+            self.keep(row).unwrap_or_else(|e| {
+                failed = Some(e);
+                true
+            })
+        });
+        failed.map_or(Ok(()), Err)
     }
 
-    fn keep(&mut self, row: &MinedRecord) -> Result<bool, CompactionError> {
+    /// Whether `row` is the first with its position among its equal keys.
+    pub(super) fn keep(&mut self, row: &MinedRecord) -> Result<bool, CompactionError> {
         self.follow_key(row);
         let Some(position) = row.ingest_position else {
             return Ok(true);
@@ -196,10 +236,17 @@ impl<'a> Repeats<'a> {
             return Ok(false);
         }
         self.held.insert(position);
+        self.publish();
         if self.held.len() > self.held_max {
             self.spill()?;
         }
         Ok(true)
+    }
+
+    /// Charge the set's slots, allocated or in use.
+    fn publish(&self) {
+        let slots = widen(self.held.capacity());
+        self.charge.positions(slots.saturating_mul(HELD_BYTES));
     }
 
     /// Forget every position once `row`'s key differs from the last.
@@ -214,11 +261,17 @@ impl<'a> Repeats<'a> {
             .key
             .as_ref()
             .is_some_and(|(s, time)| *time == row.time_unix_nano && s.as_deref() == service);
-        if !same {
-            self.key = Some((service.map(str::to_owned), row.time_unix_nano));
-            self.held.clear();
-            self.runs.clear();
+        if same {
+            return;
         }
+        self.key = Some((service.map(str::to_owned), row.time_unix_nano));
+        if self.held.capacity() > KEPT_SLOTS {
+            self.held = HashSet::new();
+            self.publish();
+        } else {
+            self.held.clear();
+        }
+        self.runs.clear();
     }
 
     fn seen(&self, position: IngestPosition) -> Result<bool, CompactionError> {
@@ -248,30 +301,40 @@ impl<'a> Repeats<'a> {
         Ok(path)
     }
 
-    /// Write the held positions as a sorted run and clear them; merge the
-    /// runs into one once there are more than the fan-in.
+    /// Keep `run`, counting it as a spill.
+    fn written(&mut self, run: PositionRun) {
+        self.charge.gauges().spilled(run.bytes());
+        self.runs.push(run);
+    }
+
+    /// Write the held positions as a tier-0 run, then merge each tier that
+    /// has filled into one run of the next.
     fn spill(&mut self) -> Result<(), CompactionError> {
         let mut sorted: Vec<Record> = self.held.drain().map(encode).collect();
         sorted.sort_unstable();
         let path = self.next_path()?;
-        let run = PositionRun::write(path, sorted.into_iter())?;
-        self.gauges
-            .spilled(run.records.saturating_mul(RECORD as u64));
-        self.runs.push(run);
-        if self.runs.len() > self.fan_in {
-            self.merge()?;
+        let run = PositionRun::write(path, 0, sorted.into_iter())?;
+        self.written(run);
+        let mut tier = 0;
+        while self.runs.iter().filter(|run| run.tier == tier).count() >= POSITION_FAN_IN {
+            self.merge_tier(tier)?;
+            tier += 1;
         }
         Ok(())
     }
 
-    /// Merge every run into one, streaming: each run's reader holds one
-    /// buffer. Runs never share a position, since a position is held only
-    /// once it is unseen.
-    fn merge(&mut self) -> Result<(), CompactionError> {
+    /// Merge the runs of `tier` into one run of the next, streaming
+    /// through the runs' own handles. Runs never share a position, since
+    /// a position is held only once it is unseen.
+    fn merge_tier(&mut self, tier: usize) -> Result<(), CompactionError> {
+        let (group, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.runs)
+            .into_iter()
+            .partition(|run| run.tier == tier);
+        self.runs = rest;
         let path = self.next_path()?;
-        let mut readers = Vec::with_capacity(self.runs.len());
-        for run in &self.runs {
-            readers.push(run.reader()?);
+        let mut readers = Vec::with_capacity(group.len());
+        for run in &group {
+            readers.push(run.records()?);
         }
         let mut heap = BinaryHeap::with_capacity(readers.len());
         let mut failed = None;
@@ -283,11 +346,11 @@ impl<'a> Repeats<'a> {
             push_next(&mut readers[i], i, &mut heap, &mut failed);
             Some(record)
         });
-        let run = PositionRun::write(path, merged)?;
+        let run = PositionRun::write(path, tier + 1, merged)?;
         if let Some(e) = failed {
             return Err(io_error("read position run", &run.path, e));
         }
-        self.runs = vec![run];
+        self.written(run);
         Ok(())
     }
 }

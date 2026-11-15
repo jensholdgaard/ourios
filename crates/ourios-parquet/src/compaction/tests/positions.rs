@@ -222,7 +222,8 @@ fn a_repeat_is_dropped_anywhere_among_its_equal_keys() {
         tuning: SortTuning::default(),
         gauges: Gauges(None),
     };
-    let mut repeats = Repeats::new(plan);
+    let charge = WriteCharge::new(plan.gauges);
+    let mut repeats = Repeats::new(plan, &charge);
     let mut rows = vec![
         positioned(1, TS0, at(1, 0)),
         positioned(1, TS0, at(1, 1)),
@@ -401,7 +402,8 @@ fn spilled_and_merged_position_runs_still_find_every_repeat() {
         },
         gauges: Gauges(Some(&stats)),
     };
-    let mut repeats = Repeats::new(plan);
+    let charge = WriteCharge::new(plan.gauges);
+    let mut repeats = Repeats::new(plan, &charge);
     let firsts: Vec<_> = (0..40u32)
         .rev()
         .map(|i| positioned(1, TS0, at(9, i)))
@@ -415,8 +417,49 @@ fn spilled_and_merged_position_runs_still_find_every_repeat() {
 
     assert_eq!(rows.len(), 41, "each position once, and the local row");
     assert_eq!(repeats.dropped, 54);
-    // A run spills each time two positions are held: 20 runs, merged
-    // into one whenever they pass two.
-    assert_eq!(stats.spill_runs(), 20);
+    // A run spills each time two positions are held: 20 runs, and each
+    // eighth of them merges the tier into one run of the next, which
+    // counts as a spill too.
+    assert_eq!(stats.spill_runs(), 22);
     assert!(repeats.held() <= 1);
+}
+
+/// The positions held are charged to the write phase as the set grows,
+/// by the slots it has allocated, and released with a wide run of keys.
+#[test]
+fn held_positions_are_charged_as_they_change() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let (store, part, promoted) = (
+        store_at(bucket.path()),
+        partition(),
+        PromotedAttributes::default(),
+    );
+    let stats = CompactionStats::new();
+    let plan = SortPlan {
+        store: &store,
+        partition: &part,
+        promoted: &promoted,
+        keys: ClusterKeys::TimeOnly,
+        tuning: SortTuning::default(),
+        gauges: Gauges(Some(&stats)),
+    };
+    let charge = WriteCharge::new(plan.gauges);
+    let mut repeats = Repeats::new(plan, &charge);
+    let mut rows: Vec<_> = (0..2_000u32)
+        .map(|i| positioned(1, TS0, at(4, i)))
+        .collect();
+    repeats.drop_from(&mut rows).expect("dropped");
+    let held = stats.usage(MemoryPhase::Write);
+    assert!(
+        held >= 2_000 * 32,
+        "{held} bytes charged for 2000 positions"
+    );
+    assert_eq!(stats.peak(MemoryPhase::Write), held);
+
+    let mut next = vec![positioned(1, TS0 + 1, at(4, 0))];
+    repeats.drop_from(&mut next).expect("dropped");
+    assert!(
+        stats.usage(MemoryPhase::Write) < held / 10,
+        "released with the key"
+    );
 }

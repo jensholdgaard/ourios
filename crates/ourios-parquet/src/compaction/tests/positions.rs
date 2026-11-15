@@ -55,6 +55,23 @@ fn declares_positions(store: &Store, key: &str) -> bool {
     declared[0]
 }
 
+/// `rows`, sorted by the fields these tests vary.
+fn sorted_rows(rows: &[MinedRecord]) -> Vec<MinedRecord> {
+    let mut rows = rows.to_vec();
+    rows.sort_by(|a, b| row_key(a).cmp(&row_key(b)));
+    rows
+}
+
+/// The rows of `rows` without a position, sorted as [`sorted_rows`] does.
+fn unpositioned(rows: &[MinedRecord]) -> Vec<MinedRecord> {
+    let local: Vec<_> = rows
+        .iter()
+        .filter(|r| r.ingest_position.is_none())
+        .cloned()
+        .collect();
+    sorted_rows(&local)
+}
+
 /// How a test compacts: wholly in memory, or spilling every input as a
 /// run and merging two at a time.
 #[derive(Debug, Clone, Copy)]
@@ -139,11 +156,10 @@ fn rfc0065_33_compaction_keeps_one_row_per_position_and_every_row_without_one() 
             "{sorted:?}: a position twice"
         );
         assert_eq!(distinct.len(), kept.len(), "{sorted:?}");
-        let unpositioned = rows.iter().filter(|r| r.ingest_position.is_none()).count();
         assert_eq!(
-            unpositioned,
-            local.len(),
-            "{sorted:?}: every local row kept"
+            unpositioned(&rows),
+            sorted_rows(&local),
+            "{sorted:?}: every local row kept, value-equal"
         );
         assert_eq!(
             outcome.rows,
@@ -301,8 +317,7 @@ proptest::proptest! {
             proptest::prop_assert!(kept.insert(position, row.clone()).is_none(), "{position:?} twice");
         }
         proptest::prop_assert_eq!(kept, written);
-        let unpositioned = got.iter().filter(|r| r.ingest_position.is_none()).count();
-        proptest::prop_assert_eq!(unpositioned, local);
+        proptest::prop_assert_eq!(unpositioned(&got), sorted_rows(&locals));
         proptest::prop_assert_eq!(outcome.rows, got.len() as u64);
     }
 }

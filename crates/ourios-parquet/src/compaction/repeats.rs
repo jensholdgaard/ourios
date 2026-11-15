@@ -136,7 +136,8 @@ impl PositionRun {
         Ok(false)
     }
 
-    /// Its records in order, read through the handle lookups use.
+    /// Its records in order, read through the handle lookups use; a read
+    /// that comes up short is an error.
     fn records(
         &self,
     ) -> Result<impl Iterator<Item = std::io::Result<Record>> + '_, CompactionError> {
@@ -144,13 +145,11 @@ impl PositionRun {
         file.seek(SeekFrom::Start(0))
             .map_err(|e| io_error("read position run", &self.path, e))?;
         let mut reader = BufReader::new(file);
-        Ok(std::iter::from_fn(move || {
+        // Exactly the records written: a run cut short is an error, never
+        // an earlier end that would lose the positions past the cut.
+        Ok((0..self.records).map(move |_| {
             let mut record = [0; RECORD];
-            match reader.read_exact(&mut record) {
-                Ok(()) => Some(Ok(record)),
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
-                Err(e) => Some(Err(e)),
-            }
+            reader.read_exact(&mut record).map(|()| record)
         }))
     }
 }
@@ -178,8 +177,9 @@ pub(super) struct Repeats<'c> {
 
 impl<'c> Repeats<'c> {
     /// Positions are held up to one open run's share of the sort budget,
-    /// the share [`cursor_batch_rows`] gives each run in the merge, and
-    /// charged to `charge` as the set grows and shrinks.
+    /// the share [`cursor_batch_rows`] gives each run in the merge, with
+    /// room in it for their sorted copy when they spill, and are charged
+    /// to `charge` as the set grows and shrinks.
     pub(super) fn new(plan: SortPlan<'_>, charge: &'c WriteCharge<'c>) -> Self {
         let SortTuning {
             in_memory_max_bytes,
@@ -187,7 +187,9 @@ impl<'c> Repeats<'c> {
             ..
         } = plan.tuning;
         let share = in_memory_max_bytes / widen(fan_in.saturating_add(1));
-        let held_max = usize::try_from(share / HELD_BYTES)
+        // A spill holds the set and its sorted copy at once, so the share
+        // pays for both.
+        let held_max = usize::try_from(share / (HELD_BYTES + widen(RECORD)))
             .unwrap_or(usize::MAX)
             .max(1);
         Self {
@@ -310,11 +312,16 @@ impl<'c> Repeats<'c> {
     /// Write the held positions as a tier-0 run, then merge each tier that
     /// has filled into one run of the next.
     fn spill(&mut self) -> Result<(), CompactionError> {
-        let mut sorted: Vec<Record> = self.held.drain().map(encode).collect();
+        let mut sorted: Vec<Record> = Vec::with_capacity(self.held.len());
+        let table = widen(self.held.capacity()).saturating_mul(HELD_BYTES);
+        let buffer = widen(sorted.capacity()).saturating_mul(widen(RECORD));
+        self.charge.positions(table.saturating_add(buffer));
+        sorted.extend(self.held.drain().map(encode));
         sorted.sort_unstable();
         let path = self.next_path()?;
         let run = PositionRun::write(path, 0, sorted.into_iter())?;
         self.written(run);
+        self.publish();
         let mut tier = 0;
         while self.runs.iter().filter(|run| run.tier == tier).count() >= POSITION_FAN_IN {
             self.merge_tier(tier)?;
@@ -366,5 +373,42 @@ fn push_next(
         Some(Ok(record)) => heap.push(Reverse((record, i))),
         Some(Err(e)) => *failed = Some(e),
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn position(index: u32) -> IngestPosition {
+        IngestPosition {
+            group: 1,
+            seq: 2,
+            index,
+        }
+    }
+
+    /// A run cut short on scratch, mid-record or a record short, reads as
+    /// an error rather than an earlier end, so no position it held is lost
+    /// to a merge.
+    #[test]
+    fn a_truncated_position_run_is_an_error_not_an_end() {
+        let dir = tempfile::tempdir().expect("temp");
+        for cut in [20, 32] {
+            let path = dir.path().join(format!("cut-{cut}.run"));
+            let records = (0..3).map(|i| encode(position(i)));
+            let run = PositionRun::write(path.clone(), 0, records).expect("write");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(cut))
+                .expect("truncate");
+            let read: Vec<_> = run.records().expect("records").collect();
+            assert!(
+                read.iter().any(Result::is_err),
+                "cut at {cut} bytes read as {} whole records",
+                read.iter().filter(|r| r.is_ok()).count()
+            );
+        }
     }
 }

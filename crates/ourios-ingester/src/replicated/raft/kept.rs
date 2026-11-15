@@ -30,6 +30,19 @@ pub struct Bounds {
     pub rows: usize,
 }
 
+/// Rows kept per group until the local Parquet cache holds them: a
+/// starting value.
+pub const ROW_BOUND: usize = 64 * 1024 * 1024;
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Self {
+            audit: AUDIT_CEILING,
+            rows: ROW_BOUND,
+        }
+    }
+}
+
 /// What a replica dropped from what it keeps, since it started.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Dropped {
@@ -46,7 +59,15 @@ pub struct Kept {
     audit_bytes: usize,
     row_bytes: usize,
     gap: Option<u64>,
+    /// The last cut applied; `0` before any.
+    cut: u64,
     dropped: Dropped,
+}
+
+impl Default for Kept {
+    fn default() -> Self {
+        Self::new(Bounds::default())
+    }
 }
 
 impl Kept {
@@ -59,6 +80,7 @@ impl Kept {
             audit_bytes: 0,
             row_bytes: 0,
             gap: None,
+            cut: 0,
             dropped: Dropped::default(),
         }
     }
@@ -90,6 +112,7 @@ impl Kept {
 
     /// Drop everything at or below `cut`, and clear a gap the cut reaches.
     pub fn checkpoint(&mut self, cut: u64) {
+        self.cut = self.cut.max(cut);
         while let Some((_, event)) = self.audit.front().filter(|(index, _)| *index <= cut) {
             self.audit_bytes -= audit_bytes(event);
             self.audit.pop_front();
@@ -124,6 +147,13 @@ impl Kept {
     #[must_use]
     pub fn gap(&self) -> Option<u64> {
         self.gap
+    }
+
+    /// The entries from the last applied cut through the gap; `0` with
+    /// no gap.
+    #[must_use]
+    pub fn gap_reach(&self) -> u64 {
+        self.gap.map_or(0, |gap| gap.saturating_sub(self.cut))
     }
 
     #[must_use]

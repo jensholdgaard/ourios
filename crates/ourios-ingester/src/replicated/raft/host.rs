@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use openraft::async_runtime::WatchReceiver as _;
@@ -20,9 +20,10 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use super::gate::SyncGate;
+use super::kept::{Bounds, Kept};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
 use super::mining::{GroupMiner, Mined};
-use super::state_machine::{Applied, GroupSm};
+use super::state_machine::{Applied, AppliedEvent, GroupSm};
 use super::telemetry::{Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
 use super::types::{LogId, NodeId, RaftTypes};
@@ -39,11 +40,15 @@ pub enum HostRole {
     /// and replicates, and mining never sits on the ack path (§6.5).
     Voter,
     /// A tail replica of its groups: mines each one's entries as its state
-    /// machine applies them and hands what it mined to `mined`, in log
-    /// order per group, waiting while the channel is full. Opening the
-    /// host replays the committed log through the miner, so `mined` must
-    /// be read while it opens.
-    Tail { mined: mpsc::Sender<GroupMined> },
+    /// machine applies them, keeps the output for a takeover within
+    /// `kept` (§6.7), and hands it to `mined`, in log order per group,
+    /// waiting while the channel is full. Opening the host replays the
+    /// committed log through the miner, so `mined` must be read while it
+    /// opens.
+    Tail {
+        mined: mpsc::Sender<GroupMined>,
+        kept: Bounds,
+    },
 }
 
 /// What a tail replica's miner mined from one of `group`'s entries.
@@ -156,21 +161,22 @@ impl Launch<'_> {
         let gate = Arc::clone(&self.gate);
         let (sm, applied) = match &self.spec.role {
             HostRole::Voter => (blocking(move || GroupSm::open(&dir, gate)).await, None),
-            HostRole::Tail { mined } => {
+            HostRole::Tail { mined, kept } => {
                 let (events, applied) = mpsc::channel(APPLIED_CAPACITY);
                 let sm = blocking(move || GroupSm::open_mining(&dir, gate, events)).await;
-                (sm, Some((applied, mined.clone())))
+                (sm, Some((applied, mined.clone(), *kept)))
             }
         };
         let mut sm = sm.map_err(|source| HostError::Snapshot { group, source })?;
         sm.count_stops(group, self.meters.storage());
         // `Raft::new` applies the committed entries the log replays before
         // it returns, so the miner must already be taking them.
-        let mining = applied.map(|(applied, mined)| {
+        let mining = applied.map(|(applied, mined, kept)| {
             let miner = GroupMiner::new(reader.clone());
             let follow = Follow {
                 group,
                 mined,
+                kept: Arc::new(Mutex::new(Kept::new(kept))),
                 storage: self.meters.storage(),
             };
             Mining::start(follow, miner, applied)
@@ -268,6 +274,7 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 struct Follow {
     group: u32,
     mined: mpsc::Sender<GroupMined>,
+    kept: Arc<Mutex<Kept>>,
     storage: Storage,
 }
 
@@ -284,6 +291,11 @@ impl Follow {
         mut stop: watch::Receiver<bool>,
     ) {
         while let Some(event) = next(&mut applied, &mut stop).await {
+            let index = event.at.index;
+            let cut = match &event.event {
+                AppliedEvent::Checkpoint(cut) => Some(cut.index),
+                _ => None,
+            };
             let mining = tokio::task::spawn_blocking(move || {
                 let followed = miner.apply(event);
                 (miner, followed)
@@ -294,7 +306,10 @@ impl Follow {
             };
             miner = back;
             let handed_on = match followed {
-                Ok(out) => self.hand_on(out, &mut stop).await,
+                Ok(out) => {
+                    self.keep(index, &out, cut);
+                    self.hand_on(out, &mut stop).await
+                }
                 Err(error) => {
                     self.storage.miner_stopped(self.group, &error);
                     false
@@ -303,6 +318,18 @@ impl Follow {
             if !handed_on {
                 return;
             }
+        }
+    }
+
+    /// Keep what the entry at `index` mined, then drop what an applied
+    /// checkpoint's `cut` passes.
+    fn keep(&self, index: u64, out: &Mined, cut: Option<u64>) {
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        if !(out.audit.is_empty() && out.rows.is_empty()) {
+            kept.keep(index, out.clone());
+        }
+        if let Some(cut) = cut {
+            kept.checkpoint(cut);
         }
     }
 
@@ -532,8 +559,8 @@ mod tests {
     use ourios_wal::Control;
 
     use super::super::mining::GroupLogRead;
-    use super::super::mining::tests::{batch_at, configured, time};
-    use super::super::snapshot_record::GroupMinerConfig;
+    use super::super::mining::tests::{batch_at, block, configured, corpus, time};
+    use super::super::snapshot_record::{GroupMinerConfig, IdBlock};
     use super::super::state_machine::AppliedEvent;
     use super::super::types::{Entry, GroupEntry};
     use super::*;
@@ -615,6 +642,7 @@ mod tests {
         let follow = Follow {
             group: 0,
             mined,
+            kept: Arc::default(),
             storage: Storage::global(),
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
@@ -722,6 +750,83 @@ mod tests {
         LogId {
             leader_id: CommittedLeaderId::new(2),
             index,
+        }
+    }
+
+    /// The event a tail replica's state machine sends for `entry`.
+    fn event_of(entry: GroupEntry) -> AppliedEvent {
+        match entry {
+            GroupEntry::Batch(batch) => AppliedEvent::Batch(batch),
+            GroupEntry::Control(Control::MinerConfig(body)) => {
+                AppliedEvent::MinerConfig(GroupMinerConfig::new(body).expect("valid"))
+            }
+            GroupEntry::Control(Control::IdBlock { after, through }) => {
+                AppliedEvent::IdBlock(IdBlock::new(after, through).expect("valid"))
+            }
+            GroupEntry::Control(other) => panic!("not sent here: {other:?}"),
+        }
+    }
+
+    /// RFC 0065 §6.7: a tail replica keeps what its miner mined, hands the
+    /// same on, and drops what an applied checkpoint's cut passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tail_replica_keeps_its_output_until_a_checkpoint_passes_it() {
+        let lines = corpus();
+        let mut entries = vec![configured(0.7), block(0, 10_000)];
+        let chunks = (1..).zip(lines.chunks(5).skip(1).take(6));
+        entries.extend(chunks.map(|(n, chunk)| batch_at(time(n), "acme", chunk)));
+        let (events, applied) = mpsc::channel(16);
+        let (mined, mut handed) = mpsc::channel(16);
+        let kept: Arc<Mutex<Kept>> = Arc::default();
+        let follow = Follow {
+            group: 0,
+            mined,
+            kept: Arc::clone(&kept),
+            storage: Storage::global(),
+        };
+        let mining = Mining::start(follow, GroupMiner::new(EmptyLog), applied);
+        for (index, entry) in (1..).zip(entries) {
+            let event = event_of(entry);
+            events
+                .send(Applied {
+                    at: log_id(index),
+                    event,
+                })
+                .await
+                .expect("sent");
+        }
+        let cut = AppliedEvent::Checkpoint(log_id(5));
+        events
+            .send(Applied {
+                at: log_id(9),
+                event: cut,
+            })
+            .await
+            .expect("sent");
+        drop(events);
+        let mut rows = Vec::new();
+        while let Some(GroupMined { mined, .. }) = handed.recv().await {
+            rows.extend(mined.rows);
+        }
+        mining.stop().await;
+
+        assert_eq!(rows.len(), 30, "every row handed on");
+        let kept = kept.lock().expect("kept");
+        let above: Vec<_> = rows
+            .into_iter()
+            .filter(|row| row.position.seq > 5)
+            .collect();
+        assert_eq!(kept.rows().cloned().collect::<Vec<_>>(), above);
+        assert_eq!(above.len(), 15, "three batches above the cut");
+        assert_eq!(kept.gap(), None);
+    }
+
+    /// A log that holds no entry.
+    struct EmptyLog;
+
+    impl GroupLogRead for EmptyLog {
+        fn entry(&self, _: u64) -> Option<Entry> {
+            None
         }
     }
 

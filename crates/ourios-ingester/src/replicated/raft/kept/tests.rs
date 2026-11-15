@@ -208,3 +208,23 @@ fn a_cut_at_or_above_the_gap_clears_it() {
     let dropped = log.iter().map(|(_, m)| m.audit.len() as u64).sum::<u64>();
     assert_eq!(kept.dropped().audit, dropped, "counts outlive the gap");
 }
+
+/// The gap's reach is the entries from the last applied cut to the gap,
+/// or from the group's start before any checkpoint, and none without one.
+#[test]
+fn the_gap_reaches_from_the_last_applied_cut() {
+    let log = mined_log(&entries(10));
+    let mut kept = kept_all(
+        &log,
+        Bounds {
+            audit: 1,
+            rows: usize::MAX,
+        },
+    );
+    let gap = kept.gap().expect("every event dropped");
+    assert_eq!(kept.gap_reach(), gap);
+    kept.checkpoint(gap - 2);
+    assert_eq!(kept.gap_reach(), 2);
+    kept.checkpoint(gap);
+    assert_eq!(kept.gap_reach(), 0);
+}

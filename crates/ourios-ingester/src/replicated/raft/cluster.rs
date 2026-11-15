@@ -23,6 +23,7 @@ use tonic::transport::server::TcpIncoming;
 use super::RaftTimings;
 use super::gate::SyncGate;
 use super::host::{GroupHost, GroupMined, GroupRaft, HostRole, HostSpec, Wiring};
+use super::kept::Bounds;
 use super::log_store::group_dir;
 use super::state_machine::GroupSm;
 use super::telemetry::Meters;
@@ -468,6 +469,7 @@ impl Cluster {
             let role = match i.checked_sub(voting).and_then(|t| mined.get(t)) {
                 Some(mined) => HostRole::Tail {
                     mined: mined.clone(),
+                    kept: Bounds::default(),
                 },
                 None => HostRole::Voter,
             };

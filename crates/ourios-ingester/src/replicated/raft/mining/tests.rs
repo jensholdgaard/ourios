@@ -120,7 +120,10 @@ fn in_force(body: MinerConfigV1) -> GroupMinerConfig {
 /// The events a mining replica's state machine sends for `entries`,
 /// applied from index 1, through a channel of `capacity` drained as they
 /// come.
-fn events_of(entries: &[GroupEntry], capacity: usize) -> Vec<Applied> {
+pub(in crate::replicated::raft) fn events_of(
+    entries: &[GroupEntry],
+    capacity: usize,
+) -> Vec<Applied> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
@@ -165,7 +168,7 @@ impl GroupLogRead for HeldLog {
 }
 
 /// A miner over a log holding `entries` from index 1.
-fn miner_of(entries: &[GroupEntry]) -> GroupMiner {
+pub(in crate::replicated::raft) fn miner_of(entries: &[GroupEntry]) -> GroupMiner {
     let held = logged(entries).into_iter().map(|e| (e.log_id.index, e));
     GroupMiner::new(HeldLog(held.collect()))
 }

@@ -13,6 +13,7 @@ pub mod flusher;
 pub mod formation;
 pub mod host;
 pub mod id_blocks;
+pub mod kept;
 pub mod learners;
 pub mod log_ids;
 pub mod log_store;

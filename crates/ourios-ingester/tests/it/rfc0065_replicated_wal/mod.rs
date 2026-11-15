@@ -14,11 +14,12 @@
 //! RFC0065.30 run on the crate-internal cluster harness, so they are unit
 //! tests: `replicated::write::tests`, `replicated::raft::cluster::tests`,
 //! `replicated::raft::formation::tests` and `replicated::raft::flusher::tests`.
-//! RFC0065.33 runs beside RFC0009.2 in `ourios-parquet`'s
-//! `compaction::tests::positions`, and its per-tenant count in this crate's
-//! `compactor::tenant_metrics_tests`.
+//! RFC0065.33's compaction and erasure arms run beside RFC0009.2 in
+//! `ourios-parquet`'s `compaction::tests::positions`, and its per-tenant
+//! count in this crate's `compactor::tenant_metrics_tests`.
 
 mod checkpoints;
+mod compaction;
 mod formation;
 mod local_backend;
 mod log_entries;

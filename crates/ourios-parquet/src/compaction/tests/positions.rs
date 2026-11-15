@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ourios_core::record::IngestPosition;
 
+use crate::compaction::repeats::Repeats;
+
 use super::*;
 
 fn at(seq: u64, index: u32) -> IngestPosition {
@@ -206,7 +208,21 @@ fn rfc0065_33_a_partition_without_positions_compacts_without_them() {
 /// size of one run of equal keys.
 #[test]
 fn a_repeat_is_dropped_anywhere_among_its_equal_keys() {
-    let mut repeats = Repeats::new(ClusterKeys::TimeOnly);
+    let bucket = tempfile::tempdir().expect("temp");
+    let (store, part, promoted) = (
+        store_at(bucket.path()),
+        partition(),
+        PromotedAttributes::default(),
+    );
+    let plan = SortPlan {
+        store: &store,
+        partition: &part,
+        promoted: &promoted,
+        keys: ClusterKeys::TimeOnly,
+        tuning: SortTuning::default(),
+        gauges: Gauges(None),
+    };
+    let mut repeats = Repeats::new(plan);
     let mut rows = vec![
         positioned(1, TS0, at(1, 0)),
         positioned(1, TS0, at(1, 1)),
@@ -216,7 +232,7 @@ fn a_repeat_is_dropped_anywhere_among_its_equal_keys() {
         positioned(1, TS0 + 1, at(2, 0)),
         positioned(1, TS0 + 1, at(2, 0)),
     ];
-    repeats.drop_from(&mut rows);
+    repeats.drop_from(&mut rows).expect("dropped");
     let kept: Vec<_> = rows
         .iter()
         .map(|r| (r.time_unix_nano, r.ingest_position))
@@ -230,11 +246,7 @@ fn a_repeat_is_dropped_anywhere_among_its_equal_keys() {
     ];
     assert_eq!(kept, expected);
     assert_eq!(repeats.dropped, 2);
-    assert_eq!(
-        repeats.seen.len(),
-        1,
-        "only the last key's positions are held"
-    );
+    assert_eq!(repeats.held(), 1, "only the last key's positions are held");
 }
 
 proptest::proptest! {
@@ -292,4 +304,119 @@ proptest::proptest! {
         proptest::prop_assert_eq!(unpositioned, local);
         proptest::prop_assert_eq!(outcome.rows, got.len() as u64);
     }
+}
+
+/// RFC 0036 §3.2: the spilled and in-memory paths write the same bytes
+/// with repeats dropped too, row groups cut at the same rows, whatever
+/// share of each merge chunk the repeats take.
+#[test]
+fn spilled_and_in_memory_write_the_same_bytes_with_repeats_dropped() {
+    let rows: Vec<_> = (0..3_000u32)
+        .map(|i| positioned(1, TS0 + u64::from(i), at(1, i)))
+        .collect();
+    let bytes: Vec<Vec<u8>> = Sorted::BOTH
+        .iter()
+        .map(|sorted| {
+            let bucket = tempfile::tempdir().expect("temp");
+            let store = store_at(bucket.path());
+            let part = partition();
+            write_positioned(&store, &rows);
+            write_positioned(&store, &rows);
+            let tuning = SortTuning {
+                compacted_flush_bytes: Some(16 * 1024),
+                ..sorted.tuning()
+            };
+            let promoted = PromotedAttributes::default();
+            let keys = ClusterKeys::for_promoted(&promoted);
+            let outcome = compact_sorted(&store, &part, &promoted, keys, tuning).expect("compact");
+            assert_eq!(outcome.rows_deduplicated, 3_000, "{sorted:?}");
+            let committed = outcome.committed.expect("committed");
+            let key = format!("{}/{}", partition_data_prefix(&part), committed.file);
+            store.get_blocking(&key).expect("get")
+        })
+        .collect();
+    assert!(bytes[0] == bytes[1], "the two paths wrote different bytes");
+}
+
+/// One run of equal keys larger than its share of the budget, as rows
+/// without a timestamp make (they all sort at `(service, 0)`): its
+/// positions spill to scratch rather than grow in memory, and every
+/// repeat is still dropped.
+#[test]
+fn a_run_of_equal_keys_past_its_share_spills_its_positions_and_stays_exact() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    let part = partition();
+    let rows: Vec<_> = (0..200u32).map(|i| positioned(1, TS0, at(5, i))).collect();
+    write_positioned(&store, &rows);
+    write_positioned(&store, &rows[..150]);
+    write_positioned(&store, &rows[50..]);
+    // Rows fit in memory; each run's share of the budget holds three
+    // positions.
+    let tuning = SortTuning {
+        in_memory_max_bytes: 10 * 1024 * 1024,
+        fan_in: 100_000,
+        ..SortTuning::default()
+    };
+    let stats = CompactionStats::new();
+    let promoted = PromotedAttributes::default();
+    let keys = ClusterKeys::for_promoted(&promoted);
+    let mut hooks = RowHooks {
+        stats: Some(&stats),
+        ..RowHooks::default()
+    };
+
+    let outcome =
+        compact_sorted_hooked(&store, &part, &promoted, keys, tuning, &mut hooks).expect("compact");
+
+    assert_eq!(outcome.rows, 200);
+    assert_eq!(outcome.rows_deduplicated, 300);
+    let got = read_partition_rows(&store);
+    let distinct: BTreeSet<_> = got.iter().filter_map(|r| r.ingest_position).collect();
+    assert_eq!(distinct.len(), 200);
+    assert!(stats.spill_runs() > 0, "the positions spilled");
+}
+
+/// With no budget every new position spills, and the runs merge each time
+/// they pass the fan-in of 2; a repeat is still found wherever its first
+/// copy went, in memory, in a run or in a merged run.
+#[test]
+fn spilled_and_merged_position_runs_still_find_every_repeat() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let (store, part, promoted) = (
+        store_at(bucket.path()),
+        partition(),
+        PromotedAttributes::default(),
+    );
+    let stats = CompactionStats::new();
+    let plan = SortPlan {
+        store: &store,
+        partition: &part,
+        promoted: &promoted,
+        keys: ClusterKeys::TimeOnly,
+        tuning: SortTuning {
+            in_memory_max_bytes: 0,
+            fan_in: 2,
+            ..SortTuning::default()
+        },
+        gauges: Gauges(Some(&stats)),
+    };
+    let mut repeats = Repeats::new(plan);
+    let firsts: Vec<_> = (0..40u32)
+        .rev()
+        .map(|i| positioned(1, TS0, at(9, i)))
+        .collect();
+    let mut rows = firsts.clone();
+    rows.extend(firsts.iter().step_by(3).cloned());
+    rows.push(rec(1, TS0));
+    rows.extend(firsts.iter().cloned());
+
+    repeats.drop_from(&mut rows).expect("dropped");
+
+    assert_eq!(rows.len(), 41, "each position once, and the local row");
+    assert_eq!(repeats.dropped, 54);
+    // A run spills each time two positions are held: 20 runs, merged
+    // into one whenever they pass two.
+    assert_eq!(stats.spill_runs(), 20);
+    assert!(repeats.held() <= 1);
 }

@@ -11,7 +11,9 @@ use super::*;
 use std::cell::Cell;
 
 use ourios_core::otlp::{AnyValue, KeyValue, any_value};
-use ourios_core::record::{IngestPosition, Param};
+use ourios_core::record::Param;
+
+use super::repeats::Repeats;
 
 use crate::record_batch::{IngestColumns, mined_records_to_batch_in};
 
@@ -80,11 +82,13 @@ pub(super) fn sort_inputs_into(
         .set_limit(MemoryPhase::Write, widen(writer.flush_bytes()));
     let mut output = Output {
         writer: &mut writer,
-        repeats: Repeats::new(plan.keys),
+        repeats: Repeats::new(plan),
         gauges: plan.gauges,
+        pending: Vec::new(),
     };
     formation.finish(&mut output)?;
     totals.rows_deduplicated = output.repeats.dropped;
+    output.finish()?;
     totals.rows = totals.rows.saturating_sub(totals.rows_deduplicated);
     Ok((totals, writer))
 }
@@ -97,68 +101,45 @@ fn set_sort_limits(plan: SortPlan<'_>) {
 }
 
 /// Where the sorted rows go: the consolidated file, less each repeat of
-/// an ingest position.
+/// an ingest position. The rows that survive reach the writer in whole
+/// [`SUB_BATCH_ROWS`] chunks and one final remainder, however the repeats
+/// fell, so the row groups the writer cuts at chunk boundaries are the
+/// same on the in-memory and the spilled path (RFC 0036 §3.2).
 struct Output<'w, 'a> {
     writer: &'w mut Writer,
-    repeats: Repeats,
+    repeats: Repeats<'a>,
     gauges: Gauges<'a>,
+    pending: Vec<MinedRecord>,
 }
 
 impl Output<'_, '_> {
     fn write(&mut self, rows: &mut Vec<MinedRecord>) -> Result<(), CompactionError> {
-        self.repeats.drop_from(rows);
-        write_rows(self.writer, rows, self.gauges)
-    }
-}
-
-/// Drops each row that repeats the ingest position of a row already
-/// written (RFC 0065 §6.6). A repeat is the same row (§6.5), so it has
-/// the same §3.1 key and arrives among the rows of equal key; only their
-/// positions are held, so memory follows the widest run of equal keys,
-/// never the partition. A row without a position is never a repeat.
-pub(super) struct Repeats {
-    keys: ClusterKeys,
-    key: Option<(Option<String>, u64)>,
-    pub(super) seen: HashSet<IngestPosition>,
-    pub(super) dropped: u64,
-}
-
-impl Repeats {
-    pub(super) fn new(keys: ClusterKeys) -> Self {
-        Self {
-            keys,
-            key: None,
-            seen: HashSet::new(),
-            dropped: 0,
+        self.repeats.drop_from(rows)?;
+        self.pending.append(rows);
+        let whole = self.pending.len() - self.pending.len() % SUB_BATCH_ROWS;
+        if whole > 0 {
+            let rest = self.pending.split_off(whole);
+            let chunks = std::mem::replace(&mut self.pending, rest);
+            self.append(&chunks)?;
         }
+        Ok(())
     }
 
-    pub(super) fn drop_from(&mut self, rows: &mut Vec<MinedRecord>) {
-        rows.retain(|row| self.keep(row));
+    /// Write the rows still held.
+    fn finish(mut self) -> Result<(), CompactionError> {
+        let rest = std::mem::take(&mut self.pending);
+        self.append(&rest)
     }
 
-    fn keep(&mut self, row: &MinedRecord) -> bool {
-        let service = match self.keys {
-            ClusterKeys::ServiceThenTime => {
-                project_string_value(&row.resource_attributes, SERVICE_NAME_KEY)
-            }
-            ClusterKeys::TimeOnly => None,
-        };
-        let same_key = self
-            .key
-            .as_ref()
-            .is_some_and(|(s, time)| *time == row.time_unix_nano && s.as_deref() == service);
-        if !same_key {
-            self.key = Some((service.map(str::to_owned), row.time_unix_nano));
-            self.seen.clear();
-        }
-        match row.ingest_position {
-            Some(position) if !self.seen.insert(position) => {
-                self.dropped = self.dropped.saturating_add(1);
-                false
-            }
-            Some(_) | None => true,
-        }
+    /// Append `rows`, charging the writer's in-progress row group and the
+    /// positions [`Repeats`] holds to the write phase.
+    fn append(&mut self, rows: &[MinedRecord]) -> Result<(), CompactionError> {
+        let (gauges, held) = (self.gauges, self.repeats.held_bytes());
+        self.writer
+            .append_records_observed(rows, &mut |in_progress| {
+                gauges.set(MemoryPhase::Write, widen(in_progress).saturating_add(held));
+            })
+            .map_err(CompactionError::Write)
     }
 }
 
@@ -359,20 +340,6 @@ fn emit_in_memory(
     output.write(&mut rows)?;
     plan.gauges.set(MemoryPhase::Sort, 0);
     Ok(())
-}
-
-/// Append `rows` to the consolidated `writer`, charging its in-progress
-/// row group to the write phase as each sub-batch lands.
-fn write_rows(
-    writer: &mut Writer,
-    rows: &[MinedRecord],
-    gauges: Gauges<'_>,
-) -> Result<(), CompactionError> {
-    writer
-        .append_records_observed(rows, &mut |in_progress| {
-            gauges.set(MemoryPhase::Write, widen(in_progress));
-        })
-        .map_err(CompactionError::Write)
 }
 
 /// Sorted runs on local scratch, in spill order.

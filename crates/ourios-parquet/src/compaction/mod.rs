@@ -57,6 +57,7 @@ const HOUR_NANOS: u64 = 3_600_000_000_000;
 mod commit;
 mod keys;
 mod plan;
+mod repeats;
 mod sort;
 mod stats;
 #[cfg(test)]

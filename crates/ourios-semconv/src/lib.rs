@@ -839,6 +839,45 @@ pub const OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS_DESCRIPTION: &str =
 /// `ourios.wal.replication.flusher.assignments` unit (UCUM).
 pub const OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS_UNIT: &str = "{assignment}";
 
+/// `ourios.wal.replication.kept.audit.dropped` (counter, unit `{event}`).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED: &str =
+    "ourios.wal.replication.kept.audit.dropped";
+
+/// `ourios.wal.replication.kept.audit.dropped` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED_DESCRIPTION: &str =
+    "Audit events a tail replica dropped from what it keeps for a takeover (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.kept.audit.dropped` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED_UNIT: &str = "{event}";
+
+/// `ourios.wal.replication.kept.audit.usage` (gauge, unit `By`).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE: &str = "ourios.wal.replication.kept.audit.usage";
+
+/// `ourios.wal.replication.kept.audit.usage` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_DESCRIPTION: &str = "Estimated bytes of the audit events a tail replica keeps for a takeover, per replication group (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.kept.audit.usage` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_UNIT: &str = "By";
+
+/// `ourios.wal.replication.kept.gap` (gauge, unit `{entry}`).
+pub const OURIOS_WAL_REPLICATION_KEPT_GAP: &str = "ourios.wal.replication.kept.gap";
+
+/// `ourios.wal.replication.kept.gap` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_KEPT_GAP_DESCRIPTION: &str = "Log entries between the last checkpoint a tail replica applied and the highest entry whose kept output it dropped (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.kept.gap` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_KEPT_GAP_UNIT: &str = "{entry}";
+
+/// `ourios.wal.replication.kept.row.dropped` (counter, unit `{row}`).
+pub const OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED: &str = "ourios.wal.replication.kept.row.dropped";
+
+/// `ourios.wal.replication.kept.row.dropped` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_DESCRIPTION: &str =
+    "Mined rows a tail replica dropped from what it keeps for a takeover (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.kept.row.dropped` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_UNIT: &str = "{row}";
+
 /// `ourios.wal.replication.lag` (gauge, unit `{entry}`).
 pub const OURIOS_WAL_REPLICATION_LAG: &str = "ourios.wal.replication.lag";
 

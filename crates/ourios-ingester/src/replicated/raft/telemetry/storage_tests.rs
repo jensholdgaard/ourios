@@ -260,3 +260,67 @@ fn a_state_machine_stop_is_the_registered_event_with_its_group() {
     )];
     assert_eq!(logged, expected);
 }
+
+/// A miner's stop is the registered event with its group, counted once
+/// with the `error.type` the registry lists for its cause.
+#[test]
+fn a_miner_stop_is_the_registered_event_with_its_cause() {
+    use crate::replicated::raft::mining::GroupMinerError;
+    use crate::replicated::raft::types::LogId;
+    use openraft::vote::leader_id_std::CommittedLeaderId;
+    use ourios_miner::cluster::{TreeShape, TreeShapeChanged};
+
+    let at = LogId {
+        leader_id: CommittedLeaderId::new(2),
+        index: 9,
+    };
+    let shape = |prefix_depth| TreeShape {
+        prefix_depth,
+        max_node_children: 100,
+    };
+    let shape_changed = TreeShapeChanged {
+        current: shape(2),
+        requested: shape(3),
+    };
+    let reader = Reader::new();
+    let storage = Meters::on(&reader.meter()).storage();
+    let undecodable = GroupMinerError::Undecodable {
+        at,
+        detail: "not a frame".to_owned(),
+    };
+    let logged = events(|| storage.miner_stopped(5, &undecodable));
+
+    let fields = [
+        "error.type=undecodable",
+        "ourios.wal.group=5",
+        "ourios.wal.replication.component=miner",
+    ];
+    let expected = [(
+        semconv::EVENT_OURIOS_WAL_REPLICATION_STOPPED.to_owned(),
+        fields.map(str::to_owned).to_vec(),
+    )];
+    assert_eq!(logged, expected);
+    assert_eq!(reader.points(STOPS), [point(["undecodable", "5", "miner"])]);
+
+    let causes = [
+        undecodable,
+        GroupMinerError::Uncaptured { at, index: 0 },
+        GroupMinerError::ShapeChanged {
+            at,
+            source: shape_changed,
+        },
+        GroupMinerError::OutOfOrder { at, last: at },
+        GroupMinerError::Installed { at },
+        GroupMinerError::Purged { at, index: 1 },
+    ];
+    let types: Vec<_> = causes.iter().map(GroupMinerError::error_type).collect();
+    let registered = [
+        "undecodable",
+        "uncaptured",
+        "shape_changed",
+        "out_of_order",
+        "installed",
+        "purged",
+    ];
+    assert_eq!(types, registered);
+}

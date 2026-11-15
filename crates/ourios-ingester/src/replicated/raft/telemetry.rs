@@ -28,6 +28,7 @@ use ourios_semconv as semconv;
 
 use super::flusher::{Hold, Reason};
 use super::host::GroupRaft;
+use super::mining::GroupMinerError;
 use super::types::{NodeId, RaftTypes, Vote};
 
 type Watch = WatchReceiverOf<RaftTypes, RaftMetrics<RaftTypes>>;
@@ -161,6 +162,7 @@ pub(crate) enum Component {
     LogStore(u32),
     StateMachine(u32),
     VoteLog,
+    Miner(u32),
 }
 
 impl Component {
@@ -169,6 +171,7 @@ impl Component {
             Self::LogStore(_) => "log_store",
             Self::StateMachine(_) => "state_machine",
             Self::VoteLog => "vote_log",
+            Self::Miner(_) => "miner",
         }
     }
 
@@ -179,10 +182,20 @@ impl Component {
     /// Its attributes: with its group, unless it is the node's vote log.
     fn attributes(self) -> Vec<KeyValue> {
         match self {
-            Self::LogStore(group) | Self::StateMachine(group) => vec![self.kv(), group_kv(group)],
+            Self::LogStore(group) | Self::StateMachine(group) | Self::Miner(group) => {
+                vec![self.kv(), group_kv(group)]
+            }
             Self::VoteLog => vec![self.kv()],
         }
     }
+}
+
+/// A component's stop: the groups it stopped in, and why.
+struct Stop<'a> {
+    component: Component,
+    groups: &'a [u32],
+    error_type: &'a str,
+    error: &'a dyn std::fmt::Display,
 }
 
 /// What a storage writer records: each write-and-fsync, and the stops its
@@ -229,31 +242,62 @@ impl Storage {
     /// `component` failed with `error` and stopped serving `groups`: logged
     /// once, and counted once per group.
     pub(crate) fn stopped(&self, component: Component, groups: &[u32], error: &io::Error) {
-        let error_type = error_type(error.kind());
+        self.report(&Stop {
+            component,
+            groups,
+            error_type: &error_type(error.kind()),
+            error,
+        });
+    }
+
+    /// `group`'s miner stopped on `error`: logged and counted once. The
+    /// replica applies on; only its mining stops.
+    pub(crate) fn miner_stopped(&self, group: u32, error: &GroupMinerError) {
+        self.report(&Stop {
+            component: Component::Miner(group),
+            groups: &[group],
+            error_type: error.error_type(),
+            error,
+        });
+    }
+
+    fn report(&self, stop: &Stop<'_>) {
+        let Stop {
+            component,
+            groups,
+            error_type,
+            error,
+        } = *stop;
         let group = match component {
-            Component::LogStore(group) | Component::StateMachine(group) => Some(i64::from(group)),
+            Component::LogStore(group)
+            | Component::StateMachine(group)
+            | Component::Miner(group) => Some(i64::from(group)),
             Component::VoteLog => None,
         };
         tracing::error!(
             name: semconv::EVENT_OURIOS_WAL_REPLICATION_STOPPED,
             {
                 { semconv::OURIOS_WAL_REPLICATION_COMPONENT } = component.as_str(),
-                { crate::metrics::ERROR_TYPE } = error_type.as_str(),
+                { crate::metrics::ERROR_TYPE } = error_type,
                 { semconv::OURIOS_WAL_GROUP } = group,
             },
-            "the replicated WAL's {} stopped groups {groups:?} until the node restarts: {error}",
+            "the replicated WAL's {} stopped in groups {groups:?} until the node restarts: {error}",
             component.as_str(),
         );
         for &group in groups {
-            self.also_stopped(component, group, error.kind());
+            self.count_stop(component, group, error_type.to_owned());
         }
     }
 
     /// `component`, already stopped on an error of `kind`, stops `group`
     /// as well: counted, not logged again.
     pub(crate) fn also_stopped(&self, component: Component, group: u32, kind: io::ErrorKind) {
-        let attributes = [component.kv(), group_kv(group), error_kv(kind)];
-        self.stops.add(1, &attributes);
+        self.count_stop(component, group, error_type(kind));
+    }
+
+    fn count_stop(&self, component: Component, group: u32, error_type: String) {
+        let error = KeyValue::new(crate::metrics::ERROR_TYPE, error_type);
+        self.stops.add(1, &[component.kv(), group_kv(group), error]);
     }
 }
 

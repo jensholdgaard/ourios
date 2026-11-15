@@ -1,7 +1,8 @@
-//! Every group a node votes in, open and running (RFC 0065 §6.1): one
-//! `Raft` per group over its group log, all served by one
-//! [`ReplicationServer`] and reaching their peers through one [`Peers`]
-//! pool.
+//! Every group a node votes in or is a tail replica of, open and running
+//! (RFC 0065 §6.1): one `Raft` per group over its group log, all served by
+//! one [`ReplicationServer`] and reaching their peers through one
+//! [`Peers`] pool. On a tail replica each group's [`GroupMiner`] mines the
+//! entries its state machine applies (§6.5).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -14,19 +15,41 @@ use openraft::storage::RaftLogStorage as _;
 use openraft::type_config::alias::{JoinErrorOf, WatchReceiverOf};
 use openraft::{Raft, RaftMetrics};
 use ourios_wal::WalConfig;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use super::gate::SyncGate;
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
-use super::state_machine::GroupSm;
-use super::telemetry::{Meters, ReplicationTelemetry};
+use super::mining::{GroupMiner, Mined};
+use super::state_machine::{Applied, GroupSm};
+use super::telemetry::{Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
 use super::types::{LogId, NodeId, RaftTypes};
 use super::vote_log::VoteLog;
 use super::{RaftTimings, group_config};
 
 pub type GroupRaft = Raft<RaftTypes, GroupSm>;
+
+/// What a node is to the groups it hosts (RFC 0065 §3.8): it votes in
+/// them or is a tail replica of them, never both.
+#[derive(Debug, Clone)]
+pub enum HostRole {
+    /// Votes in its groups and mines none of them: the leader acknowledges
+    /// and replicates, and mining never sits on the ack path (§6.5).
+    Voter,
+    /// A tail replica of its groups: mines each one's entries as its state
+    /// machine applies them and hands what it mined to `mined`, in log
+    /// order per group, waiting while the channel is full.
+    Tail { mined: mpsc::Sender<GroupMined> },
+}
+
+/// What a tail replica's miner mined from one of `group`'s entries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupMined {
+    pub group: u32,
+    pub mined: Mined,
+}
 
 /// What a node hosts.
 pub struct HostSpec {
@@ -36,8 +59,10 @@ pub struct HostSpec {
     /// WAL takes them with its root at [`group_dir`].
     pub wal: WalConfig,
     /// The groups the node votes in
-    /// ([`VotingLayout::groups_of`](crate::replicated::layout::VotingLayout::groups_of)).
+    /// ([`VotingLayout::groups_of`](crate::replicated::layout::VotingLayout::groups_of))
+    /// or, as a tail replica, is placed in.
     pub groups: Vec<u32>,
+    pub role: HostRole,
     pub peers: Peers,
     /// The Raft timings every group runs on.
     pub timings: RaftTimings,
@@ -92,6 +117,8 @@ struct Hosted {
     raft: GroupRaft,
     sm: GroupSm,
     log: GroupLogReader,
+    /// The task feeding a tail replica's miner.
+    mining: Option<JoinHandle<()>>,
     #[cfg(test)]
     probe: probe::Probe,
 }
@@ -125,9 +152,15 @@ impl Launch<'_> {
         let probe = probe::Probe::of(&log);
         log.count_takeovers(self.meters.takeovers(self.spec.id, group));
         let gate = Arc::clone(&self.gate);
-        let mut sm = blocking(move || GroupSm::open(&dir, gate))
-            .await
-            .map_err(|source| HostError::Snapshot { group, source })?;
+        let (sm, applied) = match &self.spec.role {
+            HostRole::Voter => (blocking(move || GroupSm::open(&dir, gate)).await, None),
+            HostRole::Tail { mined } => {
+                let (events, applied) = mpsc::channel(APPLIED_CAPACITY);
+                let sm = blocking(move || GroupSm::open_mining(&dir, gate, events)).await;
+                (sm, Some((applied, mined.clone())))
+            }
+        };
+        let mut sm = sm.map_err(|source| HostError::Snapshot { group, source })?;
         sm.count_stops(group, self.meters.storage());
         let (id, network) = (self.spec.id, self.spec.peers.network(self.spec.id, group));
         let raft = Raft::new(id, Arc::clone(&self.config), network, log, sm.clone())
@@ -138,13 +171,68 @@ impl Launch<'_> {
             metrics: raft.metrics(),
         };
         tokio::spawn(snapshot_at_checkpoints(builds, sm.checkpoints()));
+        let mining = applied.map(|(applied, mined)| {
+            let miner = GroupMiner::new(reader.clone());
+            let follow = Follow {
+                group,
+                mined,
+                storage: self.meters.storage(),
+            };
+            tokio::spawn(follow.run(miner, applied))
+        });
         Ok(Hosted {
             raft,
             sm,
             log: reader,
+            mining,
             #[cfg(test)]
             probe,
         })
+    }
+}
+
+/// How many applied entries a tail replica's state machine hands its
+/// miner ahead of what it has mined, before applying waits for it.
+const APPLIED_CAPACITY: usize = 64;
+
+/// Where a tail replica's miner for `group` hands what it mined, and
+/// reports its stop.
+struct Follow {
+    group: u32,
+    mined: mpsc::Sender<GroupMined>,
+    storage: Storage,
+}
+
+impl Follow {
+    /// Feed `miner` each event `applied` carries, off the runtime's
+    /// workers, and hand on whatever an event mined. A miner that stops is
+    /// reported and dropped with `applied`, and the replica applies on
+    /// without it. Ends with the group, or once the host aborts it.
+    async fn run(self, mut miner: GroupMiner, mut applied: mpsc::Receiver<Applied>) {
+        while let Some(event) = applied.recv().await {
+            let mining = tokio::task::spawn_blocking(move || {
+                let followed = miner.apply(event);
+                (miner, followed)
+            });
+            // A miner that panicked is gone; the panic is reported where it happened.
+            let Ok((back, followed)) = mining.await else {
+                return;
+            };
+            miner = back;
+            match followed {
+                Ok(out) if out.audit.is_empty() && out.rows.is_empty() => {}
+                Ok(out) => {
+                    let group = self.group;
+                    // With no one reading, the miner still mines, so a
+                    // stop is still reported.
+                    self.mined.send(GroupMined { group, mined: out }).await.ok();
+                }
+                Err(error) => {
+                    self.storage.miner_stopped(self.group, &error);
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -338,6 +426,9 @@ impl GroupHost {
     pub async fn shutdown(&self) -> Result<(), JoinErrorOf<RaftTypes>> {
         for hosted in self.groups.values() {
             hosted.raft.shutdown().await?;
+            if let Some(mining) = &hosted.mining {
+                mining.abort();
+            }
         }
         Ok(())
     }
@@ -463,6 +554,13 @@ mod probe {
 
         pub(in crate::replicated::raft) fn log_hooks(&self, group: u32) -> Option<Arc<Hooks>> {
             self.probe(group).map(|probe| Arc::clone(&probe.hooks))
+        }
+
+        /// Whether a miner follows `group` on this node.
+        pub(in crate::replicated::raft) fn mines(&self, group: u32) -> bool {
+            self.groups
+                .get(&group)
+                .is_some_and(|hosted| hosted.mining.is_some())
         }
     }
 }

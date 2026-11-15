@@ -16,13 +16,13 @@ use openraft::storage::RaftLogReader as _;
 use ourios_parquet::Store;
 use ourios_wal::{TenantBatch, WalConfig, WalOffset};
 use tempfile::TempDir;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
 use super::RaftTimings;
 use super::gate::SyncGate;
-use super::host::{GroupHost, GroupRaft, HostSpec, Wiring};
+use super::host::{GroupHost, GroupMined, GroupRaft, HostRole, HostSpec, Wiring};
 use super::log_store::group_dir;
 use super::state_machine::GroupSm;
 use super::telemetry::Meters;
@@ -135,13 +135,14 @@ pub(crate) fn name(id: NodeId) -> String {
 }
 
 /// A replica's identity, the `node_id` it runs under, the directory its
-/// logs and votes live in, the groups it votes in, where its host
-/// reports, and the timings its groups run on.
+/// logs and votes live in, the groups it hosts and what it is to them,
+/// where its host reports, and the timings its groups run on.
 pub(crate) struct Replica {
     pub(crate) id: NodeId,
     pub(crate) node_id: String,
     pub(crate) dir: TempDir,
     pub(crate) groups: Vec<u32>,
+    pub(crate) role: HostRole,
     pub(crate) meters: Meters,
     pub(crate) timings: RaftTimings,
 }
@@ -156,6 +157,7 @@ impl Replica {
             node_id: name(id),
             dir,
             groups: groups.to_vec(),
+            role: HostRole::Voter,
             meters: Meters::global(),
             timings: test_timings(),
         }
@@ -195,6 +197,7 @@ impl Node {
             id: replica.id,
             wal: wal_config(replica.dir.path()),
             groups: replica.groups.clone(),
+            role: replica.role.clone(),
             peers: peers.clone(),
             timings: replica.timings,
         };
@@ -339,23 +342,31 @@ pub(crate) struct Cluster {
     slots: Vec<Slot>,
 }
 
-/// How many nodes a cluster starts with, and the timings they run on.
-struct Shape {
+/// How many nodes a cluster starts with, the timings they run on, and
+/// where the first tail nodes hand what they mine, one sender each; a
+/// tail node without one hosts its groups as a voter would.
+pub(crate) struct Shape {
     voters: u64,
     tail: u64,
     timings: RaftTimings,
+    mined: Vec<mpsc::Sender<GroupMined>>,
 }
 
-/// `(voters, tail)` nodes on [`test_timings`].
+/// `(voters, tail)` nodes on [`test_timings`], none of them mining.
 impl From<(u64, u64)> for Shape {
     fn from((voters, tail): (u64, u64)) -> Self {
         Self {
             voters,
             tail,
             timings: test_timings(),
+            mined: Vec::new(),
         }
     }
 }
+
+/// How many entries of mined output a mining tail node buffers before
+/// its miner waits for the test to read.
+const MINED_CAPACITY: usize = 1024;
 
 impl Cluster {
     /// Start `size` nodes and bootstrap each of `groups` from node 0
@@ -389,6 +400,22 @@ impl Cluster {
         Self::open(Shape::from((voters, tail)), groups, |_| Meters::global()).await
     }
 
+    /// [`Self::start_with_tail`] on `shape`'s `(voters, tail)` nodes, with every tail node a mining tail
+    /// replica, node `i` reporting to `meters(i)`; returns each tail
+    /// node's mined output, in node order.
+    pub(crate) async fn start_mining(
+        shape: impl Into<Shape>,
+        groups: &[u32],
+        meters: impl Fn(usize) -> Meters,
+    ) -> (Self, Vec<mpsc::Receiver<GroupMined>>) {
+        let shape = shape.into();
+        let (mined, receivers) = (0..shape.tail)
+            .map(|_| mpsc::channel(MINED_CAPACITY))
+            .unzip();
+        let shape = Shape { mined, ..shape };
+        (Self::open(shape, groups, meters).await, receivers)
+    }
+
     async fn open(shape: Shape, groups: &[u32], meters: impl Fn(usize) -> Meters) -> Self {
         let (cluster, members) = Self::open_unformed(shape, groups, meters).await;
         for &group in groups {
@@ -411,6 +438,7 @@ impl Cluster {
             voters,
             tail,
             timings,
+            mined,
         }: Shape,
         groups: &[u32],
         meters: impl Fn(usize) -> Meters,
@@ -430,10 +458,19 @@ impl Cluster {
             addrs: bound.iter().map(|(_, (_, a))| *a).collect(),
             slots: Vec::new(),
         };
+        let voting = usize::try_from(voters).expect("a small cluster");
         for (n, (_, (incoming, _))) in (1..).zip(bound) {
+            let i = cluster.slots.len();
+            let role = match i.checked_sub(voting).and_then(|t| mined.get(t)) {
+                Some(mined) => HostRole::Tail {
+                    mined: mined.clone(),
+                },
+                None => HostRole::Voter,
+            };
             let replica = Replica {
-                meters: meters(cluster.slots.len()),
+                meters: meters(i),
                 timings,
+                role,
                 ..Replica::new(n, groups)
             };
             let server = ReplicationServer::default();

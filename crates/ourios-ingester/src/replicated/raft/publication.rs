@@ -6,27 +6,53 @@
 //! Audit events are handed over before the rows of the same step, and the
 //! [`PublishCoordinator`] writes every drained event durably before any
 //! file holding rows drained with it, so a template's events reach the
-//! store before the first file whose rows use it. The record sink's size
-//! trigger publishes inline; the age trigger and a full flush are the
-//! caller's to drive.
+//! store before the first file whose rows use it. A handoff and a drain's
+//! capture exclude each other, as the local path's miner lock makes them.
+//! The record sink's size trigger publishes inline, held back by the audit
+//! sink's barrier until every event emitted so far is durable; the age
+//! trigger and a full flush are the caller's to drive.
+
+use std::sync::Mutex;
 
 use ourios_core::audit::{AuditEvent, AuditSink as _};
 use ourios_core::record::{IngestPosition, MinedRecord, RecordSink as _};
+use ourios_core::sync::lock_recover;
 
 use super::kept::Kept;
 use super::mining::MinedRow;
+use crate::audit_sink::SharedParquetAuditSink;
 use crate::publish::PublishCoordinator;
+use crate::record_sink::{ParquetRecordSink, SharedParquetSink};
 
 /// A flusher's publication of one group, whose log id is `log`.
 pub struct Publication {
     log: u32,
     coordinator: PublishCoordinator,
+    /// Held across a whole handoff and across a drain's capture, so a
+    /// drain never takes a step's audit events without its rows; released
+    /// before the ordered write's I/O.
+    handoff: Mutex<()>,
 }
 
 impl Publication {
+    /// Publish through `records` and `events`. The record sink's
+    /// inline triggers are held back until every event emitted so far is
+    /// durable, as the local receiver's are.
     #[must_use]
-    pub fn new(log: u32, coordinator: PublishCoordinator) -> Self {
-        Self { log, coordinator }
+    pub fn new(log: u32, records: ParquetRecordSink, events: SharedParquetAuditSink) -> Self {
+        let barrier = events.clone();
+        let quarantine = events.clone();
+        let records = records
+            .with_audit_barrier(Box::new(move || barrier.settled()))
+            // RFC 0025 §3.3: a permanently rejected record quarantines to
+            // the audit stream rather than wedging its partition.
+            .with_audit_sink(Box::new(quarantine));
+        let coordinator = PublishCoordinator::new(SharedParquetSink::new(records), events);
+        Self {
+            log,
+            coordinator,
+            handoff: Mutex::new(()),
+        }
     }
 
     /// Hand `audit`, then `rows`, to the publish path.
@@ -35,6 +61,7 @@ impl Publication {
         audit: impl IntoIterator<Item = &'a AuditEvent>,
         rows: impl IntoIterator<Item = &'a MinedRow>,
     ) {
+        let _handoff = lock_recover(&self.handoff);
         let (mut events, mut records) = (
             self.coordinator.audit().clone(),
             self.coordinator.record().clone(),
@@ -57,15 +84,21 @@ impl Publication {
     /// drained is durable.
     #[must_use]
     pub fn flush_aged(&self) -> bool {
-        self.coordinator
-            .write_ordered(self.coordinator.drain_aged(), "age")
+        let drained = {
+            let _handoff = lock_recover(&self.handoff);
+            self.coordinator.drain_aged()
+        };
+        self.coordinator.write_ordered(drained, "age")
     }
 
     /// Publish everything buffered; `true` once it is all durable.
     #[must_use]
     pub fn flush_all(&self) -> bool {
-        self.coordinator
-            .write_ordered(self.coordinator.drain_all(), "barrier")
+        let drained = {
+            let _handoff = lock_recover(&self.handoff);
+            self.coordinator.drain_all()
+        };
+        self.coordinator.write_ordered(drained, "barrier")
     }
 
     /// `row`'s record, carrying its position in this group's log.

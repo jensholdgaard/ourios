@@ -7,7 +7,7 @@ use ourios_parquet::store::Store;
 use super::super::kept::tests::{entries, mined_log};
 use super::*;
 use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
-use crate::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
+use crate::record_sink::{FlushConfig, ParquetRecordSink};
 
 /// The log id the tests publish under.
 const LOG: u32 = 7;
@@ -19,22 +19,14 @@ struct Stores {
     publication: Publication,
 }
 
-/// A publication over local data and audit stores whose triggers never
-/// fire on their own.
-fn stores() -> Stores {
+/// A publication over local data and audit stores whose record sink
+/// flushes on its own under `config`.
+fn stores_with(config: FlushConfig) -> Stores {
     let tmp = tempfile::TempDir::new().expect("temp");
     let (data, audit) = (tmp.path().join("data"), tmp.path().join("audit"));
     std::fs::create_dir_all(&data).expect("data root");
     std::fs::create_dir_all(&audit).expect("audit root");
-    let held = FlushConfig {
-        target_bytes: usize::MAX,
-        max_buffer_age: Duration::MAX,
-        ceiling_bytes: usize::MAX,
-    };
-    let records = SharedParquetSink::new(ParquetRecordSink::new(
-        Store::local(&data).expect("data store"),
-        held,
-    ));
+    let records = ParquetRecordSink::new(Store::local(&data).expect("data store"), config);
     let events = SharedParquetAuditSink::new(BufferingAuditSink::new(
         Store::local(&audit).expect("audit store"),
         usize::MAX,
@@ -43,8 +35,23 @@ fn stores() -> Stores {
         _tmp: tmp,
         data,
         audit,
-        publication: Publication::new(LOG, PublishCoordinator::new(records, events)),
+        publication: Publication::new(LOG, records, events),
     }
+}
+
+/// [`stores_with`] triggers that never fire on their own.
+fn stores() -> Stores {
+    stores_with(FlushConfig {
+        target_bytes: usize::MAX,
+        max_buffer_age: Duration::MAX,
+        ceiling_bytes: usize::MAX,
+    })
+}
+
+/// Make the audit store refuse every write.
+fn fail_audit(stores: &Stores) {
+    std::fs::remove_dir_all(&stores.audit).expect("remove audit root");
+    std::fs::write(&stores.audit, b"not a directory").expect("sabotage");
 }
 
 fn parquet_files(root: &Path) -> Vec<PathBuf> {
@@ -124,12 +131,57 @@ fn no_row_is_published_before_its_audit_events() {
     let stores = stores();
     let kept = kept_of(&mined_log(&entries(4)));
     stores.publication.publish_kept(&kept);
-    std::fs::remove_dir_all(&stores.audit).expect("remove audit root");
-    std::fs::write(&stores.audit, b"not a directory").expect("sabotage");
+    fail_audit(&stores);
 
     assert!(!stores.publication.flush_all(), "the audit write failed");
     assert!(
         parquet_files(&stores.data).is_empty(),
         "no rows ahead of their events"
     );
+}
+
+/// The record sink's own size trigger is held back by the audit barrier:
+/// with the audit store failing, publishing rows past the size target
+/// writes no file of them.
+#[test]
+fn an_inline_flush_waits_for_the_audit_events() {
+    let stores = stores_with(FlushConfig {
+        target_bytes: 1,
+        max_buffer_age: Duration::MAX,
+        ceiling_bytes: 1,
+    });
+    fail_audit(&stores);
+    stores
+        .publication
+        .publish_kept(&kept_of(&mined_log(&entries(4))));
+    assert!(
+        parquet_files(&stores.data).is_empty(),
+        "no rows ahead of their events"
+    );
+}
+
+/// A drain waits for a publish in progress, so it never takes a step's
+/// audit events without the rows handed over with them: a drain started
+/// once the first row is taken has not finished 200 ms later.
+#[test]
+fn a_drain_waits_for_the_publish_in_progress() {
+    let stores = stores();
+    let kept = kept_of(&mined_log(&entries(4)));
+    let publication = &stores.publication;
+    std::thread::scope(|scope| {
+        let mut drain = None;
+        let mut finished_early = false;
+        let rows = kept.rows().inspect(|_| {
+            if drain.is_none() {
+                let started = scope.spawn(move || publication.flush_aged());
+                std::thread::sleep(Duration::from_millis(200));
+                finished_early = started.is_finished();
+                drain = Some(started);
+            }
+        });
+        publication.publish(kept.audit(), rows);
+        assert!(!finished_early, "a drain finished mid-publish");
+        let drain = drain.expect("the drain ran");
+        assert!(drain.join().expect("join"), "the drain then published");
+    });
 }

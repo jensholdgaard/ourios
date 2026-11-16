@@ -1,0 +1,147 @@
+//! The flusher's checkpoint cadence (RFC 0065 §6.5): RFC 0052's barrier on
+//! the replica a group names flusher, once per interval, one checkpoint at
+//! a time, and only once its miner has applied past the last cut written.
+
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use futures_util::FutureExt as _;
+use ourios_parquet::Store;
+use tokio::task::JoinHandle;
+
+use super::checkpointing::{Checkpoint, Checkpoints};
+use super::flushing::Flushing;
+use super::kept::Kept;
+use super::mining::{Captured, GroupMiner};
+use super::publication::Publication;
+
+/// Where one group's checkpoints are written and recorded.
+#[derive(Clone)]
+pub(super) struct Target {
+    group: u32,
+    store: Store,
+    checkpoints: Checkpoints,
+}
+
+/// One group's checkpoint cadence on its flusher.
+pub(super) struct Checkpointer {
+    target: Target,
+    every: Duration,
+    /// The cut of the last checkpoint written, which an idle group does
+    /// not cut again.
+    written: Option<u64>,
+    /// The checkpoint still writing, which yields its cut once written.
+    running: Option<JoinHandle<Option<u64>>>,
+}
+
+/// A cut the miner captured, and the publication it publishes through.
+pub(super) struct Cut {
+    captured: Captured,
+    publication: Arc<Publication>,
+    at: Instant,
+}
+
+impl Checkpointer {
+    pub(super) fn new(group: u32, every: Duration, store: Store, checkpoints: Checkpoints) -> Self {
+        Self {
+            target: Target {
+                group,
+                store,
+                checkpoints,
+            },
+            every,
+            written: None,
+            running: None,
+        }
+    }
+
+    /// Where its checkpoints go, for a capture off the runtime.
+    pub(super) fn target(&self) -> Target {
+        self.target.clone()
+    }
+
+    /// How often it cuts.
+    pub(super) fn every(&self) -> Duration {
+        self.every
+    }
+
+    /// Whether no checkpoint is still writing; the cut of one that has
+    /// just finished becomes [`Self::written`].
+    pub(super) fn ready(&mut self) -> bool {
+        match self.running.take() {
+            Some(running) if !running.is_finished() => {
+                self.running = Some(running);
+                false
+            }
+            Some(finished) => {
+                if let Some(Ok(Some(cut))) = finished.now_or_never() {
+                    self.written = Some(cut);
+                }
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// The cut of the last checkpoint written, which the next must pass.
+    pub(super) fn written(&self) -> Option<u64> {
+        self.written
+    }
+
+    /// Publish and write `cut` off the runtime.
+    pub(super) fn start(&mut self, cut: Cut) {
+        let target = self.target.clone();
+        self.running = Some(tokio::task::spawn_blocking(move || {
+            let seq = cut.captured.bundle.cut().seq;
+            target
+                .checkpoint(&cut.publication)
+                .run(&cut.captured, cut.at)
+                .ok()
+                .map(|_| seq)
+        }));
+    }
+}
+
+impl Target {
+    /// The cut at `miner`'s last entry, if that is past `written` and the
+    /// flusher publishes everything kept; a capture that fails is
+    /// recorded. Blocking: it runs on the miner's step.
+    pub(super) fn capture(
+        &self,
+        miner: &GroupMiner,
+        (kept, flushing): (&Mutex<Kept>, &Mutex<Flushing>),
+        written: Option<u64>,
+    ) -> Option<Cut> {
+        let through = miner.applied_through()?;
+        if written.is_some_and(|written| through <= written) {
+            return None;
+        }
+        let publication = {
+            // The order `Keeping::keep` takes them in.
+            let kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+            let flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
+            flushing.checkpointable(&kept)?
+        };
+        let at = Instant::now();
+        match miner.capture(publication.log())? {
+            Ok(captured) => Some(Cut {
+                captured,
+                publication,
+                at,
+            }),
+            Err(error) => {
+                self.checkpoint(&publication).failed(at, "_OTHER", &error);
+                None
+            }
+        }
+    }
+
+    fn checkpoint<'a>(&'a self, publication: &'a Publication) -> Checkpoint<'a> {
+        Checkpoint {
+            group: self.group,
+            publication,
+            store: &self.store,
+            checkpoints: &self.checkpoints,
+        }
+    }
+}

@@ -8,6 +8,7 @@
 
 pub mod bundle;
 mod checkpoint;
+mod checkpointer;
 pub mod checkpointing;
 mod codec;
 mod controls;

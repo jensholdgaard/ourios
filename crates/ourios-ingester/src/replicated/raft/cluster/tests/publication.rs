@@ -12,6 +12,7 @@ use ourios_core::record::{IngestPosition, MinedRecord};
 use ourios_parquet::{PromotedAttributes, Reader, Store};
 use ourios_wal::Control;
 
+use super::super::super::bundle::{Bundle, CutId, bundle_key, pointer, snapshot_key};
 use super::super::super::flushing::Publishing;
 use super::super::super::formation::{Formation, formed_key};
 use super::super::super::mining::Mined;
@@ -141,6 +142,83 @@ async fn the_named_tail_replica_publishes_every_row_under_the_log_id() {
         published(&stores[1]),
         [],
         "only the named replica publishes"
+    );
+    cluster.shutdown().await;
+}
+
+/// The cut `checkpoint.json` in `store` names for [`LOG`], once there is one.
+fn pointer(store: &Store) -> Option<CutId> {
+    let bytes = store.get_blocking_opt(&pointer::key(LOG)).expect("read")?;
+    Some(pointer::decode(&bytes, LOG).expect("a readable checkpoint.json"))
+}
+
+/// RFC 0065 §6.5 on a running group: the named flusher runs RFC 0052's
+/// barrier, publishing every row through its cut and then writing a
+/// bundle for the cut that a replica would restore and `checkpoint.json`
+/// naming it; the other tail replica writes neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_named_flusher_checkpoints_its_group() {
+    let stores = [formed_store(), formed_store()];
+    let shape = Shape {
+        publishing: stores
+            .iter()
+            .cloned()
+            .map(publishing)
+            .map(Arc::new)
+            .collect(),
+        ..Shape::from((3, 2))
+    };
+    let (cluster, mut mined) = Cluster::start_mining(shape, &[GROUP], |_| Meters::global()).await;
+    let leader = with_learners(&cluster, 3..5).await;
+    let lines = corpus();
+    let named = *cluster.id(3).uuid().as_bytes();
+    let mut entries = vec![
+        block(0, 10_000),
+        GroupEntry::Control(Control::FlusherAssignment(named)),
+    ];
+    let chunks = lines[..30].chunks(5).enumerate();
+    entries.extend(chunks.map(|(n, chunk)| batch_at(time(n as u64 + 1), "acme", chunk)));
+    commit_all(&cluster, leader, &entries).await;
+    let expected = under_log(&mined_rows(&mut mined[0], 30).await);
+    mined_rows(&mut mined[1], 30).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let cut = loop {
+        if let Some(cut) = pointer(&stores[0]) {
+            break cut;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the flusher never checkpointed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let rows = published(&stores[0]);
+    let through: Vec<_> = expected
+        .iter()
+        .filter(|row| row.ingest_position.is_some_and(|p| p.seq <= cut.seq))
+        .collect();
+    assert!(!through.is_empty(), "the cut passes mined rows");
+    for row in through {
+        assert!(rows.contains(row), "a row through the cut is published");
+    }
+    let bytes = stores[0]
+        .get_blocking(&bundle_key(LOG, cut.seq))
+        .expect("bundle.bin");
+    let bundle = Bundle::decode(&bytes).expect("a bundle a replica reads");
+    assert_eq!(bundle.cut(), cut);
+    for entry in bundle.tenants() {
+        let snap = stores[0]
+            .get_blocking(&snapshot_key(LOG, cut.seq, &entry.tenant))
+            .expect(".snap");
+        bundle
+            .snapshot(entry, &snap)
+            .expect("a snapshot it restores");
+    }
+    assert_eq!(
+        pointer(&stores[1]),
+        None,
+        "only the named replica checkpoints"
     );
     cluster.shutdown().await;
 }

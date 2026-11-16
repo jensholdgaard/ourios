@@ -46,6 +46,7 @@ pub(crate) struct Meters {
     storage: Storage,
     kept: KeptDrops,
     replays: Replays,
+    checkpoints: Checkpoints,
 }
 
 impl Meters {
@@ -75,6 +76,7 @@ impl Meters {
             storage: Storage::on(meter),
             kept: KeptDrops::on(meter),
             replays: Replays::on(meter),
+            checkpoints: Checkpoints::on(meter),
         }
     }
 
@@ -91,6 +93,11 @@ impl Meters {
     /// What a named flusher's gap replays record.
     pub(crate) fn replays(&self) -> Replays {
         self.replays.clone()
+    }
+
+    /// What a flusher's checkpoints record.
+    pub(crate) fn checkpoints(&self) -> Checkpoints {
+        self.checkpoints.clone()
     }
 
     /// What the storage writers record.

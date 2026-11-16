@@ -67,6 +67,12 @@ impl Publication {
         }
     }
 
+    /// The group's log id it publishes under.
+    #[must_use]
+    pub fn log(&self) -> u32 {
+        self.log
+    }
+
     /// Hand `audit`, then `rows`, to the publish path.
     pub fn publish<'a>(
         &self,

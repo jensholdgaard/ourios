@@ -73,23 +73,27 @@ impl Checkpoint<'_> {
         } else {
             Err(Failed::Publish)
         };
-        let error_type = outcome.as_ref().err().map(Failed::error_type);
-        self.checkpoints
-            .ended(self.group, cut_at.elapsed(), error_type);
-        if let Err(failed) = &outcome {
-            tracing::warn!(
-                name: semconv::EVENT_OURIOS_WAL_REPLICATION_CHECKPOINT_FAILED,
-                {
-                    { semconv::OURIOS_WAL_GROUP } = i64::from(self.group),
-                    { crate::metrics::ERROR_TYPE } = failed.error_type(),
-                },
-                "the flusher of group {} wrote no checkpoint at {}, and the next cut \
-                 retries: {failed}",
-                self.group,
-                captured.bundle.cut().seq,
-            );
+        match &outcome {
+            Ok(_) => self.checkpoints.ended(self.group, cut_at.elapsed(), None),
+            Err(failed) => self.failed(cut_at, failed.error_type(), failed),
         }
         outcome
+    }
+
+    /// Record and report a checkpoint cut at `cut_at` that failed with
+    /// `error_type`, for `why`.
+    pub fn failed(&self, cut_at: Instant, error_type: &'static str, why: &dyn fmt::Display) {
+        self.checkpoints
+            .ended(self.group, cut_at.elapsed(), Some(error_type));
+        tracing::warn!(
+            name: semconv::EVENT_OURIOS_WAL_REPLICATION_CHECKPOINT_FAILED,
+            {
+                { semconv::OURIOS_WAL_GROUP } = i64::from(self.group),
+                { crate::metrics::ERROR_TYPE } = error_type,
+            },
+            "the flusher of group {} wrote no checkpoint, and the next cut retries: {why}",
+            self.group,
+        );
     }
 }
 

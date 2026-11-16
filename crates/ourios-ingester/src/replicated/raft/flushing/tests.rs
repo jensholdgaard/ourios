@@ -5,6 +5,8 @@ use std::time::Duration;
 use ourios_core::record::MinedRecord;
 use ourios_parquet::Reader;
 
+use tokio::sync::watch;
+
 use super::super::kept::Bounds;
 use super::super::kept::tests::{entries, mined_log};
 use super::*;
@@ -86,7 +88,7 @@ impl Fixture {
     /// Flush the current publication, if any, and read every row on the
     /// store, in position order.
     fn published(&self) -> Vec<MinedRecord> {
-        if let Some(publication) = self.flushing.current().lock().expect("current").clone() {
+        if let Some(publication) = self.flushing.current().borrow().clone() {
             assert!(publication.flush_all(), "the store took it");
         }
         let mut rows: Vec<_> = parquet_files(&self.root.join("data"))
@@ -145,7 +147,7 @@ fn parquet_files(root: &Path) -> Vec<PathBuf> {
 fn a_named_replica_publishes_what_it_kept_then_each_step() {
     let mut f = fixture(true, Bounds::default());
     f.step(0..5, None);
-    assert!(f.flushing.current().lock().expect("current").is_none());
+    assert!(f.flushing.current().borrow().is_none());
     f.step(5..10, Some(me()));
     assert_eq!(f.published(), f.rows_of(0..10));
 }
@@ -162,7 +164,7 @@ fn an_assignment_naming_another_replica_stops_publication() {
     assert_eq!(before, f.rows_of(0..6));
     f.step(6..8, None);
     f.step(8..10, Some(other()));
-    assert!(f.flushing.current().lock().expect("current").is_none());
+    assert!(f.flushing.current().borrow().is_none());
     assert_eq!(f.published(), before, "nothing from the reassignment on");
     assert_eq!(
         f.kept.rows().count(),
@@ -177,7 +179,7 @@ fn an_assignment_naming_another_replica_stops_publication() {
 fn a_named_replica_waits_for_its_log_id() {
     let mut f = fixture(false, Bounds::default());
     f.step(0..6, Some(me()));
-    assert!(f.flushing.current().lock().expect("current").is_none());
+    assert!(f.flushing.current().borrow().is_none());
     assert!(parquet_files(&f.root.join("data")).is_empty());
     record_formation(&f.store);
     f.step(6..10, None);
@@ -218,13 +220,7 @@ fn a_replica_with_a_gap_publishes_nothing_until_it_clears() {
 fn a_retained_handle_cannot_publish_after_a_reassignment() {
     let mut f = fixture(true, Bounds::default());
     f.step(0..6, Some(me()));
-    let retained = f
-        .flushing
-        .current()
-        .lock()
-        .expect("current")
-        .clone()
-        .expect("live");
+    let retained = f.flushing.current().borrow().clone().expect("live");
     f.step(6..8, Some(other()));
     assert_eq!(retained.buffered_records(), 0, "the buffers were discarded");
     assert!(!retained.flush_all(), "a held publication refuses to flush");
@@ -240,22 +236,10 @@ fn a_retained_handle_cannot_publish_after_a_reassignment() {
 fn a_replica_named_again_reuses_its_publication() {
     let mut f = fixture(true, Bounds::default());
     f.step(0..4, Some(me()));
-    let first = f
-        .flushing
-        .current()
-        .lock()
-        .expect("current")
-        .clone()
-        .expect("live");
+    let first = f.flushing.current().borrow().clone().expect("live");
     f.step(4..6, Some(other()));
     f.step(6..10, Some(me()));
-    let again = f
-        .flushing
-        .current()
-        .lock()
-        .expect("current")
-        .clone()
-        .expect("live");
+    let again = f.flushing.current().borrow().clone().expect("live");
     assert!(Arc::ptr_eq(&first, &again), "one publication for the group");
     assert_eq!(f.published(), f.rows_of(0..10));
 }
@@ -275,4 +259,31 @@ fn a_named_replica_is_held_by_an_unusable_record_until_it_is_usable() {
     f.step(4..10, None);
     assert_eq!(f.flushing.held(), None);
     assert_eq!(f.published(), f.rows_of(0..10));
+}
+
+/// The age sweep flushes a publication whose audit buffer reached its
+/// ceiling at once, not at its next tick.
+#[test]
+fn a_sweep_flushes_an_audit_buffer_at_its_ceiling_before_its_tick() {
+    let mut f = fixture(true, Bounds::default());
+    f.flushing.source.audit_ceiling = 1;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (stop, stopped) = watch::channel(false);
+    let every = Duration::from_secs(30);
+    let sweep = runtime.spawn(sweep(f.flushing.current(), every, stopped));
+    // The first tick fires at once; publish only after it.
+    std::thread::sleep(Duration::from_millis(100));
+    f.step(0..6, Some(me()));
+    let audit = f.root.join("audit");
+    let flushed = (0..250).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !parquet_files(&audit).is_empty()
+    });
+    stop.send_replace(true);
+    runtime.block_on(sweep).expect("join");
+    assert!(flushed, "no flush before the tick");
 }

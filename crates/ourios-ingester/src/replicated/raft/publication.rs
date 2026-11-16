@@ -13,7 +13,9 @@
 //! and a full flush are the caller's to drive, and flushes run one at a
 //! time.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::Notify;
 
 use ourios_core::audit::{AuditEvent, AuditSink as _};
 use ourios_core::record::{IngestPosition, MinedRecord, RecordSink as _};
@@ -105,6 +107,13 @@ impl Publication {
         *lock_recover(&self.handoff) = true;
     }
 
+    /// Signalled when the audit buffer reaches its ceiling, so the age
+    /// sweep flushes it then rather than at its next tick.
+    #[must_use]
+    pub fn overflow(&self) -> Arc<Notify> {
+        self.coordinator.audit().overflow_notify()
+    }
+
     /// The records buffered and not yet published.
     #[must_use]
     pub fn buffered_records(&self) -> usize {
@@ -164,6 +173,6 @@ impl Publication {
 }
 
 #[cfg(test)]
-mod held;
+pub(in crate::replicated::raft) mod held;
 #[cfg(test)]
 mod tests;

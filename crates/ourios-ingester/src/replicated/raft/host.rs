@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use super::flushing::{Current, Flushing, Publishing};
+use super::flushing::{self, Current, Flushing, Publishing};
 use super::gate::SyncGate;
 use super::kept::{Bounds, Kept};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
@@ -260,7 +260,7 @@ impl Mining {
         let sweep = follow
             .sweep
             .clone()
-            .map(|(current, every)| tokio::spawn(sweep_aged(current, every, stopped.clone())));
+            .map(|(current, every)| tokio::spawn(flushing::sweep(current, every, stopped.clone())));
         let task = tokio::spawn(follow.run(miner, applied, stopped));
         Self {
             stop,
@@ -288,33 +288,6 @@ impl Mining {
                 running.await.ok();
             }
             *task = None;
-        }
-    }
-}
-
-/// Publish what the age trigger has made due, every `every`, until the
-/// host stops the group's miner. A flush that fails leaves its rows
-/// buffered for the next one, and its failure is counted where it
-/// happens.
-async fn sweep_aged(current: Current, every: Duration, mut stop: watch::Receiver<bool>) {
-    let mut ticks = tokio::time::interval(every);
-    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            biased;
-            () = stopped(&mut stop) => return,
-            _ = ticks.tick() => {}
-        }
-        let publication = current
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(publication) = publication {
-            let flushed = tokio::task::spawn_blocking(move || publication.flush_aged());
-            if flushed.await.is_err() {
-                // A panicked flush is reported where it happened.
-                return;
-            }
         }
     }
 }
@@ -379,10 +352,14 @@ impl Keeping {
             kept.checkpoint(cut);
         }
         self.drops.dropped(self.group, kept.dropped(), before);
-        if let Some(flushing) = &self.flushing {
-            let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
-            flushing.step(applied.assigned, out, &kept);
-        }
+        let Some(flushing) = &self.flushing else {
+            return;
+        };
+        let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
+        let need = flushing.plan(applied.assigned, &kept);
+        // Publishing does store I/O, and the kept gauges read `kept`.
+        drop(kept);
+        flushing.publish(need, out);
     }
 }
 
@@ -677,13 +654,19 @@ mod tests {
     use openraft::vote::leader_id_std::CommittedLeaderId;
     use ourios_wal::Control;
 
+    use super::super::flushing::Source;
+    use super::super::formation::{Formation, formed_key};
+    use super::super::kept::tests::{entries, mined_log};
     use super::super::mining::GroupLogRead;
     use super::super::mining::tests::{batch_at, block, configured, corpus, time};
+    use super::super::publication::held::first_put_held;
     use super::super::snapshot_record::{GroupMinerConfig, IdBlock};
     use super::super::state_machine::AppliedEvent;
     use super::super::telemetry::tests::{Reader, until};
     use super::super::types::{Entry, GroupEntry};
     use super::*;
+    use crate::record_sink::FlushConfig;
+    use ourios_parquet::Store;
     use ourios_semconv as semconv;
 
     /// A group whose build never ends, counting the triggers it gets.
@@ -1037,6 +1020,65 @@ mod tests {
         mining.stop().await;
         assert_eq!(reader.points(gap), [], "an ended task reports no gap");
         assert_eq!(reader.points(usage), [], "nor kept audit bytes");
+    }
+
+    /// The kept gauges read `Kept` under its lock, so a step must not hold
+    /// it across publication I/O: with the store's first write held, the
+    /// lock is still free.
+    #[test]
+    fn the_kept_lock_is_free_while_publication_writes() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let local = Store::local(tmp.path()).expect("store");
+        let voters = ["v1", "v2", "v3"];
+        let members = (1..)
+            .zip(voters)
+            .map(|(n, v)| (v.to_owned(), NodeId::from(n)))
+            .collect();
+        let formation = Formation::new(0, 5, members, &voters).expect("formation");
+        local
+            .put_blocking(&formed_key(0), formation.encode().expect("encode"))
+            .expect("record");
+        let (store, held) = first_put_held(local);
+        let source = Source {
+            store,
+            voters: voters.map(str::to_owned).to_vec(),
+            flush: FlushConfig {
+                target_bytes: 1,
+                max_buffer_age: Duration::MAX,
+                ceiling_bytes: 1,
+            },
+            promoted: ourios_parquet::PromotedAttributes::default(),
+            audit_ceiling: usize::MAX,
+        };
+        let me = NodeId::from(7);
+        let kept: Arc<Mutex<Kept>> = Arc::default();
+        let keeping = Keeping {
+            group: 0,
+            kept: Arc::clone(&kept),
+            drops: Meters::global().kept(),
+            flushing: Some(Arc::new(Mutex::new(Flushing::new(me, 0, source)))),
+        };
+        let log = mined_log(&entries(2));
+        let (index, mined) = log
+            .iter()
+            .find(|(_, mined)| !mined.rows.is_empty())
+            .expect("a batch");
+        let assigned = Applying {
+            assigned: Some(me),
+            ..Applying::default()
+        };
+        std::thread::scope(|scope| {
+            let step = scope.spawn(|| keeping.keep(*index, mined, assigned));
+            held.reached.recv().expect("publication is writing");
+            let free = (0..50).any(|_| {
+                let free = kept.try_lock().is_ok();
+                std::thread::sleep(Duration::from_millis(10));
+                free
+            });
+            held.release.send(()).expect("released");
+            step.join().expect("join");
+            assert!(free, "the step held `Kept` across its store write");
+        });
     }
 
     /// A log that holds no entry.

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use openraft::async_runtime::WatchReceiver as _;
@@ -23,7 +23,7 @@ use super::flushing::{self, Current, Flushing, Need, Publishing};
 use super::gate::SyncGate;
 use super::kept::{Bounds, Kept};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
-use super::mining::{GroupMiner, GroupMinerError, Mined};
+use super::mining::{GroupMiner, GroupMinerError, Mined, SharedLog};
 use super::state_machine::{Applied, AppliedEvent, GroupSm};
 use super::telemetry::{KeptDrops, Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
@@ -151,7 +151,8 @@ impl Launch<'_> {
         let publishing = tail.publishing.as_ref();
         let flushing = publishing.and_then(|publishing| {
             let source = publishing.source(group)?;
-            let flushing = Flushing::new(self.spec.id, group, source);
+            let log: SharedLog = Arc::new(tail.log.clone());
+            let flushing = Flushing::new(self.spec.id, group, source, log);
             Some((flushing, publishing.sweep()))
         });
         let sweep = flushing.as_ref().map(|(f, every)| (f.current(), *every));
@@ -200,6 +201,7 @@ impl Launch<'_> {
                 let tail = Tail {
                     kept: *kept,
                     publishing: publishing.clone(),
+                    log: reader.clone(),
                 };
                 (sm, Some((applied, mined.clone(), tail)))
             }
@@ -326,6 +328,8 @@ struct Follow {
 struct Tail {
     kept: Bounds,
     publishing: Option<Arc<Publishing>>,
+    /// The group's log, which a flusher replays a gap from.
+    log: GroupLogReader,
 }
 
 /// What a tail replica keeps of `group`'s mined output for a takeover,
@@ -352,22 +356,38 @@ impl Keeping {
             kept.checkpoint(cut);
         }
         self.drops.dropped(self.group, kept.dropped(), before);
-        let Some(flushing) = &self.flushing else {
-            return;
-        };
-        let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
-        let need = flushing.plan(applied.assigned, &kept);
-        // Publishing does store I/O, and the kept gauges read `kept`.
-        drop(kept);
-        let need = match need {
-            Need::Prepare if flushing.prepare() => {
-                let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
-                flushing.plan(None, &kept)
-            }
-            Need::Prepare => return,
-            need => need,
-        };
-        flushing.publish(need, out);
+        if let Some(flushing) = &self.flushing {
+            let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
+            self.publish(&mut flushing, kept, (applied.assigned, out));
+        }
+    }
+
+    /// Publish as `flushing` plans from `kept`, holding `kept` only while
+    /// planning, and drop from it what a replay rebuilt.
+    fn publish<'k>(
+        &'k self,
+        flushing: &mut Flushing,
+        mut kept: MutexGuard<'k, Kept>,
+        (mut assigned, out): (Option<NodeId>, &Mined),
+    ) {
+        loop {
+            let need = flushing.plan(assigned.take(), &kept);
+            // Publishing does store I/O, and the kept gauges read `kept`.
+            drop(kept);
+            let need = match need {
+                Need::Prepare if flushing.prepare() => {
+                    let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+                    flushing.plan(None, &kept)
+                }
+                Need::Prepare => return,
+                need => need,
+            };
+            let Some(through) = flushing.publish(need, out) else {
+                return;
+            };
+            kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+            kept.replayed(through);
+        }
     }
 }
 
@@ -1137,7 +1157,12 @@ mod tests {
             group: 0,
             kept: Arc::clone(&kept),
             drops: Meters::global().kept(),
-            flushing: Some(Arc::new(Mutex::new(Flushing::new(me, 0, source)))),
+            flushing: Some(Arc::new(Mutex::new(Flushing::new(
+                me,
+                0,
+                source,
+                Arc::new(EmptyLog),
+            )))),
         };
         let log = mined_log(&entries(2));
         let (index, mined) = log

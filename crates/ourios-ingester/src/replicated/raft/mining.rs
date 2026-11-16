@@ -203,6 +203,15 @@ pub trait GroupLogRead: Send {
     fn entry(&self, index: u64) -> Option<Entry>;
 }
 
+/// A group's log shared by the readers that need it.
+pub type SharedLog = Arc<dyn GroupLogRead + Sync>;
+
+impl<T: GroupLogRead + Sync + ?Sized> GroupLogRead for Arc<T> {
+    fn entry(&self, index: u64) -> Option<Entry> {
+        (**self).entry(index)
+    }
+}
+
 /// The time of the batch being mined: the miner's only clock, so every
 /// audit event it emits carries the batch's time.
 #[derive(Debug, Clone, Default)]

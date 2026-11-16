@@ -9,6 +9,8 @@ use tokio::sync::watch;
 
 use super::super::kept::Bounds;
 use super::super::kept::tests::{entries, mined_log};
+use super::super::mining::tests::{HeldLog, logged};
+use super::super::types::{Entry, LogId};
 use super::*;
 
 const GROUP: u32 = 3;
@@ -35,6 +37,11 @@ struct Fixture {
 /// A tail replica of `GROUP` over a local store, its mined log ready to
 /// step through, and `formed.json` written when `formed`.
 fn fixture(formed: bool, bounds: Bounds) -> Fixture {
+    fixture_sliced(formed, bounds, usize::MAX)
+}
+
+/// As [`fixture`], its record sink's size trigger at `target_bytes`.
+fn fixture_sliced(formed: bool, bounds: Bounds, target_bytes: usize) -> Fixture {
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path().to_path_buf();
     let store = Store::local(&root).expect("store");
@@ -45,20 +52,36 @@ fn fixture(formed: bool, bounds: Bounds) -> Fixture {
         store: store.clone(),
         voters: VOTERS.map(str::to_owned).to_vec(),
         flush: FlushConfig {
-            target_bytes: usize::MAX,
+            target_bytes,
             max_buffer_age: Duration::MAX,
             ceiling_bytes: usize::MAX,
         },
         promoted: PromotedAttributes::default(),
         audit_ceiling: usize::MAX,
     };
+    let entries = entries(8);
+    let mut held = HeldLog(
+        logged(&entries)
+            .into_iter()
+            .map(|e| (e.log_id.index, e))
+            .collect(),
+    );
+    // A group's log starts at 0, with the first membership.
+    let first = Entry {
+        log_id: LogId {
+            index: 0,
+            ..held.0[&1].log_id
+        },
+        payload: openraft::EntryPayload::Blank,
+    };
+    held.0.insert(0, first);
     Fixture {
         _tmp: tmp,
         root,
         store,
-        flushing: Flushing::new(me(), GROUP, source),
+        flushing: Flushing::new(me(), GROUP, source, Arc::new(held)),
         kept: Kept::new(bounds),
-        log: mined_log(&entries(8)),
+        log: mined_log(&entries),
     }
 }
 
@@ -81,8 +104,30 @@ impl Fixture {
         for (n, (index, mined)) in self.log[range].iter().enumerate() {
             self.kept.keep(*index, mined.clone());
             let named = if n == 0 { assigned } else { None };
-            self.flushing.step(named, mined, &self.kept);
+            self.flushing.step(named, mined, &mut self.kept);
         }
+    }
+
+    /// As [`Self::step`], for a replica that dropped the output of every
+    /// entry through `gap`.
+    fn step_dropping(&mut self, range: std::ops::Range<usize>, assigned: Option<NodeId>, gap: u64) {
+        for (n, (index, mined)) in self.log[range].iter().enumerate() {
+            if *index <= gap {
+                self.kept.gap_at(*index);
+            } else {
+                self.kept.keep(*index, mined.clone());
+            }
+            let named = if n == 0 { assigned } else { None };
+            self.flushing.step(named, mined, &mut self.kept);
+        }
+    }
+
+    /// The records the current replay holds buffered, unpublished.
+    fn replay_buffered(&self) -> usize {
+        self.flushing
+            .publication
+            .as_ref()
+            .map_or(0, |publication| publication.buffered_records())
     }
 
     /// Flush the current publication, if any, and read every row on the
@@ -189,6 +234,8 @@ fn a_named_replica_waits_for_its_log_id() {
 /// A replica with a gap publishes nothing; once a checkpoint at or above
 /// the gap applies, it publishes everything it still keeps.
 #[test]
+#[ignore = "superseded: RFC 0065 §6.7, a named flusher with a gap and no checkpoint \
+            replays and then publishes; see a_flusher_with_a_gap_replays_it_then_publishes_as_if_it_dropped_nothing"]
 fn a_replica_with_a_gap_publishes_nothing_until_it_clears() {
     let mut f = fixture(
         true,
@@ -302,4 +349,129 @@ fn a_named_replica_copies_its_backlog_only_once_it_can_publish() {
     f.step(8..10, None);
     assert_eq!(f.flushing.backlog_copies, 1);
     assert_eq!(f.published(), f.rows_of(0..10));
+}
+
+/// The log index of the entry at `position` in the fixture's log.
+fn index_at(f: &Fixture, position: usize) -> u64 {
+    f.log[position].0
+}
+
+/// RFC 0065 §6.7, RFC0065.23: a named flusher whose drops came before any
+/// checkpoint replays the group's log from its first entry through the
+/// gap, then publishes what it keeps above it: the same rows as a
+/// flusher that dropped nothing.
+#[test]
+fn a_flusher_with_a_gap_replays_it_then_publishes_as_if_it_dropped_nothing() {
+    let mut f = fixture(true, Bounds::default());
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..10, Some(me()));
+    assert_eq!(f.kept.gap(), None, "the replay reached the gap");
+    assert_eq!(f.published(), f.rows_of(0..10));
+}
+
+/// RFC 0065 §6.7: the replay publishes a slice at a time, each made
+/// durable before the next is mined, and publishes nothing it keeps until
+/// it reaches the gap.
+#[test]
+fn a_gap_replay_publishes_one_slice_per_step() {
+    let mut f = fixture_sliced(true, Bounds::default(), 1);
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..7, Some(me()));
+    assert_eq!(f.kept.gap(), Some(gap), "one slice does not reach the gap");
+    assert!(f.flushing.current().borrow().is_none(), "kept output waits");
+    assert_eq!(f.replay_buffered(), 0, "the slice is durable");
+    assert!(!parquet_files(&f.root.join("data")).is_empty());
+    for position in 7..10 {
+        f.step(position..position + 1, None);
+        if f.kept.gap().is_some() {
+            assert_eq!(f.replay_buffered(), 0, "each slice is durable");
+        }
+    }
+    assert_eq!(f.kept.gap(), None);
+    assert_eq!(f.published(), f.rows_of(0..10));
+}
+
+/// A checkpoint at or above the gap that applies during the replay ends
+/// it: the gap clears and the flusher publishes what it keeps.
+#[test]
+fn a_checkpoint_at_or_above_the_gap_ends_the_replay() {
+    let mut f = fixture_sliced(true, Bounds::default(), 1);
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..7, Some(me()));
+    f.kept.checkpoint(gap);
+    f.step(7..10, None);
+    assert_eq!(f.kept.gap(), None);
+    let published = f.published();
+    for row in f.rows_of(6..10) {
+        assert!(
+            published.contains(&row),
+            "kept rows above the gap published"
+        );
+    }
+}
+
+/// A checkpoint below the gap whose cut the replay has already mined past
+/// leaves the replay going: it read every entry the purge can remove.
+#[test]
+fn a_checkpoint_the_replay_has_passed_does_not_stop_it() {
+    let mut f = fixture_sliced(true, Bounds::default(), 1);
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..7, Some(me()));
+    f.kept.checkpoint(index_at(&f, 1));
+    f.step(7..10, None);
+    assert_eq!(f.flushing.held(), None);
+    assert_eq!(f.kept.gap(), None);
+    assert_eq!(f.published(), f.rows_of(0..10));
+}
+
+/// RFC 0065 §6.7: a checkpoint below the gap that the replay has not
+/// mined past means restarting from that checkpoint's bundle, which this
+/// replica cannot restore yet, so it holds, publishing nothing it keeps.
+#[test]
+fn a_checkpoint_below_the_gap_ahead_of_the_replay_holds_it() {
+    let mut f = fixture_sliced(true, Bounds::default(), 1);
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..7, Some(me()));
+    f.kept.checkpoint(index_at(&f, 4));
+    f.step(7..10, None);
+    assert_eq!(f.flushing.held(), Some("restore_unavailable"));
+    assert!(f.flushing.current().borrow().is_none());
+    assert_eq!(f.kept.gap(), Some(gap));
+}
+
+/// A gap above an applied checkpoint is rebuilt from that checkpoint's
+/// bundle, which this replica cannot restore yet: it holds.
+#[test]
+fn a_gap_above_a_checkpoint_holds_until_restore() {
+    let mut f = fixture(true, Bounds::default());
+    f.kept.checkpoint(index_at(&f, 1));
+    let gap = index_at(&f, 5);
+    f.step_dropping(2..6, None, gap);
+    f.step(6..10, Some(me()));
+    assert_eq!(f.flushing.held(), Some("restore_unavailable"));
+    assert!(parquet_files(&f.root.join("data")).is_empty());
+}
+
+/// A replay that cannot read an entry stops, holding the flusher with the
+/// replay's `error.type`, and does not start again from the top at each
+/// later entry.
+#[test]
+fn a_replay_that_cannot_read_its_log_holds_the_flusher() {
+    let mut f = fixture(true, Bounds::default());
+    f.flushing = Flushing::new(
+        me(),
+        GROUP,
+        f.flushing.source.clone(),
+        Arc::new(HeldLog(BTreeMap::new())),
+    );
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..10, Some(me()));
+    assert_eq!(f.flushing.held(), Some("purged"));
+    assert!(parquet_files(&f.root.join("data")).is_empty());
 }

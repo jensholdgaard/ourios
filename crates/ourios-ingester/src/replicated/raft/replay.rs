@@ -35,10 +35,24 @@ impl fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
+impl ReplayError {
+    /// Its `error.type`: the miner's for a stopped miner.
+    #[must_use]
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::Purged { .. } => "purged",
+            // The live state machine refused it too, and stopped the replica.
+            Self::Refused(_) => "_OTHER",
+            Self::Miner(error) => error.error_type(),
+        }
+    }
+}
+
 /// The output of the log's entries from its first through `through`: an
 /// item per entry the state machine turns into an event for the miner, and
 /// one more per batch a first configuration held, each under the index of
-/// the entry that mined it; it ends after `through` or at its first error.
+/// the entry that mined it. Past `through` it yields nothing until
+/// [`Self::reach`] moves it on, and after its first error nothing at all.
 pub struct Replayed<L> {
     log: L,
     replay: Replay,
@@ -47,7 +61,8 @@ pub struct Replayed<L> {
     through: u64,
     /// The index of the last entry the miner followed.
     followed: u64,
-    stopped: bool,
+    /// It stopped at an error, and yields nothing more.
+    failed: bool,
 }
 
 impl<L: GroupLogRead + Clone + 'static> Replayed<L> {
@@ -62,12 +77,29 @@ impl<L: GroupLogRead + Clone + 'static> Replayed<L> {
             next: first,
             through,
             followed: first,
-            stopped: false,
+            failed: false,
         }
     }
 }
 
 impl<L: GroupLogRead> Replayed<L> {
+    /// Replay on through `through`, if that is further.
+    pub fn reach(&mut self, through: u64) {
+        self.through = self.through.max(through);
+    }
+
+    /// Every entry through the last one asked for is mined and yielded.
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.next > self.through && !self.miner.holds()
+    }
+
+    /// The index of the next entry to read: every one below it is read.
+    #[must_use]
+    pub fn next_index(&self) -> u64 {
+        self.next
+    }
+
     /// The next entry the state machine turns into an event, mined.
     fn step(&mut self) -> Option<Result<(u64, Mined), ReplayError>> {
         if let Some(held) = self.miner.next_held() {
@@ -97,11 +129,11 @@ impl<L: GroupLogRead> Iterator for Replayed<L> {
     type Item = Result<(u64, Mined), ReplayError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.stopped {
+        if self.failed {
             return None;
         }
         let item = self.step();
-        self.stopped = !matches!(item, Some(Ok(_)));
+        self.failed = matches!(item, Some(Err(_)));
         item
     }
 }

@@ -59,8 +59,10 @@ impl Rebuild {
             return Slice::Pending;
         }
         self.unflushed = true;
+        // Each slice mines at least one entry, so a size trigger of zero
+        // still moves the replay on.
         let mut bytes = 0_usize;
-        while bytes < target_bytes {
+        loop {
             match self.replayed.next() {
                 Some(Ok((_, mined))) => {
                     let mined_bytes: usize = mined
@@ -70,6 +72,9 @@ impl Rebuild {
                         .sum();
                     bytes = bytes.saturating_add(mined_bytes);
                     publication.publish(&mined.audit, &mined.rows);
+                    if bytes >= target_bytes.max(1) {
+                        break;
+                    }
                 }
                 Some(Err(error)) => return Slice::Stopped(error),
                 None => break,

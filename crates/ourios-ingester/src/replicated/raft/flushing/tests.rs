@@ -607,3 +607,22 @@ fn a_retained_handle_cannot_publish_a_refused_replay_slice_after_a_reassignment(
     assert_eq!(retained.buffered_records(), 0, "the buffers were discarded");
     assert!(!retained.flush_all(), "a held publication refuses to flush");
 }
+
+/// A size trigger of zero, which the record sink takes as "flush on every
+/// record", still moves the replay on: each slice mines at least one
+/// entry.
+#[test]
+fn a_zero_size_trigger_still_moves_the_replay_on() {
+    let mut f = fixture_sliced(true, Bounds::default(), 0);
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..10, Some(me()));
+    for _ in 0..f.log.len() {
+        if f.kept.gap().is_none() {
+            break;
+        }
+        f.flushing.step(None, &Mined::default(), &mut f.kept);
+    }
+    assert_eq!(f.kept.gap(), None, "the replay reached the gap");
+    assert_eq!(f.published(), f.rows_of(0..10));
+}

@@ -31,8 +31,9 @@ pub struct Publication {
     coordinator: PublishCoordinator,
     /// Held across a whole handoff and across a drain's capture, so a
     /// drain never takes a step's audit events without its rows; released
-    /// before the ordered write's I/O.
-    handoff: Mutex<()>,
+    /// before the ordered write's I/O. It holds whether the publication is
+    /// active: a discarded one takes no handoff and publishes nothing.
+    handoff: Mutex<bool>,
     /// Held across a whole flush, so a flush starts only once every earlier
     /// one has settled: rows an earlier write failed to publish are back in
     /// the buffers for it to drain, and its success covers them.
@@ -59,7 +60,7 @@ impl Publication {
         Self {
             log,
             coordinator,
-            handoff: Mutex::new(()),
+            handoff: Mutex::new(true),
             writing: Mutex::new(()),
         }
     }
@@ -70,7 +71,10 @@ impl Publication {
         audit: impl IntoIterator<Item = &'a AuditEvent>,
         rows: impl IntoIterator<Item = &'a MinedRow>,
     ) {
-        let _handoff = lock_recover(&self.handoff);
+        let active = lock_recover(&self.handoff);
+        if !*active {
+            return;
+        }
         let (mut events, mut records) = (
             self.coordinator.audit().clone(),
             self.coordinator.record().clone(),
@@ -81,6 +85,30 @@ impl Publication {
         for row in rows {
             records.emit(self.stamped(row));
         }
+    }
+
+    /// Stop: drop everything buffered, which releases its accounting, and
+    /// take no handoff and run no flush until [`Self::resume`]. A flush
+    /// already writing finishes first. What is dropped is still kept on
+    /// the replica, and published again once it may publish.
+    pub fn discard(&self) {
+        let _writing = lock_recover(&self.writing);
+        let mut active = lock_recover(&self.handoff);
+        *active = false;
+        // No other take is open: flushes hold `writing`. So abandoning this
+        // one dooms no later drain.
+        drop(self.coordinator.drain_all());
+    }
+
+    /// Take handoffs and run flushes again.
+    pub fn resume(&self) {
+        *lock_recover(&self.handoff) = true;
+    }
+
+    /// The records buffered and not yet published.
+    #[must_use]
+    pub fn buffered_records(&self) -> usize {
+        self.coordinator.record().buffered_records()
     }
 
     /// Hand everything `kept` holds to the publish path, audit events
@@ -95,7 +123,10 @@ impl Publication {
     pub fn flush_aged(&self) -> bool {
         let _writing = lock_recover(&self.writing);
         let drained = {
-            let _handoff = lock_recover(&self.handoff);
+            let active = lock_recover(&self.handoff);
+            if !*active {
+                return false;
+            }
             self.coordinator.drain_aged()
         };
         self.coordinator.write_ordered(drained, "age")
@@ -106,7 +137,10 @@ impl Publication {
     pub fn flush_all(&self) -> bool {
         let _writing = lock_recover(&self.writing);
         let drained = {
-            let _handoff = lock_recover(&self.handoff);
+            let active = lock_recover(&self.handoff);
+            if !*active {
+                return false;
+            }
             self.coordinator.drain_all()
         };
         let written = self.coordinator.write_ordered(drained, "barrier");

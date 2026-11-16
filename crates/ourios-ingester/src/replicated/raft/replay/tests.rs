@@ -54,3 +54,57 @@ fn a_purged_entry_ends_the_replay() {
         other => panic!("expected the purged entry: {other:?}"),
     }
 }
+
+/// An id block, `held` batches of five corpus lines from index 2, then
+/// the first configuration and two more batches.
+fn configured_late(held: usize) -> Vec<super::super::types::GroupEntry> {
+    use super::super::mining::tests::{batch_at, block, configured, corpus, time};
+    let lines = corpus();
+    let mut chunks = (1..).zip(lines.chunks(5));
+    let mut entries = vec![block(0, 10_000)];
+    for (n, chunk) in chunks.by_ref().take(held) {
+        entries.push(batch_at(time(n), "acme", chunk));
+    }
+    entries.push(configured(0.7));
+    entries.extend(
+        chunks
+            .take(2)
+            .map(|(n, chunk)| batch_at(time(n), "acme", chunk)),
+    );
+    entries
+}
+
+/// RFC 0065 §6.7: a replay bounds each item to one entry's rows, the
+/// batches held for a late first configuration included, and the items
+/// for each entry join up to what the live miner mined from it.
+#[test]
+fn a_replay_mines_the_batches_held_for_the_first_configuration_one_at_a_time() {
+    let entries = configured_late(6);
+    let live = mined_log(&entries);
+    let last = live.last().expect("entries").0;
+    let replay = replayed(held(&entries), last).expect("replayed");
+    for (index, mined) in &replay {
+        let mut seqs: Vec<u64> = mined.rows.iter().map(|r| r.position.seq).collect();
+        seqs.dedup();
+        assert!(seqs.len() <= 1, "item for {index} mined entries {seqs:?}");
+    }
+    let mut joined: Vec<(u64, Mined)> = Vec::new();
+    for (index, Mined { audit, rows }) in replay {
+        match joined.last_mut() {
+            Some((last, whole)) if *last == index => {
+                whole.audit.extend(audit);
+                whole.rows.extend(rows);
+            }
+            _ => joined.push((index, Mined { audit, rows })),
+        }
+    }
+    assert_eq!(joined, live);
+    let configured_at = 8;
+    assert_eq!(
+        live.iter()
+            .find(|(index, _)| *index == configured_at)
+            .map(|(_, m)| m.rows.len()),
+        Some(30),
+        "the configuration mined the six held batches"
+    );
+}

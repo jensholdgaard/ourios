@@ -2,7 +2,9 @@
 //! replay when no checkpoint has applied): a [`Replay`] of the state
 //! machine feeds a fresh [`GroupMiner`], entry by entry, so each entry
 //! yields what the live miner mined from it, the same rows at the same
-//! positions and the same audit events, timestamps included.
+//! positions and the same audit events, timestamps included. The batches
+//! held for a late first configuration come one per item, under the
+//! configuration's index, so no item holds more than one entry's output.
 
 use std::fmt;
 use std::io;
@@ -33,15 +35,18 @@ impl fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
-/// The output of the log's entries from its first through `through`, one
-/// item per entry the state machine turns into an event for the miner; it
-/// ends after `through` or at its first error.
+/// The output of the log's entries from its first through `through`: an
+/// item per entry the state machine turns into an event for the miner, and
+/// one more per batch a first configuration held, each under the index of
+/// the entry that mined it; it ends after `through` or at its first error.
 pub struct Replayed<L> {
     log: L,
     replay: Replay,
     miner: GroupMiner,
     next: u64,
     through: u64,
+    /// The index of the last entry the miner followed.
+    followed: u64,
     stopped: bool,
 }
 
@@ -56,6 +61,7 @@ impl<L: GroupLogRead + Clone + 'static> Replayed<L> {
             replay: Replay::from_start(),
             next: first,
             through,
+            followed: first,
             stopped: false,
         }
     }
@@ -64,6 +70,10 @@ impl<L: GroupLogRead + Clone + 'static> Replayed<L> {
 impl<L: GroupLogRead> Replayed<L> {
     /// The next entry the state machine turns into an event, mined.
     fn step(&mut self) -> Option<Result<(u64, Mined), ReplayError>> {
+        if let Some(held) = self.miner.next_held() {
+            let index = self.followed;
+            return Some(held.map(|mined| (index, mined)).map_err(ReplayError::Miner));
+        }
         while self.next <= self.through {
             let index = self.next;
             self.next += 1;
@@ -75,7 +85,8 @@ impl<L: GroupLogRead> Replayed<L> {
                 Ok(None) => continue,
                 Err(error) => return Some(Err(ReplayError::Refused(error))),
             };
-            let mined = self.miner.apply(applied).map_err(ReplayError::Miner);
+            self.followed = index;
+            let mined = self.miner.step(applied).map_err(ReplayError::Miner);
             return Some(mined.map(|mined| (index, mined)));
         }
         None

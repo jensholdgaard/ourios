@@ -760,3 +760,106 @@ fn a_batch_purged_before_the_first_configuration_applies_stops_the_miner() {
     });
     assert_eq!(outcomes, [Ok(0), Ok(0), Ok(0), purged.clone(), purged]);
 }
+
+/// The seqs of the entries whose rows `mined` holds, in order, once each.
+fn entries_mined(mined: &Mined) -> Vec<u64> {
+    let mut seqs: Vec<u64> = mined.rows.iter().map(|row| row.position.seq).collect();
+    seqs.dedup();
+    seqs
+}
+
+/// What `miner` mined from `applied` a step at a time: the event's own
+/// output, then each held batch's, until none is left.
+fn stepped(miner: &mut GroupMiner, applied: Applied) -> Result<Vec<Mined>, GroupMinerError> {
+    let mut steps = vec![miner.step(applied)?];
+    while let Some(held) = miner.next_held() {
+        steps.push(held?);
+    }
+    Ok(steps)
+}
+
+fn joined(steps: Vec<Mined>) -> Mined {
+    let mut whole = Mined::default();
+    for Mined { audit, rows } in steps {
+        whole.audit.extend(audit);
+        whole.rows.extend(rows);
+    }
+    whole
+}
+
+/// RFC 0065 §6.7: the first configuration mines none of the batches held
+/// for it; each later step mines one of them, in log order, with the
+/// audit events it emitted, stamped with that batch's time.
+#[test]
+fn the_batches_held_for_the_first_configuration_mine_one_per_step() {
+    let entries = configured_at_4();
+    let mut miner = miner_of(&entries);
+    let steps: Vec<Vec<Mined>> = events_of(&entries, 8)
+        .into_iter()
+        .map(|applied| stepped(&mut miner, applied).expect("mined"))
+        .collect();
+    let per_step: Vec<Vec<Vec<u64>>> = steps
+        .iter()
+        .map(|steps| steps.iter().map(entries_mined).collect())
+        .collect();
+    let none = Vec::<u64>::new;
+    assert_eq!(
+        per_step,
+        [
+            vec![none()],
+            vec![none()],
+            vec![none()],
+            vec![none(), vec![1], vec![3]],
+            vec![vec![5]],
+        ]
+    );
+    let own_times = [time(10), time(20)].map(BatchTime::system_time);
+    assert_eq!(stamps(&steps[3][1]), own_times[..1]);
+    assert_eq!(stamps(&steps[3][2]), own_times[1..]);
+}
+
+/// An event that follows while batches are still held mines them first,
+/// so its output stays in log order.
+#[test]
+fn an_event_after_held_batches_mines_them_first() {
+    let entries = configured_at_4();
+    let mut miner = miner_of(&entries);
+    let mut events = events_of(&entries, 8).into_iter();
+    for applied in events.by_ref().take(4) {
+        assert_eq!(miner.step(applied).expect("mined"), Mined::default());
+    }
+    let last = events.next().expect("the batch at 5");
+    let out = miner.step(last).expect("mined");
+    assert_eq!(entries_mined(&out), [1, 3, 5]);
+    assert!(miner.next_held().is_none(), "nothing left held");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(ourios_testgen::proptest_cases(64)))]
+
+    /// Stepping through a log, held batches one at a time, mines what
+    /// applying it whole does, event for event, errors included, and no
+    /// held step mines more than one entry.
+    #[test]
+    fn stepping_mines_what_applying_whole_does(
+        ops in prop::collection::vec(op(), 1..40)
+    ) {
+        let corpus = corpus();
+        let entries: Vec<GroupEntry> = ops.iter().map(|op| entry_of(op, &corpus)).collect();
+        let (mut whole, mut steps) = (miner_of(&entries), miner_of(&entries));
+        for applied in events_of(&entries, 64) {
+            let expected = whole.apply(applied.clone());
+            let got = stepped(&mut steps, applied);
+            if let Ok(got) = &got {
+                for held in &got[1..] {
+                    prop_assert_eq!(entries_mined(held).len(), 1, "one entry per held step");
+                }
+            }
+            let stopped = expected.is_err();
+            prop_assert_eq!(got.map(joined), expected);
+            if stopped {
+                break;
+            }
+        }
+    }
+}

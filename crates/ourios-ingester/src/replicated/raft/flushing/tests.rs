@@ -64,6 +64,14 @@ struct Setup {
 }
 
 impl Setup {
+    /// Unbounded keeping over `entries`.
+    fn entries(entries: Vec<GroupEntry>) -> Self {
+        Self {
+            entries,
+            ..Self::bounded(Bounds::default())
+        }
+    }
+
     fn bounded(bounds: Bounds) -> Self {
         Self {
             bounds,
@@ -625,4 +633,29 @@ fn a_zero_size_trigger_still_moves_the_replay_on() {
     }
     assert_eq!(f.kept.gap(), None, "the replay reached the gap");
     assert_eq!(f.published(), f.rows_of(0..10));
+}
+
+/// RFC 0065 §6.7: a slice is bounded in entries as well as bytes, so a
+/// long run of entries that mine no rows, such as batches waiting for a
+/// late first configuration, does not replay in one step.
+#[test]
+fn a_slice_replays_a_bounded_number_of_entries() {
+    let line = corpus()[0];
+    let mut entries = vec![block(0, 10_000)];
+    entries.extend((1..=1_100).map(|n| batch_at(time(n), "acme", &[line])));
+    entries.push(configured(0.7));
+    let mut f = fixture_with(true, Setup::entries(entries));
+    let gap = f.log.last().expect("entries").0;
+    let last = f.log.len();
+    f.step_dropping(0..last, None, gap);
+    f.step(last - 1..last, Some(me()));
+    assert_eq!(f.kept.gap(), Some(gap), "one step is one bounded slice");
+    for _ in 0..last {
+        if f.kept.gap().is_none() {
+            break;
+        }
+        f.flushing.step(None, &Mined::default(), &mut f.kept);
+    }
+    assert_eq!(f.kept.gap(), None, "the replay reached the gap");
+    assert_eq!(f.published(), f.rows_of(0..last));
 }

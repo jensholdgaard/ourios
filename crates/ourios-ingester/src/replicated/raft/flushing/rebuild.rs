@@ -14,6 +14,11 @@ use crate::record_sink::estimate_bytes;
 /// membership there, and with no checkpoint applied nothing is purged.
 const FIRST: u64 = 0;
 
+/// The most entries one slice mines, so entries that mine no rows, such
+/// as batches waiting for a late first configuration, never make a step
+/// of the whole replay and hold up the live miner behind it.
+const SLICE_ENTRIES: usize = 1024;
+
 /// What one slice of a replay came to.
 pub(super) enum Slice {
     /// Every entry through the gap is published, durably.
@@ -44,9 +49,9 @@ impl Rebuild {
         self.replayed.needs_from() > cut
     }
 
-    /// Replay through `gap`, which may have grown, for one slice of at
-    /// least `target_bytes` of rows, publishing it through `publication`
-    /// and flushing it. A slice the store does not take is flushed again
+    /// Replay through `gap`, which may have grown, for one slice: until its
+    /// rows reach `target_bytes` or it has mined [`SLICE_ENTRIES`] entries.
+    /// It is published through `publication` and flushed. A slice the store does not take is flushed again
     /// before the next is mined.
     pub(super) fn slice(
         &mut self,
@@ -62,7 +67,7 @@ impl Rebuild {
         // Each slice mines at least one entry, so a size trigger of zero
         // still moves the replay on.
         let mut bytes = 0_usize;
-        loop {
+        for _ in 0..SLICE_ENTRIES {
             match self.replayed.next() {
                 Some(Ok((_, mined))) => {
                     let mined_bytes: usize = mined

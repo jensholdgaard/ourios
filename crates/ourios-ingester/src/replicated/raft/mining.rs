@@ -9,6 +9,8 @@
 //! first configuration are mined under it once it applies, read back from
 //! the group's log ([`GroupLogRead`]), which no checkpoint can purge below
 //! a configuration; until then the miner keeps only the index of the first.
+//! They are read back one at a time ([`GroupMiner::next_held`]), so no step
+//! holds more than one entry's output however many waited.
 //! Anything it cannot mine exactly as its peers would, a batch it cannot
 //! decode, one its log no longer holds or a snapshot installed over the
 //! log, stops it for good with the error naming the entry.
@@ -113,6 +115,13 @@ impl fmt::Display for GroupMinerError {
                  configuration at {at}"
             ),
         }
+    }
+}
+
+impl Mined {
+    fn append(&mut self, Mined { audit, rows }: Mined) {
+        self.audit.extend(audit);
+        self.rows.extend(rows);
     }
 }
 
@@ -265,13 +274,23 @@ impl Frame {
     }
 }
 
+/// The batches the first configuration, at `at`, has yet to mine: those
+/// in the group's log from `next` up to it.
+struct Held {
+    next: u64,
+    at: LogId,
+}
+
 enum Stage {
     /// No configuration has applied: the batches from the index of the
     /// `first` one applied wait for it in the group's log.
     Unconfigured {
         first: Option<u64>,
     },
-    Mining(Box<MinerCluster>),
+    Mining {
+        miner: Box<MinerCluster>,
+        held: Option<Held>,
+    },
     Stopped(GroupMinerError),
 }
 
@@ -307,17 +326,66 @@ impl GroupMiner {
     }
 
     /// Follow one event; returns the audit events and rows it mined, in
-    /// log order.
+    /// log order, the batches held for a first configuration included.
     ///
     /// # Errors
     ///
     /// The [`GroupMinerError`] that stopped the miner, at this event or
     /// an earlier one.
     pub fn apply(&mut self, applied: Applied) -> Result<Mined, GroupMinerError> {
+        let mut mined = self.step(applied)?;
+        mined.append(self.drain_held()?);
+        Ok(mined)
+    }
+
+    /// Follow one event, leaving the batches a first configuration holds
+    /// to [`Self::next_held`]. Batches still held when it is called are
+    /// mined first, ahead of its own output, to keep log order.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply`].
+    pub fn step(&mut self, applied: Applied) -> Result<Mined, GroupMinerError> {
+        let mut mined = self.drain_held()?;
         let followed = match &self.stage {
             Stage::Stopped(error) => Err(error.clone()),
-            Stage::Unconfigured { .. } | Stage::Mining(_) => self.follow(applied),
+            Stage::Unconfigured { .. } | Stage::Mining { .. } => self.follow(applied),
         };
+        mined.append(self.settle(followed)?);
+        Ok(mined)
+    }
+
+    /// Mine the next batch held for the first configuration, in log
+    /// order; `None` once none is left.
+    ///
+    /// # Errors
+    ///
+    /// The [`GroupMinerError`] that stopped the miner at that batch.
+    pub fn next_held(&mut self) -> Option<Result<Mined, GroupMinerError>> {
+        let read = self.read_held()?;
+        Some(self.settle(read))
+    }
+
+    /// Whether a first configuration still holds batches to mine.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        matches!(self.stage, Stage::Mining { held: Some(_), .. })
+    }
+
+    fn drain_held(&mut self) -> Result<Mined, GroupMinerError> {
+        let mut mined = Mined::default();
+        while let Some(held) = self.next_held() {
+            mined.append(held?);
+        }
+        Ok(mined)
+    }
+
+    /// The audit events emitted since the last call, with `followed`'s
+    /// rows; an error stops the miner.
+    fn settle(
+        &mut self,
+        followed: Result<Vec<MinedRow>, GroupMinerError>,
+    ) -> Result<Mined, GroupMinerError> {
         let audit = self.audit.drain();
         match followed {
             Ok(rows) => Ok(Mined { audit, rows }),
@@ -355,31 +423,35 @@ impl GroupMiner {
                 first.get_or_insert(at.index);
                 Ok(Vec::new())
             }
-            Stage::Mining(miner) => Frame::decode(at, batch)?.mine(miner, &self.clock),
+            Stage::Mining { miner, .. } => Frame::decode(at, batch)?.mine(miner, &self.clock),
             Stage::Stopped(error) => Err(error.clone()),
         }
     }
 
-    /// Mine the batches in the group's log from `first` up to the first
-    /// configuration at `at`, in log order.
-    fn read_back(
-        &self,
-        miner: &mut MinerCluster,
-        first: u64,
-        at: LogId,
-    ) -> Result<Vec<MinedRow>, GroupMinerError> {
-        let mut rows = Vec::new();
-        for index in first..at.index {
+    /// The rows of the next held batch in the group's log, or `None`
+    /// once the configuration holds none.
+    fn read_held(&mut self) -> Option<Result<Vec<MinedRow>, GroupMinerError>> {
+        let Stage::Mining { miner, held } = &mut self.stage else {
+            return None;
+        };
+        let Held { next, at } = held.as_mut()?;
+        while *next < at.index {
+            let index = *next;
+            *next += 1;
             match self.log.entry(index) {
-                None => return Err(GroupMinerError::Purged { at, index }),
+                None => return Some(Err(GroupMinerError::Purged { at: *at, index })),
                 Some(Entry {
                     log_id,
                     payload: EntryPayload::Normal(GroupEntry::Batch(batch)),
-                }) => rows.extend(Frame::decode(log_id, &batch)?.mine(miner, &self.clock)?),
+                }) => {
+                    let frame = Frame::decode(log_id, &batch);
+                    return Some(frame.and_then(|frame| frame.mine(miner, &self.clock)));
+                }
                 Some(_) => {}
             }
         }
-        Ok(rows)
+        *held = None;
+        None
     }
 
     fn configure(
@@ -388,26 +460,22 @@ impl GroupMiner {
         config: GroupMinerConfig,
     ) -> Result<Vec<MinedRow>, GroupMinerError> {
         match &mut self.stage {
-            Stage::Mining(miner) => {
+            Stage::Mining { miner, .. } => {
                 let refused = |source| GroupMinerError::ShapeChanged { at, source };
                 miner.reconfigure(config.config()).map_err(refused)?;
                 Ok(Vec::new())
             }
             Stage::Unconfigured { first } => {
-                let first = *first;
+                let held = first.map(|next| Held { next, at });
                 let audit = Box::new(self.audit.clone());
                 let reserver = Box::new(self.blocks.clone());
-                let mut miner = Box::new(
+                let miner = Box::new(
                     MinerCluster::with_audit_sink(config.config(), audit)
                         .with_clock(Box::new(self.clock.clone()))
                         .with_id_reserver(reserver),
                 );
-                let rows = match first {
-                    Some(first) => self.read_back(&mut miner, first, at)?,
-                    None => Vec::new(),
-                };
-                self.stage = Stage::Mining(miner);
-                Ok(rows)
+                self.stage = Stage::Mining { miner, held };
+                Ok(Vec::new())
             }
             Stage::Stopped(error) => Err(error.clone()),
         }

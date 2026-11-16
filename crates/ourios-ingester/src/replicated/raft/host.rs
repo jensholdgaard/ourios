@@ -23,7 +23,7 @@ use super::flushing::{self, Current, Flushing, Need, Publishing};
 use super::gate::SyncGate;
 use super::kept::{Bounds, Kept};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
-use super::mining::{GroupMiner, Mined};
+use super::mining::{GroupMiner, GroupMinerError, Mined};
 use super::state_machine::{Applied, AppliedEvent, GroupSm};
 use super::telemetry::{KeptDrops, Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
@@ -398,10 +398,11 @@ impl Applying {
 
 impl Follow {
     /// Feed `miner` each event `applied` carries, off the runtime's
-    /// workers, and hand on whatever an event mined. A miner that stops is
-    /// reported and dropped with `applied`, and the replica applies on
-    /// without it. Ends with the group or once `stop` says so, never in
-    /// the middle of a step.
+    /// workers, and hand on whatever an event mined, the batches a first
+    /// configuration held one at a time. A miner that stops is reported
+    /// and dropped with `applied`, and the replica applies on without it.
+    /// Ends with the group or once `stop` says so, never in the middle of
+    /// a step.
     async fn run(
         self,
         mut miner: GroupMiner,
@@ -410,31 +411,52 @@ impl Follow {
     ) {
         while let Some(event) = next(&mut applied, &mut stop).await {
             let index = event.at.index;
-            let applying = Applying::of(&event.event);
-            let keeping = self.keeping.clone();
-            let mining = tokio::task::spawn_blocking(move || {
-                let followed = miner.apply(event);
-                if let Ok(out) = &followed {
-                    keeping.keep(index, out, applying);
+            let mut work = Some(event);
+            while work.is_some() || miner.holds() {
+                let Some((back, followed)) = self.mine(miner, index, work.take()).await else {
+                    return;
+                };
+                miner = back;
+                let handed_on = match followed {
+                    None => break,
+                    Some(Ok(out)) => self.hand_on(out, &mut stop).await,
+                    Some(Err(error)) => {
+                        self.storage.miner_stopped(self.group, &error);
+                        false
+                    }
+                };
+                if !handed_on || *stop.borrow() {
+                    return;
                 }
-                (miner, followed)
-            });
-            // A miner that panicked is gone; the panic is reported where it happened.
-            let Ok((back, followed)) = mining.await else {
-                return;
-            };
-            miner = back;
-            let handed_on = match followed {
-                Ok(out) => self.hand_on(out, &mut stop).await,
-                Err(error) => {
-                    self.storage.miner_stopped(self.group, &error);
-                    false
-                }
-            };
-            if !handed_on {
-                return;
             }
         }
+    }
+
+    /// One step of `miner` off the runtime's workers: follow `event`, or
+    /// with none mine the next held batch, keeping its output under
+    /// `index`. `None` if the miner panicked; the panic is reported where
+    /// it happened.
+    async fn mine(
+        &self,
+        mut miner: GroupMiner,
+        index: u64,
+        event: Option<Applied>,
+    ) -> Option<(GroupMiner, Option<Result<Mined, GroupMinerError>>)> {
+        let keeping = self.keeping.clone();
+        let mining = tokio::task::spawn_blocking(move || {
+            let (followed, applying) = match event {
+                Some(event) => {
+                    let applying = Applying::of(&event.event);
+                    (Some(miner.step(event)), applying)
+                }
+                None => (miner.next_held(), Applying::default()),
+            };
+            if let Some(Ok(out)) = &followed {
+                keeping.keep(index, out, applying);
+            }
+            (miner, followed)
+        });
+        mining.await.ok()
     }
 
     /// Send `out` on, unless it is empty; `false` once told to stop. With
@@ -666,7 +688,9 @@ mod tests {
     use super::super::formation::{Formation, formed_key};
     use super::super::kept::tests::{entries, mined_log};
     use super::super::mining::GroupLogRead;
-    use super::super::mining::tests::{batch_at, block, configured, corpus, time};
+    use super::super::mining::tests::{
+        HeldLog as InMemoryLog, batch_at, block, configured, corpus, logged, time,
+    };
     use super::super::publication::held::first_put_held;
     use super::super::snapshot_record::{GroupMinerConfig, IdBlock};
     use super::super::state_machine::AppliedEvent;
@@ -894,6 +918,15 @@ mod tests {
     }
 
     fn following(bounds: Bounds, meters: &Meters) -> Following {
+        following_over(bounds, meters, EmptyLog)
+    }
+
+    /// As [`following`], over `log`.
+    fn following_over(
+        bounds: Bounds,
+        meters: &Meters,
+        log: impl GroupLogRead + 'static,
+    ) -> Following {
         let (events, applied) = mpsc::channel(16);
         let (mined, handed) = mpsc::channel(16);
         let kept = Arc::new(Mutex::new(Kept::new(bounds)));
@@ -910,7 +943,7 @@ mod tests {
             sweep: None,
             storage: Storage::global(),
         };
-        let mining = Mining::start(follow, GroupMiner::new(EmptyLog), applied);
+        let mining = Mining::start(follow, GroupMiner::new(log), applied);
         Following {
             events,
             handed,
@@ -970,6 +1003,46 @@ mod tests {
         assert_eq!(kept.rows().cloned().collect::<Vec<_>>(), above);
         assert_eq!(above.len(), 15, "three batches above the cut");
         assert_eq!(kept.gap(), None);
+    }
+
+    /// RFC 0065 §6.7: a tail replica keeps and hands on the batches held
+    /// for a late first configuration one at a time, each under the
+    /// configuration's index, so no step holds more than one batch's rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tail_replica_hands_on_each_held_batch_on_its_own() {
+        let lines = corpus();
+        let mut entries = vec![block(0, 10_000)];
+        let chunks = (1..).zip(lines.chunks(5).take(4));
+        entries.extend(chunks.map(|(n, chunk)| batch_at(time(n), "acme", chunk)));
+        entries.push(configured(0.7));
+        let log = InMemoryLog(
+            logged(&entries)
+                .into_iter()
+                .map(|e| (e.log_id.index, e))
+                .collect(),
+        );
+        let Following {
+            events,
+            mut handed,
+            mining,
+            kept,
+        } = following_over(Bounds::default(), &Meters::global(), log);
+        for (index, entry) in (1..).zip(entries) {
+            let event = event_of(entry);
+            let at = log_id(index);
+            events.send(Applied { at, event }).await.expect("sent");
+        }
+        drop(events);
+        let mut seqs = Vec::new();
+        while let Some(GroupMined { mined, .. }) = handed.recv().await {
+            let mut handed_seqs: Vec<u64> = mined.rows.iter().map(|r| r.position.seq).collect();
+            handed_seqs.dedup();
+            seqs.push(handed_seqs);
+        }
+        mining.stop().await;
+        assert_eq!(seqs, [vec![2], vec![3], vec![4], vec![5]]);
+        let kept = kept.lock().expect("kept");
+        assert_eq!(kept.rows().count(), 20, "every held row kept");
     }
 
     /// What a tail replica drops past its bounds is counted per group.

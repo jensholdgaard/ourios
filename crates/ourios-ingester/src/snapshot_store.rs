@@ -21,7 +21,7 @@ use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 use ourios_core::tenant::TenantId;
-use ourios_miner::snapshot::{SnapshotError, SnapshotState, WalHighWater, snapshot};
+use ourios_miner::snapshot::{SegmentMark, SnapshotError, SnapshotState, WalHighWater, snapshot};
 use ourios_parquet::{percent_decode_tenant, percent_encode_tenant};
 use ourios_wal::WalOffset;
 use uuid::Uuid;
@@ -338,17 +338,20 @@ pub fn load_all(root: &Path) -> Result<Vec<(TenantId, Vec<u8>)>, SnapshotStoreEr
 /// The artefact's `wal_high_water` for a WAL offset.
 #[must_use]
 pub fn high_water(offset: WalOffset) -> WalHighWater {
-    WalHighWater {
+    WalHighWater::Local(SegmentMark {
         segment: offset.segment.to_string(),
         byte: offset.byte,
-    }
+    })
 }
 
 /// The WAL offset an artefact's `wal_high_water` names, or `None` when
-/// its segment is not a UUID — which no writer produces, so a caller
-/// reads it as corrupt.
+/// it is a replicated group's cut or its segment is not a UUID, neither
+/// of which a local writer produces, so a caller reads it as corrupt.
 #[must_use]
 pub fn offset_of(high_water: &WalHighWater) -> Option<WalOffset> {
+    let WalHighWater::Local(high_water) = high_water else {
+        return None;
+    };
     let segment = Uuid::parse_str(&high_water.segment).ok()?;
     Some(WalOffset {
         segment,
@@ -360,7 +363,7 @@ pub fn offset_of(high_water: &WalHighWater) -> Option<WalOffset> {
 mod tests {
     use super::*;
     use ourios_miner::snapshot::{
-        LeafRecord, StructuredTemplateRecord, TokenRecord, WalHighWater, load_snapshot,
+        LeafRecord, SegmentMark, StructuredTemplateRecord, TokenRecord, load_snapshot,
     };
 
     /// A single-component relative root's entry lives in the current
@@ -402,10 +405,10 @@ mod tests {
                 event_name: None,
                 template_id: template_id + 1,
             }],
-            wal_high_water: Some(WalHighWater {
+            wal_high_water: Some(WalHighWater::Local(SegmentMark {
                 segment: "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0".to_string(),
                 byte: 64,
-            }),
+            })),
             adopted_templates: vec![],
         }
     }

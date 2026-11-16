@@ -545,12 +545,14 @@ impl LegacyMarks {
     fn note(&mut self, tenant: &TenantId, bytes: &[u8]) {
         match ourios_miner::snapshot::legacy_v1_mark(bytes) {
             LegacyMark::NotLegacy => {}
-            LegacyMark::Recorded(mark) => match snapshot_store::offset_of(&mark) {
-                Some(offset) => {
-                    self.recorded.insert(tenant.clone(), offset);
+            LegacyMark::Recorded(mark) => {
+                match snapshot_store::offset_of(&WalHighWater::Local(mark)) {
+                    Some(offset) => {
+                        self.recorded.insert(tenant.clone(), offset);
+                    }
+                    None => self.unreadable.push(tenant.clone()),
                 }
-                None => self.unreadable.push(tenant.clone()),
-            },
+            }
             LegacyMark::Unreadable => self.unreadable.push(tenant.clone()),
         }
     }
@@ -642,6 +644,11 @@ fn restore_artefact(miner: &mut MinerCluster, tenant_id: &TenantId, bytes: &[u8]
     // the snapshot already folded — exactly the v1 double-apply hazard.
     // §6.9 maps a missing horizon to the discard class, same as an
     // unparseable one.
+    // RFC 0065 §6.5: only a tail replica reads a group's cut, from a
+    // bundle; here it is corrupt.
+    if let Some(WalHighWater::Replicated(_)) = state.wal_high_water {
+        return SnapshotFate::Discarded(DiscardReason::Corrupt);
+    }
     let Some(horizon) = parse_high_water(state.wal_high_water.as_ref()) else {
         return SnapshotFate::Discarded(DiscardReason::NoHorizon);
     };
@@ -891,6 +898,7 @@ fn reject(kind: FrameKind, offset: WalOffset, error: &dyn std::fmt::Display) -> 
 mod tests {
     use super::*;
     use ourios_config::MinerConfig;
+    use ourios_miner::snapshot::SegmentMark;
 
     const SEGMENT: &str = "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0";
 
@@ -903,20 +911,23 @@ mod tests {
 
     #[test]
     fn parse_high_water_accepts_a_concrete_mark() {
-        let hw = WalHighWater {
+        let hw = SegmentMark {
             segment: SEGMENT.to_string(),
             byte: 64,
         };
-        assert_eq!(parse_high_water(Some(&hw)), Some(offset(SEGMENT, 64)));
+        assert_eq!(
+            parse_high_water(Some(&WalHighWater::Local(hw))),
+            Some(offset(SEGMENT, 64))
+        );
     }
 
     #[test]
     fn parse_high_water_rejects_an_unparseable_segment() {
-        let hw = WalHighWater {
+        let hw = SegmentMark {
             segment: "not-a-uuid".to_string(),
             byte: 64,
         };
-        assert_eq!(parse_high_water(Some(&hw)), None);
+        assert_eq!(parse_high_water(Some(&WalHighWater::Local(hw))), None);
     }
 
     #[test]
@@ -925,6 +936,25 @@ mod tests {
         // double-apply hazard); absent maps to the same discard
         // signal as unparseable.
         assert_eq!(parse_high_water(None), None);
+    }
+
+    /// RFC 0065 §6.5: only a tail replica reads a group's cut, and only
+    /// in a bundle; the local loader discards it as corrupt and replays.
+    #[test]
+    fn a_snapshot_marked_with_a_group_cut_is_discarded_as_corrupt() {
+        let tenant = TenantId::new("t");
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        let mut state = miner.snapshot_state(&tenant);
+        state.wal_high_water = Some(WalHighWater::Replicated(ourios_miner::snapshot::LogMark {
+            log: 3,
+            seq: 200,
+        }));
+        let bytes = ourios_miner::snapshot::snapshot(&state).expect("encodes");
+
+        assert_eq!(
+            restore_artefact(&mut miner, &tenant, &bytes),
+            SnapshotFate::Discarded(DiscardReason::Corrupt)
+        );
     }
 
     #[test]

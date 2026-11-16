@@ -336,6 +336,5 @@ async fn rfc0008_10_shutdown_without_live_traffic_stamps_the_recovered_high_wate
         .expect("known-version artefact decodes")
         .wal_high_water
         .expect("the zero-request shutdown snapshot still records a high-water mark");
-    assert_eq!(high_water.segment, durable.segment.to_string());
-    assert_eq!(high_water.byte, durable.byte);
+    assert_eq!(snapshot_store::offset_of(&high_water), Some(durable));
 }

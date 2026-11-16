@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use super::checkpointer::Checkpointer;
 use super::flushing::{self, Current, Flushing, Need, Publishing};
 use super::gate::SyncGate;
 use super::kept::{Bounds, Kept};
@@ -152,11 +153,18 @@ impl Launch<'_> {
         let flushing = publishing.and_then(|publishing| {
             let source = publishing.source(group)?;
             let log: SharedLog = Arc::new(tail.log.clone());
+            let checkpointer = Checkpointer::new(
+                group,
+                publishing.barrier(),
+                source.store.clone(),
+                self.meters.checkpoints(),
+            );
             let flushing =
                 Flushing::new(self.spec.id, group, source, log).with_replays(self.meters.replays());
-            Some((flushing, publishing.sweep()))
+            Some((flushing, publishing.sweep(), checkpointer))
         });
-        let sweep = flushing.as_ref().map(|(f, every)| (f.current(), *every));
+        let sweep = flushing.as_ref().map(|(f, every, _)| (f.current(), *every));
+        let (flushing, checkpointer) = flushing.map(|(f, _, c)| (f, c)).unzip();
         Follow {
             group,
             mined,
@@ -164,10 +172,11 @@ impl Launch<'_> {
                 group,
                 kept,
                 drops: self.meters.kept(),
-                flushing: flushing.map(|(f, _)| Arc::new(Mutex::new(f))),
+                flushing: flushing.map(|f| Arc::new(Mutex::new(f))),
             },
             sweep,
             storage: self.meters.storage(),
+            checkpointer,
         }
     }
 
@@ -308,6 +317,16 @@ async fn next(
     }
 }
 
+/// Resolves at `barrier`'s next tick, never without one.
+async fn ticked(barrier: &mut Option<tokio::time::Interval>) {
+    match barrier {
+        Some(barrier) => {
+            barrier.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// Resolves once the host stops the miner, or drops the means to.
 async fn stopped(stop: &mut watch::Receiver<bool>) {
     stop.wait_for(|stopped| *stopped).await.ok();
@@ -323,6 +342,9 @@ struct Follow {
     /// can be published from this replica.
     sweep: Option<(Current, Duration)>,
     storage: Storage,
+    /// The group's checkpoint cadence, when it can be published from this
+    /// replica.
+    checkpointer: Option<Checkpointer>,
 }
 
 /// What a tail replica's settings say of its groups' output.
@@ -425,32 +447,64 @@ impl Follow {
     /// Ends with the group or once `stop` says so, never in the middle of
     /// a step.
     async fn run(
-        self,
+        mut self,
         mut miner: GroupMiner,
         mut applied: mpsc::Receiver<Applied>,
         mut stop: watch::Receiver<bool>,
     ) {
-        while let Some(event) = next(&mut applied, &mut stop).await {
-            let index = event.at.index;
-            let mut work = Some(event);
-            while work.is_some() || miner.holds() {
-                let Some((back, followed)) = self.mine(miner, index, work.take()).await else {
-                    return;
-                };
-                miner = back;
-                let handed_on = match followed {
-                    None => break,
-                    Some(Ok(out)) => self.hand_on(out, &mut stop).await,
-                    Some(Err(error)) => {
-                        self.storage.miner_stopped(self.group, &error);
-                        false
-                    }
-                };
-                if !handed_on || *stop.borrow() {
-                    return;
+        let mut checkpointer = self.checkpointer.take();
+        let mut barrier = checkpointer.as_ref().map(|c| {
+            let mut barrier = tokio::time::interval(c.every());
+            barrier.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            barrier
+        });
+        loop {
+            // Unbiased, so a queue that is never empty does not starve the
+            // barrier; `next` still puts a stop before another event.
+            let work = tokio::select! {
+                event = next(&mut applied, &mut stop) => event.map(Some),
+                () = ticked(&mut barrier) => Some(None),
+            };
+            let back = match (work, checkpointer.as_mut()) {
+                (None, _) => None,
+                (Some(Some(event)), _) => self.follow(miner, event, &mut stop).await,
+                (Some(None), Some(checkpointer)) => self.checkpoint(checkpointer, miner).await,
+                (Some(None), None) => Some(miner),
+            };
+            let Some(back) = back else {
+                return;
+            };
+            miner = back;
+        }
+    }
+
+    /// Follow `event`, then mine the batches a first configuration holds,
+    /// handing on each output. `None` once the miner has stopped or the
+    /// host says to.
+    async fn follow(
+        &self,
+        mut miner: GroupMiner,
+        event: Applied,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Option<GroupMiner> {
+        let index = event.at.index;
+        let mut work = Some(event);
+        while work.is_some() || miner.holds() {
+            let (back, followed) = self.mine(miner, index, work.take()).await?;
+            miner = back;
+            let handed_on = match followed {
+                None => break,
+                Some(Ok(out)) => self.hand_on(out, stop).await,
+                Some(Err(error)) => {
+                    self.storage.miner_stopped(self.group, &error);
+                    false
                 }
+            };
+            if !handed_on || *stop.borrow() {
+                return None;
             }
         }
+        Some(miner)
     }
 
     /// One step of `miner` off the runtime's workers: follow `event`, or
@@ -478,6 +532,40 @@ impl Follow {
             (miner, followed)
         });
         mining.await.ok()
+    }
+
+    /// Cut a checkpoint at `miner`'s last entry, off the runtime's
+    /// workers, and start writing it, unless one is still writing or the
+    /// cut would not pass the last one written. `None` if the capture
+    /// panicked; the panic is reported where it happened.
+    async fn checkpoint(
+        &self,
+        checkpointer: &mut Checkpointer,
+        miner: GroupMiner,
+    ) -> Option<GroupMiner> {
+        let Some(flushing) = self
+            .keeping
+            .flushing
+            .as_ref()
+            .filter(|_| checkpointer.ready())
+        else {
+            return Some(miner);
+        };
+        let written = checkpointer.written();
+        let (target, kept, flushing) = (
+            checkpointer.target(),
+            Arc::clone(&self.keeping.kept),
+            Arc::clone(flushing),
+        );
+        let capturing = tokio::task::spawn_blocking(move || {
+            let cut = target.capture(&miner, (&kept, &flushing), written);
+            (miner, cut)
+        });
+        let (miner, cut) = capturing.await.ok()?;
+        if let Some(cut) = cut {
+            checkpointer.start(cut);
+        }
+        Some(miner)
     }
 
     /// Send `out` on, unless it is empty; `false` once told to stop. With
@@ -807,6 +895,7 @@ mod tests {
             },
             sweep: None,
             storage: Storage::global(),
+            checkpointer: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         let GroupEntry::Batch(batch) = batch_at(time(1), "acme", &["a b c"]) else {
@@ -963,6 +1052,7 @@ mod tests {
             },
             sweep: None,
             storage: Storage::global(),
+            checkpointer: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         Following {

@@ -71,6 +71,12 @@ impl GroupMiner {
         Some(captured(miner, cut, *config, &self.blocks.state()))
     }
 
+    /// The index of the last entry applied, if any.
+    #[must_use]
+    pub fn applied_through(&self) -> Option<u64> {
+        self.last.map(|last| last.index)
+    }
+
     /// The miner's cluster, once a configuration has applied.
     #[cfg(test)]
     pub(super) fn cluster(&self) -> Option<&MinerCluster> {

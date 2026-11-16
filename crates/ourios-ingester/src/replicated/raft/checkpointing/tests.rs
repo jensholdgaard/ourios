@@ -37,7 +37,10 @@ fn run(stores: &Stores, store: &Store, metrics: &Metrics) -> Result<Published, F
         store,
         checkpoints: &checkpoints,
     }
-    .run(&captured(), Instant::now())
+    .run(
+        &captured(),
+        (Instant::now(), stores.publication.generation()),
+    )
 }
 
 fn bundle_written(store: &Store) -> bool {
@@ -132,6 +135,7 @@ fn each_failure_names_a_documented_error_type() {
     };
     let cases = [
         (Failed::Publish, "store"),
+        (Failed::Discarded, "_OTHER"),
         (Failed::Write(store_error()), "store"),
         (
             Failed::Write(WriteError::Differs {
@@ -152,4 +156,33 @@ fn each_failure_names_a_documented_error_type() {
     for (failed, error_type) in cases {
         assert_eq!(failed.error_type(), error_type, "{failed:?}");
     }
+}
+
+/// A publication discarded after the cut, as a replay does when a later
+/// step overflows what is kept, may have dropped rows through the cut, so
+/// the checkpoint writes no bundle even once rows are buffered again.
+#[test]
+fn a_publication_discarded_after_the_cut_writes_no_bundle() {
+    let (stores, store, metrics) = (stores(), Store::in_memory(), Metrics::new());
+    buffered(&stores);
+    let at_cut = stores.publication.generation();
+    stores.publication.discard();
+    stores.publication.resume();
+    buffered(&stores);
+    let checkpoints = Checkpoints::on(&metrics.meter());
+
+    let failed = Checkpoint {
+        group: GROUP,
+        publication: &stores.publication,
+        store: &store,
+        checkpoints: &checkpoints,
+    }
+    .run(&captured(), (Instant::now(), at_cut));
+
+    assert!(matches!(failed, Err(Failed::Discarded)), "{failed:?}");
+    assert!(!bundle_written(&store));
+    assert_eq!(
+        metrics.counts(CHECKPOINT_DURATION),
+        [(vec!["_OTHER".to_owned(), GROUP.to_string()], 1)]
+    );
 }

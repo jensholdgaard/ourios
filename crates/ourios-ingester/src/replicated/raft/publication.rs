@@ -13,6 +13,7 @@
 //! and a full flush are the caller's to drive, and flushes run one at a
 //! time.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
@@ -40,6 +41,9 @@ pub struct Publication {
     /// one has settled: rows an earlier write failed to publish are back in
     /// the buffers for it to drain, and its success covers them.
     writing: Mutex<()>,
+    /// How many times it was discarded: what was buffered before a discard
+    /// is no longer here to flush.
+    discards: AtomicU64,
 }
 
 impl Publication {
@@ -64,7 +68,14 @@ impl Publication {
             coordinator,
             handoff: Mutex::new(true),
             writing: Mutex::new(()),
+            discards: AtomicU64::new(0),
         }
+    }
+
+    /// The group's log id it publishes under.
+    #[must_use]
+    pub fn log(&self) -> u32 {
+        self.log
     }
 
     /// Hand `audit`, then `rows`, to the publish path.
@@ -97,9 +108,17 @@ impl Publication {
         let _writing = lock_recover(&self.writing);
         let mut active = lock_recover(&self.handoff);
         *active = false;
+        self.discards.fetch_add(1, Ordering::Relaxed);
         // No other take is open: flushes hold `writing`. So abandoning this
         // one dooms no later drain.
         drop(self.coordinator.drain_all());
+    }
+
+    /// Which discard it is past: a flush [`Self::flush_since`] it publishes
+    /// only what was buffered since then.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.discards.load(Ordering::Relaxed)
     }
 
     /// Take handoffs and run flushes again.
@@ -144,10 +163,25 @@ impl Publication {
     /// Publish everything buffered; `true` once it is all durable.
     #[must_use]
     pub fn flush_all(&self) -> bool {
+        self.flush(None)
+    }
+
+    /// As [`Self::flush_all`], but `false` without writing anything once
+    /// it was discarded after `generation`: what was buffered then may be
+    /// gone, so its success would not cover it.
+    #[must_use]
+    pub fn flush_since(&self, generation: u64) -> bool {
+        self.flush(Some(generation))
+    }
+
+    fn flush(&self, generation: Option<u64>) -> bool {
         let _writing = lock_recover(&self.writing);
         let drained = {
             let active = lock_recover(&self.handoff);
-            if !*active {
+            // `discard` takes `writing`, so it cannot run between this
+            // check and the drain.
+            let discarded = generation.is_some_and(|at| self.generation() != at);
+            if !*active || discarded {
                 return false;
             }
             self.coordinator.drain_all()

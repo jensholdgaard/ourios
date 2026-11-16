@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use openraft::async_runtime::WatchReceiver as _;
 use ourios_wal::Control;
 
 use super::super::super::mining::GroupLogRead as _;
@@ -25,12 +26,20 @@ const HIGHEST_KIND: u8 = 0x04;
 /// flusher, every node answering proposals; its leader, and the log id
 /// of its last entry.
 async fn proposing() -> (Cluster, usize, LogId) {
+    let (cluster, leader, cut, _) = proposing_with_targets().await;
+    (cluster, leader, cut)
+}
+
+/// As [`proposing`], with each node's `Propose` target.
+async fn proposing_with_targets() -> (Cluster, usize, LogId, Vec<Arc<Proposals>>) {
     let shape = Shape::from((3, 2));
     let (cluster, _mined) = Cluster::start_mining(shape, &[GROUP], |_| Meters::global()).await;
+    let mut targets = Vec::new();
     for i in 0..5 {
         let host = &cluster.node(i).host;
-        host.server()
-            .serve_proposals(Arc::new(Proposals::new(host)));
+        let target = Arc::new(Proposals::new(host));
+        host.server().serve_proposals(Arc::clone(&target) as _);
+        targets.push(target);
     }
     let leader = with_learners(&cluster, 3..5).await;
     let named = *cluster.id(3).uuid().as_bytes();
@@ -48,7 +57,7 @@ async fn proposing() -> (Cluster, usize, LogId) {
     let last = commit_all(&cluster, leader, &entries).await;
     let log = cluster.node(leader).host.log(GROUP).expect("hosted");
     let cut = log.entry(last).expect("the last entry").log_id;
-    (cluster, leader, cut)
+    (cluster, leader, cut, targets)
 }
 
 fn report(proposer: NodeId, cut: LogId) -> Report {
@@ -139,5 +148,79 @@ async fn the_leader_refuses_a_follower_call_another_replica_and_a_malformed_requ
     );
     assert_eq!(not_flusher, Outcome::NotFlusher);
     assert!(matches!(malformed, Outcome::Malformed(_)), "{malformed:?}");
+    cluster.shutdown().await;
+}
+
+/// Send `report` to `to` while its proposal lock is held, run `meanwhile`,
+/// then let the proposal go; what it came to.
+async fn queued(
+    cluster: &Cluster,
+    (to, target): (usize, &Proposals),
+    report: &Report,
+    meanwhile: impl std::future::Future<Output = ()>,
+) -> Outcome {
+    let held = target.held(GROUP).await;
+    let (peers, addressee, request) = (
+        cluster.peers().clone(),
+        name(cluster.id(to)),
+        report.request(GROUP),
+    );
+    let waiting = tokio::spawn(async move { peers.propose(&addressee, request, COMMIT).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    meanwhile.await;
+    drop(held);
+    waiting.await.expect("join")
+}
+
+/// A proposal queued behind another is checked once it holds the lock: a
+/// flusher assignment of another replica that commits while it waits
+/// refuses it as `not_flusher`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_proposal_is_refused_once_another_flusher_is_named() {
+    let (cluster, leader, cut, targets) = proposing_with_targets().await;
+    let other = *cluster.id(4).uuid().as_bytes();
+    let reassign = async {
+        let entry = GroupEntry::Control(Control::FlusherAssignment(other));
+        super::propose(cluster.node(leader).raft(GROUP), entry).await;
+    };
+
+    let outcome = queued(
+        &cluster,
+        (leader, &targets[leader]),
+        &report(cluster.id(3), cut),
+        reassign,
+    )
+    .await;
+
+    assert_eq!(outcome, Outcome::NotFlusher);
+    cluster.shutdown().await;
+}
+
+/// A proposal queued on a leader that loses the group while it waits is
+/// refused as `not_leader` once it holds the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_proposal_is_refused_once_its_leader_is_replaced() {
+    let (cluster, leader, cut, targets) = proposing_with_targets().await;
+    let follower = (0..3).find(|&i| i != leader).expect("a follower");
+    let replace = async {
+        let raft = cluster.node(leader).raft(GROUP);
+        let to = cluster.id(follower);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        // A transfer to a follower not yet caught up is dropped: ask again
+        // until another node leads.
+        while raft.metrics().borrow_watched().current_leader == Some(cluster.id(leader)) {
+            assert!(tokio::time::Instant::now() < deadline, "never replaced");
+            raft.trigger().transfer_leader(to).await.expect("transfer");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    };
+    let report_only = Report {
+        checkpoint: None,
+        ..report(cluster.id(3), cut)
+    };
+
+    let outcome = queued(&cluster, (leader, &targets[leader]), &report_only, replace).await;
+
+    assert!(matches!(outcome, Outcome::NotLeader { .. }), "{outcome:?}");
     cluster.shutdown().await;
 }

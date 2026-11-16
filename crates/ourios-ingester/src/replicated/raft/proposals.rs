@@ -61,6 +61,15 @@ impl Proposals {
     }
 }
 
+#[cfg(test)]
+impl Proposals {
+    /// Hold `group`'s proposal lock, so a proposal queues behind it.
+    pub(super) async fn held(&self, group: u32) -> tokio::sync::OwnedMutexGuard<()> {
+        let hosted = self.groups.get(&group).expect("hosted");
+        Arc::clone(&hosted.one).lock_owned().await
+    }
+}
+
 impl ProposeTarget for Proposals {
     fn propose(
         &self,
@@ -78,8 +87,11 @@ impl ProposeTarget for Proposals {
 }
 
 impl Hosted {
-    /// Checks 2 to 5 in order, then the checkpoint's append.
+    /// Checks 2 to 5 in order, then the checkpoint's append, all under the
+    /// group's lock, so a proposal that waited for it is checked against
+    /// the leadership and the flusher as they are once it runs.
     async fn propose(&self, report: Result<Report, String>) -> Result<Option<LogId>, Refusal> {
+        let _one = self.one.lock().await;
         self.leads()?;
         let report = report.map_err(Refusal::Malformed)?;
         let group = Group {
@@ -90,7 +102,6 @@ impl Hosted {
         if group.controls().flusher != Some(report.proposer) {
             return Err(Refusal::NotFlusher);
         }
-        let _one = self.one.lock().await;
         self.fresh(&report).map_err(Refusal::Stale)?;
         let Some(ProposedCheckpoint { cut, highest_kind }) = report.checkpoint else {
             return Ok(None);
@@ -115,8 +126,10 @@ impl Hosted {
     fn fresh(&self, report: &Report) -> Result<(), String> {
         let held = self.log.held_controls();
         let snapshot = self.sm.snapshot();
+        let applied = *self.sm.checkpoints().borrow();
         let view = View {
             snapshot: snapshot.as_ref(),
+            applied,
             held: &held,
             committed: self.raft.metrics().borrow_watched().local_committed,
             log: &self.log,
@@ -143,6 +156,9 @@ impl Hosted {
 pub(super) struct View<'a> {
     /// The snapshot at the last checkpoint it applied.
     pub(super) snapshot: Option<&'a GroupSnapshot>,
+    /// The cut of the last checkpoint it applied, which the snapshot can
+    /// lag while it is being built.
+    pub(super) applied: Option<LogId>,
     /// The control entries its log holds, committed or not.
     pub(super) held: &'a HeldControls,
     /// Its commit index.
@@ -156,7 +172,9 @@ pub(super) struct View<'a> {
 /// proposes after it, with the log's highest kind there and a miner
 /// configuration in force there. Why it is stale, otherwise.
 pub(super) fn stale(report: &Report, view: &View<'_>) -> Result<(), String> {
-    let last_cut = view.snapshot.and_then(|s| s.meta.last_log_id);
+    let last_cut = view
+        .applied
+        .max(view.snapshot.and_then(|s| s.meta.last_log_id));
     match report.mined {
         None => Err("the report names no entry its miner followed".to_owned()),
         Some(mined) if Some(mined) < last_cut => {

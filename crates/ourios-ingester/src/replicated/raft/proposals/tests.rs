@@ -107,6 +107,7 @@ fn checked(
     let held = log.held();
     let view = View {
         snapshot,
+        applied: snapshot.and_then(|s| s.meta.last_log_id),
         held: &held,
         committed: Some(id(2, committed)),
         log: &log.entries,
@@ -212,4 +213,26 @@ fn raft_log_ids_order_as_log_ids() {
     assert!(wal_id(&id(2, 9)) > wal_id(&id(2, 8)));
     assert!(wal_id(&id(3, 1)) > wal_id(&id(2, 8)));
     assert_eq!(wal_id(&id(2, 8)), RaftLogId { term: 2, index: 8 });
+}
+
+/// The snapshot of a checkpoint just applied can lag its cut while it is
+/// built: freshness is checked against the applied cut.
+#[test]
+fn a_report_below_an_applied_cut_the_snapshot_lags_is_stale() {
+    let log = Log::configured_at(1);
+    let held = log.held();
+    let snapshot = snapshot_at(id(2, 5));
+    let view = View {
+        snapshot: Some(&snapshot),
+        applied: Some(id(2, 7)),
+        held: &held,
+        committed: Some(id(2, 10)),
+        log: &log.entries,
+    };
+    assert!(stale(&report(Some(id(2, 6)), None), &view).is_err());
+    assert!(stale(&report(Some(id(2, 10)), Some((id(2, 7), CONFIG))), &view).is_err());
+    assert_eq!(
+        stale(&report(Some(id(2, 10)), Some((id(2, 8), CONFIG))), &view),
+        Ok(())
+    );
 }

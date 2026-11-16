@@ -209,3 +209,53 @@ fn a_replica_with_a_gap_publishes_nothing_until_it_clears() {
     f.step(after..10, None);
     assert_eq!(f.published(), f.rows_of(after..10));
 }
+
+/// A handle taken from `current()` before a reassignment cannot publish
+/// after it: the publication's buffers are discarded, releasing their
+/// accounting, and it refuses to flush. Those rows stay kept for the new
+/// flusher.
+#[test]
+fn a_retained_handle_cannot_publish_after_a_reassignment() {
+    let mut f = fixture(true, Bounds::default());
+    f.step(0..6, Some(me()));
+    let retained = f
+        .flushing
+        .current()
+        .lock()
+        .expect("current")
+        .clone()
+        .expect("live");
+    f.step(6..8, Some(other()));
+    assert_eq!(retained.buffered_records(), 0, "the buffers were discarded");
+    assert!(!retained.flush_all(), "a held publication refuses to flush");
+    assert!(
+        parquet_files(&f.root.join("data")).is_empty(),
+        "nothing published"
+    );
+}
+
+/// A replica named again publishes through the same publication, so a
+/// takeover cycle builds no second set of sinks and their metrics.
+#[test]
+fn a_replica_named_again_reuses_its_publication() {
+    let mut f = fixture(true, Bounds::default());
+    f.step(0..4, Some(me()));
+    let first = f
+        .flushing
+        .current()
+        .lock()
+        .expect("current")
+        .clone()
+        .expect("live");
+    f.step(4..6, Some(other()));
+    f.step(6..10, Some(me()));
+    let again = f
+        .flushing
+        .current()
+        .lock()
+        .expect("current")
+        .clone()
+        .expect("live");
+    assert!(Arc::ptr_eq(&first, &again), "one publication for the group");
+    assert_eq!(f.published(), f.rows_of(0..10));
+}

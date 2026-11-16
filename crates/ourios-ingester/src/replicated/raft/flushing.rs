@@ -87,6 +87,7 @@ impl Flushing {
         if self.caught_up {
             publication.publish(&out.audit, &out.rows);
         } else {
+            publication.resume();
             publication.publish_kept(kept);
             self.caught_up = true;
             *lock_recover(&self.current) = Some(publication);
@@ -94,10 +95,16 @@ impl Flushing {
     }
 
     /// Stop publishing: what is not yet published stays kept, and the
-    /// whole of it is published again once this replica may publish.
+    /// whole of it is published again once this replica may publish. The
+    /// publication is kept, discarded, for that: one per group, so its
+    /// sinks and their metrics are built once.
     fn hold(&mut self) {
+        if self.caught_up
+            && let Some(publication) = &self.publication
+        {
+            publication.discard();
+        }
         self.caught_up = false;
-        self.publication = None;
         *lock_recover(&self.current) = None;
     }
 

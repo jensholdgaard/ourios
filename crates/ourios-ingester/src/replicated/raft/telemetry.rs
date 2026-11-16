@@ -45,6 +45,7 @@ pub(crate) struct Meters {
     flusher: FlusherCounts,
     storage: Storage,
     kept: KeptDrops,
+    replays: Replays,
 }
 
 impl Meters {
@@ -73,6 +74,7 @@ impl Meters {
             flusher,
             storage: Storage::on(meter),
             kept: KeptDrops::on(meter),
+            replays: Replays::on(meter),
         }
     }
 
@@ -84,6 +86,11 @@ impl Meters {
     /// Report `group`'s kept output from `kept` for as long as it lives.
     pub(crate) fn keep(&self, group: u32, kept: &Arc<Mutex<Kept>>) {
         self.gauges.keep(group, kept);
+    }
+
+    /// What a named flusher's gap replays record.
+    pub(crate) fn replays(&self) -> Replays {
+        self.replays.clone()
     }
 
     /// What the storage writers record.
@@ -360,6 +367,39 @@ impl KeptDrops {
     }
 }
 
+/// How long a named flusher's gap replays take (§6.7, §6.9).
+#[derive(Clone, Debug)]
+pub(crate) struct Replays {
+    duration: Histogram<f64>,
+}
+
+impl Replays {
+    /// The instrument on the installed global provider.
+    #[must_use]
+    pub(crate) fn global() -> Self {
+        Self::on(&scoped(&opentelemetry::global::meter_provider()))
+    }
+
+    pub(crate) fn on(meter: &Meter) -> Self {
+        let (name, description, unit) = REPLAY_DURATION;
+        let duration = meter
+            .f64_histogram(name)
+            .with_description(description)
+            .with_unit(unit)
+            .with_boundaries(ourios_core::histogram_buckets::LONG_DURATION_S.to_vec())
+            .build();
+        Self { duration }
+    }
+
+    /// A replay of `group`'s gap ended after `elapsed`, stopped by
+    /// `error_type` if it did not rebuild the gap.
+    pub(crate) fn ended(&self, group: u32, elapsed: Duration, error_type: Option<&'static str>) {
+        let mut attributes = vec![group_kv(group)];
+        attributes.extend(error_type.map(|e| KeyValue::new(crate::metrics::ERROR_TYPE, e)));
+        self.duration.record(elapsed.as_secs_f64(), &attributes);
+    }
+}
+
 /// A counter's name, description and unit.
 type Spec = (&'static str, &'static str, &'static str);
 
@@ -397,6 +437,12 @@ const KEPT_ROW_DROPPED: Spec = (
     semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED,
     semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_DESCRIPTION,
     semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_UNIT,
+);
+
+const REPLAY_DURATION: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_REPLAY_DURATION,
+    semconv::OURIOS_WAL_REPLICATION_REPLAY_DURATION_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_REPLAY_DURATION_UNIT,
 );
 
 const STOPS: Spec = (

@@ -152,7 +152,8 @@ impl Launch<'_> {
         let flushing = publishing.and_then(|publishing| {
             let source = publishing.source(group)?;
             let log: SharedLog = Arc::new(tail.log.clone());
-            let flushing = Flushing::new(self.spec.id, group, source, log);
+            let flushing =
+                Flushing::new(self.spec.id, group, source, log).with_replays(self.meters.replays());
             Some((flushing, publishing.sweep()))
         });
         let sweep = flushing.as_ref().map(|(f, every)| (f.current(), *every));

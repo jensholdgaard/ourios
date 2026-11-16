@@ -571,6 +571,7 @@ fn checkpoint_json_with_a_field_missing_unknown_or_repeated_is_unreadable() {
         POINTER.replace(r#""seq":200"#, r#""seq":-1"#),
         POINTER.replace(r#""log":3"#, r#""log":4294967296"#),
         "not json".to_string(),
+        r#"[1,3,200,4,"wal/replicated/logs/3/checkpoints/00000000000000000200/"]"#.to_string(),
     ];
     for object in objects {
         assert!(
@@ -585,7 +586,7 @@ fn checkpoint_json_with_a_field_missing_unknown_or_repeated_is_unreadable() {
 
 #[test]
 fn checkpoint_json_of_another_format_log_or_bundle_is_unreadable() {
-    let other_format = POINTER.replace(r#""format":1"#, r#""format":2"#);
+    let other_format = POINTER.replace(r#""format":1"#, r#""format":2,"published_high":7"#);
     let other_bundle = POINTER.replace("00000000000000000200", "00000000000000000100");
 
     assert_eq!(

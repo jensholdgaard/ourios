@@ -22,6 +22,8 @@ pub fn key(log: u32) -> String {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Object {
+    // Read through `Header`; kept here so the object must carry it.
+    #[expect(dead_code, reason = "required field, checked through the header")]
     format: u64,
     log: u32,
     seq: u64,
@@ -81,11 +83,23 @@ pub fn encode(cut: CutId) -> Vec<u8> {
 ///
 /// The [`PointerError`] naming why the object is unreadable.
 pub fn decode(bytes: &[u8], log: u32) -> Result<CutId, PointerError> {
-    let object: Object =
-        serde_json::from_slice(bytes).map_err(|e| PointerError::Malformed(e.to_string()))?;
-    if object.format != FORMAT {
-        return Err(PointerError::Format(object.format));
+    // The format is read on its own first: another format may hold other
+    // fields, which is a version mismatch, not a malformed object.
+    #[derive(Deserialize)]
+    struct Header {
+        format: u64,
     }
+    let malformed = |e: serde_json::Error| PointerError::Malformed(e.to_string());
+    // Derived structs also read a JSON array positionally.
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(malformed)?;
+    if !value.is_object() {
+        return Err(PointerError::Malformed("not a JSON object".to_owned()));
+    }
+    let header: Header = serde_json::from_slice(bytes).map_err(malformed)?;
+    if header.format != FORMAT {
+        return Err(PointerError::Format(header.format));
+    }
+    let object: Object = serde_json::from_slice(bytes).map_err(malformed)?;
     if object.log != log {
         return Err(PointerError::Log {
             found: object.log,

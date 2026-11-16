@@ -77,7 +77,7 @@ fn export(lines: &[&str]) -> Vec<u8> {
     request.encode_to_vec()
 }
 
-fn framed(tenant: &str, protobuf: &[u8]) -> GroupEntry {
+pub(in crate::replicated::raft) fn framed(tenant: &str, protobuf: &[u8]) -> GroupEntry {
     framed_at(BatchTime::default(), tenant, protobuf)
 }
 
@@ -86,7 +86,7 @@ fn framed_at(time: BatchTime, tenant: &str, protobuf: &[u8]) -> GroupEntry {
     GroupEntry::batch(time, TenantBatchBytes::new(payload).expect("prefix"))
 }
 
-fn batch(tenant: &str, lines: &[&str]) -> GroupEntry {
+pub(in crate::replicated::raft) fn batch(tenant: &str, lines: &[&str]) -> GroupEntry {
     framed(tenant, &export(lines))
 }
 
@@ -102,7 +102,7 @@ pub(in crate::replicated::raft) fn block(after: u64, through: u64) -> GroupEntry
     GroupEntry::Control(Control::IdBlock { after, through })
 }
 
-fn with_threshold(similarity_threshold: f32) -> MinerConfigV1 {
+pub(in crate::replicated::raft) fn with_threshold(similarity_threshold: f32) -> MinerConfigV1 {
     MinerConfigV1 {
         similarity_threshold,
         ..BASE
@@ -113,7 +113,7 @@ pub(in crate::replicated::raft) fn configured(similarity_threshold: f32) -> Grou
     GroupEntry::Control(Control::MinerConfig(with_threshold(similarity_threshold)))
 }
 
-fn in_force(body: MinerConfigV1) -> GroupMinerConfig {
+pub(in crate::replicated::raft) fn in_force(body: MinerConfigV1) -> GroupMinerConfig {
     GroupMinerConfig::new(body).expect("valid")
 }
 
@@ -704,7 +704,7 @@ async fn group_log(dir: &Path, entries: &[GroupEntry]) -> GroupLog {
 }
 
 /// Batches, an id block, the first configuration at index 4, a batch.
-fn configured_at_4() -> Vec<GroupEntry> {
+pub(in crate::replicated::raft) fn configured_at_4() -> Vec<GroupEntry> {
     vec![
         batch_at(time(10), "acme", &["a b c d e"]),
         block(0, 100),

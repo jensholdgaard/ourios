@@ -36,6 +36,8 @@ struct Fixture {
     log: Vec<(u64, Mined)>,
     /// Takes down the store the flusher publishes to.
     outage: Outage,
+    /// The group's log, as the flusher reads it.
+    held: HeldLog,
 }
 
 /// A tail replica of `GROUP` over a local store, its mined log ready to
@@ -124,10 +126,11 @@ fn fixture_with(formed: bool, setup: Setup) -> Fixture {
         _tmp: tmp,
         root,
         store,
-        flushing: Flushing::new(me(), GROUP, source, Arc::new(held)),
+        flushing: Flushing::new(me(), GROUP, source, Arc::new(held.clone())),
         kept: Kept::new(bounds),
         log: mined_log(&entries),
         outage,
+        held,
     }
 }
 
@@ -658,4 +661,19 @@ fn a_slice_replays_a_bounded_number_of_entries() {
     }
     assert_eq!(f.kept.gap(), None, "the replay reached the gap");
     assert_eq!(f.published(), f.rows_of(0..last));
+}
+
+/// A replay that stops on an error discards what it handed on at once,
+/// rather than leaving it in an active publication until the next entry.
+#[test]
+fn a_replay_that_stops_discards_what_it_handed_on() {
+    let mut f = fixture(true, Bounds::default());
+    let mut log = f.held.clone();
+    log.0.remove(&index_at(&f, 4));
+    f.flushing = Flushing::new(me(), GROUP, f.flushing.source.clone(), Arc::new(log));
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..7, Some(me()));
+    assert_eq!(f.flushing.held(), Some("purged"));
+    assert_eq!(f.replay_buffered(), 0, "nothing stays buffered");
 }

@@ -375,6 +375,7 @@ impl Flushing {
                 Some(gap)
             }
             Slice::Stopped(error) => {
+                self.hold();
                 self.rebuilding = Some(Rebuilding::Held);
                 let why = format!("the replay of its gap at {gap} stopped: {error}");
                 self.report_held(error.error_type(), &why);

@@ -33,9 +33,11 @@ pub enum WriteError {
     Differs { key: String },
     /// `checkpoint.json` is unreadable, and is never replaced.
     Unreadable(PointerError),
-    /// `checkpoint.json` came without an `ETag` from a store whose writes
-    /// are compare-and-swap, so nothing can guard its replacement.
+    /// `checkpoint.json` came without an `ETag`, so nothing can guard its
+    /// replacement.
     Untagged,
+    /// The store has no compare-and-swap, which RFC 0065 §6.2 requires.
+    NoCompareAndSwap,
     /// A store call failed.
     Store { key: String, source: StoreError },
 }
@@ -50,6 +52,7 @@ impl fmt::Display for WriteError {
             Self::Differs { key } => write!(f, "{key} already holds other bytes"),
             Self::Unreadable(e) => write!(f, "{e}"),
             Self::Untagged => f.write_str("checkpoint.json was read without an ETag"),
+            Self::NoCompareAndSwap => f.write_str("the store has no compare-and-swap"),
             Self::Store { key, source } => write!(f, "{key}: {source}"),
         }
     }
@@ -61,7 +64,10 @@ impl std::error::Error for WriteError {
             Self::Bundle(e) => Some(e),
             Self::Unreadable(e) => Some(e),
             Self::Store { source, .. } => Some(source),
-            Self::Snapshots { .. } | Self::Differs { .. } | Self::Untagged => None,
+            Self::Snapshots { .. }
+            | Self::Differs { .. }
+            | Self::Untagged
+            | Self::NoCompareAndSwap => None,
         }
     }
 }
@@ -80,6 +86,9 @@ pub fn write(
     bundle: &Bundle,
     snapshots: &[Vec<u8>],
 ) -> Result<Published, WriteError> {
+    if !store.supports_conditional_update() {
+        return Err(WriteError::NoCompareAndSwap);
+    }
     let tenants = bundle.tenants();
     if tenants.len() != snapshots.len() {
         return Err(WriteError::Snapshots {
@@ -124,8 +133,7 @@ fn put_once(store: &Store, key: &str, bytes: &[u8]) -> Result<(), WriteError> {
 }
 
 /// Move `checkpoint.json` up to `cut`, never back: a stored cut at or
-/// above it stays, and a lost race re-reads and decides again. A store
-/// without compare-and-swap is overwritten, as RFC 0059 §3.6 does there.
+/// above it stays, and a lost race re-reads and decides again.
 fn advance(store: &Store, cut: CutId) -> Result<Published, WriteError> {
     let key = pointer::key(cut.log);
     loop {
@@ -141,13 +149,10 @@ fn advance(store: &Store, cut: CutId) -> Result<Published, WriteError> {
                     store.sync_local_blocking(&key).map_err(failed(&key))?;
                     return Ok(Published::Behind(stored));
                 }
-                match (e_tag, store.supports_conditional_update()) {
-                    (Some(tag), true) => {
-                        store.put_if_match_blocking(&key, pointer::encode(cut), &tag)
-                    }
-                    (None, true) => return Err(WriteError::Untagged),
-                    (_, false) => store.put_blocking(&key, pointer::encode(cut)),
-                }
+                let Some(tag) = e_tag else {
+                    return Err(WriteError::Untagged);
+                };
+                store.put_if_match_blocking(&key, pointer::encode(cut), &tag)
             }
         };
         match put {

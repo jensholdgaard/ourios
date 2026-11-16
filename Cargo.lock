@@ -3668,8 +3668,8 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.38"
-source = "git+https://github.com/databendlabs/openraft?rev=d132ba8753d0c484bbb8b19f2b6ac7f6ae626509#d132ba8753d0c484bbb8b19f2b6ac7f6ae626509"
+version = "0.10.1"
+source = "git+https://github.com/databendlabs/openraft?rev=a728203cdc6dd15da28a053e5ae72a5d444bc8d1#a728203cdc6dd15da28a053e5ae72a5d444bc8d1"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -3695,8 +3695,8 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.38"
-source = "git+https://github.com/databendlabs/openraft?rev=d132ba8753d0c484bbb8b19f2b6ac7f6ae626509#d132ba8753d0c484bbb8b19f2b6ac7f6ae626509"
+version = "0.10.1"
+source = "git+https://github.com/databendlabs/openraft?rev=a728203cdc6dd15da28a053e5ae72a5d444bc8d1#a728203cdc6dd15da28a053e5ae72a5d444bc8d1"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -3707,8 +3707,8 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.38"
-source = "git+https://github.com/databendlabs/openraft?rev=d132ba8753d0c484bbb8b19f2b6ac7f6ae626509#d132ba8753d0c484bbb8b19f2b6ac7f6ae626509"
+version = "0.10.1"
+source = "git+https://github.com/databendlabs/openraft?rev=a728203cdc6dd15da28a053e5ae72a5d444bc8d1#a728203cdc6dd15da28a053e5ae72a5d444bc8d1"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -3719,8 +3719,8 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.38"
-source = "git+https://github.com/databendlabs/openraft?rev=d132ba8753d0c484bbb8b19f2b6ac7f6ae626509#d132ba8753d0c484bbb8b19f2b6ac7f6ae626509"
+version = "0.10.1"
+source = "git+https://github.com/databendlabs/openraft?rev=a728203cdc6dd15da28a053e5ae72a5d444bc8d1#a728203cdc6dd15da28a053e5ae72a5d444bc8d1"
 dependencies = [
  "futures-util",
  "openraft-rt",

@@ -21,14 +21,14 @@ use crate::template_ids::HIGH_WATER_KEY;
 type BoxStream<T> = futures::stream::BoxStream<'static, T>;
 
 /// Takes the store returned with it down and back up.
-pub(super) struct Outage(Arc<AtomicBool>);
+pub(in crate::replicated::raft) struct Outage(Arc<AtomicBool>);
 
 impl Outage {
-    pub(super) fn begin(&self) {
+    pub(in crate::replicated::raft) fn begin(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
 
-    pub(super) fn end(&self) {
+    pub(in crate::replicated::raft) fn end(&self) {
         self.0.store(false, Ordering::SeqCst);
     }
 }
@@ -119,7 +119,7 @@ impl Hold {
 }
 
 /// `store`, behind a switch that takes it down.
-pub(super) fn with_outage(store: Store) -> (Store, Outage) {
+pub(in crate::replicated::raft) fn with_outage(store: Store) -> (Store, Outage) {
     let down = Arc::new(AtomicBool::new(false));
     let wrapped = wrap(store, Arc::clone(&down), Hold::default(), None);
     (wrapped, Outage(down))

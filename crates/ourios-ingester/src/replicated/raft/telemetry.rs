@@ -28,6 +28,8 @@ use ourios_semconv as semconv;
 
 use super::flusher::{Hold, Reason};
 use super::host::GroupRaft;
+use super::kept::{Dropped, Kept};
+use super::mining::GroupMinerError;
 use super::types::{NodeId, RaftTypes, Vote};
 
 type Watch = WatchReceiverOf<RaftTypes, RaftMetrics<RaftTypes>>;
@@ -42,6 +44,8 @@ pub(crate) struct Meters {
     takeovers: Counter<u64>,
     flusher: FlusherCounts,
     storage: Storage,
+    kept: KeptDrops,
+    replays: Replays,
 }
 
 impl Meters {
@@ -69,7 +73,24 @@ impl Meters {
             takeovers,
             flusher,
             storage: Storage::on(meter),
+            kept: KeptDrops::on(meter),
+            replays: Replays::on(meter),
         }
+    }
+
+    /// What a tail replica counts of the output it drops.
+    pub(crate) fn kept(&self) -> KeptDrops {
+        self.kept.clone()
+    }
+
+    /// Report `group`'s kept output from `kept` for as long as it lives.
+    pub(crate) fn keep(&self, group: u32, kept: &Arc<Mutex<Kept>>) {
+        self.gauges.keep(group, kept);
+    }
+
+    /// What a named flusher's gap replays record.
+    pub(crate) fn replays(&self) -> Replays {
+        self.replays.clone()
     }
 
     /// What the storage writers record.
@@ -161,6 +182,7 @@ pub(crate) enum Component {
     LogStore(u32),
     StateMachine(u32),
     VoteLog,
+    Miner(u32),
 }
 
 impl Component {
@@ -169,6 +191,7 @@ impl Component {
             Self::LogStore(_) => "log_store",
             Self::StateMachine(_) => "state_machine",
             Self::VoteLog => "vote_log",
+            Self::Miner(_) => "miner",
         }
     }
 
@@ -179,10 +202,20 @@ impl Component {
     /// Its attributes: with its group, unless it is the node's vote log.
     fn attributes(self) -> Vec<KeyValue> {
         match self {
-            Self::LogStore(group) | Self::StateMachine(group) => vec![self.kv(), group_kv(group)],
+            Self::LogStore(group) | Self::StateMachine(group) | Self::Miner(group) => {
+                vec![self.kv(), group_kv(group)]
+            }
             Self::VoteLog => vec![self.kv()],
         }
     }
+}
+
+/// A component's stop: the groups it stopped in, and why.
+struct Stop<'a> {
+    component: Component,
+    groups: &'a [u32],
+    error_type: &'a str,
+    error: &'a dyn std::fmt::Display,
 }
 
 /// What a storage writer records: each write-and-fsync, and the stops its
@@ -229,31 +262,62 @@ impl Storage {
     /// `component` failed with `error` and stopped serving `groups`: logged
     /// once, and counted once per group.
     pub(crate) fn stopped(&self, component: Component, groups: &[u32], error: &io::Error) {
-        let error_type = error_type(error.kind());
+        self.report(&Stop {
+            component,
+            groups,
+            error_type: &error_type(error.kind()),
+            error,
+        });
+    }
+
+    /// `group`'s miner stopped on `error`: logged and counted once. The
+    /// replica applies on; only its mining stops.
+    pub(crate) fn miner_stopped(&self, group: u32, error: &GroupMinerError) {
+        self.report(&Stop {
+            component: Component::Miner(group),
+            groups: &[group],
+            error_type: error.error_type(),
+            error,
+        });
+    }
+
+    fn report(&self, stop: &Stop<'_>) {
+        let Stop {
+            component,
+            groups,
+            error_type,
+            error,
+        } = *stop;
         let group = match component {
-            Component::LogStore(group) | Component::StateMachine(group) => Some(i64::from(group)),
+            Component::LogStore(group)
+            | Component::StateMachine(group)
+            | Component::Miner(group) => Some(i64::from(group)),
             Component::VoteLog => None,
         };
         tracing::error!(
             name: semconv::EVENT_OURIOS_WAL_REPLICATION_STOPPED,
             {
                 { semconv::OURIOS_WAL_REPLICATION_COMPONENT } = component.as_str(),
-                { crate::metrics::ERROR_TYPE } = error_type.as_str(),
+                { crate::metrics::ERROR_TYPE } = error_type,
                 { semconv::OURIOS_WAL_GROUP } = group,
             },
-            "the replicated WAL's {} stopped groups {groups:?} until the node restarts: {error}",
+            "the replicated WAL's {} stopped in groups {groups:?} until the node restarts: {error}",
             component.as_str(),
         );
         for &group in groups {
-            self.also_stopped(component, group, error.kind());
+            self.count_stop(component, group, error_type.to_owned());
         }
     }
 
     /// `component`, already stopped on an error of `kind`, stops `group`
     /// as well: counted, not logged again.
     pub(crate) fn also_stopped(&self, component: Component, group: u32, kind: io::ErrorKind) {
-        let attributes = [component.kv(), group_kv(group), error_kv(kind)];
-        self.stops.add(1, &attributes);
+        self.count_stop(component, group, error_type(kind));
+    }
+
+    fn count_stop(&self, component: Component, group: u32, error_type: String) {
+        let error = KeyValue::new(crate::metrics::ERROR_TYPE, error_type);
+        self.stops.add(1, &[component.kv(), group_kv(group), error]);
     }
 }
 
@@ -272,6 +336,68 @@ pub(super) fn error_type(kind: io::ErrorKind) -> String {
         snake.push(c.to_ascii_lowercase());
     }
     snake
+}
+
+/// What a tail replica counts of the output it drops from what it keeps
+/// for a takeover (§6.7). The audit bytes it keeps and its gap are gauges
+/// read from the live [`Kept`] each group registers.
+#[derive(Clone, Debug)]
+pub(crate) struct KeptDrops {
+    audit: Counter<u64>,
+    rows: Counter<u64>,
+}
+
+impl KeptDrops {
+    fn on(meter: &Meter) -> Self {
+        Self {
+            audit: counter(meter, KEPT_AUDIT_DROPPED),
+            rows: counter(meter, KEPT_ROW_DROPPED),
+        }
+    }
+
+    /// `group` has dropped `now` in all, `before` of it until this step.
+    pub(crate) fn dropped(&self, group: u32, now: Dropped, before: Dropped) {
+        let attributes = [group_kv(group)];
+        if now.audit > before.audit {
+            self.audit.add(now.audit - before.audit, &attributes);
+        }
+        if now.rows > before.rows {
+            self.rows.add(now.rows - before.rows, &attributes);
+        }
+    }
+}
+
+/// How long a named flusher's gap replays take (§6.7, §6.9).
+#[derive(Clone, Debug)]
+pub(crate) struct Replays {
+    duration: Histogram<f64>,
+}
+
+impl Replays {
+    /// The instrument on the installed global provider.
+    #[must_use]
+    pub(crate) fn global() -> Self {
+        Self::on(&scoped(&opentelemetry::global::meter_provider()))
+    }
+
+    pub(crate) fn on(meter: &Meter) -> Self {
+        let (name, description, unit) = REPLAY_DURATION;
+        let duration = meter
+            .f64_histogram(name)
+            .with_description(description)
+            .with_unit(unit)
+            .with_boundaries(ourios_core::histogram_buckets::LONG_DURATION_S.to_vec())
+            .build();
+        Self { duration }
+    }
+
+    /// A replay of `group`'s gap ended after `elapsed`, stopped by
+    /// `error_type` if it did not rebuild the gap.
+    pub(crate) fn ended(&self, group: u32, elapsed: Duration, error_type: Option<&'static str>) {
+        let mut attributes = vec![group_kv(group)];
+        attributes.extend(error_type.map(|e| KeyValue::new(crate::metrics::ERROR_TYPE, e)));
+        self.duration.record(elapsed.as_secs_f64(), &attributes);
+    }
 }
 
 /// A counter's name, description and unit.
@@ -301,6 +427,24 @@ const SYNCS: Spec = (
     semconv::OURIOS_WAL_REPLICATION_SYNC_DURATION_UNIT,
 );
 
+const KEPT_AUDIT_DROPPED: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED_UNIT,
+);
+
+const KEPT_ROW_DROPPED: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_UNIT,
+);
+
+const REPLAY_DURATION: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_REPLAY_DURATION,
+    semconv::OURIOS_WAL_REPLICATION_REPLAY_DURATION_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_REPLAY_DURATION_UNIT,
+);
+
 const STOPS: Spec = (
     semconv::OURIOS_WAL_REPLICATION_STOPS,
     semconv::OURIOS_WAL_REPLICATION_STOPS_DESCRIPTION,
@@ -315,20 +459,35 @@ fn counter(meter: &Meter, (name, description, unit): Spec) -> Counter<u64> {
         .build()
 }
 
-/// One provider's gauges and the live hosts they read.
+/// Each tail-replica group's kept output, held weakly.
+type KeptGroups = Arc<Mutex<Vec<(u32, Weak<Mutex<Kept>>)>>>;
+
+/// One provider's gauges and the live hosts and kept outputs they read.
 struct Gauges {
     hosts: Hosts,
+    kept: KeptGroups,
     _instruments: [ObservableGauge<u64>; 2],
+    _kept: [ObservableGauge<u64>; 2],
 }
 
 impl Gauges {
     fn register(meter: &Meter) -> Self {
         let hosts = Hosts::default();
         let instruments = GAUGES.map(|spec| gauge(meter, spec, Arc::clone(&hosts)));
+        let kept = KeptGroups::default();
+        let kept_gauges = KEPT_GAUGES.map(|spec| kept_gauge(meter, spec, Arc::clone(&kept)));
         Self {
             hosts,
+            kept,
             _instruments: instruments,
+            _kept: kept_gauges,
         }
+    }
+
+    fn keep(&self, group: u32, kept: &Arc<Mutex<Kept>>) {
+        let mut groups = lock_recover(&self.kept);
+        groups.retain(|(_, kept)| kept.strong_count() > 0);
+        groups.push((group, Arc::downgrade(kept)));
     }
 
     fn add(&self, watches: &Arc<Watches>) {
@@ -419,6 +578,46 @@ fn gauge(
             for (value, attributes) in points {
                 observer.observe(value, &attributes);
             }
+        })
+        .build()
+}
+
+/// A kept-output gauge: its name, description, unit and value.
+type KeptSpec = (&'static str, &'static str, &'static str, fn(&Kept) -> u64);
+
+const KEPT_GAUGES: [KeptSpec; 2] = [
+    (
+        semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE,
+        semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_DESCRIPTION,
+        semconv::OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_UNIT,
+        |kept| u64::try_from(kept.audit_bytes()).unwrap_or(u64::MAX),
+    ),
+    (
+        semconv::OURIOS_WAL_REPLICATION_KEPT_GAP,
+        semconv::OURIOS_WAL_REPLICATION_KEPT_GAP_DESCRIPTION,
+        semconv::OURIOS_WAL_REPLICATION_KEPT_GAP_UNIT,
+        Kept::gap_reach,
+    ),
+];
+
+fn kept_gauge(
+    meter: &Meter,
+    (name, description, unit, read): KeptSpec,
+    groups: KeptGroups,
+) -> ObservableGauge<u64> {
+    meter
+        .u64_observable_gauge(name)
+        .with_description(description)
+        .with_unit(unit)
+        .with_callback(move |observer| {
+            let mut groups = lock_recover(&groups);
+            groups.retain(|(group, kept)| {
+                let Some(kept) = kept.upgrade() else {
+                    return false;
+                };
+                observer.observe(read(&lock_recover(&kept)), &[group_kv(*group)]);
+                true
+            });
         })
         .build()
 }

@@ -56,7 +56,9 @@ use crate::parquet_io::{
 };
 use crate::partition::PartitionKey;
 use crate::promoted::PromotedAttributes;
-use crate::record_batch::{BatchError, IngestColumns, mined_records_to_batch_with_promoted};
+use crate::record_batch::{
+    BatchError, IngestColumns, mined_records_to_batch_in, mined_records_to_batch_with_promoted,
+};
 use crate::store::Store;
 use crate::{data_schema_with_promoted, with_ingest_columns};
 
@@ -204,6 +206,9 @@ pub(crate) struct CompactedOutput {
     /// is named `<uuidv7>.g<generation>.parquet`, so GC can tell an
     /// in-flight output from a dead one.
     pub(crate) generation: u64,
+    /// The RFC 0065 §6.6 ingest columns the output declares: the layout
+    /// its inputs need (RFC 0065 §6.6).
+    pub(crate) ingest: IngestColumns,
 }
 
 impl ClusterKeys {
@@ -436,13 +441,9 @@ impl Writer {
         promoted: PromotedAttributes,
         output: CompactedOutput,
     ) -> Result<Self, WriterError> {
-        Self::open_in_inner(
-            store,
-            partition,
-            DEFAULT_ZSTD_LEVEL,
-            FileColumns::local(promoted),
-            Some(output),
-        )
+        let ingest = output.ingest;
+        let columns = FileColumns { promoted, ingest };
+        Self::open_in_inner(store, partition, DEFAULT_ZSTD_LEVEL, columns, Some(output))
     }
 
     /// Shared body of [`Writer::open_in_with_promoted`] (ingest layout,
@@ -605,10 +606,7 @@ impl Writer {
             }
         }
         let declared = self.columns.ingest;
-        if let Some(row_index) = records
-            .iter()
-            .position(|r| IngestColumns::for_record(r) != declared)
-        {
+        if let Some(row_index) = records.iter().position(|r| !declared.admits(r)) {
             return Err(WriterError::IngestColumnsMismatch {
                 row_index,
                 declared,
@@ -627,7 +625,7 @@ impl Writer {
             records,
             SUB_BATCH_ROWS,
             |chunk| {
-                mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch)
+                mined_records_to_batch_in(chunk, promoted, declared).map_err(WriterError::Batch)
             },
             on_sub_batch,
         )

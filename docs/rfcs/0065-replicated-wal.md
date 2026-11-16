@@ -1121,6 +1121,25 @@ the mass-failover time and vote-log batching as tuning signals.
 >   from `checkpoint.json`'s later cut counts every acknowledged record
 >   once
 
+> **Scenario RFC0065.33 — compaction keeps one row per position and every row without one (B13, H8)**
+> - **Given** a partition holding two files a reassignment's two
+>   flushers published with the same positions, a later file repeating
+>   some of them, and a local-backend file without the columns
+> - **When** it is compacted, and the output is then erased from by
+>   RFC 0009's rewrite
+> - **Then** the compacted file carries the three columns, each
+>   `(tenant, ingest position)` once and the local file's rows with the
+>   columns null, every row of the local file kept; its row count is
+>   the distinct positions plus the local file's rows, and the dropped
+>   repeats are counted per tenant on
+>   `ourios.compaction.row.deduplicated`
+> - **And** a partition whose files all lack the columns compacts to a
+>   file without them, with nothing counted; the erasure rewrite keeps
+>   every surviving row's position; a query over the partition returns
+>   the same rows before and after the compaction, and after an erasure
+>   that matches at least one row, exactly those rows less the ones it
+>   matched
+
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
@@ -1994,6 +2013,22 @@ record.
   §3.5:** row count and per-`template_id` counts stay invariant except
   for those repeats, and RFC0009.2 is restated to count distinct
   positions where the columns are present.
+  **Mixed inputs.** A compaction's output, and the erasure rewrite's,
+  carries the three columns whenever any of its input files does, and
+  none when no input does. A row from an input without them, an older
+  file or a local-backend one, is written with all three null, which
+  is what every reader already makes of an absent column (RFC 0005
+  §3.9), so its meaning does not change. Only rows whose position is
+  present are compared: a null position never repeats another, so a
+  partition mixing the two shapes, as a tenant whose backend changed
+  leaves behind, keeps every row without one, and the log ids above
+  keep the backends' positions from meeting. A partition is never
+  refused for mixing them, since refusing would leave its small files
+  uncompacted for good (hazard #4). Repeats are the same row (§6.5),
+  so which one survives changes nothing a query returns; compaction
+  keeps the first in its merge order. The rows it drops are counted per
+  tenant as `ourios.compaction.row.deduplicated`, H8's dedup hit count
+  (§6.9).
 - **Queries** dedup the tail against Parquet by it (§6.7).
 - **What it does not remove.** A client retry after a lost ack is a
   new entry with a new `seq`, the same duplicate the local backend makes
@@ -2568,7 +2603,8 @@ never count toward an ack (learners, under §4.3's shape).
   conflicts on the group record; forwarded exports; flusher
   assignments and control-kind holds, each by reason;
   tail calls, their latency and `tail_unavailable` responses; and H8's
-  two detection signals, the dedup hit count and
+  two detection signals, the dedup hit count
+  (`ourios.compaction.row.deduplicated`, §6.6) and
   `bytes_stored / bytes_received` per tenant.
 - Peer RPCs are traced as gRPC client and server spans under the
   existing RPC conventions (RFC 0038 §3.5); a query's span covers its
@@ -2734,6 +2770,8 @@ from rows.
   bundle puts and the store made unreachable across a tail replica's
   restart.
 - RFC0065.16: the existing suites, unchanged.
+- RFC0065.33: compaction and erasure tests in `ourios-parquet` beside
+  RFC0009.2's, on files written with and without the ingest columns.
 - RFC0065.31's lock arms (two replicated starts, a crashed
   bootstrapper, a deletion with groups holding blocks): the in-process
   cluster on the in-memory store, with failpoints between the lock,

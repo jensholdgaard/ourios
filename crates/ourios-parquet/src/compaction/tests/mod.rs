@@ -13,6 +13,7 @@ mod bounded_sort;
 mod late_writes;
 mod plan_cost;
 mod plan_reclaim;
+mod positions;
 
 /// 2026-04-02T10:58:00 UTC — offsets stay within hour 10, so
 /// every record shares one partition.
@@ -597,6 +598,7 @@ fn write_uncommitted_output(store: &Store, rows: &[MinedRecord], generation: u64
         flush_override: None,
         estimated_output_bytes: 0,
         generation,
+        ingest: IngestColumns::Omitted,
     };
     let mut w = Writer::open_in_compacted(store, partition(), promoted, output).expect("writer");
     w.append_records(rows).expect("append");

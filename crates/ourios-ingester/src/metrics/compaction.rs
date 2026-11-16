@@ -53,6 +53,9 @@ pub struct CompactionMetrics {
     partitions: Counter<u64>,
     files: Counter<u64>,
     rows: Counter<u64>,
+    /// `ourios.compaction.row.deduplicated`, H8's dedup hit count per
+    /// tenant (RFC 0065 §6.6); recorded on every commit, `0` included.
+    deduplicated: Counter<u64>,
     orphan_files: Counter<u64>,
     /// `ourios.compaction.orphan.reclaimed`, per tenant, `error.type` on a
     /// failed delete.
@@ -187,6 +190,11 @@ const COMPACTION_ROWS: MetricDef = (
     semconv::OURIOS_COMPACTION_ROWS,
     semconv::OURIOS_COMPACTION_ROWS_DESCRIPTION,
     semconv::OURIOS_COMPACTION_ROWS_UNIT,
+);
+const COMPACTION_ROW_DEDUPLICATED: MetricDef = (
+    semconv::OURIOS_COMPACTION_ROW_DEDUPLICATED,
+    semconv::OURIOS_COMPACTION_ROW_DEDUPLICATED_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_ROW_DEDUPLICATED_UNIT,
 );
 const COMPACTION_ORPHAN_FILES: MetricDef = (
     semconv::OURIOS_COMPACTION_ORPHAN_FILES,
@@ -330,6 +338,7 @@ impl CompactionMetrics {
             partitions,
             files,
             rows,
+            deduplicated: counter(meter, COMPACTION_ROW_DEDUPLICATED),
             orphan_files,
             orphan_reclaimed: counter(meter, COMPACTION_ORPHAN_RECLAIMED),
             duration: meter
@@ -364,7 +373,7 @@ impl CompactionMetrics {
     }
 
     /// Record one committed partition rewrite, the moment its manifest
-    /// commits: `partitions`, `files`, `rows`, both `io` directions, and
+    /// commits: `partitions`, `files`, `rows`, `row.deduplicated`, both `io` directions, and
     /// the H4 `file.size` sample, each attributed to the partition's tenant
     /// (#1016). Recorded per partition, not per sweep, so a sweep working
     /// through a large backlog shows its progress while it runs.
@@ -374,6 +383,7 @@ impl CompactionMetrics {
         self.partitions.add(1, attrs);
         self.files.add(commit.files, attrs);
         self.rows.add(commit.rows, attrs);
+        self.deduplicated.add(commit.rows_deduplicated, attrs);
         self.record_io(commit.bytes_read, commit.bytes_written, attrs);
         self.record_file_size(commit.tenant, commit.bytes_written);
         self.record_input(commit, &tenant);

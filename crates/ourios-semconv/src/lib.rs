@@ -192,6 +192,16 @@ pub const OURIOS_COMPACTION_PARTITIONS_DESCRIPTION: &str = "Number of partitions
 /// `ourios.compaction.partitions` unit (UCUM).
 pub const OURIOS_COMPACTION_PARTITIONS_UNIT: &str = "{partition}";
 
+/// `ourios.compaction.row.deduplicated` (counter, unit `{row}`).
+pub const OURIOS_COMPACTION_ROW_DEDUPLICATED: &str = "ourios.compaction.row.deduplicated";
+
+/// `ourios.compaction.row.deduplicated` description (the registry `brief`).
+pub const OURIOS_COMPACTION_ROW_DEDUPLICATED_DESCRIPTION: &str =
+    "Rows a compaction dropped because they repeat a kept row's ingest position.";
+
+/// `ourios.compaction.row.deduplicated` unit (UCUM).
+pub const OURIOS_COMPACTION_ROW_DEDUPLICATED_UNIT: &str = "{row}";
+
 /// `ourios.compaction.rows` (counter, unit `{row}`).
 pub const OURIOS_COMPACTION_ROWS: &str = "ourios.compaction.rows";
 
@@ -829,6 +839,45 @@ pub const OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS_DESCRIPTION: &str =
 /// `ourios.wal.replication.flusher.assignments` unit (UCUM).
 pub const OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS_UNIT: &str = "{assignment}";
 
+/// `ourios.wal.replication.kept.audit.dropped` (counter, unit `{event}`).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED: &str =
+    "ourios.wal.replication.kept.audit.dropped";
+
+/// `ourios.wal.replication.kept.audit.dropped` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED_DESCRIPTION: &str =
+    "Audit events a tail replica dropped from what it keeps for a takeover (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.kept.audit.dropped` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_DROPPED_UNIT: &str = "{event}";
+
+/// `ourios.wal.replication.kept.audit.usage` (gauge, unit `By`).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE: &str = "ourios.wal.replication.kept.audit.usage";
+
+/// `ourios.wal.replication.kept.audit.usage` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_DESCRIPTION: &str = "Estimated bytes of the audit events a tail replica keeps for a takeover, per replication group (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.kept.audit.usage` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_KEPT_AUDIT_USAGE_UNIT: &str = "By";
+
+/// `ourios.wal.replication.kept.gap` (gauge, unit `{entry}`).
+pub const OURIOS_WAL_REPLICATION_KEPT_GAP: &str = "ourios.wal.replication.kept.gap";
+
+/// `ourios.wal.replication.kept.gap` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_KEPT_GAP_DESCRIPTION: &str = "Log entries between the last checkpoint a tail replica applied and the highest entry whose kept output it dropped (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.kept.gap` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_KEPT_GAP_UNIT: &str = "{entry}";
+
+/// `ourios.wal.replication.kept.row.dropped` (counter, unit `{row}`).
+pub const OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED: &str = "ourios.wal.replication.kept.row.dropped";
+
+/// `ourios.wal.replication.kept.row.dropped` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_DESCRIPTION: &str =
+    "Mined rows a tail replica dropped from what it keeps for a takeover (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.kept.row.dropped` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_UNIT: &str = "{row}";
+
 /// `ourios.wal.replication.lag` (gauge, unit `{entry}`).
 pub const OURIOS_WAL_REPLICATION_LAG: &str = "ourios.wal.replication.lag";
 
@@ -837,6 +886,16 @@ pub const OURIOS_WAL_REPLICATION_LAG_DESCRIPTION: &str = "Log entries a replicat
 
 /// `ourios.wal.replication.lag` unit (UCUM).
 pub const OURIOS_WAL_REPLICATION_LAG_UNIT: &str = "{entry}";
+
+/// `ourios.wal.replication.replay.duration` (histogram, unit `s`).
+pub const OURIOS_WAL_REPLICATION_REPLAY_DURATION: &str = "ourios.wal.replication.replay.duration";
+
+/// `ourios.wal.replication.replay.duration` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_REPLAY_DURATION_DESCRIPTION: &str =
+    "Wall-clock duration of a flusher's gap replay, from its start until it ends (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.replay.duration` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_REPLAY_DURATION_UNIT: &str = "s";
 
 /// `ourios.wal.replication.stops` (counter, unit `{stop}`).
 pub const OURIOS_WAL_REPLICATION_STOPS: &str = "ourios.wal.replication.stops";
@@ -1329,6 +1388,10 @@ pub const EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED: &str =
 
 /// `ourios.wal.recovery.tail.truncated` log event name.
 pub const EVENT_OURIOS_WAL_RECOVERY_TAIL_TRUNCATED: &str = "ourios.wal.recovery.tail.truncated";
+
+/// `ourios.wal.replication.publication.held` log event name.
+pub const EVENT_OURIOS_WAL_REPLICATION_PUBLICATION_HELD: &str =
+    "ourios.wal.replication.publication.held";
 
 /// `ourios.wal.replication.stopped` log event name.
 pub const EVENT_OURIOS_WAL_REPLICATION_STOPPED: &str = "ourios.wal.replication.stopped";

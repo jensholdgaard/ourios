@@ -20,6 +20,9 @@ use super::{
     group_dir, name, propose, wal_config, write,
 };
 
+mod mining;
+mod publication;
+
 const GROUP: u32 = 0;
 
 /// Write `ns` through node `i`, returning the last index.
@@ -486,6 +489,7 @@ async fn a_group_that_fails_to_open_stops_the_ones_before_it() {
         id: replica.id,
         wal: wal_config(replica.dir.path()),
         groups: replica.groups.clone(),
+        role: replica.role.clone(),
         peers: Peers::plaintext(),
         timings: replica.timings,
     };

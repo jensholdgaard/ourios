@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use super::super::cluster::wal_config;
 use super::super::log_store::{GroupLog, group_dir};
 use super::super::snapshot_record::GroupState;
-use super::super::state_machine::GroupSm;
+use super::super::state_machine::{GroupSm, Replay};
 use super::super::types::{Entry, GroupEntry, RaftTypes, TenantBatchBytes};
 use super::super::vote_log::{self, VoteLog};
 use super::*;
@@ -40,7 +40,7 @@ const BASE: MinerConfigV1 = MinerConfigV1 {
     upstream_association_limit: 4,
 };
 
-fn corpus() -> Vec<&'static str> {
+pub(in crate::replicated::raft) fn corpus() -> Vec<&'static str> {
     CORPUS
         .iter()
         .flat_map(|text| text.lines())
@@ -90,11 +90,15 @@ fn batch(tenant: &str, lines: &[&str]) -> GroupEntry {
     framed(tenant, &export(lines))
 }
 
-fn batch_at(time: BatchTime, tenant: &str, lines: &[&str]) -> GroupEntry {
+pub(in crate::replicated::raft) fn batch_at(
+    time: BatchTime,
+    tenant: &str,
+    lines: &[&str],
+) -> GroupEntry {
     framed_at(time, tenant, &export(lines))
 }
 
-fn block(after: u64, through: u64) -> GroupEntry {
+pub(in crate::replicated::raft) fn block(after: u64, through: u64) -> GroupEntry {
     GroupEntry::Control(Control::IdBlock { after, through })
 }
 
@@ -105,7 +109,7 @@ fn with_threshold(similarity_threshold: f32) -> MinerConfigV1 {
     }
 }
 
-fn configured(similarity_threshold: f32) -> GroupEntry {
+pub(in crate::replicated::raft) fn configured(similarity_threshold: f32) -> GroupEntry {
     GroupEntry::Control(Control::MinerConfig(with_threshold(similarity_threshold)))
 }
 
@@ -116,7 +120,10 @@ fn in_force(body: MinerConfigV1) -> GroupMinerConfig {
 /// The events a mining replica's state machine sends for `entries`,
 /// applied from index 1, through a channel of `capacity` drained as they
 /// come.
-fn events_of(entries: &[GroupEntry], capacity: usize) -> Vec<Applied> {
+pub(in crate::replicated::raft) fn events_of(
+    entries: &[GroupEntry],
+    capacity: usize,
+) -> Vec<Applied> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
@@ -141,7 +148,7 @@ fn events_of(entries: &[GroupEntry], capacity: usize) -> Vec<Applied> {
 }
 
 /// `entries` in a log from index 1, as [`events_of`] applies them.
-fn logged(entries: &[GroupEntry]) -> Vec<Entry> {
+pub(in crate::replicated::raft) fn logged(entries: &[GroupEntry]) -> Vec<Entry> {
     (1..)
         .zip(entries.iter().cloned())
         .map(|(index, data)| Entry {
@@ -152,7 +159,10 @@ fn logged(entries: &[GroupEntry]) -> Vec<Entry> {
 }
 
 /// A log held in memory, entries by index.
-struct HeldLog(BTreeMap<u64, Entry>);
+#[derive(Clone)]
+pub(in crate::replicated::raft) struct HeldLog(
+    pub(in crate::replicated::raft) BTreeMap<u64, Entry>,
+);
 
 impl GroupLogRead for HeldLog {
     fn entry(&self, index: u64) -> Option<Entry> {
@@ -161,7 +171,7 @@ impl GroupLogRead for HeldLog {
 }
 
 /// A miner over a log holding `entries` from index 1.
-fn miner_of(entries: &[GroupEntry]) -> GroupMiner {
+pub(in crate::replicated::raft) fn miner_of(entries: &[GroupEntry]) -> GroupMiner {
     let held = logged(entries).into_iter().map(|e| (e.log_id.index, e));
     GroupMiner::new(HeldLog(held.collect()))
 }
@@ -279,6 +289,29 @@ proptest! {
             let from_a_block = blocks.iter().any(|b| (b.after() + 1..=b.through()).contains(&id));
             prop_assert!(from_a_block, "id {} is in no applied block", id);
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(ourios_testgen::proptest_cases(64)))]
+
+    /// RFC 0065 §6.7: replaying a group's log in memory from its first
+    /// entry yields exactly the events the live state machine sent the
+    /// miner, ignored id blocks and stopping configurations included.
+    #[test]
+    fn a_replay_of_the_log_yields_the_events_the_state_machine_sent(
+        ops in prop::collection::vec(op(), 1..40)
+    ) {
+        let corpus = corpus();
+        let entries: Vec<GroupEntry> = ops.iter().map(|op| entry_of(op, &corpus)).collect();
+        let sent = events_of(&entries, 64);
+        let mut replay = Replay::from_start();
+        let replayed: Vec<Applied> = logged(&entries)
+            .into_iter()
+            .map_while(|entry| replay.apply(entry).ok())
+            .flatten()
+            .collect();
+        prop_assert_eq!(replayed, sent);
     }
 }
 
@@ -592,7 +625,7 @@ fn two_replicas_emit_the_same_audit_events_apart_from_timestamps() {
     assert_eq!(untimed(replica.clone()), untimed(audit(miner_of(&entries))));
 }
 
-fn time(nanos: u64) -> BatchTime {
+pub(in crate::replicated::raft) fn time(nanos: u64) -> BatchTime {
     BatchTime::from_nanos(nanos).expect("in range")
 }
 
@@ -726,4 +759,107 @@ fn a_batch_purged_before_the_first_configuration_applies_stops_the_miner() {
         index: 1,
     });
     assert_eq!(outcomes, [Ok(0), Ok(0), Ok(0), purged.clone(), purged]);
+}
+
+/// The seqs of the entries whose rows `mined` holds, in order, once each.
+fn entries_mined(mined: &Mined) -> Vec<u64> {
+    let mut seqs: Vec<u64> = mined.rows.iter().map(|row| row.position.seq).collect();
+    seqs.dedup();
+    seqs
+}
+
+/// What `miner` mined from `applied` a step at a time: the event's own
+/// output, then each held batch's, until none is left.
+fn stepped(miner: &mut GroupMiner, applied: Applied) -> Result<Vec<Mined>, GroupMinerError> {
+    let mut steps = vec![miner.step(applied)?];
+    while let Some(held) = miner.next_held() {
+        steps.push(held?);
+    }
+    Ok(steps)
+}
+
+fn joined(steps: Vec<Mined>) -> Mined {
+    let mut whole = Mined::default();
+    for Mined { audit, rows } in steps {
+        whole.audit.extend(audit);
+        whole.rows.extend(rows);
+    }
+    whole
+}
+
+/// RFC 0065 §6.7: the first configuration mines none of the batches held
+/// for it; each later step mines one of them, in log order, with the
+/// audit events it emitted, stamped with that batch's time.
+#[test]
+fn the_batches_held_for_the_first_configuration_mine_one_per_step() {
+    let entries = configured_at_4();
+    let mut miner = miner_of(&entries);
+    let steps: Vec<Vec<Mined>> = events_of(&entries, 8)
+        .into_iter()
+        .map(|applied| stepped(&mut miner, applied).expect("mined"))
+        .collect();
+    let per_step: Vec<Vec<Vec<u64>>> = steps
+        .iter()
+        .map(|steps| steps.iter().map(entries_mined).collect())
+        .collect();
+    let none = Vec::<u64>::new;
+    assert_eq!(
+        per_step,
+        [
+            vec![none()],
+            vec![none()],
+            vec![none()],
+            vec![none(), vec![1], vec![3]],
+            vec![vec![5]],
+        ]
+    );
+    let own_times = [time(10), time(20)].map(BatchTime::system_time);
+    assert_eq!(stamps(&steps[3][1]), own_times[..1]);
+    assert_eq!(stamps(&steps[3][2]), own_times[1..]);
+}
+
+/// An event that follows while batches are still held mines them first,
+/// so its output stays in log order.
+#[test]
+fn an_event_after_held_batches_mines_them_first() {
+    let entries = configured_at_4();
+    let mut miner = miner_of(&entries);
+    let mut events = events_of(&entries, 8).into_iter();
+    for applied in events.by_ref().take(4) {
+        assert_eq!(miner.step(applied).expect("mined"), Mined::default());
+    }
+    let last = events.next().expect("the batch at 5");
+    let out = miner.step(last).expect("mined");
+    assert_eq!(entries_mined(&out), [1, 3, 5]);
+    assert!(miner.next_held().is_none(), "nothing left held");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(ourios_testgen::proptest_cases(64)))]
+
+    /// Stepping through a log, held batches one at a time, mines what
+    /// applying it whole does, event for event, errors included, and no
+    /// held step mines more than one entry.
+    #[test]
+    fn stepping_mines_what_applying_whole_does(
+        ops in prop::collection::vec(op(), 1..40)
+    ) {
+        let corpus = corpus();
+        let entries: Vec<GroupEntry> = ops.iter().map(|op| entry_of(op, &corpus)).collect();
+        let (mut whole, mut steps) = (miner_of(&entries), miner_of(&entries));
+        for applied in events_of(&entries, 64) {
+            let expected = whole.apply(applied.clone());
+            let got = stepped(&mut steps, applied);
+            if let Ok(got) = &got {
+                for held in &got[1..] {
+                    prop_assert_eq!(entries_mined(held).len(), 1, "one entry per held step");
+                }
+            }
+            let stopped = expected.is_err();
+            prop_assert_eq!(got.map(joined), expected);
+            if stopped {
+                break;
+            }
+        }
+    }
 }

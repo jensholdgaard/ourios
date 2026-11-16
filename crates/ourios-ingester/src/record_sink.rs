@@ -219,7 +219,7 @@ pub struct ParquetRecordSink {
 /// rough heuristic over the larger variable-length fields, not the exact
 /// encoded (compressed) size and not every field. Good enough to bound memory
 /// and roughly right-size files; precise estimation is RFC 0014 §7.
-fn estimate_bytes(r: &MinedRecord) -> usize {
+pub(crate) fn estimate_bytes(r: &MinedRecord) -> usize {
     let opt = |o: &Option<String>| o.as_ref().map_or(0, String::len);
     // Fixed per-record overhead plus the variable-length payloads.
     96 + opt(&r.body)

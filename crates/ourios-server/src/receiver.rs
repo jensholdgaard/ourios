@@ -2083,10 +2083,7 @@ mod tests {
             max_buffer_age: SINK_MAX_BUFFER_AGE,
             max_request_bytes: ourios_ingester::receiver::MAX_REQUEST_BYTES,
         };
-        let expected = Some(ourios_miner::snapshot::WalHighWater {
-            segment: horizon.segment.to_string(),
-            byte: horizon.byte,
-        });
+        let expected = Some(ourios_ingester::snapshot_store::high_water(horizon));
 
         // When the node restarts idle twice.
         for start in ["first", "second"] {
@@ -2365,12 +2362,7 @@ mod tests {
     fn disk_high_water(snapshots_root: &Path, tenant: &str) -> Option<WalOffset> {
         let bytes = std::fs::read(snapshots_root.join(format!("{tenant}.snap"))).expect("read");
         let (state, _) = ourios_miner::snapshot::recover(Some(&bytes));
-        let high_water = state.expect("decodes").wal_high_water?;
-        let segment = high_water.segment.parse().expect("segment uuid");
-        Some(WalOffset {
-            segment,
-            byte: high_water.byte,
-        })
+        ourios_ingester::snapshot_store::offset_of(&state.expect("decodes").wal_high_water?)
     }
 
     /// Every `*.wal` segment directly under the WAL root.
@@ -3128,8 +3120,10 @@ mod tests {
         assert_eq!(artefacts.len(), 1, "the rotation snapshot was stamped");
         let state = ourios_miner::snapshot::load_snapshot(&artefacts[0].1).expect("known version");
         let stamped = state.wal_high_water.expect("stamped with a horizon");
-        assert_eq!(stamped.segment, mark.segment.to_string());
-        assert_eq!(stamped.byte, mark.byte);
+        assert_eq!(
+            ourios_ingester::snapshot_store::offset_of(&stamped),
+            Some(mark)
+        );
     }
 
     /// An age sweep stopped halfway: the drain has happened, the

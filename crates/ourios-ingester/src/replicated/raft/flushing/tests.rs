@@ -12,6 +12,8 @@ use super::super::kept::tests::{entries, mined_log};
 use super::super::log_ids::gated::{Outage, with_outage};
 use super::super::mining::tests::{HeldLog, logged};
 use super::super::mining::tests::{batch_at, block, configured, corpus, time};
+use super::super::telemetry::Replays;
+use super::super::telemetry::tests::Reader as Metrics;
 use super::super::types::{Entry, GroupEntry, LogId};
 use super::*;
 
@@ -63,6 +65,7 @@ struct Setup {
     target_bytes: usize,
     /// The group's log from index 1.
     entries: Vec<GroupEntry>,
+    replays: Replays,
 }
 
 impl Setup {
@@ -79,6 +82,7 @@ impl Setup {
             bounds,
             target_bytes: usize::MAX,
             entries: entries(8),
+            replays: Replays::global(),
         }
     }
 }
@@ -88,6 +92,7 @@ fn fixture_with(formed: bool, setup: Setup) -> Fixture {
         bounds,
         target_bytes,
         entries,
+        replays,
     } = setup;
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path().to_path_buf();
@@ -126,7 +131,7 @@ fn fixture_with(formed: bool, setup: Setup) -> Fixture {
         _tmp: tmp,
         root,
         store,
-        flushing: Flushing::new(me(), GROUP, source, Arc::new(held.clone())),
+        flushing: Flushing::new(me(), GROUP, source, Arc::new(held.clone())).with_replays(replays),
         kept: Kept::new(bounds),
         log: mined_log(&entries),
         outage,
@@ -169,6 +174,15 @@ impl Fixture {
             let named = if n == 0 { assigned } else { None };
             self.flushing.step(named, mined, &mut self.kept);
         }
+    }
+
+    /// Drop the output of the first six entries, then step the seventh
+    /// naming this replica, which replays one slice; returns the gap.
+    fn replay_one_slice(&mut self) -> u64 {
+        let gap = index_at(self, 5);
+        self.step_dropping(0..6, None, gap);
+        self.step(6..7, Some(me()));
+        gap
     }
 
     /// The records the current replay holds buffered, unpublished.
@@ -425,9 +439,7 @@ fn a_flusher_with_a_gap_replays_it_then_publishes_as_if_it_dropped_nothing() {
 #[test]
 fn a_gap_replay_publishes_one_slice_per_step() {
     let mut f = fixture_sliced(true, Bounds::default(), 1);
-    let gap = index_at(&f, 5);
-    f.step_dropping(0..6, None, gap);
-    f.step(6..7, Some(me()));
+    let gap = f.replay_one_slice();
     assert_eq!(f.kept.gap(), Some(gap), "one slice does not reach the gap");
     assert!(f.flushing.current().borrow().is_none(), "kept output waits");
     assert_eq!(f.replay_buffered(), 0, "the slice is durable");
@@ -447,9 +459,7 @@ fn a_gap_replay_publishes_one_slice_per_step() {
 #[test]
 fn a_checkpoint_at_or_above_the_gap_ends_the_replay() {
     let mut f = fixture_sliced(true, Bounds::default(), 1);
-    let gap = index_at(&f, 5);
-    f.step_dropping(0..6, None, gap);
-    f.step(6..7, Some(me()));
+    let gap = f.replay_one_slice();
     f.kept.checkpoint(gap);
     f.step(7..10, None);
     assert_eq!(f.kept.gap(), None);
@@ -467,9 +477,7 @@ fn a_checkpoint_at_or_above_the_gap_ends_the_replay() {
 #[test]
 fn a_checkpoint_the_replay_has_passed_does_not_stop_it() {
     let mut f = fixture_sliced(true, Bounds::default(), 1);
-    let gap = index_at(&f, 5);
-    f.step_dropping(0..6, None, gap);
-    f.step(6..7, Some(me()));
+    f.replay_one_slice();
     f.kept.checkpoint(index_at(&f, 1));
     f.step(7..10, None);
     assert_eq!(f.flushing.held(), None);
@@ -483,9 +491,7 @@ fn a_checkpoint_the_replay_has_passed_does_not_stop_it() {
 #[test]
 fn a_checkpoint_below_the_gap_ahead_of_the_replay_holds_it() {
     let mut f = fixture_sliced(true, Bounds::default(), 1);
-    let gap = index_at(&f, 5);
-    f.step_dropping(0..6, None, gap);
-    f.step(6..7, Some(me()));
+    let gap = f.replay_one_slice();
     f.kept.checkpoint(index_at(&f, 4));
     f.step(7..10, None);
     assert_eq!(f.flushing.held(), Some("restore_unavailable"));
@@ -569,9 +575,7 @@ fn a_checkpoint_over_batches_the_replay_still_holds_stops_it() {
 #[test]
 fn a_fresh_replay_starts_without_an_abandoned_slice() {
     let mut f = fixture_sliced(true, Bounds::default(), 1);
-    let gap = index_at(&f, 5);
-    f.step_dropping(0..6, None, gap);
-    f.step(6..7, Some(me()));
+    f.replay_one_slice();
     f.outage.begin();
     f.step(7..8, None);
     assert!(
@@ -676,4 +680,91 @@ fn a_replay_that_stops_discards_what_it_handed_on() {
     f.step(6..7, Some(me()));
     assert_eq!(f.flushing.held(), Some("purged"));
     assert_eq!(f.replay_buffered(), 0, "nothing stays buffered");
+}
+
+const REPLAY_DURATION: &str = ourios_semconv::OURIOS_WAL_REPLICATION_REPLAY_DURATION;
+
+/// A sliced fixture whose replays are recorded on `reader`.
+fn recorded(reader: &Metrics) -> Fixture {
+    fixture_with(
+        true,
+        Setup {
+            target_bytes: 1,
+            replays: Replays::on(&reader.meter()),
+            ..Setup::bounded(Bounds::default())
+        },
+    )
+}
+
+/// RFC 0065 §6.9: a replay that rebuilds its gap records one duration
+/// for its group, with no `error.type`.
+#[test]
+fn a_replay_that_reaches_its_gap_records_its_duration() {
+    let reader = Metrics::new();
+    let mut f = recorded(&reader);
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..10, Some(me()));
+    assert_eq!(f.kept.gap(), None);
+    assert_eq!(reader.counts(REPLAY_DURATION), [(vec!["3".to_owned()], 1)]);
+}
+
+/// A checkpoint at or above the gap ends the replay, which records its
+/// duration as one that ended without an error.
+#[test]
+fn a_replay_a_checkpoint_ends_records_its_duration() {
+    let reader = Metrics::new();
+    let mut f = recorded(&reader);
+    let gap = f.replay_one_slice();
+    f.kept.checkpoint(gap);
+    f.step(7..8, None);
+    assert_eq!(reader.counts(REPLAY_DURATION), [(vec!["3".to_owned()], 1)]);
+}
+
+/// A replay that stops on an error records its duration with that
+/// error's `error.type`.
+#[test]
+fn a_replay_that_stops_records_its_error_type() {
+    let reader = Metrics::new();
+    let mut f = recorded(&reader);
+    f.flushing = Flushing::new(
+        me(),
+        GROUP,
+        f.flushing.source.clone(),
+        Arc::new(HeldLog(BTreeMap::new())),
+    )
+    .with_replays(Replays::on(&reader.meter()));
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..10, Some(me()));
+    let stopped = vec!["purged".to_owned(), "3".to_owned()];
+    assert_eq!(reader.counts(REPLAY_DURATION), [(stopped, 1)]);
+}
+
+/// A replay abandoned because another replica was named has not ended:
+/// it records nothing.
+#[test]
+fn an_abandoned_replay_records_nothing() {
+    let reader = Metrics::new();
+    let mut f = recorded(&reader);
+    f.replay_one_slice();
+    f.step(7..8, Some(other()));
+    assert!(reader.counts(REPLAY_DURATION).is_empty());
+}
+
+/// A replay a checkpoint below the gap overtakes holds for that
+/// checkpoint's bundle; a later checkpoint at or above the gap still ends
+/// it, and its duration is recorded then.
+#[test]
+fn a_replay_held_for_a_bundle_records_when_a_later_checkpoint_ends_it() {
+    let reader = Metrics::new();
+    let mut f = recorded(&reader);
+    let gap = f.replay_one_slice();
+    f.kept.checkpoint(index_at(&f, 4));
+    f.step(7..8, None);
+    assert_eq!(f.flushing.held(), Some("restore_unavailable"));
+    assert!(reader.counts(REPLAY_DURATION).is_empty(), "not ended yet");
+    f.kept.checkpoint(gap);
+    f.step(8..9, None);
+    assert_eq!(reader.counts(REPLAY_DURATION), [(vec!["3".to_owned()], 1)]);
 }

@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ourios_core::audit::AuditEvent;
 use ourios_parquet::{PromotedAttributes, Store};
@@ -26,6 +26,7 @@ use super::formation::{Formation, formed_key};
 use super::kept::Kept;
 use super::mining::{Mined, MinedRow, SharedLog};
 use super::publication::Publication;
+use super::telemetry::Replays;
 use super::types::NodeId;
 use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use crate::record_sink::{FlushConfig, ParquetRecordSink};
@@ -103,8 +104,9 @@ pub enum Need {
 /// Where a named replica with a gap is in rebuilding it.
 enum Rebuilding {
     Replaying(Box<Rebuild>),
-    /// Held, as reported, until the gap clears.
-    Held,
+    /// Held, as reported, until the gap clears; with the start of a
+    /// replay a checkpoint overtook, which ends once the gap clears.
+    Held(Option<Instant>),
 }
 
 /// What a replica keeps, copied for publishing once it is no longer held.
@@ -195,6 +197,7 @@ pub struct Flushing {
     held: Option<&'static str>,
     log: SharedLog,
     rebuilding: Option<Rebuilding>,
+    replays: Replays,
     /// How many times the kept backlog was copied for publication.
     #[cfg(test)]
     backlog_copies: usize,
@@ -215,10 +218,17 @@ impl Flushing {
             held: None,
             log,
             rebuilding: None,
+            replays: Replays::global(),
             #[cfg(test)]
             backlog_copies: 0,
             current: watch::Sender::new(None),
         }
+    }
+
+    /// Record its gap replays' durations on `replays`.
+    #[must_use]
+    pub(crate) fn with_replays(self, replays: Replays) -> Self {
+        Self { replays, ..self }
     }
 
     /// The publication to drive the age trigger on.
@@ -260,12 +270,12 @@ impl Flushing {
         }
         match kept.gap() {
             _ if !self.named => {
-                self.end_rebuild();
+                self.end_rebuild(false);
                 Need::Hold
             }
             Some(gap) => self.plan_rebuild(gap, kept.cut()),
             None => {
-                self.end_rebuild();
+                self.end_rebuild(true);
                 self.plan_publish(kept)
             }
         }
@@ -293,7 +303,7 @@ impl Flushing {
     /// the checkpoint's bundle.
     fn plan_rebuild(&mut self, gap: u64, cut: u64) -> Need {
         let passed = match &self.rebuilding {
-            Some(Rebuilding::Held) => return Need::Hold,
+            Some(Rebuilding::Held(_)) => return Need::Hold,
             Some(Rebuilding::Replaying(rebuild)) => Some(cut == 0 || rebuild.passed(cut)),
             None => None,
         };
@@ -302,7 +312,11 @@ impl Flushing {
             None if cut == 0 && self.publication.is_none() => Need::Prepare,
             None if cut == 0 => Need::Replay { gap },
             Some(false) | None => {
-                self.rebuilding = Some(Rebuilding::Held);
+                let overtaken = match self.rebuilding.take() {
+                    Some(Rebuilding::Replaying(rebuild)) => Some(rebuild.started()),
+                    _ => None,
+                };
+                self.rebuilding = Some(Rebuilding::Held(overtaken));
                 let why = format!(
                     "the checkpoint at {cut} is below its gap at {gap}, and it cannot yet \
                      restore the checkpoint's bundle to replay from"
@@ -313,11 +327,21 @@ impl Flushing {
         }
     }
 
-    /// Leave any rebuild: the gap cleared, or this replica is no longer
-    /// named.
-    fn end_rebuild(&mut self) {
-        if self.rebuilding.take().is_some() {
-            self.held = None;
+    /// Leave any rebuild: the gap `cleared`, which ends a replay, or this
+    /// replica is no longer named, which abandons it.
+    fn end_rebuild(&mut self, cleared: bool) {
+        match self.rebuilding.take() {
+            Some(Rebuilding::Replaying(rebuild)) if cleared => {
+                self.replays
+                    .ended(self.group, rebuild.started().elapsed(), None);
+                self.held = None;
+            }
+            Some(Rebuilding::Held(Some(started))) if cleared => {
+                self.replays.ended(self.group, started.elapsed(), None);
+                self.held = None;
+            }
+            Some(_) => self.held = None,
+            None => {}
         }
     }
 
@@ -371,14 +395,19 @@ impl Flushing {
         match rebuild.slice(gap, &publication, self.source.flush.target_bytes) {
             Slice::Pending => None,
             Slice::Rebuilt => {
+                self.replays
+                    .ended(self.group, rebuild.started().elapsed(), None);
                 self.rebuilding = None;
                 Some(gap)
             }
             Slice::Stopped(error) => {
+                let error_type = error.error_type();
+                self.replays
+                    .ended(self.group, rebuild.started().elapsed(), Some(error_type));
                 self.hold();
-                self.rebuilding = Some(Rebuilding::Held);
+                self.rebuilding = Some(Rebuilding::Held(None));
                 let why = format!("the replay of its gap at {gap} stopped: {error}");
-                self.report_held(error.error_type(), &why);
+                self.report_held(error_type, &why);
                 None
             }
         }

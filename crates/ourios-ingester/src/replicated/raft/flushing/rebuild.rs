@@ -5,6 +5,8 @@
 //! and is made durable, its audit events ahead of its rows, before the
 //! next is mined, so the replay holds one slice and its miner's state.
 
+use std::time::Instant;
+
 use super::super::mining::SharedLog;
 use super::super::publication::Publication;
 use super::super::replay::{ReplayError, Replayed};
@@ -30,6 +32,7 @@ pub(super) enum Slice {
 
 pub(super) struct Rebuild {
     replayed: Replayed<SharedLog>,
+    started: Instant,
     /// The last slice is published but not yet durable.
     unflushed: bool,
 }
@@ -39,8 +42,14 @@ impl Rebuild {
     pub(super) fn start(log: SharedLog, gap: u64) -> Self {
         Self {
             replayed: Replayed::new(log, FIRST, gap),
+            started: Instant::now(),
             unflushed: false,
         }
+    }
+
+    /// When the replay started.
+    pub(super) fn started(&self) -> Instant {
+        self.started
     }
 
     /// Whether the replay has read every entry through `cut`, so a purge

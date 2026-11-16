@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use super::flushing::{self, Current, Flushing, Need, Publishing};
 use super::gate::SyncGate;
 use super::kept::{Bounds, Kept};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
@@ -44,10 +45,12 @@ pub enum HostRole {
     /// `kept` (§6.7), and hands it to `mined`, in log order per group,
     /// waiting while the channel is full. Opening the host replays the
     /// committed log through the miner, so `mined` must be read while it
-    /// opens.
+    /// opens. With `publishing`, a group whose latest flusher assignment
+    /// names this replica is also published from it (§6.5, §6.7).
     Tail {
         mined: mpsc::Sender<GroupMined>,
         kept: Bounds,
+        publishing: Option<Arc<Publishing>>,
     },
 }
 
@@ -142,9 +145,16 @@ struct Launch<'a> {
 impl Launch<'_> {
     /// Where a tail replica's miner for `group` hands its output and keeps
     /// it within `bounds`, its gauges registered.
-    fn follow(&self, group: u32, mined: mpsc::Sender<GroupMined>, bounds: Bounds) -> Follow {
-        let kept = Arc::new(Mutex::new(Kept::new(bounds)));
+    fn follow(&self, group: u32, mined: mpsc::Sender<GroupMined>, tail: &Tail) -> Follow {
+        let kept = Arc::new(Mutex::new(Kept::new(tail.kept)));
         self.meters.keep(group, &kept);
+        let publishing = tail.publishing.as_ref();
+        let flushing = publishing.and_then(|publishing| {
+            let source = publishing.source(group)?;
+            let flushing = Flushing::new(self.spec.id, group, source);
+            Some((flushing, publishing.sweep()))
+        });
+        let sweep = flushing.as_ref().map(|(f, every)| (f.current(), *every));
         Follow {
             group,
             mined,
@@ -152,7 +162,9 @@ impl Launch<'_> {
                 group,
                 kept,
                 drops: self.meters.kept(),
+                flushing: flushing.map(|(f, _)| Arc::new(Mutex::new(f))),
             },
+            sweep,
             storage: self.meters.storage(),
         }
     }
@@ -178,18 +190,26 @@ impl Launch<'_> {
         let gate = Arc::clone(&self.gate);
         let (sm, applied) = match &self.spec.role {
             HostRole::Voter => (blocking(move || GroupSm::open(&dir, gate)).await, None),
-            HostRole::Tail { mined, kept } => {
+            HostRole::Tail {
+                mined,
+                kept,
+                publishing,
+            } => {
                 let (events, applied) = mpsc::channel(APPLIED_CAPACITY);
                 let sm = blocking(move || GroupSm::open_mining(&dir, gate, events)).await;
-                (sm, Some((applied, mined.clone(), *kept)))
+                let tail = Tail {
+                    kept: *kept,
+                    publishing: publishing.clone(),
+                };
+                (sm, Some((applied, mined.clone(), tail)))
             }
         };
         let mut sm = sm.map_err(|source| HostError::Snapshot { group, source })?;
         sm.count_stops(group, self.meters.storage());
         // `Raft::new` applies the committed entries the log replays before
         // it returns, so the miner must already be taking them.
-        let mining = applied.map(|(applied, mined, kept)| {
-            let follow = self.follow(group, mined, kept);
+        let mining = applied.map(|(applied, mined, tail)| {
+            let follow = self.follow(group, mined, &tail);
             Mining::start(follow, GroupMiner::new(reader.clone()), applied)
         });
         let (id, network) = (self.spec.id, self.spec.peers.network(self.spec.id, group));
@@ -229,15 +249,23 @@ struct Mining {
     /// Cleared only once the task has ended, so every stop, a concurrent
     /// one or one retried after a cancelled one, waits for it.
     task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The group's age sweep, when it can be published from this replica;
+    /// it stops with the miner.
+    sweep: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Mining {
     fn start(follow: Follow, miner: GroupMiner, applied: mpsc::Receiver<Applied>) -> Self {
         let (stop, stopped) = watch::channel(false);
+        let sweep = follow
+            .sweep
+            .clone()
+            .map(|(current, every)| tokio::spawn(flushing::sweep(current, every, stopped.clone())));
         let task = tokio::spawn(follow.run(miner, applied, stopped));
         Self {
             stop,
             task: tokio::sync::Mutex::new(Some(task)),
+            sweep: tokio::sync::Mutex::new(sweep),
         }
     }
 
@@ -253,12 +281,14 @@ impl Mining {
     /// them, outlives the stop.
     async fn stop(&self) {
         self.stop.send_replace(true);
-        let mut task = self.task.lock().await;
-        if let Some(running) = task.as_mut() {
-            // A miner that panicked has ended too.
-            running.await.ok();
+        for task in [&self.task, &self.sweep] {
+            let mut task = task.lock().await;
+            if let Some(running) = task.as_mut() {
+                // A task that panicked has ended too.
+                running.await.ok();
+            }
+            *task = None;
         }
-        *task = None;
     }
 }
 
@@ -286,7 +316,16 @@ struct Follow {
     group: u32,
     mined: mpsc::Sender<GroupMined>,
     keeping: Keeping,
+    /// The publication the age sweep drives, and how often, when the group
+    /// can be published from this replica.
+    sweep: Option<(Current, Duration)>,
     storage: Storage,
+}
+
+/// What a tail replica's settings say of its groups' output.
+struct Tail {
+    kept: Bounds,
+    publishing: Option<Arc<Publishing>>,
 }
 
 /// What a tail replica keeps of `group`'s mined output for a takeover,
@@ -296,21 +335,64 @@ struct Keeping {
     group: u32,
     kept: Arc<Mutex<Kept>>,
     drops: KeptDrops,
+    flushing: Option<Arc<Mutex<Flushing>>>,
 }
 
 impl Keeping {
     /// Keep what the entry at `index` mined, then drop what an applied
-    /// checkpoint's `cut` passes.
-    fn keep(&self, index: u64, out: &Mined, cut: Option<u64>) {
+    /// checkpoint's `cut` passes; then publish, as the replica `assigned`
+    /// by a flusher assignment at this entry allows.
+    fn keep(&self, index: u64, out: &Mined, applied: Applying) {
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
         let before = kept.dropped();
         if !(out.audit.is_empty() && out.rows.is_empty()) {
             kept.keep(index, out.clone());
         }
-        if let Some(cut) = cut {
+        if let Some(cut) = applied.cut {
             kept.checkpoint(cut);
         }
         self.drops.dropped(self.group, kept.dropped(), before);
+        let Some(flushing) = &self.flushing else {
+            return;
+        };
+        let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
+        let need = flushing.plan(applied.assigned, &kept);
+        // Publishing does store I/O, and the kept gauges read `kept`.
+        drop(kept);
+        let need = match need {
+            Need::Prepare if flushing.prepare() => {
+                let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+                flushing.plan(None, &kept)
+            }
+            Need::Prepare => return,
+            need => need,
+        };
+        flushing.publish(need, out);
+    }
+}
+
+/// What an applied event changes besides the miner's output.
+#[derive(Clone, Copy, Default)]
+struct Applying {
+    /// The cut of a checkpoint applied at it.
+    cut: Option<u64>,
+    /// The replica a flusher assignment applied at it names.
+    assigned: Option<NodeId>,
+}
+
+impl Applying {
+    fn of(event: &AppliedEvent) -> Self {
+        match event {
+            AppliedEvent::Checkpoint(cut) => Self {
+                cut: Some(cut.index),
+                ..Self::default()
+            },
+            AppliedEvent::Flusher(replica) => Self {
+                assigned: Some(*replica),
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
     }
 }
 
@@ -328,15 +410,12 @@ impl Follow {
     ) {
         while let Some(event) = next(&mut applied, &mut stop).await {
             let index = event.at.index;
-            let cut = match &event.event {
-                AppliedEvent::Checkpoint(cut) => Some(cut.index),
-                _ => None,
-            };
+            let applying = Applying::of(&event.event);
             let keeping = self.keeping.clone();
             let mining = tokio::task::spawn_blocking(move || {
                 let followed = miner.apply(event);
                 if let Ok(out) = &followed {
-                    keeping.keep(index, out, cut);
+                    keeping.keep(index, out, applying);
                 }
                 (miner, followed)
             });
@@ -583,13 +662,19 @@ mod tests {
     use openraft::vote::leader_id_std::CommittedLeaderId;
     use ourios_wal::Control;
 
+    use super::super::flushing::Source;
+    use super::super::formation::{Formation, formed_key};
+    use super::super::kept::tests::{entries, mined_log};
     use super::super::mining::GroupLogRead;
     use super::super::mining::tests::{batch_at, block, configured, corpus, time};
+    use super::super::publication::held::first_put_held;
     use super::super::snapshot_record::{GroupMinerConfig, IdBlock};
     use super::super::state_machine::AppliedEvent;
     use super::super::telemetry::tests::{Reader, until};
     use super::super::types::{Entry, GroupEntry};
     use super::*;
+    use crate::record_sink::FlushConfig;
+    use ourios_parquet::Store;
     use ourios_semconv as semconv;
 
     /// A group whose build never ends, counting the triggers it gets.
@@ -673,7 +758,9 @@ mod tests {
                 group: 0,
                 kept: Arc::default(),
                 drops: Meters::global().kept(),
+                flushing: None,
             },
+            sweep: None,
             storage: Storage::global(),
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
@@ -818,7 +905,9 @@ mod tests {
                 group: 0,
                 kept: Arc::clone(&kept),
                 drops: meters.kept(),
+                flushing: None,
             },
+            sweep: None,
             storage: Storage::global(),
         };
         let mining = Mining::start(follow, GroupMiner::new(EmptyLog), applied);
@@ -939,6 +1028,65 @@ mod tests {
         mining.stop().await;
         assert_eq!(reader.points(gap), [], "an ended task reports no gap");
         assert_eq!(reader.points(usage), [], "nor kept audit bytes");
+    }
+
+    /// The kept gauges read `Kept` under its lock, so a step must not hold
+    /// it across publication I/O: with the store's first write held, the
+    /// lock is still free.
+    #[test]
+    fn the_kept_lock_is_free_while_publication_writes() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let local = Store::local(tmp.path()).expect("store");
+        let voters = ["v1", "v2", "v3"];
+        let members = (1..)
+            .zip(voters)
+            .map(|(n, v)| (v.to_owned(), NodeId::from(n)))
+            .collect();
+        let formation = Formation::new(0, 5, members, &voters).expect("formation");
+        local
+            .put_blocking(&formed_key(0), formation.encode().expect("encode"))
+            .expect("record");
+        let (store, held) = first_put_held(local);
+        let source = Source {
+            store,
+            voters: voters.map(str::to_owned).to_vec(),
+            flush: FlushConfig {
+                target_bytes: 1,
+                max_buffer_age: Duration::MAX,
+                ceiling_bytes: 1,
+            },
+            promoted: ourios_parquet::PromotedAttributes::default(),
+            audit_ceiling: usize::MAX,
+        };
+        let me = NodeId::from(7);
+        let kept: Arc<Mutex<Kept>> = Arc::default();
+        let keeping = Keeping {
+            group: 0,
+            kept: Arc::clone(&kept),
+            drops: Meters::global().kept(),
+            flushing: Some(Arc::new(Mutex::new(Flushing::new(me, 0, source)))),
+        };
+        let log = mined_log(&entries(2));
+        let (index, mined) = log
+            .iter()
+            .find(|(_, mined)| !mined.rows.is_empty())
+            .expect("a batch");
+        let assigned = Applying {
+            assigned: Some(me),
+            ..Applying::default()
+        };
+        std::thread::scope(|scope| {
+            let step = scope.spawn(|| keeping.keep(*index, mined, assigned));
+            held.reached.recv().expect("publication is writing");
+            let free = (0..50).any(|_| {
+                let free = kept.try_lock().is_ok();
+                std::thread::sleep(Duration::from_millis(10));
+                free
+            });
+            held.release.send(()).expect("released");
+            step.join().expect("join");
+            assert!(free, "the step held `Kept` across its store write");
+        });
     }
 
     /// A log that holds no entry.

@@ -11,22 +11,26 @@
 //! keeps again, and a row a former publication already wrote repeats only
 //! its position, which compaction and queries count once (§6.6).
 
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
-use ourios_core::sync::lock_recover;
+use ourios_core::audit::AuditEvent;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_semconv as semconv;
 
 use super::formation::{Formation, formed_key};
 use super::kept::Kept;
-use super::mining::Mined;
+use super::mining::{Mined, MinedRow};
 use super::publication::Publication;
 use super::types::NodeId;
 use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use crate::record_sink::{FlushConfig, ParquetRecordSink};
+use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
 
 /// Where and how a group's flusher publishes.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Source {
     pub store: Store,
     /// The group's voters in placement order, which `formed.json` names.
@@ -37,8 +41,130 @@ pub struct Source {
     pub audit_ceiling: usize,
 }
 
+/// How a tail node publishes the groups it is named flusher of.
+#[derive(Clone, Debug)]
+pub struct Publishing {
+    pub store: Store,
+    /// Each group's voters in placement order, which its `formed.json`
+    /// names.
+    pub voters: BTreeMap<u32, Vec<String>>,
+    pub flush: FlushConfig,
+    pub promoted: PromotedAttributes,
+    /// The audit sink's soft ceiling, in events.
+    pub audit_ceiling: usize,
+}
+
+/// The age sweep's most: a partition flushes within its age plus this
+/// (RFC 0063 §3.2, as the local receiver's sweep).
+const SWEEP_TICK: Duration = Duration::from_secs(30);
+
+/// The age sweep's least, so an age of zero does not spin.
+const SWEEP_FLOOR: Duration = Duration::from_millis(10);
+
+impl Publishing {
+    /// `group`'s source, if this node knows its voters.
+    #[must_use]
+    pub fn source(&self, group: u32) -> Option<Source> {
+        Some(Source {
+            store: self.store.clone(),
+            voters: self.voters.get(&group)?.clone(),
+            flush: self.flush.clone(),
+            promoted: self.promoted.clone(),
+            audit_ceiling: self.audit_ceiling,
+        })
+    }
+
+    /// How often a group's age sweep runs: at most 30 s and
+    /// never slower than the age it enforces.
+    #[must_use]
+    pub fn sweep(&self) -> Duration {
+        SWEEP_TICK.min(self.flush.max_buffer_age).max(SWEEP_FLOOR)
+    }
+}
+
+/// What one step publishes.
+pub enum Need {
+    /// Nothing: stop, if publishing.
+    Hold,
+    /// The publication is to be built first: see [`Flushing::prepare`].
+    Prepare,
+    /// The step's own output.
+    Output,
+    /// Everything kept, the step's output among it.
+    Backlog(Backlog),
+}
+
+/// What a replica keeps, copied for publishing once it is no longer held.
+pub struct Backlog {
+    audit: Vec<AuditEvent>,
+    rows: Vec<MinedRow>,
+}
+
+/// Publish what the age trigger has made due, every `every` or as soon as
+/// the live publication's audit buffer reaches its ceiling, until `stop`
+/// says so. A flush that fails leaves its rows buffered for the next one,
+/// and its failure is counted where it happens.
+pub async fn sweep(mut current: Current, every: Duration, mut stop: watch::Receiver<bool>) {
+    let mut ticks = tokio::time::interval(every);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        match wake(&mut current, &mut ticks, &mut stop).await {
+            Wake::Stop => return,
+            // A new publication has a notifier of its own to wait on.
+            Wake::Changed => {}
+            Wake::Flush => {
+                if !flush_aged(&current).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Why the sweep woke.
+enum Wake {
+    Stop,
+    Changed,
+    Flush,
+}
+
+async fn wake(
+    current: &mut Current,
+    ticks: &mut tokio::time::Interval,
+    stop: &mut watch::Receiver<bool>,
+) -> Wake {
+    let overflow = current.borrow().as_ref().map(|p| p.overflow());
+    let overflowed = async {
+        match &overflow {
+            Some(notify) => notify.notified().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = stop.wait_for(|stopped| *stopped) => Wake::Stop,
+        changed = current.changed() => match changed {
+            Ok(()) => Wake::Changed,
+            Err(_) => Wake::Stop,
+        },
+        _ = ticks.tick() => Wake::Flush,
+        () = overflowed => Wake::Flush,
+    }
+}
+
+/// Run the age flush of the live publication, if any, off the runtime's
+/// workers; `false` if it panicked, which is reported where it happened.
+async fn flush_aged(current: &Current) -> bool {
+    let Some(publication) = current.borrow().clone() else {
+        return true;
+    };
+    tokio::task::spawn_blocking(move || publication.flush_aged())
+        .await
+        .is_ok()
+}
+
 /// The publication a group's age loop drives, while there is one.
-pub type Current = Arc<Mutex<Option<Arc<Publication>>>>;
+pub type Current = watch::Receiver<Option<Arc<Publication>>>;
 
 /// One group's publication on one tail replica.
 pub struct Flushing {
@@ -51,7 +177,10 @@ pub struct Flushing {
     caught_up: bool,
     /// Why the log id was last unreadable, as reported; `None` once read.
     held: Option<&'static str>,
-    current: Current,
+    /// How many times the kept backlog was copied for publication.
+    #[cfg(test)]
+    backlog_copies: usize,
+    current: watch::Sender<Option<Arc<Publication>>>,
 }
 
 impl Flushing {
@@ -65,14 +194,16 @@ impl Flushing {
             publication: None,
             caught_up: false,
             held: None,
-            current: Current::default(),
+            #[cfg(test)]
+            backlog_copies: 0,
+            current: watch::Sender::new(None),
         }
     }
 
     /// The publication to drive the age trigger on.
     #[must_use]
     pub fn current(&self) -> Current {
-        Arc::clone(&self.current)
+        self.current.subscribe()
     }
 
     /// Why a named replica is not publishing, as the `error.type` it last
@@ -85,23 +216,65 @@ impl Flushing {
     /// One step: `assigned` is the replica a flusher assignment applied at
     /// this entry named, `out` what the entry mined, already in `kept`.
     pub fn step(&mut self, assigned: Option<NodeId>, out: &Mined, kept: &Kept) {
+        let need = match self.plan(assigned, kept) {
+            Need::Prepare if self.prepare() => self.plan(None, kept),
+            Need::Prepare => return,
+            need => need,
+        };
+        self.publish(need, out);
+    }
+
+    /// Decide what this step publishes, while `kept`, which already holds
+    /// the step's output, is held; it does no I/O, so whoever holds `kept`
+    /// is not kept waiting on the store.
+    pub fn plan(&mut self, assigned: Option<NodeId>, kept: &Kept) -> Need {
         if let Some(assigned) = assigned {
             self.named = assigned == self.replica;
         }
         if !self.named || kept.gap().is_some() {
-            self.hold();
-            return;
-        }
-        let Some(publication) = self.publication() else {
-            return;
-        };
-        if self.caught_up {
-            publication.publish(&out.audit, &out.rows);
+            Need::Hold
+        } else if self.caught_up {
+            Need::Output
+        } else if self.publication.is_none() {
+            Need::Prepare
         } else {
-            publication.resume();
-            publication.publish_kept(kept);
-            self.caught_up = true;
-            *lock_recover(&self.current) = Some(publication);
+            #[cfg(test)]
+            {
+                self.backlog_copies += 1;
+            }
+            Need::Backlog(Backlog {
+                audit: kept.audit().cloned().collect(),
+                rows: kept.rows().cloned().collect(),
+            })
+        }
+    }
+
+    /// Build the publication, reading the group's log id; `true` once
+    /// there is one. Done without `kept` held, so a store that cannot be
+    /// read costs no copy of what is kept, then [`Self::plan`] again.
+    pub fn prepare(&mut self) -> bool {
+        self.publication().is_some()
+    }
+
+    /// Publish what [`Self::plan`] decided, `out` being the step's output.
+    pub fn publish(&mut self, need: Need, out: &Mined) {
+        match need {
+            Need::Hold => self.hold(),
+            Need::Prepare => {}
+            Need::Output => {
+                if let Some(publication) = &self.publication {
+                    publication.publish(&out.audit, &out.rows);
+                }
+            }
+            Need::Backlog(backlog) => {
+                let Some(publication) = self.publication() else {
+                    return;
+                };
+                publication.resume();
+                publication.publish(&backlog.audit, &backlog.rows);
+                self.caught_up = true;
+                self.current.send_replace(Some(publication));
+            }
         }
     }
 
@@ -116,7 +289,7 @@ impl Flushing {
             publication.discard();
         }
         self.caught_up = false;
-        *lock_recover(&self.current) = None;
+        self.current.send_replace(None);
     }
 
     /// This group's publication, built once its log id is readable.

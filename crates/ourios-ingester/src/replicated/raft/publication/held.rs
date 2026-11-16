@@ -14,15 +14,15 @@ use ourios_parquet::Store;
 type BoxStream<T> = futures::stream::BoxStream<'static, T>;
 
 /// The first put through the store returned with it, held.
-pub(super) struct Held {
+pub(in crate::replicated::raft) struct Held {
     /// Receives once that put has been called.
-    pub(super) reached: mpsc::Receiver<()>,
+    pub(in crate::replicated::raft) reached: mpsc::Receiver<()>,
     /// Lets it fail.
-    pub(super) release: mpsc::Sender<()>,
+    pub(in crate::replicated::raft) release: mpsc::Sender<()>,
 }
 
 /// `store` with its first put held until released.
-pub(super) fn first_put_held(store: Store) -> (Store, Held) {
+pub(in crate::replicated::raft) fn first_put_held(store: Store) -> (Store, Held) {
     let (reached_tx, reached) = mpsc::channel();
     let (release, release_rx) = mpsc::channel();
     let gate = Arc::new(Gate {

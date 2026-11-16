@@ -20,7 +20,7 @@ use super::{Cluster, GROUP, name, propose, write};
 /// Commit the group's first miner configuration, which also waits until
 /// its leader takes writes, then add nodes `tail` as learners through
 /// that leader, and return it.
-async fn with_learners(cluster: &Cluster, tail: std::ops::Range<usize>) -> usize {
+pub(super) async fn with_learners(cluster: &Cluster, tail: std::ops::Range<usize>) -> usize {
     let leader = cluster.leader(GROUP, None).await;
     propose(cluster.node(leader).raft(GROUP), configured(0.7)).await;
     for i in tail {
@@ -36,7 +36,7 @@ async fn with_learners(cluster: &Cluster, tail: std::ops::Range<usize>) -> usize
 }
 
 /// Commit `entries` through node `leader`, returning the last index.
-async fn commit_all(cluster: &Cluster, leader: usize, entries: &[GroupEntry]) -> u64 {
+pub(super) async fn commit_all(cluster: &Cluster, leader: usize, entries: &[GroupEntry]) -> u64 {
     let mut last = 0;
     for entry in entries {
         last = propose(cluster.node(leader).raft(GROUP), entry.clone()).await;
@@ -45,7 +45,7 @@ async fn commit_all(cluster: &Cluster, leader: usize, entries: &[GroupEntry]) ->
 }
 
 /// What `mined` hands on until it holds `rows` rows; fails after 10 s.
-async fn mined_rows(mined: &mut mpsc::Receiver<GroupMined>, rows: usize) -> Vec<Mined> {
+pub(super) async fn mined_rows(mined: &mut mpsc::Receiver<GroupMined>, rows: usize) -> Vec<Mined> {
     let mut received = Vec::new();
     let mut held = 0;
     while held < rows {

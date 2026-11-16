@@ -49,7 +49,7 @@ fn snap(tenant: &str, mark: Option<WalHighWater>) -> Vec<u8> {
     snapshot(&state).expect("snapshot encodes")
 }
 
-pub(super) fn marked(tenant: &str) -> Vec<u8> {
+pub(in crate::replicated::raft) fn marked(tenant: &str) -> Vec<u8> {
     snap(
         tenant,
         Some(WalHighWater::Replicated(LogMark { log: LOG, seq: SEQ })),
@@ -60,7 +60,7 @@ fn entry(tenant: &str) -> TenantEntry {
     TenantEntry::of(TenantId::new(tenant), config(), &marked(tenant))
 }
 
-pub(super) fn sample() -> Bundle {
+pub(in crate::replicated::raft) fn sample() -> Bundle {
     let ids =
         Allocator::new(1500, Some(block(1000, 2000)), vec![block(2000, 3000)]).expect("allocator");
     Bundle::new(AT, ids, vec![entry("acme"), entry("beta")]).expect("bundle")

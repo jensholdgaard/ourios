@@ -545,4 +545,4 @@ impl<'a> Reader<'a> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::replicated::raft) mod tests;

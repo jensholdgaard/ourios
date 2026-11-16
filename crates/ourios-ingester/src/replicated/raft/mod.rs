@@ -8,6 +8,7 @@
 
 pub mod bundle;
 mod checkpoint;
+pub mod checkpointing;
 mod codec;
 mod controls;
 pub mod flusher;

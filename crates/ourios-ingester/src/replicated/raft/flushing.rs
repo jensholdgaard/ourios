@@ -188,6 +188,9 @@ pub struct Flushing {
     publication: Option<Arc<Publication>>,
     /// Everything kept has been handed to `publication`.
     caught_up: bool,
+    /// `publication` takes handoffs: it was resumed, for the backlog or a
+    /// replay, and not discarded since.
+    active: bool,
     /// Why it last held, as reported; `None` once publishing.
     held: Option<&'static str>,
     log: SharedLog,
@@ -208,6 +211,7 @@ impl Flushing {
             named: false,
             publication: None,
             caught_up: false,
+            active: false,
             held: None,
             log,
             rebuilding: None,
@@ -340,6 +344,7 @@ impl Flushing {
             Need::Backlog(backlog) => {
                 let publication = self.publication()?;
                 publication.resume();
+                self.active = true;
                 publication.publish(&backlog.audit, &backlog.rows);
                 self.caught_up = true;
                 self.current.send_replace(Some(publication));
@@ -352,12 +357,11 @@ impl Flushing {
     fn replay(&mut self, gap: u64) -> Option<u64> {
         let publication = self.publication.clone()?;
         if self.rebuilding.is_none() {
-            // Start from what is durable: what was handed on before the gap,
-            // or by an abandoned replay, and not yet written may be among
-            // what was dropped, and would sit beside this replay's slices.
+            // Start from what is durable: what was handed on before the gap
+            // and not yet written may be among what was dropped.
             self.hold();
-            publication.discard();
             publication.resume();
+            self.active = true;
             let rebuild = Rebuild::start(Arc::clone(&self.log), gap);
             self.rebuilding = Some(Rebuilding::Replaying(Box::new(rebuild)));
         }
@@ -384,11 +388,12 @@ impl Flushing {
     /// publication is kept, discarded, for that: one per group, so its
     /// sinks and their metrics are built once.
     fn hold(&mut self) {
-        if self.caught_up
+        if self.active
             && let Some(publication) = &self.publication
         {
             publication.discard();
         }
+        self.active = false;
         self.caught_up = false;
         self.current.send_replace(None);
     }

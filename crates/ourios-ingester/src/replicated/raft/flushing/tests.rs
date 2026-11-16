@@ -585,3 +585,25 @@ fn a_fresh_replay_starts_without_an_abandoned_slice() {
     once.dedup_by_key(|row| row.ingest_position);
     assert_eq!(once, f.rows_of(0..10));
 }
+
+/// A reassignment during a replay discards what the replay handed on and
+/// the store refused: a handle retained from before the gap, such as the
+/// age sweep's, cannot publish it after another replica is named.
+#[test]
+fn a_retained_handle_cannot_publish_a_refused_replay_slice_after_a_reassignment() {
+    let mut f = fixture_sliced(true, Bounds::default(), 1);
+    f.step(0..2, Some(me()));
+    let retained = f.flushing.current().borrow().clone().expect("live");
+    let gap = index_at(&f, 5);
+    f.step_dropping(2..6, None, gap);
+    f.outage.begin();
+    f.step(6..7, None);
+    assert!(
+        retained.buffered_records() > 0,
+        "the refused slice is buffered"
+    );
+    f.step(7..8, Some(other()));
+    f.outage.end();
+    assert_eq!(retained.buffered_records(), 0, "the buffers were discarded");
+    assert!(!retained.flush_all(), "a held publication refuses to flush");
+}

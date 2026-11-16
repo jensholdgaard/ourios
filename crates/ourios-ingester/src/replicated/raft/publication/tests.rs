@@ -5,6 +5,7 @@ use ourios_parquet::Reader;
 use ourios_parquet::store::Store;
 
 use super::super::kept::tests::{entries, mined_log};
+use super::held::first_put_held;
 use super::*;
 use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use crate::record_sink::{FlushConfig, ParquetRecordSink};
@@ -22,11 +23,16 @@ struct Stores {
 /// A publication over local data and audit stores whose record sink
 /// flushes on its own under `config`.
 fn stores_with(config: FlushConfig) -> Stores {
+    stores_over(config, |store| store)
+}
+
+/// [`stores_with`], its data store wrapped by `wrap`.
+fn stores_over(config: FlushConfig, wrap: impl FnOnce(Store) -> Store) -> Stores {
     let tmp = tempfile::TempDir::new().expect("temp");
     let (data, audit) = (tmp.path().join("data"), tmp.path().join("audit"));
     std::fs::create_dir_all(&data).expect("data root");
     std::fs::create_dir_all(&audit).expect("audit root");
-    let records = ParquetRecordSink::new(Store::local(&data).expect("data store"), config);
+    let records = ParquetRecordSink::new(wrap(Store::local(&data).expect("data store")), config);
     let events = SharedParquetAuditSink::new(BufferingAuditSink::new(
         Store::local(&audit).expect("audit store"),
         usize::MAX,
@@ -39,13 +45,29 @@ fn stores_with(config: FlushConfig) -> Stores {
     }
 }
 
-/// [`stores_with`] triggers that never fire on their own.
+/// Triggers that never fire on their own.
+const HELD_BACK: FlushConfig = FlushConfig {
+    target_bytes: usize::MAX,
+    max_buffer_age: Duration::MAX,
+    ceiling_bytes: usize::MAX,
+};
+
+/// [`stores_with`] [`HELD_BACK`].
 fn stores() -> Stores {
-    stores_with(FlushConfig {
-        target_bytes: usize::MAX,
-        max_buffer_age: Duration::MAX,
-        ceiling_bytes: usize::MAX,
-    })
+    stores_with(HELD_BACK)
+}
+
+/// Every record in the files under `root`.
+fn published(root: &Path) -> Vec<MinedRecord> {
+    parquet_files(root)
+        .iter()
+        .flat_map(|file| {
+            Reader::open_file(file)
+                .expect("open")
+                .read_all()
+                .expect("read")
+        })
+        .collect()
 }
 
 /// Make the audit store refuse every write.
@@ -184,4 +206,56 @@ fn a_drain_waits_for_the_publish_in_progress() {
         let drain = drain.expect("the drain ran");
         assert!(drain.join().expect("join"), "the drain then published");
     });
+}
+
+/// On a healthy store, crossing the size target during one publish writes
+/// files before it returns: the audit barrier flushes the events first
+/// rather than holding the rows back.
+#[test]
+fn a_publish_past_the_size_target_writes_files_before_it_returns() {
+    let stores = stores_with(FlushConfig {
+        target_bytes: 1,
+        max_buffer_age: Duration::MAX,
+        ceiling_bytes: 1,
+    });
+    let kept = kept_of(&mined_log(&entries(4)));
+    stores.publication.publish_kept(&kept);
+    assert_eq!(
+        published(&stores.data).len(),
+        kept.rows().count(),
+        "every row published"
+    );
+}
+
+/// A full flush waits for an age flush still writing: one whose data write
+/// fails after the full flush began has its rows back in the buffers,
+/// and the full flush publishes them before it reports success.
+#[test]
+fn a_full_flush_waits_for_an_earlier_flush_still_writing() {
+    let mut held = None;
+    let aged_now = FlushConfig {
+        max_buffer_age: Duration::ZERO,
+        ..HELD_BACK
+    };
+    let stores = stores_over(aged_now, |store| {
+        let (store, gate) = first_put_held(store);
+        held = Some(gate);
+        store
+    });
+    let held = held.expect("held");
+    let kept = kept_of(&mined_log(&entries(4)));
+    stores.publication.publish_kept(&kept);
+    let publication = &stores.publication;
+    std::thread::scope(|scope| {
+        let aged = scope.spawn(|| publication.flush_aged());
+        held.reached.recv().expect("the age flush is writing");
+        let full = scope.spawn(|| publication.flush_all());
+        std::thread::sleep(Duration::from_millis(200));
+        let waited = !full.is_finished();
+        held.release.send(()).expect("released");
+        assert!(waited, "the full flush did not wait");
+        assert!(!aged.join().expect("join"), "the held write failed");
+        assert!(full.join().expect("join"), "the full flush published");
+    });
+    assert_eq!(published(&stores.data).len(), kept.rows().count());
 }

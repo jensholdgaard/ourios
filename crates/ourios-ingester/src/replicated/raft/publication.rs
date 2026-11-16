@@ -8,9 +8,10 @@
 //! file holding rows drained with it, so a template's events reach the
 //! store before the first file whose rows use it. A handoff and a drain's
 //! capture exclude each other, as the local path's miner lock makes them.
-//! The record sink's size trigger publishes inline, held back by the audit
-//! sink's barrier until every event emitted so far is durable; the age
-//! trigger and a full flush are the caller's to drive.
+//! The record sink's size trigger publishes inline, once the audit sink's
+//! barrier has made every event emitted so far durable; the age trigger
+//! and a full flush are the caller's to drive, and flushes run one at a
+//! time.
 
 use std::sync::Mutex;
 
@@ -32,6 +33,10 @@ pub struct Publication {
     /// drain never takes a step's audit events without its rows; released
     /// before the ordered write's I/O.
     handoff: Mutex<()>,
+    /// Held across a whole flush, so a flush starts only once every earlier
+    /// one has settled: rows an earlier write failed to publish are back in
+    /// the buffers for it to drain, and its success covers them.
+    writing: Mutex<()>,
 }
 
 impl Publication {
@@ -43,7 +48,10 @@ impl Publication {
         let barrier = events.clone();
         let quarantine = events.clone();
         let records = records
-            .with_audit_barrier(Box::new(move || barrier.settled()))
+            // Flushing, not `settled`: no encode worker is on this path,
+            // and a handoff must not leave rows past the ceiling while its
+            // own events wait for a drain the handoff excludes.
+            .with_audit_barrier(Box::new(move || barrier.barrier()))
             // RFC 0025 §3.3: a permanently rejected record quarantines to
             // the audit stream rather than wedging its partition.
             .with_audit_sink(Box::new(quarantine));
@@ -52,6 +60,7 @@ impl Publication {
             log,
             coordinator,
             handoff: Mutex::new(()),
+            writing: Mutex::new(()),
         }
     }
 
@@ -84,6 +93,7 @@ impl Publication {
     /// drained is durable.
     #[must_use]
     pub fn flush_aged(&self) -> bool {
+        let _writing = lock_recover(&self.writing);
         let drained = {
             let _handoff = lock_recover(&self.handoff);
             self.coordinator.drain_aged()
@@ -94,6 +104,7 @@ impl Publication {
     /// Publish everything buffered; `true` once it is all durable.
     #[must_use]
     pub fn flush_all(&self) -> bool {
+        let _writing = lock_recover(&self.writing);
         let drained = {
             let _handoff = lock_recover(&self.handoff);
             self.coordinator.drain_all()
@@ -114,5 +125,7 @@ impl Publication {
     }
 }
 
+#[cfg(test)]
+mod held;
 #[cfg(test)]
 mod tests;

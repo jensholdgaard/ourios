@@ -72,7 +72,7 @@ impl Publishing {
         })
     }
 
-    /// How often a group's age sweep runs: at most [`SWEEP_TICK`] and
+    /// How often a group's age sweep runs: at most 30 s and
     /// never slower than the age it enforces.
     #[must_use]
     pub fn sweep(&self) -> Duration {

@@ -109,7 +109,11 @@ impl Publication {
             let _handoff = lock_recover(&self.handoff);
             self.coordinator.drain_all()
         };
-        self.coordinator.write_ordered(drained, "barrier")
+        let written = self.coordinator.write_ordered(drained, "barrier");
+        // Rows the writer rejects are quarantined during that write, and the
+        // events recording them are emitted after its audit write.
+        let _handoff = lock_recover(&self.handoff);
+        written && self.coordinator.audit().barrier()
     }
 
     /// `row`'s record, carrying its position in this group's log.

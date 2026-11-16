@@ -259,3 +259,27 @@ fn a_full_flush_waits_for_an_earlier_flush_still_writing() {
     });
     assert_eq!(published(&stores.data).len(), kept.rows().count());
 }
+
+/// A row the writer rejects is quarantined during the full flush, and the
+/// `RecordQuarantined` event that emits is durable once `flush_all`
+/// reports success, not left in the audit buffer.
+#[test]
+fn a_full_flush_makes_its_quarantine_events_durable() {
+    let stores = stores();
+    let kept = kept_of(&mined_log(&entries(4)));
+    let mut rows: Vec<MinedRow> = kept.rows().cloned().collect();
+    // Its partition derives from its own time, and its observed time
+    // overflows only when the batch is built.
+    rows[0].record.time_unix_nano = 1_700_000_000_000_000_000;
+    rows[0].record.observed_time_unix_nano = Some(u64::MAX);
+    stores.publication.publish(kept.audit(), &rows);
+
+    assert!(stores.publication.flush_all(), "the healthy rows published");
+    assert_eq!(
+        published(&stores.data).len(),
+        rows.len() - 1,
+        "one quarantined"
+    );
+    let buffered = stores.publication.coordinator.audit().buffered_events();
+    assert_eq!(buffered, 0, "the quarantine event is durable");
+}

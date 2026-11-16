@@ -287,3 +287,19 @@ fn a_sweep_flushes_an_audit_buffer_at_its_ceiling_before_its_tick() {
     runtime.block_on(sweep).expect("join");
     assert!(flushed, "no flush before the tick");
 }
+
+/// A named replica that cannot read its log id copies nothing it keeps:
+/// the backlog is copied once, when its publication can be built.
+#[test]
+fn a_named_replica_copies_its_backlog_only_once_it_can_publish() {
+    let mut f = fixture(false, Bounds::default());
+    f.step(0..8, Some(me()));
+    assert_eq!(
+        f.flushing.backlog_copies, 0,
+        "no copy while the log id is unread"
+    );
+    record_formation(&f.store);
+    f.step(8..10, None);
+    assert_eq!(f.flushing.backlog_copies, 1);
+    assert_eq!(f.published(), f.rows_of(0..10));
+}

@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use super::flushing::{self, Current, Flushing, Publishing};
+use super::flushing::{self, Current, Flushing, Need, Publishing};
 use super::gate::SyncGate;
 use super::kept::{Bounds, Kept};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
@@ -359,6 +359,14 @@ impl Keeping {
         let need = flushing.plan(applied.assigned, &kept);
         // Publishing does store I/O, and the kept gauges read `kept`.
         drop(kept);
+        let need = match need {
+            Need::Prepare if flushing.prepare() => {
+                let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+                flushing.plan(None, &kept)
+            }
+            Need::Prepare => return,
+            need => need,
+        };
         flushing.publish(need, out);
     }
 }

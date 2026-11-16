@@ -86,6 +86,8 @@ impl Publishing {
 pub enum Need {
     /// Nothing: stop, if publishing.
     Hold,
+    /// The publication is to be built first: see [`Flushing::prepare`].
+    Prepare,
     /// The step's own output.
     Output,
     /// Everything kept, the step's output among it.
@@ -175,6 +177,9 @@ pub struct Flushing {
     caught_up: bool,
     /// Why the log id was last unreadable, as reported; `None` once read.
     held: Option<&'static str>,
+    /// How many times the kept backlog was copied for publication.
+    #[cfg(test)]
+    backlog_copies: usize,
     current: watch::Sender<Option<Arc<Publication>>>,
 }
 
@@ -189,6 +194,8 @@ impl Flushing {
             publication: None,
             caught_up: false,
             held: None,
+            #[cfg(test)]
+            backlog_copies: 0,
             current: watch::Sender::new(None),
         }
     }
@@ -209,7 +216,11 @@ impl Flushing {
     /// One step: `assigned` is the replica a flusher assignment applied at
     /// this entry named, `out` what the entry mined, already in `kept`.
     pub fn step(&mut self, assigned: Option<NodeId>, out: &Mined, kept: &Kept) {
-        let need = self.plan(assigned, kept);
+        let need = match self.plan(assigned, kept) {
+            Need::Prepare if self.prepare() => self.plan(None, kept),
+            Need::Prepare => return,
+            need => need,
+        };
         self.publish(need, out);
     }
 
@@ -224,7 +235,13 @@ impl Flushing {
             Need::Hold
         } else if self.caught_up {
             Need::Output
+        } else if self.publication.is_none() {
+            Need::Prepare
         } else {
+            #[cfg(test)]
+            {
+                self.backlog_copies += 1;
+            }
             Need::Backlog(Backlog {
                 audit: kept.audit().cloned().collect(),
                 rows: kept.rows().cloned().collect(),
@@ -232,10 +249,18 @@ impl Flushing {
         }
     }
 
+    /// Build the publication, reading the group's log id; `true` once
+    /// there is one. Done without `kept` held, so a store that cannot be
+    /// read costs no copy of what is kept, then [`Self::plan`] again.
+    pub fn prepare(&mut self) -> bool {
+        self.publication().is_some()
+    }
+
     /// Publish what [`Self::plan`] decided, `out` being the step's output.
     pub fn publish(&mut self, need: Need, out: &Mined) {
         match need {
             Need::Hold => self.hold(),
+            Need::Prepare => {}
             Need::Output => {
                 if let Some(publication) = &self.publication {
                     publication.publish(&out.audit, &out.rows);

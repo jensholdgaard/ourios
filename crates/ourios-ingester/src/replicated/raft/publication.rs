@@ -175,4 +175,4 @@ impl Publication {
 #[cfg(test)]
 pub(in crate::replicated::raft) mod held;
 #[cfg(test)]
-mod tests;
+pub(in crate::replicated::raft) mod tests;

@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use super::super::cluster::wal_config;
 use super::super::log_store::{GroupLog, group_dir};
 use super::super::snapshot_record::GroupState;
-use super::super::state_machine::GroupSm;
+use super::super::state_machine::{GroupSm, Replay};
 use super::super::types::{Entry, GroupEntry, RaftTypes, TenantBatchBytes};
 use super::super::vote_log::{self, VoteLog};
 use super::*;
@@ -148,7 +148,7 @@ pub(in crate::replicated::raft) fn events_of(
 }
 
 /// `entries` in a log from index 1, as [`events_of`] applies them.
-fn logged(entries: &[GroupEntry]) -> Vec<Entry> {
+pub(in crate::replicated::raft) fn logged(entries: &[GroupEntry]) -> Vec<Entry> {
     (1..)
         .zip(entries.iter().cloned())
         .map(|(index, data)| Entry {
@@ -159,7 +159,10 @@ fn logged(entries: &[GroupEntry]) -> Vec<Entry> {
 }
 
 /// A log held in memory, entries by index.
-struct HeldLog(BTreeMap<u64, Entry>);
+#[derive(Clone)]
+pub(in crate::replicated::raft) struct HeldLog(
+    pub(in crate::replicated::raft) BTreeMap<u64, Entry>,
+);
 
 impl GroupLogRead for HeldLog {
     fn entry(&self, index: u64) -> Option<Entry> {
@@ -286,6 +289,29 @@ proptest! {
             let from_a_block = blocks.iter().any(|b| (b.after() + 1..=b.through()).contains(&id));
             prop_assert!(from_a_block, "id {} is in no applied block", id);
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(ourios_testgen::proptest_cases(64)))]
+
+    /// RFC 0065 §6.7: replaying a group's log in memory from its first
+    /// entry yields exactly the events the live state machine sent the
+    /// miner, ignored id blocks and stopping configurations included.
+    #[test]
+    fn a_replay_of_the_log_yields_the_events_the_state_machine_sent(
+        ops in prop::collection::vec(op(), 1..40)
+    ) {
+        let corpus = corpus();
+        let entries: Vec<GroupEntry> = ops.iter().map(|op| entry_of(op, &corpus)).collect();
+        let sent = events_of(&entries, 64);
+        let mut replay = Replay::from_start();
+        let replayed: Vec<Applied> = logged(&entries)
+            .into_iter()
+            .map_while(|entry| replay.apply(entry).ok())
+            .flatten()
+            .collect();
+        prop_assert_eq!(replayed, sent);
     }
 }
 

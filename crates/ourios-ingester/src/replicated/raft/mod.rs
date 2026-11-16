@@ -21,6 +21,7 @@ pub mod log_store;
 mod miner_config;
 pub mod mining;
 pub mod publication;
+pub mod replay;
 mod snapshot_record;
 pub mod state_machine;
 mod telemetry;

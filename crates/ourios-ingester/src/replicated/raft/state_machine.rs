@@ -53,7 +53,7 @@ use super::snapshot_record::{
     self, GroupMinerConfig, GroupSnapshot, GroupState, IdBlock, SnapshotMeta,
 };
 use super::telemetry::{Component, Storage};
-use super::types::{GroupEntry, LogId, Membership, NodeId, RaftTypes, TimedBatch};
+use super::types::{Entry, GroupEntry, LogId, Membership, NodeId, RaftTypes, TimedBatch};
 
 type StoredMembership = StoredMembershipOf<RaftTypes>;
 
@@ -222,6 +222,36 @@ impl State {
         self.group.id_block = Some(block);
         self.history.changed(at.index, Change::IdBlock(block));
         Some(block)
+    }
+}
+
+/// A group's state machine applied again over its log in memory, from
+/// the first entry, with nothing recorded (RFC 0065 §6.7's gap replay with
+/// no checkpoint applied). It applies each entry as the live state machine
+/// does, so the events it returns are the ones the live state machine sent
+/// the group's miner for the same entries.
+pub struct Replay {
+    state: State,
+}
+
+impl Replay {
+    #[must_use]
+    pub fn from_start() -> Self {
+        Self {
+            state: State::opened(None),
+        }
+    }
+
+    /// Apply `entry`, the next in the log; returns what it changed for the
+    /// miner.
+    ///
+    /// # Errors
+    ///
+    /// The error that stopped the live state machine at this entry.
+    pub fn apply(&mut self, entry: Entry) -> io::Result<Option<Applied>> {
+        let at = entry.log_id;
+        let event = self.state.apply(at, entry.payload)?;
+        Ok(event.map(|event| Applied { at, event }))
     }
 }
 

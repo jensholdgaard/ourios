@@ -137,6 +137,8 @@ fn advance(store: &Store, cut: CutId) -> Result<Published, WriteError> {
             Some((bytes, e_tag)) => {
                 let stored = pointer::decode(&bytes, cut.log).map_err(WriteError::Unreadable)?;
                 if stored.seq >= cut.seq {
+                    // It may be this cut's own earlier put, whose sync failed.
+                    store.sync_local_blocking(&key).map_err(failed(&key))?;
                     return Ok(Published::Behind(stored));
                 }
                 match (e_tag, store.supports_conditional_update()) {

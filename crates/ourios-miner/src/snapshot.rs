@@ -365,6 +365,19 @@ impl From<SegmentMark> for WalHighWater {
     }
 }
 
+impl SnapshotState {
+    /// The highest template id the state holds, `None` when it holds none.
+    #[must_use]
+    pub fn highest_template_id(&self) -> Option<u64> {
+        self.leaves
+            .iter()
+            .map(|leaf| leaf.template_id)
+            .chain(self.structured_templates.iter().map(|s| s.template_id))
+            .chain(self.adopted_templates.iter().map(|a| a.template_id))
+            .max()
+    }
+}
+
 /// Errors from [`load_snapshot`]. Enum-carried states (no panicking
 /// accessors on the recovery path): every malformed input is a
 /// typed variant the caller dispatches on, and [`recover`] maps all
@@ -857,6 +870,18 @@ mod tests {
                 "{mark}"
             );
         }
+    }
+
+    #[test]
+    fn the_highest_template_id_spans_leaves_structured_and_adopted() {
+        let state = sample_state();
+        let mut empty = sample_state();
+        empty.leaves.clear();
+        empty.structured_templates.clear();
+        empty.adopted_templates.clear();
+
+        assert_eq!(state.highest_template_id(), Some(4));
+        assert_eq!(empty.highest_template_id(), None);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! the writer's reply, so one fsync completes every record queued while
 //! the previous one ran.
 
+pub mod bundle;
 mod checkpoint;
 mod codec;
 mod controls;

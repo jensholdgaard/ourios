@@ -887,6 +887,16 @@ pub const OURIOS_WAL_REPLICATION_LAG_DESCRIPTION: &str = "Log entries a replicat
 /// `ourios.wal.replication.lag` unit (UCUM).
 pub const OURIOS_WAL_REPLICATION_LAG_UNIT: &str = "{entry}";
 
+/// `ourios.wal.replication.replay.duration` (histogram, unit `s`).
+pub const OURIOS_WAL_REPLICATION_REPLAY_DURATION: &str = "ourios.wal.replication.replay.duration";
+
+/// `ourios.wal.replication.replay.duration` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_REPLAY_DURATION_DESCRIPTION: &str =
+    "Wall-clock duration of a flusher's gap replay, from its start until it ends (RFC 0065 §6.7).";
+
+/// `ourios.wal.replication.replay.duration` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_REPLAY_DURATION_UNIT: &str = "s";
+
 /// `ourios.wal.replication.stops` (counter, unit `{stop}`).
 pub const OURIOS_WAL_REPLICATION_STOPS: &str = "ourios.wal.replication.stops";
 

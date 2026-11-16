@@ -10,6 +10,7 @@ mod checkpoint;
 mod codec;
 mod controls;
 pub mod flusher;
+pub mod flushing;
 pub mod formation;
 pub mod host;
 pub mod id_blocks;

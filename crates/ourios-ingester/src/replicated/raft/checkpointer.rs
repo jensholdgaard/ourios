@@ -39,6 +39,8 @@ pub(super) struct Cut {
     captured: Captured,
     publication: Arc<Publication>,
     at: Instant,
+    /// The publication's generation at the cut.
+    generation: u64,
 }
 
 impl Checkpointer {
@@ -95,7 +97,7 @@ impl Checkpointer {
             let seq = cut.captured.bundle.cut().seq;
             target
                 .checkpoint(&cut.publication)
-                .run(&cut.captured, cut.at)
+                .run(&cut.captured, (cut.at, cut.generation))
                 .ok()
                 .map(|_| seq)
         }));
@@ -116,11 +118,13 @@ impl Target {
         if written.is_some_and(|written| through <= written) {
             return None;
         }
-        let publication = {
+        let (publication, generation) = {
             // The order `Keeping::keep` takes them in.
             let kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
             let flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
-            flushing.checkpointable(&kept)?
+            let publication = flushing.checkpointable(&kept)?;
+            let generation = publication.generation();
+            (publication, generation)
         };
         let at = Instant::now();
         match miner.capture(publication.log())? {
@@ -128,6 +132,7 @@ impl Target {
                 captured,
                 publication,
                 at,
+                generation,
             }),
             Err(error) => {
                 self.checkpoint(&publication).failed(at, "_OTHER", &error);

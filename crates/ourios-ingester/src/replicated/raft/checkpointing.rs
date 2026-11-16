@@ -20,6 +20,9 @@ pub use super::telemetry::Checkpoints;
 pub enum Failed {
     /// What was buffered through the cut did not all become durable.
     Publish,
+    /// The publication was discarded after the cut, so what was buffered
+    /// through it may not be there to publish.
+    Discarded,
     /// The bundle or `checkpoint.json` was not written.
     Write(WriteError),
 }
@@ -34,7 +37,7 @@ impl Failed {
             Self::Write(WriteError::Differs { .. }) => "object_differs",
             Self::Write(WriteError::Unreadable(_)) => "pointer_unreadable",
             Self::Write(WriteError::NoCompareAndSwap) => "no_compare_and_swap",
-            Self::Write(_) => "_OTHER",
+            Self::Discarded | Self::Write(_) => "_OTHER",
         }
     }
 }
@@ -45,6 +48,7 @@ impl fmt::Display for Failed {
             Self::Publish => {
                 f.write_str("the rows buffered through the cut were not all published")
             }
+            Self::Discarded => f.write_str("the publication was discarded after the cut"),
             Self::Write(e) => write!(f, "{e}"),
         }
     }
@@ -62,14 +66,21 @@ pub struct Checkpoint<'a> {
 
 impl Checkpoint<'_> {
     /// Publish, then write `captured`, timed from `cut_at`, when the miner
-    /// captured it. Blocking: the caller runs it off the async runtime.
+    /// captured it while the publication was at `generation`. Blocking:
+    /// the caller runs it off the async runtime.
     ///
     /// # Errors
     ///
     /// The [`Failed`] step; it is recorded and reported.
-    pub fn run(&self, captured: &Captured, cut_at: Instant) -> Result<Published, Failed> {
-        let outcome = if self.publication.flush_all() {
+    pub fn run(
+        &self,
+        captured: &Captured,
+        (cut_at, generation): (Instant, u64),
+    ) -> Result<Published, Failed> {
+        let outcome = if self.publication.flush_since(generation) {
             write(self.store, &captured.bundle, &captured.snapshots).map_err(Failed::Write)
+        } else if self.publication.generation() != generation {
+            Err(Failed::Discarded)
         } else {
             Err(Failed::Publish)
         };

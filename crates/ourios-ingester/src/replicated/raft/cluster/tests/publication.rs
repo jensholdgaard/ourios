@@ -182,9 +182,16 @@ async fn the_named_flusher_checkpoints_its_group() {
     let expected = under_log(&mined_rows(&mut mined[0], 30).await);
     mined_rows(&mut mined[1], 30).await;
 
+    let last = expected
+        .iter()
+        .filter_map(|row| row.ingest_position)
+        .map(|position| position.seq)
+        .max()
+        .expect("mined rows");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let cut = loop {
-        if let Some(cut) = pointer(&stores[0]) {
+        // An earlier checkpoint may cut before the first batch is mined.
+        if let Some(cut) = pointer(&stores[0]).filter(|cut| cut.seq >= last) {
             break cut;
         }
         assert!(

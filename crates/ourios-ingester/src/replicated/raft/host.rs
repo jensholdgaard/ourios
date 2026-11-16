@@ -459,8 +459,9 @@ impl Follow {
             barrier
         });
         loop {
+            // Unbiased, so a queue that is never empty does not starve the
+            // barrier; `next` still puts a stop before another event.
             let work = tokio::select! {
-                biased;
                 event = next(&mut applied, &mut stop) => event.map(Some),
                 () = ticked(&mut barrier) => Some(None),
             };

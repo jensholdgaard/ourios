@@ -31,13 +31,15 @@ use super::super::snapshot_record::GroupState;
 use super::super::types::RaftTypes;
 use super::forward::{self, ForwardTarget};
 use super::identify::{self, Identity};
+use super::propose::{self, ProposeTarget};
 use super::trace::{Call, Carried, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, Malformed, SnapshotRequest,
     StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
 };
 use super::{
-    APPEND, FORWARD, IDENTIFY, INSTALL_SNAPSHOT, PRE_VOTE, SERVICE, STREAM_APPEND, VERSION, VOTE,
+    APPEND, FORWARD, IDENTIFY, INSTALL_SNAPSHOT, PRE_VOTE, PROPOSE, SERVICE, STREAM_APPEND,
+    VERSION, VOTE,
 };
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
@@ -51,6 +53,9 @@ where
     /// The node's ingest for `Forward`; until it is set, every forwarded
     /// export is refused as not hosted.
     forwards: Arc<RwLock<Option<Arc<dyn ForwardTarget>>>>,
+    /// The node's groups for `Propose`; until it is set, every proposal is
+    /// refused as not hosted.
+    proposals: Arc<RwLock<Option<Arc<dyn ProposeTarget>>>>,
     /// Who this node is, for `Identify`; until it is set the call is
     /// unavailable.
     identity: Arc<RwLock<Option<Identity>>>,
@@ -69,6 +74,7 @@ where
         Self {
             groups: Arc::clone(&self.groups),
             forwards: Arc::clone(&self.forwards),
+            proposals: Arc::clone(&self.proposals),
             identity: Arc::clone(&self.identity),
             tracing: self.tracing.clone(),
             closing: Arc::clone(&self.closing),
@@ -84,6 +90,7 @@ where
         Self {
             groups: Arc::default(),
             forwards: Arc::default(),
+            proposals: Arc::default(),
             identity: Arc::default(),
             tracing: Tracing::default(),
             closing: Arc::new(watch::Sender::new(false)),
@@ -120,6 +127,14 @@ where
             .unwrap_or_else(PoisonError::into_inner) = Some(target);
     }
 
+    /// Answer proposals with `target`, replacing any earlier one.
+    pub fn serve_proposals(&self, target: Arc<dyn ProposeTarget>) {
+        *self
+            .proposals
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(target);
+    }
+
     /// Answer `Identify` as `identity`, replacing any earlier one.
     pub fn identify_as(&self, identity: Identity) {
         *self
@@ -138,6 +153,14 @@ where
         target.clone()
     }
 
+    fn propose_target(&self) -> Option<Arc<dyn ProposeTarget>> {
+        let target = self
+            .proposals
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        target.clone()
+    }
+
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Groups<SM>> {
         self.groups.write().unwrap_or_else(PoisonError::into_inner)
     }
@@ -147,6 +170,7 @@ where
         Self {
             groups: Arc::default(),
             forwards: Arc::default(),
+            proposals: Arc::default(),
             identity: Arc::default(),
             tracing,
             closing: Arc::new(watch::Sender::new(false)),
@@ -617,6 +641,10 @@ where
             FORWARD => unary(FORWARD, tracing, request, move |r| {
                 let target = server.forward_target();
                 forward::serve(target, r)
+            }),
+            PROPOSE => unary(PROPOSE, tracing, request, move |r| {
+                let target = server.propose_target();
+                propose::serve(target, r)
             }),
             IDENTIFY => unary(IDENTIFY, tracing, request, move |r| {
                 let identity = server.identity();

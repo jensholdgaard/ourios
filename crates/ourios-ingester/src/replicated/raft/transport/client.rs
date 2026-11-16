@@ -36,6 +36,7 @@ use super::connect::TlsConnector;
 use super::forward;
 use super::identify::{self, IdentifyError, Identity};
 use super::links::{Link, Links};
+use super::propose;
 use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, MAX_MESSAGE_BYTES, Malformed, Pieces, Recipient, Reply,
@@ -152,6 +153,26 @@ impl Peers {
             commit: commit_timeout,
         };
         forward::traced_call(channel, (&addr, self.tracing.clone()), request, deadlines).await
+    }
+
+    /// Propose `request` to the node named `node_id` (RFC 0065 §6.8),
+    /// bounded as a forwarded call is.
+    pub async fn propose(
+        &self,
+        node_id: &str,
+        request: propose::ProposeRequest,
+        commit_timeout: Duration,
+    ) -> propose::Outcome {
+        let (addr, channel) = self.resolve(node_id);
+        let channel = match channel {
+            Ok(channel) => channel,
+            Err(e) => return propose::Outcome::Unreached(e.to_string()),
+        };
+        let deadlines = forward::Deadlines {
+            connect: CONNECT_TIMEOUT,
+            commit: commit_timeout,
+        };
+        propose::traced_call(channel, (&addr, self.tracing.clone()), request, deadlines).await
     }
 
     /// Ask the peer configured as `node_id` who it is (RFC 0065 §6.8),

@@ -7,9 +7,9 @@ use ourios_miner::snapshot::{
 use super::*;
 use crate::replicated::raft::miner_config::body_of;
 
-const LOG: u32 = 3;
-const SEQ: u64 = 200;
-const TERM: u64 = 4;
+pub(super) const LOG: u32 = 3;
+pub(super) const SEQ: u64 = 200;
+pub(super) const TERM: u64 = 4;
 
 fn config() -> GroupMinerConfig {
     GroupMinerConfig::new(body_of(&MinerConfig::default())).expect("default config")
@@ -19,7 +19,7 @@ fn block(after: u64, through: u64) -> IdBlock {
     IdBlock::new(after, through).expect("test block")
 }
 
-const AT: CutId = CutId {
+pub(super) const AT: CutId = CutId {
     log: LOG,
     seq: SEQ,
     term: TERM,
@@ -49,7 +49,7 @@ fn snap(tenant: &str, mark: Option<WalHighWater>) -> Vec<u8> {
     snapshot(&state).expect("snapshot encodes")
 }
 
-fn marked(tenant: &str) -> Vec<u8> {
+pub(super) fn marked(tenant: &str) -> Vec<u8> {
     snap(
         tenant,
         Some(WalHighWater::Replicated(LogMark { log: LOG, seq: SEQ })),
@@ -60,7 +60,7 @@ fn entry(tenant: &str) -> TenantEntry {
     TenantEntry::of(TenantId::new(tenant), config(), &marked(tenant))
 }
 
-fn sample() -> Bundle {
+pub(super) fn sample() -> Bundle {
     let ids =
         Allocator::new(1500, Some(block(1000, 2000)), vec![block(2000, 3000)]).expect("allocator");
     Bundle::new(AT, ids, vec![entry("acme"), entry("beta")]).expect("bundle")

@@ -329,3 +329,24 @@ fn snapshots_the_bundle_would_not_restore_write_nothing() {
         }
     }
 }
+
+/// RFC 0065 §6.2: the design needs compare-and-swap, so on a store
+/// without it nothing is written and `checkpoint.json` never moves back.
+#[test]
+fn a_store_without_compare_and_swap_is_refused_before_any_write() {
+    let root = tempfile::tempdir().expect("temp");
+    let local = Store::local(root.path()).expect("local store");
+    put_pointer(&local, pointer_at(300));
+
+    let refused = write(&local, &sample(), &snapshots());
+
+    assert!(
+        matches!(refused, Err(WriteError::NoCompareAndSwap)),
+        "{refused:?}"
+    );
+    for key in &keys()[..=TENANTS.len()] {
+        assert_eq!(stored(&local, key), None, "{key}");
+    }
+    let pointer = stored(&local, &pointer::key(LOG)).expect("pointer");
+    assert_eq!(pointer::decode(&pointer, LOG), Ok(pointer_at(300)));
+}

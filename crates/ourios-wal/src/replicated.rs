@@ -319,6 +319,25 @@ impl Control {
         }
     }
 
+    /// The entry's bytes after a control record's log id: its kind byte,
+    /// then its body.
+    #[must_use]
+    pub fn to_bytes(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + self.body_len());
+        self.write(&mut out);
+        out
+    }
+
+    /// The entry `bytes`, a kind byte and its body, hold.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicatedRecordError`] for an unknown kind, a body of the wrong
+    /// length, or one its kind's checks refuse.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ReplicatedRecordError> {
+        Self::read(bytes)
+    }
+
     /// The entry, unless it is an id block outside the id domain.
     fn checked(self) -> Result<Self, ReplicatedRecordError> {
         match self {
@@ -985,6 +1004,45 @@ mod tests {
         assert_eq!(Control::HIGHEST_KIND, 0x02);
         assert_eq!(Control::FlusherAssignment(replica).kind(), 0x01);
         assert_eq!(checkpoint.kind(), 0x02);
+    }
+
+    /// A control's bytes are its kind and body, as the group log stores
+    /// them after the log id, and read back as the same control.
+    #[test]
+    fn a_control_reads_back_from_its_kind_and_body() {
+        let checkpoint = Control::Checkpoint {
+            proposer: [7; REPLICA_LEN],
+            cut: RaftLogId {
+                term: 4,
+                index: 200,
+            },
+            highest_kind: 4,
+        };
+        let bytes = checkpoint.to_bytes();
+        assert_eq!(bytes[0], checkpoint.kind());
+        assert_eq!(bytes.len(), 1 + CHECKPOINT_LEN);
+        assert_eq!(Control::from_bytes(&bytes), Ok(checkpoint));
+        for control in [
+            Control::FlusherAssignment([1; REPLICA_LEN]),
+            Control::IdBlock {
+                after: 0,
+                through: 100,
+            },
+        ] {
+            assert_eq!(Control::from_bytes(&control.to_bytes()), Ok(control));
+        }
+    }
+
+    #[test]
+    fn a_control_of_an_unknown_kind_or_length_does_not_read() {
+        let mut short = Control::FlusherAssignment([1; REPLICA_LEN]).to_bytes();
+        short.pop();
+        assert!(Control::from_bytes(&short).is_err());
+        assert!(Control::from_bytes(&[]).is_err());
+        assert!(matches!(
+            Control::from_bytes(&[0x7f, 1, 2]),
+            Err(ReplicatedRecordError::UnknownControlKind { found: 0x7f })
+        ));
     }
 
     fn control(control: Control) -> ReplicatedRecord<'static> {

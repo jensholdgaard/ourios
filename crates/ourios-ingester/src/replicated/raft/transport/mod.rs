@@ -32,6 +32,7 @@ mod connect;
 mod forward;
 mod identify;
 mod links;
+pub mod propose;
 mod server;
 mod trace;
 pub mod wire;
@@ -56,6 +57,7 @@ const PRE_VOTE: &str = "/ourios.wal.v1.Replication/PreVote";
 const INSTALL_SNAPSHOT: &str = "/ourios.wal.v1.Replication/InstallSnapshot";
 const FORWARD: &str = "/ourios.wal.v1.Replication/Forward";
 const IDENTIFY: &str = "/ourios.wal.v1.Replication/Identify";
+const PROPOSE: &str = "/ourios.wal.v1.Replication/Propose";
 
 #[cfg(test)]
 mod tests;

@@ -152,6 +152,40 @@ fn pointer(store: &Store) -> Option<CutId> {
     Some(pointer::decode(&bytes, LOG).expect("a readable checkpoint.json"))
 }
 
+/// The checkpoint `checkpoint.json` in `store` names once it reaches
+/// `last`: an earlier one may cut before the first batch is mined.
+async fn checkpointed_through(store: &Store, last: u64) -> CutId {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(cut) = pointer(store).filter(|cut| cut.seq >= last) {
+            return cut;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the flusher never checkpointed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `cut`'s bundle in `store` is one a replica restores: `bundle.bin`
+/// names the cut and admits every tenant's `.snap`.
+fn assert_restorable(store: &Store, cut: CutId) {
+    let bytes = store
+        .get_blocking(&bundle_key(LOG, cut.seq))
+        .expect("bundle.bin");
+    let bundle = Bundle::decode(&bytes).expect("a bundle a replica reads");
+    assert_eq!(bundle.cut(), cut);
+    for entry in bundle.tenants() {
+        let snap = store
+            .get_blocking(&snapshot_key(LOG, cut.seq, &entry.tenant))
+            .expect(".snap");
+        bundle
+            .snapshot(entry, &snap)
+            .expect("a snapshot it restores");
+    }
+}
+
 /// RFC 0065 §6.5 on a running group: the named flusher runs RFC 0052's
 /// barrier, publishing every row through its cut and then writing a
 /// bundle for the cut that a replica would restore and `checkpoint.json`
@@ -188,18 +222,7 @@ async fn the_named_flusher_checkpoints_its_group() {
         .map(|position| position.seq)
         .max()
         .expect("mined rows");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let cut = loop {
-        // An earlier checkpoint may cut before the first batch is mined.
-        if let Some(cut) = pointer(&stores[0]).filter(|cut| cut.seq >= last) {
-            break cut;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the flusher never checkpointed"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    let cut = checkpointed_through(&stores[0], last).await;
     let rows = published(&stores[0]);
     let through: Vec<_> = expected
         .iter()
@@ -209,19 +232,7 @@ async fn the_named_flusher_checkpoints_its_group() {
     for row in through {
         assert!(rows.contains(row), "a row through the cut is published");
     }
-    let bytes = stores[0]
-        .get_blocking(&bundle_key(LOG, cut.seq))
-        .expect("bundle.bin");
-    let bundle = Bundle::decode(&bytes).expect("a bundle a replica reads");
-    assert_eq!(bundle.cut(), cut);
-    for entry in bundle.tenants() {
-        let snap = stores[0]
-            .get_blocking(&snapshot_key(LOG, cut.seq, &entry.tenant))
-            .expect(".snap");
-        bundle
-            .snapshot(entry, &snap)
-            .expect("a snapshot it restores");
-    }
+    assert_restorable(&stores[0], cut);
     assert_eq!(
         pointer(&stores[1]),
         None,

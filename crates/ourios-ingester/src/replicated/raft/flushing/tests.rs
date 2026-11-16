@@ -751,3 +751,20 @@ fn an_abandoned_replay_records_nothing() {
     f.step(7..8, Some(other()));
     assert!(reader.counts(REPLAY_DURATION).is_empty());
 }
+
+/// A replay a checkpoint below the gap overtakes holds for that
+/// checkpoint's bundle; a later checkpoint at or above the gap still ends
+/// it, and its duration is recorded then.
+#[test]
+fn a_replay_held_for_a_bundle_records_when_a_later_checkpoint_ends_it() {
+    let reader = Metrics::new();
+    let mut f = recorded(&reader);
+    let gap = f.replay_one_slice();
+    f.kept.checkpoint(index_at(&f, 4));
+    f.step(7..8, None);
+    assert_eq!(f.flushing.held(), Some("restore_unavailable"));
+    assert!(reader.counts(REPLAY_DURATION).is_empty(), "not ended yet");
+    f.kept.checkpoint(gap);
+    f.step(8..9, None);
+    assert_eq!(reader.counts(REPLAY_DURATION), [(vec!["3".to_owned()], 1)]);
+}

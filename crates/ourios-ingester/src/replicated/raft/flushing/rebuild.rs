@@ -5,7 +5,7 @@
 //! and is made durable, its audit events ahead of its rows, before the
 //! next is mined, so the replay holds one slice and its miner's state.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::super::mining::SharedLog;
 use super::super::publication::Publication;
@@ -47,9 +47,9 @@ impl Rebuild {
         }
     }
 
-    /// How long since the replay started.
-    pub(super) fn elapsed(&self) -> Duration {
-        self.started.elapsed()
+    /// When the replay started.
+    pub(super) fn started(&self) -> Instant {
+        self.started
     }
 
     /// Whether the replay has read every entry through `cut`, so a purge

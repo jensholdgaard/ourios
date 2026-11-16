@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
 use super::RaftTimings;
+use super::flushing::Publishing;
 use super::gate::SyncGate;
 use super::host::{GroupHost, GroupMined, GroupRaft, HostRole, HostSpec, Wiring};
 use super::kept::Bounds;
@@ -353,6 +354,9 @@ pub(crate) struct Shape {
     timings: RaftTimings,
     mined: Vec<mpsc::Sender<GroupMined>>,
     capacity: usize,
+    /// How each mining tail node publishes, in node order; none publish
+    /// when it is empty.
+    pub(crate) publishing: Vec<Arc<Publishing>>,
 }
 
 /// `(voters, tail)` nodes on [`test_timings`], none of them mining.
@@ -364,6 +368,7 @@ impl From<(u64, u64)> for Shape {
             timings: test_timings(),
             mined: Vec::new(),
             capacity: MINED_CAPACITY,
+            publishing: Vec::new(),
         }
     }
 }
@@ -444,6 +449,7 @@ impl Cluster {
             timings,
             mined,
             capacity: _,
+            publishing,
         }: Shape,
         groups: &[u32],
         meters: impl Fn(usize) -> Meters,
@@ -466,10 +472,12 @@ impl Cluster {
         let voting = usize::try_from(voters).expect("a small cluster");
         for (n, (_, (incoming, _))) in (1..).zip(bound) {
             let i = cluster.slots.len();
-            let role = match i.checked_sub(voting).and_then(|t| mined.get(t)) {
+            let tail = i.checked_sub(voting);
+            let role = match tail.and_then(|t| mined.get(t)) {
                 Some(mined) => HostRole::Tail {
                     mined: mined.clone(),
                     kept: Bounds::default(),
+                    publishing: tail.and_then(|t| publishing.get(t)).cloned(),
                 },
                 None => HostRole::Voter,
             };

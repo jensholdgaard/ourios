@@ -11,7 +11,9 @@
 //! keeps again, and a row a former publication already wrote repeats only
 //! its position, which compaction and queries count once (§6.6).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ourios_core::sync::lock_recover;
 use ourios_parquet::{PromotedAttributes, Store};
@@ -26,7 +28,7 @@ use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use crate::record_sink::{FlushConfig, ParquetRecordSink};
 
 /// Where and how a group's flusher publishes.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Source {
     pub store: Store,
     /// The group's voters in placement order, which `formed.json` names.
@@ -35,6 +37,47 @@ pub struct Source {
     pub promoted: PromotedAttributes,
     /// The audit sink's soft ceiling, in events.
     pub audit_ceiling: usize,
+}
+
+/// How a tail node publishes the groups it is named flusher of.
+#[derive(Clone, Debug)]
+pub struct Publishing {
+    pub store: Store,
+    /// Each group's voters in placement order, which its `formed.json`
+    /// names.
+    pub voters: BTreeMap<u32, Vec<String>>,
+    pub flush: FlushConfig,
+    pub promoted: PromotedAttributes,
+    /// The audit sink's soft ceiling, in events.
+    pub audit_ceiling: usize,
+}
+
+/// The age sweep's most: a partition flushes within its age plus this
+/// (RFC 0063 §3.2, as the local receiver's sweep).
+const SWEEP_TICK: Duration = Duration::from_secs(30);
+
+/// The age sweep's least, so an age of zero does not spin.
+const SWEEP_FLOOR: Duration = Duration::from_millis(10);
+
+impl Publishing {
+    /// `group`'s source, if this node knows its voters.
+    #[must_use]
+    pub fn source(&self, group: u32) -> Option<Source> {
+        Some(Source {
+            store: self.store.clone(),
+            voters: self.voters.get(&group)?.clone(),
+            flush: self.flush.clone(),
+            promoted: self.promoted.clone(),
+            audit_ceiling: self.audit_ceiling,
+        })
+    }
+
+    /// How often a group's age sweep runs: at most [`SWEEP_TICK`] and
+    /// never slower than the age it enforces.
+    #[must_use]
+    pub fn sweep(&self) -> Duration {
+        SWEEP_TICK.min(self.flush.max_buffer_age).max(SWEEP_FLOOR)
+    }
 }
 
 /// The publication a group's age loop drives, while there is one.

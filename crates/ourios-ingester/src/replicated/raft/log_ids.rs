@@ -258,6 +258,6 @@ fn next_of(lock: &LogIds) -> Result<u32, AllocateError> {
 #[cfg(test)]
 mod bootstrap_tests;
 #[cfg(test)]
-mod gated;
+pub(in crate::replicated::raft) mod gated;
 #[cfg(test)]
 mod tests;

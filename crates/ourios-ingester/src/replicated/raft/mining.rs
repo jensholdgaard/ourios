@@ -375,6 +375,19 @@ impl GroupMiner {
         Some(self.settle(read))
     }
 
+    /// The index from which a first configuration's held batches are
+    /// still to be read, while it holds any.
+    #[must_use]
+    pub fn held_from(&self) -> Option<u64> {
+        match &self.stage {
+            Stage::Mining {
+                held: Some(Held { next, .. }),
+                ..
+            } => Some(*next),
+            _ => None,
+        }
+    }
+
     /// Whether a first configuration still holds batches to mine.
     #[must_use]
     pub fn holds(&self) -> bool {

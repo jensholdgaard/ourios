@@ -9,8 +9,10 @@ use tokio::sync::watch;
 
 use super::super::kept::Bounds;
 use super::super::kept::tests::{entries, mined_log};
+use super::super::log_ids::gated::{Outage, with_outage};
 use super::super::mining::tests::{HeldLog, logged};
-use super::super::types::{Entry, LogId};
+use super::super::mining::tests::{batch_at, block, configured, corpus, time};
+use super::super::types::{Entry, GroupEntry, LogId};
 use super::*;
 
 const GROUP: u32 = 3;
@@ -32,24 +34,60 @@ struct Fixture {
     flushing: Flushing,
     kept: Kept,
     log: Vec<(u64, Mined)>,
+    /// Takes down the store the flusher publishes to.
+    outage: Outage,
 }
 
 /// A tail replica of `GROUP` over a local store, its mined log ready to
 /// step through, and `formed.json` written when `formed`.
 fn fixture(formed: bool, bounds: Bounds) -> Fixture {
-    fixture_sliced(formed, bounds, usize::MAX)
+    fixture_with(formed, Setup::bounded(bounds))
 }
 
 /// As [`fixture`], its record sink's size trigger at `target_bytes`.
 fn fixture_sliced(formed: bool, bounds: Bounds, target_bytes: usize) -> Fixture {
+    fixture_with(
+        formed,
+        Setup {
+            target_bytes,
+            ..Setup::bounded(bounds)
+        },
+    )
+}
+
+/// How a [`fixture_with`] replica is set up.
+struct Setup {
+    bounds: Bounds,
+    target_bytes: usize,
+    /// The group's log from index 1.
+    entries: Vec<GroupEntry>,
+}
+
+impl Setup {
+    fn bounded(bounds: Bounds) -> Self {
+        Self {
+            bounds,
+            target_bytes: usize::MAX,
+            entries: entries(8),
+        }
+    }
+}
+
+fn fixture_with(formed: bool, setup: Setup) -> Fixture {
+    let Setup {
+        bounds,
+        target_bytes,
+        entries,
+    } = setup;
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path().to_path_buf();
     let store = Store::local(&root).expect("store");
     if formed {
         record_formation(&store);
     }
+    let (publishing, outage) = with_outage(store.clone());
     let source = Source {
-        store: store.clone(),
+        store: publishing,
         voters: VOTERS.map(str::to_owned).to_vec(),
         flush: FlushConfig {
             target_bytes,
@@ -59,7 +97,6 @@ fn fixture_sliced(formed: bool, bounds: Bounds, target_bytes: usize) -> Fixture 
         promoted: PromotedAttributes::default(),
         audit_ceiling: usize::MAX,
     };
-    let entries = entries(8);
     let mut held = HeldLog(
         logged(&entries)
             .into_iter()
@@ -82,6 +119,7 @@ fn fixture_sliced(formed: bool, bounds: Bounds, target_bytes: usize) -> Fixture 
         flushing: Flushing::new(me(), GROUP, source, Arc::new(held)),
         kept: Kept::new(bounds),
         log: mined_log(&entries),
+        outage,
     }
 }
 
@@ -474,4 +512,76 @@ fn a_replay_that_cannot_read_its_log_holds_the_flusher() {
     f.step(6..10, Some(me()));
     assert_eq!(f.flushing.held(), Some("purged"));
     assert!(parquet_files(&f.root.join("data")).is_empty());
+}
+
+/// RFC 0065 §6.7: batches held for a late first configuration are read
+/// after the replay has moved past the configuration, so a checkpoint at
+/// or above them but below the gap can purge what the replay still needs:
+/// it holds for the checkpoint's bundle instead of reading on.
+#[test]
+fn a_checkpoint_over_batches_the_replay_still_holds_stops_it() {
+    let lines = corpus();
+    let mut entries = vec![block(0, 10_000)];
+    let chunks: Vec<_> = (1..).zip(lines.chunks(5)).take(6).collect();
+    for (n, chunk) in &chunks[..3] {
+        entries.push(batch_at(time(*n), "acme", chunk));
+    }
+    entries.push(configured(0.7));
+    for (n, chunk) in &chunks[3..] {
+        entries.push(batch_at(time(*n), "acme", chunk));
+    }
+    let mut f = fixture_with(
+        true,
+        Setup {
+            target_bytes: 1,
+            entries,
+            ..Setup::bounded(Bounds::default())
+        },
+    );
+    // Positions: the block at 1, the configuration at 5 mining 2 to 4.
+    let configuration = 5;
+    let gap = f.log.last().expect("entries").0;
+    let last = f.log.len();
+    f.step_dropping(0..last, None, gap);
+    f.step(last - 1..last, Some(me()));
+    assert_eq!(f.kept.gap(), Some(gap), "one held batch replayed");
+    f.kept.checkpoint(configuration);
+    f.step(last - 1..last, None);
+    assert_eq!(f.flushing.held(), Some("restore_unavailable"));
+}
+
+/// A replay abandoned with a slice the store refused, because another
+/// replica was named, leaves nothing behind once this one is named again:
+/// the fresh replay holds only its own slice, so the refused one is
+/// published once, by it. Slices already durable repeat only their
+/// positions.
+#[test]
+fn a_fresh_replay_starts_without_an_abandoned_slice() {
+    let mut f = fixture_sliced(true, Bounds::default(), 1);
+    let gap = index_at(&f, 5);
+    f.step_dropping(0..6, None, gap);
+    f.step(6..7, Some(me()));
+    f.outage.begin();
+    f.step(7..8, None);
+    assert!(
+        f.replay_buffered() > 0,
+        "the refused slice is still buffered"
+    );
+    f.step(8..9, Some(other()));
+    f.outage.end();
+    f.step(9..10, Some(me()));
+    while f.kept.gap().is_some() {
+        f.flushing.step(None, &Mined::default(), &mut f.kept);
+    }
+    let published = f.published();
+    let refused = index_at(&f, 3);
+    let of_refused = |row: &&MinedRecord| row.ingest_position.is_some_and(|p| p.seq == refused);
+    assert_eq!(
+        published.iter().filter(of_refused).count(),
+        f.rows_of(3..4).len(),
+        "the refused slice is published by the fresh replay alone"
+    );
+    let mut once = published;
+    once.dedup_by_key(|row| row.ingest_position);
+    assert_eq!(once, f.rows_of(0..10));
 }

@@ -94,10 +94,13 @@ impl<L: GroupLogRead> Replayed<L> {
         self.next > self.through && !self.miner.holds()
     }
 
-    /// The index of the next entry to read: every one below it is read.
+    /// The lowest index it has still to read: the next entry, or a batch
+    /// a first configuration holds below it. Every entry below this is read.
     #[must_use]
-    pub fn next_index(&self) -> u64 {
-        self.next
+    pub fn needs_from(&self) -> u64 {
+        self.miner
+            .held_from()
+            .map_or(self.next, |held| held.min(self.next))
     }
 
     /// The next entry the state machine turns into an event, mined.

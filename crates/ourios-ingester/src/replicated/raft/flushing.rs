@@ -352,9 +352,11 @@ impl Flushing {
     fn replay(&mut self, gap: u64) -> Option<u64> {
         let publication = self.publication.clone()?;
         if self.rebuilding.is_none() {
-            // What was handed on before the gap and not yet durable may be
-            // among what was dropped: start from what is durable.
+            // Start from what is durable: what was handed on before the gap,
+            // or by an abandoned replay, and not yet written may be among
+            // what was dropped, and would sit beside this replay's slices.
             self.hold();
+            publication.discard();
             publication.resume();
             let rebuild = Rebuild::start(Arc::clone(&self.log), gap);
             self.rebuilding = Some(Rebuilding::Replaying(Box::new(rebuild)));

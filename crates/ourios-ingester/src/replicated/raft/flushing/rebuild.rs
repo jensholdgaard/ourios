@@ -41,7 +41,7 @@ impl Rebuild {
     /// Whether the replay has read every entry through `cut`, so a purge
     /// through it removes nothing the replay still needs.
     pub(super) fn passed(&self, cut: u64) -> bool {
-        self.replayed.next_index() > cut
+        self.replayed.needs_from() > cut
     }
 
     /// Replay through `gap`, which may have grown, for one slice of at

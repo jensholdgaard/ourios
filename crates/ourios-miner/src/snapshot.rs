@@ -98,7 +98,7 @@ pub struct SnapshotState {
     /// recovery path the driver replays only this tenant's frames
     /// above it (RFC 0008 §6.7 offset-resume). In a replicated
     /// checkpoint bundle it is the group's cut instead (RFC 0065 §6.5).
-    pub wal_high_water: Option<Mark>,
+    pub wal_high_water: Option<WalHighWater>,
     /// RFC 0050 §3.3 adopted-template map entries.
     /// `#[serde(default)]` — absent in pre-RFC snapshots, which had
     /// no adopted templates. No `SNAPSHOT_VERSION` bump (additive).
@@ -332,7 +332,7 @@ fn slot_types_to_record(s: SlotTypes) -> Vec<ParamTypeRecord> {
 /// not to compare WAL offsets, so a string is sufficient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WalHighWater {
+pub struct SegmentMark {
     pub segment: String,
     pub byte: u64,
 }
@@ -352,15 +352,15 @@ pub struct LogMark {
 /// object with the keys of both, or of neither, is corrupt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Mark {
+pub enum WalHighWater {
     /// The local backend's: the tenant's own last frame.
-    Local(WalHighWater),
+    Local(SegmentMark),
     /// The replicated backend's, read only from a checkpoint bundle.
     Replicated(LogMark),
 }
 
-impl From<WalHighWater> for Mark {
-    fn from(mark: WalHighWater) -> Self {
+impl From<SegmentMark> for WalHighWater {
+    fn from(mark: SegmentMark) -> Self {
         Self::Local(mark)
     }
 }
@@ -450,7 +450,7 @@ const LEGACY_V1: u8 = 1;
 /// The one field RFC 0052 §3.2 still reads from a version-1 artefact.
 #[derive(Deserialize)]
 struct LegacyPayload {
-    wal_high_water: Option<WalHighWater>,
+    wal_high_water: Option<SegmentMark>,
 }
 
 /// What a snapshot artefact offers RFC 0052 §3.2's legacy stale-gap
@@ -460,7 +460,7 @@ pub enum LegacyMark {
     /// Not a version-1 artefact: the check has nothing to read here.
     NotLegacy,
     /// A version-1 artefact and the global mark it recorded.
-    Recorded(WalHighWater),
+    Recorded(SegmentMark),
     /// A version-1 artefact whose payload does not decode even for its
     /// mark, or that recorded none. There is no horizon to compare, so
     /// the check fails closed on it.
@@ -591,7 +591,7 @@ mod tests {
                 event_name: Some("gen_ai.client.inference.operation.details".to_string()),
                 template_id: 3,
             }],
-            wal_high_water: Some(Mark::Local(WalHighWater {
+            wal_high_water: Some(WalHighWater::Local(SegmentMark {
                 segment: "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0".to_string(),
                 byte: 4096,
             })),
@@ -757,7 +757,7 @@ mod tests {
 
         assert_eq!(
             legacy_v1_mark(&v1),
-            LegacyMark::Recorded(WalHighWater {
+            LegacyMark::Recorded(SegmentMark {
                 segment: "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0".to_string(),
                 byte: 4096,
             })
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn a_replicated_mark_round_trips_as_log_and_seq() {
         let mut state = sample_state();
-        state.wal_high_water = Some(Mark::Replicated(LogMark { log: 3, seq: 200 }));
+        state.wal_high_water = Some(WalHighWater::Replicated(LogMark { log: 3, seq: 200 }));
 
         assert_eq!(mark_json(&state), serde_json::json!({"log": 3, "seq": 200}));
         let bytes = snapshot(&state).expect("snapshot encodes");

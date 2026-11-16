@@ -25,7 +25,7 @@ use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
 use ourios_core::record::{MinedRecord, RecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, RestoreError};
-use ourios_miner::snapshot::{LegacyMark, Mark, RecoveryOutcome, SnapshotError};
+use ourios_miner::snapshot::{LegacyMark, RecoveryOutcome, SnapshotError, WalHighWater};
 use ourios_wal::{
     FrameKind, FrameSink, HousekeepingError, LedgerError, RecoveryError, TenantBatch,
     TenantHorizon, Wal, WalOffset,
@@ -545,12 +545,14 @@ impl LegacyMarks {
     fn note(&mut self, tenant: &TenantId, bytes: &[u8]) {
         match ourios_miner::snapshot::legacy_v1_mark(bytes) {
             LegacyMark::NotLegacy => {}
-            LegacyMark::Recorded(mark) => match snapshot_store::offset_of(&Mark::Local(mark)) {
-                Some(offset) => {
-                    self.recorded.insert(tenant.clone(), offset);
+            LegacyMark::Recorded(mark) => {
+                match snapshot_store::offset_of(&WalHighWater::Local(mark)) {
+                    Some(offset) => {
+                        self.recorded.insert(tenant.clone(), offset);
+                    }
+                    None => self.unreadable.push(tenant.clone()),
                 }
-                None => self.unreadable.push(tenant.clone()),
-            },
+            }
             LegacyMark::Unreadable => self.unreadable.push(tenant.clone()),
         }
     }
@@ -644,7 +646,7 @@ fn restore_artefact(miner: &mut MinerCluster, tenant_id: &TenantId, bytes: &[u8]
     // unparseable one.
     // RFC 0065 §6.5: only a tail replica reads a group's cut, from a
     // bundle; here it is corrupt.
-    if let Some(Mark::Replicated(_)) = state.wal_high_water {
+    if let Some(WalHighWater::Replicated(_)) = state.wal_high_water {
         return SnapshotFate::Discarded(DiscardReason::Corrupt);
     }
     let Some(horizon) = parse_high_water(state.wal_high_water.as_ref()) else {
@@ -762,7 +764,7 @@ fn reclaim_explains(horizon: WalOffset, reclaimed_through: Option<&WalOffset>) -
 /// `None` — the mark is absent or its segment UUID is unparseable —
 /// is the caller's discard-as-corrupt signal: a restorable snapshot
 /// requires a concrete horizon.
-fn parse_high_water(high_water: Option<&Mark>) -> Option<WalOffset> {
+fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
     snapshot_store::offset_of(high_water?)
 }
 
@@ -896,7 +898,7 @@ fn reject(kind: FrameKind, offset: WalOffset, error: &dyn std::fmt::Display) -> 
 mod tests {
     use super::*;
     use ourios_config::MinerConfig;
-    use ourios_miner::snapshot::WalHighWater;
+    use ourios_miner::snapshot::SegmentMark;
 
     const SEGMENT: &str = "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0";
 
@@ -909,23 +911,23 @@ mod tests {
 
     #[test]
     fn parse_high_water_accepts_a_concrete_mark() {
-        let hw = WalHighWater {
+        let hw = SegmentMark {
             segment: SEGMENT.to_string(),
             byte: 64,
         };
         assert_eq!(
-            parse_high_water(Some(&Mark::Local(hw))),
+            parse_high_water(Some(&WalHighWater::Local(hw))),
             Some(offset(SEGMENT, 64))
         );
     }
 
     #[test]
     fn parse_high_water_rejects_an_unparseable_segment() {
-        let hw = WalHighWater {
+        let hw = SegmentMark {
             segment: "not-a-uuid".to_string(),
             byte: 64,
         };
-        assert_eq!(parse_high_water(Some(&Mark::Local(hw))), None);
+        assert_eq!(parse_high_water(Some(&WalHighWater::Local(hw))), None);
     }
 
     #[test]
@@ -943,7 +945,7 @@ mod tests {
         let tenant = TenantId::new("t");
         let mut miner = MinerCluster::new(MinerConfig::default());
         let mut state = miner.snapshot_state(&tenant);
-        state.wal_high_water = Some(Mark::Replicated(ourios_miner::snapshot::LogMark {
+        state.wal_high_water = Some(WalHighWater::Replicated(ourios_miner::snapshot::LogMark {
             log: 3,
             seq: 200,
         }));

@@ -2207,7 +2207,7 @@ mod tests {
         snapshots_root: &Path,
     ) -> (
         ourios_miner::snapshot::SnapshotState,
-        Option<ourios_miner::snapshot::Mark>,
+        Option<ourios_miner::snapshot::WalHighWater>,
     ) {
         let artefacts = ourios_ingester::snapshot_store::load_all(snapshots_root).expect("load");
         assert_eq!(artefacts.len(), 1, "one tenant's artefact");

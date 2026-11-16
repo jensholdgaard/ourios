@@ -259,3 +259,20 @@ fn a_replica_named_again_reuses_its_publication() {
     assert!(Arc::ptr_eq(&first, &again), "one publication for the group");
     assert_eq!(f.published(), f.rows_of(0..10));
 }
+
+/// A named replica whose `formed.json` it cannot use is held for that
+/// reason, reported once; once the record is usable the hold clears and
+/// it publishes everything it kept.
+#[test]
+fn a_named_replica_is_held_by_an_unusable_record_until_it_is_usable() {
+    let mut f = fixture(false, Bounds::default());
+    f.store
+        .put_blocking(&formed_key(GROUP), b"not json".to_vec())
+        .expect("write");
+    f.step(0..4, Some(me()));
+    assert_eq!(f.flushing.held(), Some("malformed"));
+    record_formation(&f.store);
+    f.step(4..10, None);
+    assert_eq!(f.flushing.held(), None);
+    assert_eq!(f.published(), f.rows_of(0..10));
+}

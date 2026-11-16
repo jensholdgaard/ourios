@@ -113,15 +113,31 @@ impl Kept {
     /// Drop everything at or below `cut`, and clear a gap the cut reaches.
     pub fn checkpoint(&mut self, cut: u64) {
         self.cut = self.cut.max(cut);
-        while let Some((_, event)) = self.audit.front().filter(|(index, _)| *index <= cut) {
+        self.drop_through(cut);
+    }
+
+    /// Drop everything at or below `through`, which a replay has published,
+    /// and clear a gap it reaches. Unlike a checkpoint, it moves no cut.
+    pub fn replayed(&mut self, through: u64) {
+        self.drop_through(through);
+    }
+
+    /// The last cut applied; `0` before any.
+    #[must_use]
+    pub fn cut(&self) -> u64 {
+        self.cut
+    }
+
+    fn drop_through(&mut self, through: u64) {
+        while let Some((_, event)) = self.audit.front().filter(|(index, _)| *index <= through) {
             self.audit_bytes -= audit_bytes(event);
             self.audit.pop_front();
         }
-        while let Some(row) = self.rows.front().filter(|row| row.position.seq <= cut) {
+        while let Some(row) = self.rows.front().filter(|row| row.position.seq <= through) {
             self.row_bytes -= estimate_bytes(&row.record);
             self.rows.pop_front();
         }
-        if self.gap.is_some_and(|gap| gap <= cut) {
+        if self.gap.is_some_and(|gap| gap <= through) {
             self.gap = None;
         }
     }
@@ -159,6 +175,12 @@ impl Kept {
     #[must_use]
     pub fn dropped(&self) -> Dropped {
         self.dropped
+    }
+
+    /// Record a drop of the output of the entry at `index`.
+    #[cfg(test)]
+    pub(in crate::replicated::raft) fn gap_at(&mut self, index: u64) {
+        self.gapped(index);
     }
 
     fn gapped(&mut self, index: u64) {

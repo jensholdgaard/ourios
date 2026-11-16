@@ -6,10 +6,13 @@
 //! publishes everything it keeps, then each later step's output. Without a
 //! readable record it publishes nothing and tries again at the next step.
 //! An assignment naming another replica stops it at that entry: what it
-//! has not published stays kept, as on every tail replica. A replica with
-//! a gap publishes nothing; once no gap remains it publishes everything it
-//! keeps again, and a row a former publication already wrote repeats only
-//! its position, which compaction and queries count once (§6.6).
+//! has not published stays kept, as on every tail replica. A named
+//! replica with a gap publishes nothing it keeps until it has rebuilt what
+//! the gap dropped, by a replay of the group's log; with a checkpoint applied that needs the
+//! checkpoint's bundle, which it holds for. Once no gap remains it
+//! publishes everything it keeps again, and a row a former publication or
+//! the replay already wrote repeats only its position, which compaction
+//! and queries count once (§6.6).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,11 +24,12 @@ use ourios_semconv as semconv;
 
 use super::formation::{Formation, formed_key};
 use super::kept::Kept;
-use super::mining::{Mined, MinedRow};
+use super::mining::{Mined, MinedRow, SharedLog};
 use super::publication::Publication;
 use super::types::NodeId;
 use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use crate::record_sink::{FlushConfig, ParquetRecordSink};
+use rebuild::{Rebuild, Slice};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
@@ -92,6 +96,15 @@ pub enum Need {
     Output,
     /// Everything kept, the step's output among it.
     Backlog(Backlog),
+    /// The next slice of the replay through the gap.
+    Replay { gap: u64 },
+}
+
+/// Where a named replica with a gap is in rebuilding it.
+enum Rebuilding {
+    Replaying(Box<Rebuild>),
+    /// Held, as reported, until the gap clears.
+    Held,
 }
 
 /// What a replica keeps, copied for publishing once it is no longer held.
@@ -175,8 +188,13 @@ pub struct Flushing {
     publication: Option<Arc<Publication>>,
     /// Everything kept has been handed to `publication`.
     caught_up: bool,
-    /// Why the log id was last unreadable, as reported; `None` once read.
+    /// `publication` takes handoffs: it was resumed, for the backlog or a
+    /// replay, and not discarded since.
+    active: bool,
+    /// Why it last held, as reported; `None` once publishing.
     held: Option<&'static str>,
+    log: SharedLog,
+    rebuilding: Option<Rebuilding>,
     /// How many times the kept backlog was copied for publication.
     #[cfg(test)]
     backlog_copies: usize,
@@ -185,7 +203,7 @@ pub struct Flushing {
 
 impl Flushing {
     #[must_use]
-    pub fn new(replica: NodeId, group: u32, source: Source) -> Self {
+    pub fn new(replica: NodeId, group: u32, source: Source, log: SharedLog) -> Self {
         Self {
             replica,
             group,
@@ -193,7 +211,10 @@ impl Flushing {
             named: false,
             publication: None,
             caught_up: false,
+            active: false,
             held: None,
+            log,
+            rebuilding: None,
             #[cfg(test)]
             backlog_copies: 0,
             current: watch::Sender::new(None),
@@ -215,13 +236,19 @@ impl Flushing {
 
     /// One step: `assigned` is the replica a flusher assignment applied at
     /// this entry named, `out` what the entry mined, already in `kept`.
-    pub fn step(&mut self, assigned: Option<NodeId>, out: &Mined, kept: &Kept) {
-        let need = match self.plan(assigned, kept) {
-            Need::Prepare if self.prepare() => self.plan(None, kept),
-            Need::Prepare => return,
-            need => need,
-        };
-        self.publish(need, out);
+    pub fn step(&mut self, assigned: Option<NodeId>, out: &Mined, kept: &mut Kept) {
+        let mut assigned = assigned;
+        loop {
+            let need = match self.plan(assigned.take(), kept) {
+                Need::Prepare if self.prepare() => self.plan(None, kept),
+                Need::Prepare => return,
+                need => need,
+            };
+            let Some(through) = self.publish(need, out) else {
+                return;
+            };
+            kept.replayed(through);
+        }
     }
 
     /// Decide what this step publishes, while `kept`, which already holds
@@ -231,9 +258,21 @@ impl Flushing {
         if let Some(assigned) = assigned {
             self.named = assigned == self.replica;
         }
-        if !self.named || kept.gap().is_some() {
-            Need::Hold
-        } else if self.caught_up {
+        match kept.gap() {
+            _ if !self.named => {
+                self.end_rebuild();
+                Need::Hold
+            }
+            Some(gap) => self.plan_rebuild(gap, kept.cut()),
+            None => {
+                self.end_rebuild();
+                self.plan_publish(kept)
+            }
+        }
+    }
+
+    fn plan_publish(&mut self, kept: &Kept) -> Need {
+        if self.caught_up {
             Need::Output
         } else if self.publication.is_none() {
             Need::Prepare
@@ -249,6 +288,39 @@ impl Flushing {
         }
     }
 
+    /// A gap through `gap` above the last cut, `cut`: replay it from the
+    /// first entry while no checkpoint has passed the replay, or hold for
+    /// the checkpoint's bundle.
+    fn plan_rebuild(&mut self, gap: u64, cut: u64) -> Need {
+        let passed = match &self.rebuilding {
+            Some(Rebuilding::Held) => return Need::Hold,
+            Some(Rebuilding::Replaying(rebuild)) => Some(cut == 0 || rebuild.passed(cut)),
+            None => None,
+        };
+        match passed {
+            Some(true) => Need::Replay { gap },
+            None if cut == 0 && self.publication.is_none() => Need::Prepare,
+            None if cut == 0 => Need::Replay { gap },
+            Some(false) | None => {
+                self.rebuilding = Some(Rebuilding::Held);
+                let why = format!(
+                    "the checkpoint at {cut} is below its gap at {gap}, and it cannot yet \
+                     restore the checkpoint's bundle to replay from"
+                );
+                self.report_held("restore_unavailable", &why);
+                Need::Hold
+            }
+        }
+    }
+
+    /// Leave any rebuild: the gap cleared, or this replica is no longer
+    /// named.
+    fn end_rebuild(&mut self) {
+        if self.rebuilding.take().is_some() {
+            self.held = None;
+        }
+    }
+
     /// Build the publication, reading the group's log id; `true` once
     /// there is one. Done without `kept` held, so a store that cannot be
     /// read costs no copy of what is kept, then [`Self::plan`] again.
@@ -257,8 +329,11 @@ impl Flushing {
     }
 
     /// Publish what [`Self::plan`] decided, `out` being the step's output.
-    pub fn publish(&mut self, need: Need, out: &Mined) {
+    /// Returns the gap a replay has just rebuilt through, for the caller to
+    /// drop from `kept` ([`Kept::replayed`]) before planning again.
+    pub fn publish(&mut self, need: Need, out: &Mined) -> Option<u64> {
         match need {
+            Need::Replay { gap } => return self.replay(gap),
             Need::Hold => self.hold(),
             Need::Prepare => {}
             Need::Output => {
@@ -267,13 +342,44 @@ impl Flushing {
                 }
             }
             Need::Backlog(backlog) => {
-                let Some(publication) = self.publication() else {
-                    return;
-                };
+                let publication = self.publication()?;
                 publication.resume();
+                self.active = true;
                 publication.publish(&backlog.audit, &backlog.rows);
                 self.caught_up = true;
                 self.current.send_replace(Some(publication));
+            }
+        }
+        None
+    }
+
+    /// One slice of the replay through `gap`; the gap once it is rebuilt.
+    fn replay(&mut self, gap: u64) -> Option<u64> {
+        let publication = self.publication.clone()?;
+        if self.rebuilding.is_none() {
+            // Start from what is durable: what was handed on before the gap
+            // and not yet written may be among what was dropped.
+            self.hold();
+            publication.resume();
+            self.active = true;
+            let rebuild = Rebuild::start(Arc::clone(&self.log), gap);
+            self.rebuilding = Some(Rebuilding::Replaying(Box::new(rebuild)));
+        }
+        let Some(Rebuilding::Replaying(rebuild)) = &mut self.rebuilding else {
+            return None;
+        };
+        match rebuild.slice(gap, &publication, self.source.flush.target_bytes) {
+            Slice::Pending => None,
+            Slice::Rebuilt => {
+                self.rebuilding = None;
+                Some(gap)
+            }
+            Slice::Stopped(error) => {
+                self.hold();
+                self.rebuilding = Some(Rebuilding::Held);
+                let why = format!("the replay of its gap at {gap} stopped: {error}");
+                self.report_held(error.error_type(), &why);
+                None
             }
         }
     }
@@ -283,11 +389,12 @@ impl Flushing {
     /// publication is kept, discarded, for that: one per group, so its
     /// sinks and their metrics are built once.
     fn hold(&mut self) {
-        if self.caught_up
+        if self.active
             && let Some(publication) = &self.publication
         {
             publication.discard();
         }
+        self.active = false;
         self.caught_up = false;
         self.current.send_replace(None);
     }
@@ -299,7 +406,8 @@ impl Flushing {
                 Ok(log) => log,
                 Err(Unread::Absent) => return None,
                 Err(Unread::Failed { error_type, error }) => {
-                    self.report_held(error_type, &error);
+                    let why = format!("it cannot read the group's log id: {error}");
+                    self.report_held(error_type, &why);
                     return None;
                 }
             };
@@ -342,7 +450,7 @@ impl Flushing {
     }
 
     /// Report being held for `error_type`, once until the reason changes.
-    fn report_held(&mut self, error_type: &'static str, error: &str) {
+    fn report_held(&mut self, error_type: &'static str, why: &str) {
         if self.held == Some(error_type) {
             return;
         }
@@ -353,7 +461,7 @@ impl Flushing {
                 { semconv::OURIOS_WAL_GROUP } = i64::from(self.group),
                 { crate::metrics::ERROR_TYPE } = error_type,
             },
-            "the flusher of group {} publishes nothing until it can read the group's log id: {error}",
+            "the flusher of group {} publishes nothing: {why}",
             self.group,
         );
     }
@@ -369,5 +477,6 @@ enum Unread {
     },
 }
 
+mod rebuild;
 #[cfg(test)]
 mod tests;

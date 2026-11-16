@@ -79,7 +79,7 @@ use ourios_config::UpstreamTemplates;
 use crate::mask::{TypedParam, mask};
 use crate::metrics::{MinerMetrics, service_of};
 use crate::sim_seq::sim_seq_owned;
-use crate::snapshot::WalHighWater;
+use crate::snapshot::Mark;
 use crate::tokenize::tokenize;
 use crate::tree::{Leaf, OwnedToken, Tree, UpstreamAssociations, format_template};
 use crate::upstream;
@@ -344,7 +344,7 @@ struct TenantState {
     /// tenant's own last frame folded into the state above. Opaque
     /// here — the cluster never compares it — and `None` until a
     /// caller records one.
-    folded: Option<WalHighWater>,
+    folded: Option<Mark>,
 }
 
 impl TenantState {

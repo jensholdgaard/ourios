@@ -212,7 +212,7 @@ impl MinerCluster {
     /// snapshot. `None` for an unseen tenant or one no caller has
     /// recorded a frame for.
     #[must_use]
-    pub fn folded_horizon(&self, tenant_id: &TenantId) -> Option<&crate::snapshot::WalHighWater> {
+    pub fn folded_horizon(&self, tenant_id: &TenantId) -> Option<&crate::snapshot::Mark> {
         self.tenants.get(tenant_id)?.folded.as_ref()
     }
 
@@ -224,7 +224,7 @@ impl MinerCluster {
     /// A tenant whose frames allocated no state — every record
     /// body-less — is allocated here: its horizon must still reach a
     /// snapshot, or its frames would pin reclamation for good.
-    pub fn fold_through(&mut self, tenant_id: &TenantId, horizon: crate::snapshot::WalHighWater) {
+    pub fn fold_through(&mut self, tenant_id: &TenantId, horizon: crate::snapshot::Mark) {
         let config = self.effective_config(tenant_id);
         self.tenants
             .entry(tenant_id.clone())

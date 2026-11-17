@@ -105,6 +105,30 @@ impl HeldControls {
         }
     }
 
+    /// The id blocks after the entry at `mined` that a replica would apply,
+    /// over `snapshot`'s latest: those a flusher that mined through it has
+    /// not reached.
+    pub(super) fn blocks_after(&self, snapshot: Option<&GroupSnapshot>, mined: u64) -> u32 {
+        let start = Ahead::starting(snapshot.and_then(|s| s.state.id_block));
+        let (_, after) = self.controls.range(first_after(snapshot)..).fold(
+            (start, 0_u32),
+            |(ahead, after), (&index, control)| match *control {
+                Control::IdBlock {
+                    after: from,
+                    through,
+                } => {
+                    let next = ahead.then(IdBlock::new(from, through));
+                    let applied = next.blocks > ahead.blocks && index > mined;
+                    (next, after + u32::from(applied))
+                }
+                Control::FlusherAssignment(_)
+                | Control::Checkpoint { .. }
+                | Control::MinerConfig(_) => (ahead, after),
+            },
+        );
+        after
+    }
+
     /// The highest cut a checkpoint entry after `snapshot` proposes.
     pub(super) fn proposed_after(&self, snapshot: Option<&GroupSnapshot>) -> Option<RaftLogId> {
         self.controls

@@ -25,7 +25,7 @@ use super::{
 };
 use crate::replicated::raft::cluster::{Cluster, WAIT, name, seated_store, write};
 use crate::replicated::raft::flusher::Steward;
-use crate::replicated::raft::id_blocks::{self, AHEAD, Ahead, Refusal, TopUp};
+use crate::replicated::raft::id_blocks::{self, AHEAD, Ahead, Refusal, Reported, Reports, TopUp};
 use crate::replicated::raft::snapshot_record::IdBlock;
 use crate::replicated::raft::telemetry::tests::Reader;
 use crate::template_ids::{self, BLOCK, HIGH_WATER_KEY};
@@ -53,6 +53,7 @@ async fn high_water(store: &Store) -> Option<u64> {
 /// A fresh group gets one block a pass until it holds three, each above
 /// the last, and a pass once they have committed appends none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the leader tops id blocks up only on its flusher's reports (RFC 0065 §6.8); see `reported::` for this test with one"]
 async fn a_fresh_group_gets_three_blocks_and_then_none() {
     let cluster = Cluster::start(3, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -80,6 +81,7 @@ async fn a_fresh_group_gets_three_blocks_and_then_none() {
 /// reservation is held once its write lands, and the log holds no block
 /// until it is let go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the leader tops id blocks up only on its flusher's reports (RFC 0065 §6.8); see `reported::` for this test with one"]
 async fn the_block_is_reserved_before_its_entry_exists() {
     let cluster = Cluster::start(3, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -110,6 +112,7 @@ async fn the_block_is_reserved_before_its_entry_exists() {
 /// reading below `0x03`, which the gate never asked. The block's ids are
 /// only skipped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the leader tops id blocks up only on its flusher's reports (RFC 0065 §6.8); see `reported::` for this test with one"]
 async fn a_reservation_outliving_its_membership_appends_nothing() {
     let cluster = Cluster::start_with_tail(3, 1, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -140,6 +143,7 @@ async fn a_reservation_outliving_its_membership_appends_nothing() {
 /// A reservation that outlives the term the kind gate admitted it under
 /// appends nothing, even when the same node leads the next term.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the leader tops id blocks up only on its flusher's reports (RFC 0065 §6.8); see `reported::` for this test with one"]
 async fn a_reservation_outliving_its_term_appends_nothing() {
     let cluster = Cluster::start(3, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -248,6 +252,7 @@ async fn held_back_after_reserving(cluster: &Cluster, leader: usize, store: &Sto
 /// A reservation that fails appends nothing and says why; so does a store
 /// without the high-water, which a reservation never creates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the leader tops id blocks up only on its flusher's reports (RFC 0065 §6.8); see `reported::` for this test with one"]
 async fn a_failed_or_absent_reservation_appends_nothing() {
     let cluster = Cluster::start(3, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -276,6 +281,7 @@ async fn a_failed_or_absent_reservation_appends_nothing() {
 /// appends no block; once every member reads it, a block is appended even
 /// though the miner configuration, `0x04`, is still held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the leader tops id blocks up only on its flusher's reports (RFC 0065 §6.8); see `reported::` for this test with one"]
 async fn the_kind_gate_holds_the_block_back() {
     let cluster = Cluster::start(3, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -303,6 +309,7 @@ async fn the_kind_gate_holds_the_block_back() {
 /// A leader cut off after appending a block it reserved never commits it,
 /// and the next leader reserves above it: its ids are only skipped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the leader tops id blocks up only on its flusher's reports (RFC 0065 §6.8); see `reported::` for this test with one"]
 async fn a_deposed_leaders_block_is_only_skipped_ids() {
     let mut cluster = Cluster::start(3, &[0]).await;
     let first = ready_leader(&cluster).await;
@@ -340,6 +347,7 @@ async fn a_deposed_leaders_block_is_only_skipped_ids() {
 /// new kind, the assignment, the miner configuration nor an id block, and
 /// counts each hold; once it commits, all three are appended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the leader tops id blocks up only on its flusher's reports (RFC 0065 §6.8); see `reported::` for this test with one"]
 async fn a_membership_change_in_flight_holds_back_every_new_kind() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -382,6 +390,7 @@ async fn a_membership_change_in_flight_holds_back_every_new_kind() {
 /// and the id block's, and the assignment once it commits, each by group
 /// and reason; a pass that holds back nothing counts nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "superseded: the leader tops id blocks up only on its flusher's reports (RFC 0065 §6.8); see `reported::` for this test with one"]
 async fn every_held_kind_and_committed_assignment_is_counted() {
     let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
     let leader = ready_leader(&cluster).await;
@@ -674,3 +683,100 @@ impl ObjectStore for Pausing {
         self.inner.copy_opts(from, to, options).await
     }
 }
+
+/// A steward over `ids` topping up from `reports`.
+fn reporting(ids: Store, reports: &Reports) -> Steward {
+    steward(ids).with_reports(reports.clone())
+}
+
+/// The log id of `leader`'s last entry, as a flusher that mined through
+/// it reports.
+async fn last_entry(cluster: &Cluster, leader: usize) -> crate::replicated::raft::types::LogId {
+    let entries = cluster.node(leader).log(0).await;
+    entries.last().expect("an entry").log_id
+}
+
+/// RFC 0065 §6.5, §6.8: the leader tops id blocks up on its flusher's
+/// reports, so with none it reserves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_report_the_leader_reserves_no_block() {
+    let cluster = Cluster::start(3, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let store = seated_store(5_000);
+    let mut steward = reporting(store.clone(), &Reports::default());
+
+    let passed = pass(&mut steward, &cluster, leader, &[]).await;
+
+    assert_eq!(passed.id_block, None);
+    assert_eq!(high_water(&store).await, Some(5_000), "nothing reserved");
+    cluster.shutdown().await;
+}
+
+/// A report tops the group up until the blocks its flusher has not
+/// started, and those the log holds after its `mined`, are three; one with
+/// two unstarted gets one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_tops_the_group_up_to_three_blocks_its_flusher_has_not_started() {
+    for (unstarted, appended) in [(0, AHEAD), (2, 1)] {
+        let cluster = Cluster::start(3, &[0]).await;
+        let leader = ready_leader(&cluster).await;
+        let reports = Reports::default();
+        let mut steward = reporting(seated_store(5_000), &reports);
+        let mined = last_entry(&cluster, leader).await;
+        reports.record(Reported { mined, unstarted });
+
+        for n in 0..u64::from(appended) {
+            let topped = pass(&mut steward, &cluster, leader, &[]).await;
+            let expected = block(5_000 + n * BLOCK);
+            assert_eq!(
+                topped.id_block,
+                Some(TopUp::Appended(expected)),
+                "{unstarted}"
+            );
+        }
+        let again = pass(&mut steward, &cluster, leader, &[]).await;
+        assert_eq!(again.id_block, None, "{unstarted}: three not started");
+        cluster.shutdown().await;
+    }
+}
+
+/// RFC 0065 §6.8: a report whose `mined` a checkpoint has since passed may
+/// count blocks the purge removed short, so it tops up nothing until the
+/// flusher reports afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_a_checkpoint_has_passed_tops_up_nothing() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (placed, _) = placement(&cluster, 3..5);
+    let placed = strs(&placed);
+    let reports = Reports::default();
+    let mut steward = Steward::with_patience(PATIENCE)
+        .reserving(seated_store(0))
+        .with_reports(reports.clone());
+    let flusher = super::pass_until_assigned(&mut steward, &cluster, leader, &placed).await;
+    let before = last_entry(&cluster, leader).await;
+    super::checkpoint_purging(&cluster, (leader, flusher), &[leader]).await;
+    reports.record(Reported {
+        mined: before,
+        unstarted: 0,
+    });
+
+    let passed = pass(&mut steward, &cluster, leader, &placed).await;
+
+    assert_eq!(passed.id_block, None, "the report is behind the cut");
+    let fresh = last_entry(&cluster, leader).await;
+    reports.record(Reported {
+        mined: fresh,
+        unstarted: 0,
+    });
+    let passed = pass(&mut steward, &cluster, leader, &placed).await;
+    assert!(
+        matches!(passed.id_block, Some(TopUp::Appended(_))),
+        "{:?}",
+        passed.id_block
+    );
+    cluster.shutdown().await;
+}
+
+/// The superseded tests above, run on a report.
+mod reported;

@@ -15,6 +15,7 @@ use ourios_wal::Control;
 use super::codec::{raft_id, wal_id};
 use super::controls::HeldControls;
 use super::host::{GroupHost, GroupRaft};
+use super::id_blocks::{Reported, Reports};
 use super::learners::Group;
 use super::log_store::GroupLogReader;
 use super::mining::GroupLogRead;
@@ -37,6 +38,8 @@ struct Hosted {
     sm: GroupSm,
     /// One proposal at a time: check 5 and the append see one log.
     one: Arc<tokio::sync::Mutex<()>>,
+    /// The latest report it accepted.
+    reports: Reports,
 }
 
 impl Proposals {
@@ -51,6 +54,7 @@ impl Proposals {
                     log: host.log(group)?.clone(),
                     sm: host.state_machine(group)?.clone(),
                     one: Arc::default(),
+                    reports: Reports::default(),
                 };
                 Some((group, hosted))
             })
@@ -67,6 +71,15 @@ impl Proposals {
     pub(super) async fn held(&self, group: u32) -> tokio::sync::OwnedMutexGuard<()> {
         let hosted = self.groups.get(&group).expect("hosted");
         Arc::clone(&hosted.one).lock_owned().await
+    }
+}
+
+impl Proposals {
+    /// The reports `group`'s leader accepted, which its steward tops the
+    /// group's id blocks up from.
+    #[must_use]
+    pub fn reports(&self, group: u32) -> Option<Reports> {
+        self.groups.get(&group).map(|hosted| hosted.reports.clone())
     }
 }
 
@@ -103,6 +116,12 @@ impl Hosted {
             return Err(Refusal::NotFlusher);
         }
         self.fresh(&report).map_err(Refusal::Stale)?;
+        if let Some(mined) = report.mined {
+            self.reports.record(Reported {
+                mined,
+                unstarted: report.unstarted,
+            });
+        }
         let Some(ProposedCheckpoint { cut, highest_kind }) = report.checkpoint else {
             return Ok(None);
         };

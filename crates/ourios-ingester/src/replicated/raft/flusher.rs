@@ -43,9 +43,10 @@ use ourios_parquet::Store;
 use ourios_wal::{Control, MinerConfigV1};
 
 use super::host::GroupRaft;
-use super::id_blocks::{self, Ahead, TopUp};
+use super::id_blocks::{self, Ahead, Reports, TopUp};
 use super::learners::{self, Changes, Group, Tail};
 use super::miner_config;
+use super::snapshot_record::IdBlock;
 use super::telemetry::{FlusherCounts, Meters};
 use super::types::{GroupEntry, LogId, NodeId, RaftTypes};
 
@@ -217,6 +218,9 @@ pub struct Steward {
     /// leading it.
     led: Option<(u64, Instant)>,
     counts: FlusherCounts,
+    /// The flusher's latest accepted report, which id blocks are topped up
+    /// from (§6.8).
+    reports: Reports,
 }
 
 impl Steward {
@@ -230,7 +234,15 @@ impl Steward {
             ids,
             led: None,
             counts: Meters::global().flusher(),
+            reports: Reports::default(),
         }
+    }
+
+    /// This steward, topping id blocks up from the reports `reports`
+    /// holds, which the group's `Propose` target records.
+    #[must_use]
+    pub fn with_reports(self, reports: Reports) -> Self {
+        Self { reports, ..self }
     }
 
     /// This steward, with `miner` as its node's own effective miner
@@ -267,6 +279,7 @@ impl Steward {
             ids: Store::in_memory(),
             led: None,
             counts,
+            reports: Reports::default(),
         }
     }
 
@@ -427,8 +440,27 @@ impl Steward {
     fn plan_block(&mut self, group: Group<'_>) -> Option<(u64, u8)> {
         let metrics = group.raft.metrics().borrow_watched().clone();
         self.led_for(&metrics)?;
-        let floor = Ahead::of(group).short()?;
+        let floor = self.short(group)?;
         Some((floor, group.controls().highest_kind))
+    }
+
+    /// The floor to reserve the next block above, while the flusher's
+    /// latest report counts fewer than [`id_blocks::AHEAD`] blocks it has
+    /// not started (§6.8): its unstarted ones and those the log holds
+    /// after its `mined`. A report a checkpoint has passed may count blocks
+    /// the purge removed short, so it counts for nothing until the flusher
+    /// reports again, as it does when it applies the checkpoint.
+    fn short(&self, group: Group<'_>) -> Option<u64> {
+        let reported = self.reports.latest()?;
+        let snapshot = group.sm.snapshot();
+        let cut = snapshot.as_ref().and_then(|s| s.meta.last_log_id);
+        if Some(reported.mined) < cut {
+            return None;
+        }
+        let held = group.log.held_controls();
+        let after = held.blocks_after(snapshot.as_ref(), reported.mined.index);
+        let unstarted = reported.unstarted.saturating_add(after);
+        (unstarted < id_blocks::AHEAD).then(|| Ahead::of(group).latest.map_or(0, IdBlock::through))
     }
 
     /// The assignment [`plan`] gives from what the leader sees now, with the

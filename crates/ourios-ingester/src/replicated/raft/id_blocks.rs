@@ -11,12 +11,15 @@
 //! flusher's report of the blocks it has not started replaces that count
 //! once the `Propose` call carries it.
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use ourios_miner::cluster::IdSpaceExhausted;
 use ourios_parquet::Store;
 use ourios_wal::Control;
 
 use super::learners::Group;
 use super::snapshot_record::IdBlock;
+use super::types::LogId;
 use crate::template_ids::{self, TemplateIdsError, names};
 
 /// The blocks the leader keeps ahead of the group's miner: "the target
@@ -79,6 +82,33 @@ impl Ahead {
     #[must_use]
     pub fn short(self) -> Option<u64> {
         (self.blocks < AHEAD).then(|| self.latest.map_or(0, IdBlock::through))
+    }
+}
+
+/// What a group's flusher last reported to its leader (RFC 0065 §6.8):
+/// the last entry its miner followed and the applied blocks it has not
+/// started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reported {
+    pub mined: LogId,
+    pub unstarted: u32,
+}
+
+/// The latest report a group's leader accepted, which its steward tops
+/// the group's id blocks up from. Clones share one report.
+#[derive(Debug, Clone, Default)]
+pub struct Reports(Arc<Mutex<Option<Reported>>>);
+
+impl Reports {
+    /// Keep `reported` as the latest.
+    pub fn record(&self, reported: Reported) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(reported);
+    }
+
+    /// The latest report accepted, if any.
+    #[must_use]
+    pub fn latest(&self) -> Option<Reported> {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

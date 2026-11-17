@@ -10,7 +10,9 @@ use serde_json::Value;
 
 mod bootstrap;
 
-pub use bootstrap::{Evidence, LockStart, RaftState, StartError, Started, Waiting, start};
+pub use bootstrap::{
+    Evidence, LockStart, RaftState, StartError, Started, Waiting, raft_state, start,
+};
 
 /// The key, under the store root, of the lock and counter.
 pub const LOG_IDS_KEY: &str = "wal/log_ids.json";
@@ -259,5 +261,7 @@ fn next_of(lock: &LogIds) -> Result<u32, AllocateError> {
 mod bootstrap_tests;
 #[cfg(test)]
 pub(in crate::replicated::raft) mod gated;
+#[cfg(test)]
+mod raft_state_tests;
 #[cfg(test)]
 mod tests;

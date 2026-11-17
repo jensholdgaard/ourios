@@ -113,23 +113,6 @@ fn not_leader(hint: Option<&str>) -> Answer {
     })
 }
 
-/// The leader the flusher's log names takes it at once.
-#[tokio::test]
-async fn the_named_leader_takes_it_first() {
-    let accept = Some(vec![Ok(Some(id(21)))]);
-    let (peers, calls, _serving) = voters([accept.clone(), accept.clone(), accept]);
-
-    let delivered = proposer(peers).send(&report(), Some("v2".to_owned())).await;
-
-    assert_eq!(
-        delivered,
-        Delivered::Accepted {
-            appended: Some(id(21))
-        }
-    );
-    assert_eq!(count(&calls), [0, 1, 0]);
-}
-
 /// RFC 0065 §6.8: after `not_leader` it goes to the hint, after
 /// `not_hosted` or a call never sent to the voters in placement order.
 #[tokio::test]
@@ -141,14 +124,14 @@ async fn it_follows_the_hint_then_the_voters_in_order() {
     ]);
 
     let delivered = proposer(peers.clone())
-        .send(&report(), Some("v3".to_owned()))
+        .send(&report(), None, Some("v3".to_owned()))
         .await;
 
     assert_eq!(delivered, Delivered::Accepted { appended: None });
     assert_eq!(count(&calls), [1, 1, 1], "v3, its hint v1, then v2");
 
     let (peers, calls, _serving) = voters([None, Some(vec![Ok(None)]), Some(vec![Ok(None)])]);
-    let delivered = proposer(peers).send(&report(), None).await;
+    let delivered = proposer(peers).send(&report(), None, None).await;
     assert_eq!(delivered, Delivered::Accepted { appended: None });
     assert_eq!(count(&calls), [0, 1, 0], "v1 unreachable, then v2");
 }
@@ -164,7 +147,9 @@ async fn it_resends_after_an_uncertain_outcome() {
         Some(vec![Ok(None)]),
     ]);
 
-    let delivered = proposer(peers).send(&report(), Some("v1".to_owned())).await;
+    let delivered = proposer(peers)
+        .send(&report(), None, Some("v1".to_owned()))
+        .await;
 
     assert_eq!(
         delivered,
@@ -198,7 +183,9 @@ async fn a_leaders_refusal_ends_the_sending() {
         let accept = Some(vec![Ok(None)]);
         let (peers, calls, _serving) = voters([Some(vec![Err(refusal)]), accept.clone(), accept]);
 
-        let delivered = proposer(peers).send(&report(), Some("v1".to_owned())).await;
+        let delivered = proposer(peers)
+            .send(&report(), None, Some("v1".to_owned()))
+            .await;
 
         assert_eq!(delivered, expected);
         assert_eq!(count(&calls), [1, 0, 0]);
@@ -211,7 +198,7 @@ async fn a_leaders_refusal_ends_the_sending() {
 async fn it_gives_up_after_a_bounded_number_of_calls() {
     let not_hosted = Some(vec![Err(Refusal::NotHosted)]);
     let (peers, calls, _serving) = voters([not_hosted.clone(), not_hosted.clone(), not_hosted]);
-    let delivered = proposer(peers).send(&report(), None).await;
+    let delivered = proposer(peers).send(&report(), None, None).await;
     assert!(
         matches!(delivered, Delivered::Undelivered(_)),
         "{delivered:?}"
@@ -220,26 +207,14 @@ async fn it_gives_up_after_a_bounded_number_of_calls() {
 
     let lost = Some(vec![Err(Refusal::Failed("lost".to_owned()))]);
     let (peers, calls, _serving) = voters([lost.clone(), lost.clone(), lost]);
-    let delivered = proposer(peers).send(&report(), Some("v1".to_owned())).await;
+    let delivered = proposer(peers)
+        .send(&report(), None, Some("v1".to_owned()))
+        .await;
     assert!(
         matches!(delivered, Delivered::Undelivered(_)),
         "{delivered:?}"
     );
     assert_eq!(count(&calls).iter().sum::<usize>(), 2 * VOTERS.len());
-}
-
-/// A hint naming a node outside the group's voters is passed over.
-#[tokio::test]
-async fn a_hint_that_is_no_voter_is_passed_over() {
-    let accept = Some(vec![Ok(None)]);
-    let (peers, calls, _serving) = voters([accept.clone(), accept.clone(), accept]);
-
-    let delivered = proposer(peers)
-        .send(&report(), Some("elsewhere".to_owned()))
-        .await;
-
-    assert_eq!(delivered, Delivered::Accepted { appended: None });
-    assert_eq!(count(&calls), [1, 0, 0]);
 }
 
 /// RFC 0065 §6.8: the flusher stops proposing to the leader that refused
@@ -253,7 +228,9 @@ async fn not_flusher_names_the_node_that_refused() {
         Some(vec![Ok(None)]),
     ]);
 
-    let delivered = proposer(peers).send(&report(), Some("v1".to_owned())).await;
+    let delivered = proposer(peers)
+        .send(&report(), None, Some("v1".to_owned()))
+        .await;
 
     assert_eq!(
         delivered,
@@ -261,4 +238,45 @@ async fn not_flusher_names_the_node_that_refused() {
             leader: "v2".to_owned()
         }
     );
+}
+
+/// RFC 0065 §6.8: after `not_flusher` the flusher sends nothing to that
+/// node in that term, whether it is the leader named, a hint, or a voter.
+#[tokio::test]
+async fn a_node_that_refused_it_is_not_tried_again() {
+    let (peers, calls, _serving) = voters([
+        Some(vec![not_leader(Some("v2"))]),
+        Some(vec![Ok(None)]),
+        Some(vec![Ok(None)]),
+    ]);
+
+    let delivered = proposer(peers)
+        .send(&report(), Some("v2"), Some("v1".to_owned()))
+        .await;
+
+    assert_eq!(delivered, Delivered::Accepted { appended: None });
+    assert_eq!(count(&calls), [1, 0, 1], "v2 skipped as hint and as voter");
+}
+
+/// The leader the flusher's log names takes it at once; a named node that
+/// is no voter of the group is passed over for the voters in order.
+#[tokio::test]
+async fn the_named_leader_takes_it_first_unless_it_is_no_voter() {
+    for (named, reached) in [("v2", [0, 1, 0]), ("elsewhere", [1, 0, 0])] {
+        let accept = Some(vec![Ok(Some(id(21)))]);
+        let (peers, calls, _serving) = voters([accept.clone(), accept.clone(), accept]);
+
+        let delivered = proposer(peers)
+            .send(&report(), None, Some(named.to_owned()))
+            .await;
+
+        assert_eq!(
+            delivered,
+            Delivered::Accepted {
+                appended: Some(id(21))
+            },
+            "{named}"
+        );
+        assert_eq!(count(&calls), reached, "{named}");
+    }
 }

@@ -236,3 +236,17 @@ fn a_report_below_an_applied_cut_the_snapshot_lags_is_stale() {
         Ok(())
     );
 }
+
+/// Reading the log at an entry its snapshot covers gives the snapshot's
+/// state there rather than a reversed range.
+#[test]
+fn at_an_entry_the_snapshot_covers_is_the_snapshots() {
+    let log = Log::configured_at(1);
+    let held = log.held();
+    let snapshot = snapshot_at(id(2, 8));
+
+    let at = held.at(Some(&snapshot), 5);
+
+    assert_eq!(at.highest_kind, CONFIG);
+    assert!(at.configured);
+}

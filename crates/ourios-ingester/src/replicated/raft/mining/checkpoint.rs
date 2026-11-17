@@ -71,6 +71,13 @@ impl GroupMiner {
         Some(captured(miner, cut, *config, &self.blocks.state()))
     }
 
+    /// The index of the last entry applied that changed what a bundle
+    /// holds: not a checkpoint or a flusher assignment.
+    #[must_use]
+    pub fn changed_through(&self) -> Option<u64> {
+        self.changed
+    }
+
     /// The index of the last entry applied, if any.
     #[must_use]
     pub fn applied_through(&self) -> Option<u64> {

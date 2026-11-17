@@ -32,6 +32,14 @@
 #![deny(unsafe_code)]
 
 mod receiver;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the replicated start uses it once wired in (RFC 0065 server wiring, phase 4)"
+    )
+)]
+mod replicated;
 
 use std::error::Error;
 use std::io::Write;

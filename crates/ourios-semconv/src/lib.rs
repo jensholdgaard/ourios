@@ -1403,6 +1403,10 @@ pub const EVENT_OURIOS_WAL_RECOVERY_TAIL_TRUNCATED: &str = "ourios.wal.recovery.
 pub const EVENT_OURIOS_WAL_REPLICATION_CHECKPOINT_FAILED: &str =
     "ourios.wal.replication.checkpoint.failed";
 
+/// `ourios.wal.replication.layout.unchecked` log event name.
+pub const EVENT_OURIOS_WAL_REPLICATION_LAYOUT_UNCHECKED: &str =
+    "ourios.wal.replication.layout.unchecked";
+
 /// `ourios.wal.replication.publication.held` log event name.
 pub const EVENT_OURIOS_WAL_REPLICATION_PUBLICATION_HELD: &str =
     "ourios.wal.replication.publication.held";

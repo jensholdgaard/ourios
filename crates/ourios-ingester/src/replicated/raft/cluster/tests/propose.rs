@@ -243,6 +243,7 @@ async fn the_leader_keeps_the_report_it_accepts_for_the_top_up() {
 
     assert_eq!(outcome, Outcome::Accepted { appended: None });
     let kept = Reported {
+        proposer: cluster.id(3),
         mined: cut,
         unstarted: 1,
     };

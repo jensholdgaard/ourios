@@ -723,7 +723,12 @@ async fn a_report_tops_the_group_up_to_three_blocks_its_flusher_has_not_started(
         let reports = Reports::default();
         let mut steward = reporting(seated_store(5_000), &reports);
         let mined = last_entry(&cluster, leader).await;
-        reports.record(Reported { mined, unstarted });
+        let proposer = cluster.id(0);
+        reports.record(Reported {
+            proposer,
+            mined,
+            unstarted,
+        });
 
         for n in 0..u64::from(appended) {
             let topped = pass(&mut steward, &cluster, leader, &[]).await;
@@ -757,6 +762,7 @@ async fn a_report_a_checkpoint_has_passed_tops_up_nothing() {
     let before = last_entry(&cluster, leader).await;
     super::checkpoint_purging(&cluster, (leader, flusher), &[leader]).await;
     reports.record(Reported {
+        proposer: flusher,
         mined: before,
         unstarted: 0,
     });
@@ -766,7 +772,51 @@ async fn a_report_a_checkpoint_has_passed_tops_up_nothing() {
     assert_eq!(passed.id_block, None, "the report is behind the cut");
     let fresh = last_entry(&cluster, leader).await;
     reports.record(Reported {
+        proposer: flusher,
         mined: fresh,
+        unstarted: 0,
+    });
+    let passed = pass(&mut steward, &cluster, leader, &placed).await;
+    assert!(
+        matches!(passed.id_block, Some(TopUp::Appended(_))),
+        "{:?}",
+        passed.id_block
+    );
+    cluster.shutdown().await;
+}
+
+/// RFC 0065 §6.8: a report counts while its sender is the flusher in
+/// force; once another replica is named it tops up nothing until that one
+/// reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_former_flushers_report_tops_up_nothing() {
+    let cluster = Cluster::start_with_tail(3, 2, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    let (placed, tail) = placement(&cluster, 3..5);
+    let placed = strs(&placed);
+    let reports = Reports::default();
+    let mut steward = Steward::with_patience(PATIENCE)
+        .reserving(seated_store(0))
+        .with_reports(reports.clone());
+    let flusher = super::pass_until_assigned(&mut steward, &cluster, leader, &placed).await;
+    let former = tail
+        .iter()
+        .map(|&i| cluster.id(i))
+        .find(|&id| id != flusher)
+        .expect("another tail replica");
+    let mined = last_entry(&cluster, leader).await;
+    reports.record(Reported {
+        proposer: former,
+        mined,
+        unstarted: 0,
+    });
+
+    let passed = pass(&mut steward, &cluster, leader, &placed).await;
+
+    assert_eq!(passed.id_block, None, "not the flusher in force");
+    reports.record(Reported {
+        proposer: flusher,
+        mined,
         unstarted: 0,
     });
     let passed = pass(&mut steward, &cluster, leader, &placed).await;

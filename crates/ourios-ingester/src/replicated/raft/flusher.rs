@@ -452,12 +452,16 @@ impl Steward {
     /// reports again, as it does when it applies the checkpoint.
     fn short(&self, group: Group<'_>) -> Option<u64> {
         let reported = self.reports.latest()?;
+        // The log first, as `Group::controls` reads it: a snapshot is
+        // recorded before the log is purged through it.
+        let held = group.log.held_controls();
         let snapshot = group.sm.snapshot();
-        let cut = snapshot.as_ref().and_then(|s| s.meta.last_log_id);
-        if Some(reported.mined) < cut {
+        let applied = *group.sm.checkpoints().borrow();
+        let cut = applied.max(snapshot.as_ref().and_then(|s| s.meta.last_log_id));
+        let flusher = held.over(snapshot.as_ref()).flusher;
+        if Some(reported.mined) < cut || flusher.is_some_and(|f| f != reported.proposer) {
             return None;
         }
-        let held = group.log.held_controls();
         let after = held.blocks_after(snapshot.as_ref(), reported.mined.index);
         let unstarted = reported.unstarted.saturating_add(after);
         (unstarted < id_blocks::AHEAD).then(|| Ahead::of(group).latest.map_or(0, IdBlock::through))

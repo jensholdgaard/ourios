@@ -8,12 +8,14 @@ use openraft::vote::leader_id_std::CommittedLeaderId;
 #[allow(clippy::wildcard_imports)] // the parent's fixtures, as its own tests use them
 use super::*;
 use crate::replicated::raft::telemetry::tests::Reader;
-use crate::replicated::raft::types::LogId;
+use crate::replicated::raft::types::{LogId, NodeId};
 
-/// A report from a flusher that has mined nothing and holds no block.
-fn from_the_start() -> Reports {
+/// A report from `proposer`, a flusher that has mined nothing and holds
+/// no block.
+fn from_the_start(proposer: NodeId) -> Reports {
     let reports = Reports::default();
     reports.record(Reported {
+        proposer,
         mined: LogId {
             leader_id: CommittedLeaderId::new(0),
             index: 0,
@@ -23,12 +25,15 @@ fn from_the_start() -> Reports {
     reports
 }
 
+/// No flusher is named in these tests, so any sender's report counts.
 fn steward(ids: Store) -> Steward {
-    super::steward(ids).with_reports(from_the_start())
+    super::steward(ids).with_reports(from_the_start(NodeId::from(0)))
 }
 
-fn counted(reader: &Reader) -> Steward {
-    super::counted(reader).with_reports(from_the_start())
+/// A steward counting to `reader`, on a report from `flusher`, the replica
+/// its first pass names.
+fn counted_by(reader: &Reader, flusher: NodeId) -> Steward {
+    super::counted(reader).with_reports(from_the_start(flusher))
 }
 
 /// A fresh group gets one block a pass until it holds three, each above
@@ -255,7 +260,7 @@ async fn a_membership_change_in_flight_holds_back_every_new_kind() {
     let (membership, followers) = membership_change_in_flight(&cluster, leader, second).await;
 
     let reader = Reader::new();
-    let mut steward = counted(&reader).reserving(seated_store(0));
+    let mut steward = counted_by(&reader, cluster.id(order[0])).reserving(seated_store(0));
     let held = pass(&mut steward, &cluster, leader, &first).await;
     assert_eq!(
         held,
@@ -293,7 +298,7 @@ async fn every_held_kind_and_committed_assignment_is_counted() {
     let placed = strs(&placed);
     let voter = (0..3).find(|&i| i != leader).expect("a follower");
     let reader = Reader::new();
-    let mut steward = counted(&reader).reserving(seated_store(0));
+    let mut steward = counted_by(&reader, cluster.id(order[0])).reserving(seated_store(0));
     let holds = semconv::OURIOS_WAL_REPLICATION_CONTROL_HOLDS;
     let assignments = semconv::OURIOS_WAL_REPLICATION_FLUSHER_ASSIGNMENTS;
 

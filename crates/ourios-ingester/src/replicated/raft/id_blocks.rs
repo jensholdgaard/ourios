@@ -19,7 +19,7 @@ use ourios_wal::Control;
 
 use super::learners::Group;
 use super::snapshot_record::IdBlock;
-use super::types::LogId;
+use super::types::{LogId, NodeId};
 use crate::template_ids::{self, TemplateIdsError, names};
 
 /// The blocks the leader keeps ahead of the group's miner: "the target
@@ -90,6 +90,8 @@ impl Ahead {
 /// started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reported {
+    /// The flusher that sent it.
+    pub proposer: NodeId,
     pub mined: LogId,
     pub unstarted: u32,
 }
@@ -100,9 +102,16 @@ pub struct Reported {
 pub struct Reports(Arc<Mutex<Option<Reported>>>);
 
 impl Reports {
-    /// Keep `reported` as the latest.
+    /// Keep `reported`, unless it is behind the one its flusher already
+    /// sent: a delayed report never replaces a further one, while a retry
+    /// at the same frontier and another flusher's report do.
     pub fn record(&self, reported: Reported) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(reported);
+        let mut latest = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let behind = latest
+            .is_some_and(|kept| kept.proposer == reported.proposer && kept.mined > reported.mined);
+        if !behind {
+            *latest = Some(reported);
+        }
     }
 
     /// The latest report accepted, if any.
@@ -211,6 +220,33 @@ mod tests {
 
     fn block(after: u64, through: u64) -> Option<IdBlock> {
         IdBlock::new(after, through)
+    }
+
+    fn reported(proposer: u64, index: u64, unstarted: u32) -> Reported {
+        use openraft::vote::leader_id_std::CommittedLeaderId;
+        Reported {
+            proposer: NodeId::from(proposer),
+            mined: LogId {
+                leader_id: CommittedLeaderId::new(2),
+                index,
+            },
+            unstarted,
+        }
+    }
+
+    /// RFC 0065 §6.8: within one flusher, the furthest report counts, and a
+    /// retry at its frontier replaces it; a delayed one behind it does
+    /// not. Another flusher's report replaces it whatever its frontier.
+    #[test]
+    fn reports_keep_the_furthest_frontier_of_their_flusher() {
+        let reports = Reports::default();
+        reports.record(reported(7, 10, 0));
+        reports.record(reported(7, 8, 3));
+        assert_eq!(reports.latest(), Some(reported(7, 10, 0)), "a delayed one");
+        reports.record(reported(7, 10, 1));
+        assert_eq!(reports.latest(), Some(reported(7, 10, 1)), "a retry");
+        reports.record(reported(8, 5, 2));
+        assert_eq!(reports.latest(), Some(reported(8, 5, 2)), "another flusher");
     }
 
     #[test]

@@ -116,12 +116,21 @@ impl Hosted {
             return Err(Refusal::NotFlusher);
         }
         self.fresh(&report).map_err(Refusal::Stale)?;
+        let appended = self.append(&report).await?;
+        // Only an accepted request counts toward the top-up.
         if let Some(mined) = report.mined {
             self.reports.record(Reported {
+                proposer: report.proposer,
                 mined,
                 unstarted: report.unstarted,
             });
         }
+        Ok(appended)
+    }
+
+    /// Append `report`'s checkpoint, if it carries one; its committed log
+    /// id.
+    async fn append(&self, report: &Report) -> Result<Option<LogId>, Refusal> {
         let Some(ProposedCheckpoint { cut, highest_kind }) = report.checkpoint else {
             return Ok(None);
         };

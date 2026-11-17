@@ -1407,5 +1407,8 @@ pub const EVENT_OURIOS_WAL_REPLICATION_CHECKPOINT_FAILED: &str =
 pub const EVENT_OURIOS_WAL_REPLICATION_PUBLICATION_HELD: &str =
     "ourios.wal.replication.publication.held";
 
+/// `ourios.wal.replication.restore.held` log event name.
+pub const EVENT_OURIOS_WAL_REPLICATION_RESTORE_HELD: &str = "ourios.wal.replication.restore.held";
+
 /// `ourios.wal.replication.stopped` log event name.
 pub const EVENT_OURIOS_WAL_REPLICATION_STOPPED: &str = "ourios.wal.replication.stopped";

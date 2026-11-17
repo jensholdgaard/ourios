@@ -144,7 +144,7 @@ async fn an_undecodable_batch_stops_the_miner_and_its_replica_applies_on() {
 
 /// One single-line batch per corpus line in `range`, as the leader
 /// would time them.
-fn single_lines(range: std::ops::Range<usize>) -> Vec<GroupEntry> {
+pub(super) fn single_lines(range: std::ops::Range<usize>) -> Vec<GroupEntry> {
     let lines = corpus();
     range
         .map(|n| {

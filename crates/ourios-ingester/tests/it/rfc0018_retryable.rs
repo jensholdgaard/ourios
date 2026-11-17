@@ -106,7 +106,7 @@ async fn rfc0018_3_http_503_carries_a_status_naming_the_failure() {
         ("application/json", json),
     ] {
         let (status, body) = send(
-            router(failing_sync_pipeline().into(), &HttpConfig::default()),
+            router(Arc::new(failing_sync_pipeline()), &HttpConfig::default()),
             post_request("/v1/logs", Some(content_type), None, payload),
         )
         .await;
@@ -126,7 +126,7 @@ async fn rfc0018_3_http_503_carries_a_status_naming_the_failure() {
 async fn rfc0018_3_http_transient_is_503_permanent_is_400() {
     // Transient fsync failure → 503 (retryable), not 500.
     let (status, _) = send(
-        router(failing_sync_pipeline().into(), &HttpConfig::default()),
+        router(Arc::new(failing_sync_pipeline()), &HttpConfig::default()),
         post_request(
             "/v1/logs",
             Some(PROTOBUF),
@@ -144,7 +144,7 @@ async fn rfc0018_3_http_transient_is_503_permanent_is_400() {
     // Transient append I/O failure → 503 (retryable) too.
     let (status, _) = send(
         router(
-            failing_append_pipeline_transient().into(),
+            Arc::new(failing_append_pipeline_transient()),
             &HttpConfig::default(),
         ),
         post_request(
@@ -164,7 +164,7 @@ async fn rfc0018_3_http_transient_is_503_permanent_is_400() {
     // Permanent oversize payload (AppendError::TooLarge) → 413, never the
     // retryable 503: retrying the same oversized body can't succeed.
     let (status, _) = send(
-        router(oversize_append_pipeline().into(), &HttpConfig::default()),
+        router(Arc::new(oversize_append_pipeline()), &HttpConfig::default()),
         post_request(
             "/v1/logs",
             Some(PROTOBUF),

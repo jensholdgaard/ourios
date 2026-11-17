@@ -55,7 +55,8 @@ async fn a_follower_crashed_mid_append_keeps_every_entry_it_acknowledged() {
         // writes, so the follower's match is past it rather than only
         // past the leader's setup entry.
         let first = ingest.ingest(export("first")).await.expect("committed");
-        acknowledged_through(&cluster, (leader, follower), committed(first).seq).await;
+        let confirmed = committed(first).seq;
+        acknowledged_through(&cluster, (leader, follower), confirmed).await;
         let writing = Arc::new(AtomicBool::new(true));
         let still = Arc::clone(&writing);
         let writes = tokio::spawn(async move {
@@ -74,7 +75,9 @@ async fn a_follower_crashed_mid_append_keeps_every_entry_it_acknowledged() {
         for &other in &others {
             cluster.cut(follower, other);
         }
-        let acknowledged = matched(&cluster, leader, follower);
+        // The confirmed export bounds it below, should the leader have lost
+        // its replication metrics by stepping down meanwhile.
+        let acknowledged = matched(&cluster, leader, follower).max(Some(confirmed));
         cluster.crash(follower).await;
         cluster.restart(follower).await;
         let held = cluster

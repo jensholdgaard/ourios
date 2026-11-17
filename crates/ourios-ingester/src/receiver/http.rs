@@ -54,7 +54,8 @@ use prost::Message;
 use opentelemetry::context::FutureExt as _;
 
 use crate::receiver::decode::{decode_json, decode_protobuf};
-use crate::receiver::pipeline::{Export, IngestFailure, ReceiveError, SharedPipeline};
+use crate::receiver::ingest::SharedIngest;
+use crate::receiver::pipeline::{Export, IngestFailure, ReceiveError};
 use crate::receiver::selector;
 use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
 use ourios_serving::propagation::extract_context;
@@ -94,14 +95,14 @@ impl Default for HttpConfig {
 /// runs in [`AuthLayer`], before the handler.
 #[derive(Clone)]
 struct AppState {
-    pipeline: SharedPipeline,
+    pipeline: SharedIngest,
     max_decompressed_bytes: usize,
     /// RFC 0061 §3.5 — every `413` counts as `request_too_large`.
     metrics: Arc<crate::metrics::IngestMetrics>,
 }
 
 /// Build the OTLP/HTTP router over `pipeline`.
-pub fn router(pipeline: SharedPipeline, config: &HttpConfig) -> Router {
+pub fn router(pipeline: SharedIngest, config: &HttpConfig) -> Router {
     let state = AppState {
         pipeline,
         max_decompressed_bytes: config.max_body_bytes,
@@ -287,6 +288,12 @@ async fn logs_response(
     // credential, absence is open mode. (Arc: cloning the extension is
     // a refcount bump, not a tenant-set deep-clone.)
     let binding = binding.map(|axum::Extension(b)| b);
+    // RFC 0065 §6.8: a replicated node forwards an export it does not lead
+    // with the client's credential, which the leader authenticates.
+    let credential = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     // RFC 0046 §3.1: the tenant selector is required, exactly once, and
     // decided before authorization against the set, before decode, before
     // any WAL work — a missing/malformed selector is a 400 with the reason.
@@ -332,7 +339,9 @@ async fn logs_response(
                 binding: binding.as_deref(),
                 lenient_json,
             };
-            pipeline.ingest_reported(export, as_5xx).await
+            pipeline
+                .ingest_reported(export, credential.as_deref(), as_5xx)
+                .await
         }
         .with_context(parent),
     )

@@ -55,11 +55,18 @@ impl Proposer {
     }
 
     /// Send `report` to the group's leader, trying `leader`, the one its
-    /// log names, first. At most twice as many calls as the group has
+    /// log names, first, and never `refused`, the node that refused this
+    /// flusher as `not_flusher` in this term. At most twice as many calls as the group has
     /// voters, so uncertain answers cannot keep it sending.
-    pub async fn send(&self, report: &Report, leader: Option<String>) -> Delivered {
+    pub async fn send(
+        &self,
+        report: &Report,
+        refused: Option<&str>,
+        leader: Option<String>,
+    ) -> Delivered {
         let request = report.request(self.group);
-        let mut tried: Vec<String> = Vec::new();
+        // The node that refused this flusher in this term is never tried.
+        let mut tried: Vec<String> = refused.map(str::to_owned).into_iter().collect();
         let mut named = leader;
         let mut last = String::from("no voter to send to");
         for _ in 0..2 * self.voters.len() {

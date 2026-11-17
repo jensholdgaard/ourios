@@ -138,7 +138,9 @@ impl Target {
         (kept, flushing): (&Mutex<Kept>, &Mutex<Flushing>),
         written: Option<u64>,
     ) -> Option<Cut> {
-        let through = miner.applied_through()?;
+        // A checkpoint entry moves the miner on but changes nothing a
+        // bundle holds: an idle group cuts nothing new.
+        let through = miner.changed_through()?;
         if written.is_some_and(|written| through <= written) {
             return None;
         }

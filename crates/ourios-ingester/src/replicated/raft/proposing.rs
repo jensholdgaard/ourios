@@ -18,7 +18,7 @@ use super::mining::Captured;
 use super::proposer::{Delivered, Proposer};
 use super::state_machine::GroupSm;
 use super::transport::propose::{ProposedCheckpoint, Report};
-use super::types::{LogId, NodeId};
+use super::types::NodeId;
 
 /// How one group's flusher proposes.
 #[derive(Clone)]
@@ -45,11 +45,14 @@ impl Proposing {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if leader.is_some() && refused == leader.clone().map(|l| (l, term)) {
-            return None;
-        }
-        let report = self.report(captured);
-        let delivered = self.proposer.send(&report, leader).await;
+        let refused = refused
+            .filter(|(_, refused_in)| *refused_in == term)
+            .map(|(node, _)| node);
+        let report = self.report(captured)?;
+        let delivered = self
+            .proposer
+            .send(&report, refused.as_deref(), leader)
+            .await;
         match &delivered {
             Delivered::NotFlusher { leader } => {
                 *self.refused.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -70,31 +73,29 @@ impl Proposing {
     }
 
     /// The checkpoint's proposal: its cut, the log's highest kind there,
-    /// and the blocks its allocator had not started.
-    fn report(&self, captured: &Captured) -> Report {
+    /// and the blocks its allocator had not started; `None` once a later
+    /// checkpoint, another flusher's, has passed the cut, which every
+    /// replica would ignore.
+    fn report(&self, captured: &Captured) -> Option<Report> {
         let cut = captured.bundle.cut();
         let cut = raft_id(RaftLogId {
             term: cut.term,
             index: cut.seq,
         });
-        let unstarted = u32::try_from(captured.bundle.ids().pending().len()).unwrap_or(u32::MAX);
-        Report {
-            proposer: self.replica,
-            mined: Some(cut),
-            unstarted,
-            checkpoint: Some(ProposedCheckpoint {
-                cut,
-                highest_kind: self.highest_kind_at(cut),
-            }),
-        }
-    }
-
-    /// The highest control kind the log holds through `cut`.
-    fn highest_kind_at(&self, cut: LogId) -> u8 {
         // The log first, as `Group::controls` reads it.
         let held = self.log.held_controls();
         let snapshot = self.sm.snapshot();
-        held.at(snapshot.as_ref(), cut.index).highest_kind
+        if snapshot.as_ref().and_then(|s| s.meta.last_log_id) >= Some(cut) {
+            return None;
+        }
+        let highest_kind = held.at(snapshot.as_ref(), cut.index).highest_kind;
+        let unstarted = u32::try_from(captured.bundle.ids().pending().len()).unwrap_or(u32::MAX);
+        Some(Report {
+            proposer: self.replica,
+            mined: Some(cut),
+            unstarted,
+            checkpoint: Some(ProposedCheckpoint { cut, highest_kind }),
+        })
     }
 
     /// The leader's `node_id` this replica knows of, if any, and its term;

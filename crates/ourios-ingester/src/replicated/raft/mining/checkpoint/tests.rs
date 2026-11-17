@@ -178,3 +178,34 @@ fn each_snapshot_is_its_tenants_state_marked_with_the_cut() {
     expected.wal_high_water = Some(WalHighWater::Replicated(LogMark { log: LOG, seq: 3 }));
     assert_eq!(load_snapshot(&snapshots[0]).expect("decodes"), expected);
 }
+
+/// A checkpoint or a flusher assignment changes nothing a bundle holds, so
+/// an idle group's checkpoint entries never call for another checkpoint.
+#[test]
+fn checkpoint_and_flusher_entries_change_nothing_a_bundle_holds() {
+    use openraft::vote::leader_id_std::CommittedLeaderId;
+
+    use crate::replicated::raft::state_machine::{Applied, AppliedEvent};
+    use crate::replicated::raft::types::{LogId, NodeId};
+
+    let entries = vec![configured(0.7), block(0, 100), batch("acme", &["a b"])];
+    let mut miner = applied(&entries);
+    let at = |index| LogId {
+        leader_id: CommittedLeaderId::new(TERM),
+        index,
+    };
+    for (index, event) in [
+        (4, AppliedEvent::Checkpoint(at(3))),
+        (5, AppliedEvent::Flusher(NodeId::from(9))),
+    ] {
+        miner
+            .apply(Applied {
+                at: at(index),
+                event,
+            })
+            .expect("followed");
+    }
+
+    assert_eq!(miner.applied_through(), Some(5));
+    assert_eq!(miner.changed_through(), Some(3));
+}

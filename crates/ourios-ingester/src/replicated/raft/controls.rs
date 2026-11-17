@@ -94,7 +94,11 @@ impl HeldControls {
     /// snapshot.
     pub(super) fn at(&self, snapshot: Option<&GroupSnapshot>, index: u64) -> AtEntry {
         let from = first_after(snapshot);
-        let through = || self.controls.range(from..=index).map(|(_, c)| *c);
+        // An entry the snapshot covers reads as the snapshot's state.
+        let through = || {
+            let range = (from <= index).then(|| self.controls.range(from..=index));
+            range.into_iter().flatten().map(|(_, c)| *c)
+        };
         let snapshot_kind = snapshot.map_or(0, |s| s.state.highest_kind);
         AtEntry {
             highest_kind: through()

@@ -242,11 +242,10 @@ async fn the_named_flusher_checkpoints_its_group() {
     cluster.shutdown().await;
 }
 
-/// RFC 0065 §6.5, §6.8 on a running group: once the named flusher has
-/// written a checkpoint, it proposes the checkpoint entry to the leader,
-/// and every replica applies it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_named_flushers_checkpoint_applies_on_every_replica() {
+/// A running group whose nodes all serve proposals, its named flusher
+/// node 3 having mined thirty rows; its stores, and the log id of its last
+/// mined entry.
+async fn checkpointing_group() -> (Cluster, [Store; 2], u64) {
     let stores = [formed_store(), formed_store()];
     let shape = Shape {
         publishing: stores
@@ -281,21 +280,61 @@ async fn the_named_flushers_checkpoint_applies_on_every_replica() {
         .map(|position| position.seq)
         .max()
         .expect("mined rows");
+    (cluster, stores, last)
+}
 
-    let cut = checkpointed_through(&stores[0], last).await;
+/// The `bundle.bin` keys `store` holds for [`LOG`].
+fn bundles(store: &Store) -> Vec<String> {
+    let keys = store
+        .list_blocking(Some(&format!("wal/replicated/logs/{LOG}/checkpoints/")))
+        .expect("list");
+    keys.into_iter()
+        .filter(|key| key.ends_with("bundle.bin"))
+        .collect()
+}
 
+/// Every node applies a checkpoint at or past `seq`; fails after 20 s.
+async fn applied_everywhere(cluster: &Cluster, seq: u64) {
     for i in 0..5 {
         let sm = cluster.node(i).host.state_machine(GROUP).expect("hosted");
         let mut cuts = sm.checkpoints();
         let applied = tokio::time::timeout(
             Duration::from_secs(20),
-            cuts.wait_for(|applied| applied.is_some_and(|c| c.index >= cut.seq)),
+            cuts.wait_for(|applied| applied.is_some_and(|c| c.index >= seq)),
         )
         .await;
-        assert!(
-            matches!(applied, Ok(Ok(_))),
-            "node {i} never applied {cut:?}"
-        );
+        assert!(matches!(applied, Ok(Ok(_))), "node {i} never applied {seq}");
     }
+}
+
+/// RFC 0065 §6.5, §6.8 on a running group: once the named flusher has
+/// written a checkpoint, it proposes the checkpoint entry to the leader,
+/// and every replica applies it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_named_flushers_checkpoint_applies_on_every_replica() {
+    let (cluster, stores, last) = checkpointing_group().await;
+
+    let cut = checkpointed_through(&stores[0], last).await;
+
+    applied_everywhere(&cluster, cut.seq).await;
+    cluster.shutdown().await;
+}
+
+/// A group that takes nothing after its checkpoint applies writes no
+/// further one: the checkpoint entry itself changes nothing a bundle
+/// holds, so barrier after barrier cuts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_group_writes_no_further_checkpoint() {
+    let (cluster, stores, last) = checkpointing_group().await;
+    let cut = checkpointed_through(&stores[0], last).await;
+    applied_everywhere(&cluster, cut.seq).await;
+
+    let before = bundles(&stores[0]);
+
+    // Three barrier intervals, at the one-second floor.
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+
+    assert_eq!(pointer(&stores[0]), Some(cut), "checkpoint.json unchanged");
+    assert_eq!(bundles(&stores[0]), before, "no further bundle");
     cluster.shutdown().await;
 }

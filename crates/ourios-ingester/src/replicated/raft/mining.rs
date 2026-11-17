@@ -330,6 +330,8 @@ pub struct GroupMiner {
     audit: SharedAuditSink,
     clock: BatchClock,
     last: Option<LogId>,
+    /// The index of the last entry that changed what a bundle holds.
+    changed: Option<u64>,
 }
 
 impl GroupMiner {
@@ -344,6 +346,7 @@ impl GroupMiner {
             audit: SharedAuditSink::new(),
             clock: BatchClock::default(),
             last: None,
+            changed: None,
         }
     }
 
@@ -445,6 +448,12 @@ impl GroupMiner {
                 return Err(GroupMinerError::OutOfOrder { at, last });
             }
             _ => self.last = Some(at),
+        }
+        if !matches!(
+            event,
+            AppliedEvent::Flusher(_) | AppliedEvent::Checkpoint(_)
+        ) {
+            self.changed = Some(at.index);
         }
         match event {
             AppliedEvent::Batch(batch) => self.batch(at, &batch),

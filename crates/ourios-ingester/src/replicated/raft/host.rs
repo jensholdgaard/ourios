@@ -27,6 +27,7 @@ use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
 use super::mining::{GroupMiner, GroupMinerError, Mined, SharedLog};
 use super::proposer::Proposer;
 use super::proposing::Proposing;
+use super::reporting::Reporting;
 use super::state_machine::{Applied, AppliedEvent, GroupSm};
 use super::telemetry::{KeptDrops, Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
@@ -175,6 +176,7 @@ impl Launch<'_> {
                 sm: sm.clone(),
                 refused: Arc::default(),
             };
+            let reporting = Reporting::new(proposing.clone());
             let checkpointer = Checkpointer::new(
                 group,
                 publishing.barrier(),
@@ -184,10 +186,11 @@ impl Launch<'_> {
             .proposing(proposing);
             let flushing =
                 Flushing::new(self.spec.id, group, source, log).with_replays(self.meters.replays());
-            Some((flushing, publishing.sweep(), checkpointer))
+            Some((flushing, publishing.sweep(), (checkpointer, reporting)))
         });
         let sweep = flushing.as_ref().map(|(f, every, _)| (f.current(), *every));
-        let (flushing, checkpointer) = flushing.map(|(f, _, c)| (f, c)).unzip();
+        let (flushing, flusher) = flushing.map(|(f, _, c)| (f, c)).unzip();
+        let (checkpointer, reporting) = flusher.unzip();
         Follow {
             group,
             mined,
@@ -200,6 +203,7 @@ impl Launch<'_> {
             sweep,
             storage: self.meters.storage(),
             checkpointer,
+            reporting,
         }
     }
 
@@ -349,6 +353,23 @@ async fn next(
     }
 }
 
+/// What the miner's task does next.
+enum Work {
+    Event(Applied),
+    /// The checkpoint barrier's tick.
+    Barrier,
+    /// The report tick, which forces a report, so one goes out at least
+    /// every patience; reports are checked after every piece of work.
+    Report,
+}
+
+/// A tick every `every`, delayed rather than bunched after a slow step.
+fn interval(every: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(every);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval
+}
+
 /// Resolves at `barrier`'s next tick, never without one.
 async fn ticked(barrier: &mut Option<tokio::time::Interval>) {
     match barrier {
@@ -377,6 +398,9 @@ struct Follow {
     /// The group's checkpoint cadence, when it can be published from this
     /// replica.
     checkpointer: Option<Checkpointer>,
+    /// The flusher's reports to its leader, when it can be published from
+    /// this replica.
+    reporting: Option<Reporting>,
 }
 
 /// What a tail replica's settings say of its groups' output.
@@ -488,28 +512,46 @@ impl Follow {
         mut stop: watch::Receiver<bool>,
     ) {
         let mut checkpointer = self.checkpointer.take();
-        let mut barrier = checkpointer.as_ref().map(|c| {
-            let mut barrier = tokio::time::interval(c.every());
-            barrier.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            barrier
-        });
+        let mut reporting = self.reporting.take();
+        let mut barrier = checkpointer.as_ref().map(|c| interval(c.every()));
+        let mut reports = reporting.as_ref().map(|_| interval(Reporting::every()));
         loop {
             // Unbiased, so a queue that is never empty does not starve the
-            // barrier; `next` still puts a stop before another event.
+            // ticks; `next` still puts a stop before another event.
             let work = tokio::select! {
-                event = next(&mut applied, &mut stop) => event.map(Some),
-                () = ticked(&mut barrier) => Some(None),
+                event = next(&mut applied, &mut stop) => event.map(Work::Event),
+                () = ticked(&mut barrier) => Some(Work::Barrier),
+                () = ticked(&mut reports) => Some(Work::Report),
             };
-            let back = match (work, checkpointer.as_mut()) {
-                (None, _) => None,
-                (Some(Some(event)), _) => self.follow(miner, event, &mut stop).await,
-                (Some(None), Some(checkpointer)) => self.checkpoint(checkpointer, miner).await,
-                (Some(None), None) => Some(miner),
+            let Some(work) = work else {
+                return;
             };
-            let Some(back) = back else {
+            let forced = matches!(work, Work::Report);
+            let Some(back) = self
+                .work(work, miner, (checkpointer.as_mut(), &mut stop))
+                .await
+            else {
                 return;
             };
             miner = back;
+            if let Some(reporting) = reporting.as_mut() {
+                reporting.maybe(&miner, forced);
+            }
+        }
+    }
+
+    /// Do one piece of `work` with `miner`; `None` once the miner has
+    /// stopped or the host says to.
+    async fn work(
+        &self,
+        work: Work,
+        miner: GroupMiner,
+        (checkpointer, stop): (Option<&mut Checkpointer>, &mut watch::Receiver<bool>),
+    ) -> Option<GroupMiner> {
+        match (work, checkpointer) {
+            (Work::Event(event), _) => self.follow(miner, event, stop).await,
+            (Work::Barrier, Some(checkpointer)) => self.checkpoint(checkpointer, miner).await,
+            (Work::Barrier | Work::Report, _) => Some(miner),
         }
     }
 
@@ -931,6 +973,7 @@ mod tests {
             sweep: None,
             storage: Storage::global(),
             checkpointer: None,
+            reporting: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         let GroupEntry::Batch(batch) = batch_at(time(1), "acme", &["a b c"]) else {
@@ -1088,6 +1131,7 @@ mod tests {
             sweep: None,
             storage: Storage::global(),
             checkpointer: None,
+            reporting: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         Following {

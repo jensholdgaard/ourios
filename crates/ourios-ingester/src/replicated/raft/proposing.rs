@@ -36,10 +36,24 @@ pub(super) struct Proposing {
 }
 
 impl Proposing {
-    /// Propose `captured`'s checkpoint, unless the leader in force refused
-    /// this flusher in this term; what came of it.
+    /// Propose `captured`'s checkpoint; what came of it, `None` before its
+    /// raft runs or once a later checkpoint has passed the cut.
     pub(super) async fn propose(&self, captured: &Captured) -> Option<Delivered> {
-        let (leader, term) = self.leader()?;
+        let leader = self.leader()?;
+        let report = self.report(captured)?;
+        Some(self.send(&report, leader).await)
+    }
+
+    /// Send the flusher's report, `report`, with no entry (§6.8); what came
+    /// of it, `None` before its raft runs.
+    pub(super) async fn report_only(&self, report: &Report) -> Option<Delivered> {
+        let leader = self.leader()?;
+        Some(self.send(report, leader).await)
+    }
+
+    /// Send `report` to `leader`, in `term`, never to the node that refused
+    /// this flusher as `not_flusher` in it.
+    async fn send(&self, report: &Report, (leader, term): (Option<String>, u64)) -> Delivered {
         let refused = self
             .refused
             .lock()
@@ -48,11 +62,7 @@ impl Proposing {
         let refused = refused
             .filter(|(_, refused_in)| *refused_in == term)
             .map(|(node, _)| node);
-        let report = self.report(captured)?;
-        let delivered = self
-            .proposer
-            .send(&report, refused.as_deref(), leader)
-            .await;
+        let delivered = self.proposer.send(report, refused.as_deref(), leader).await;
         match &delivered {
             Delivered::NotFlusher { leader } => {
                 *self.refused.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -64,12 +74,34 @@ impl Proposing {
                     { semconv::OURIOS_WAL_GROUP } = i64::from(self.group),
                     { crate::metrics::ERROR_TYPE } = "_OTHER",
                 },
-                "the leader of group {} refused the flusher's checkpoint as malformed: {why}",
+                "the leader of group {} refused the flusher's proposal as malformed: {why}",
                 self.group,
             ),
             Delivered::Accepted { .. } | Delivered::Stale(_) | Delivered::Undelivered(_) => {}
         }
-        Some(delivered)
+        delivered
+    }
+
+    /// This replica.
+    pub(super) fn replica(&self) -> NodeId {
+        self.replica
+    }
+
+    /// Whether this replica's state machine names it the flusher.
+    pub(super) fn named(&self) -> bool {
+        self.sm.flusher() == Some(self.replica)
+    }
+
+    /// The cut of the last checkpoint this replica applied.
+    pub(super) fn applied_cut(&self) -> Option<super::types::LogId> {
+        *self.sm.checkpoints().borrow()
+    }
+
+    /// The leader this replica knows of and the term, as ids, for noticing
+    /// a change.
+    pub(super) fn leadership(&self) -> Option<(Option<NodeId>, u64)> {
+        let metrics = self.raft.get()?.metrics().borrow_watched().clone();
+        Some((metrics.current_leader, metrics.current_term))
     }
 
     /// The checkpoint's proposal: its cut, the log's highest kind there,

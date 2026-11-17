@@ -179,6 +179,14 @@ impl LogBlocks {
         self.blocks().current
     }
 
+    /// Hold `current` as the block drawn last and `pending` as those not
+    /// yet drawn, as a bundle records them.
+    fn seat(&self, current: Option<IdBlock>, pending: &[IdBlock]) {
+        let mut blocks = self.blocks();
+        blocks.current = current;
+        blocks.queue = pending.iter().copied().collect();
+    }
+
     /// The block drawn last and those not yet drawn, in log order.
     fn state(&self) -> (Option<IdBlock>, Vec<IdBlock>) {
         let blocks = self.blocks();
@@ -356,6 +364,15 @@ impl GroupMiner {
         }
     }
 
+    /// A cluster under `config`, emitting its audit events to this miner
+    /// at the batch's time and drawing ids from the group's blocks.
+    fn cluster_under(&self, config: GroupMinerConfig) -> MinerCluster {
+        let audit = Box::new(self.audit.clone());
+        MinerCluster::with_audit_sink(config.config(), audit)
+            .with_clock(Box::new(self.clock.clone()))
+            .with_id_reserver(Box::new(self.blocks.clone()))
+    }
+
     /// The id blocks applied and not yet drawn.
     #[must_use]
     pub fn blocks(&self) -> &LogBlocks {
@@ -528,13 +545,7 @@ impl GroupMiner {
             }
             Stage::Unconfigured { first } => {
                 let held = first.map(|next| Held { next, at });
-                let audit = Box::new(self.audit.clone());
-                let reserver = Box::new(self.blocks.clone());
-                let miner = Box::new(
-                    MinerCluster::with_audit_sink(config.config(), audit)
-                        .with_clock(Box::new(self.clock.clone()))
-                        .with_id_reserver(reserver),
-                );
+                let miner = Box::new(self.cluster_under(config));
                 self.stage = Stage::Mining {
                     miner,
                     held,
@@ -548,8 +559,10 @@ impl GroupMiner {
 }
 
 mod checkpoint;
+mod restore;
 
 pub use checkpoint::{CaptureError, Captured};
+pub use restore::RestoreError;
 
 #[cfg(test)]
 pub(super) mod tests;

@@ -25,6 +25,7 @@ async fn traced(
         .build();
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
+    crate::global_subscriber();
     let outcome = ingest
         .ingest(export(line))
         .with_subscriber(subscriber)

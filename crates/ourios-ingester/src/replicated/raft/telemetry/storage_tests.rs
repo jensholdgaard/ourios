@@ -93,6 +93,7 @@ fn events(run: impl FnOnce()) -> Vec<(String, Vec<String>)> {
         }
     }
 
+    crate::global_subscriber();
     let captured = Captured::default();
     let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&captured)));
     tracing::subscriber::with_default(subscriber, run);

@@ -41,6 +41,14 @@ impl Counts {
     fn open(&self) -> usize {
         Self::get(&self.accepted) - Self::get(&self.closed_by_client)
     }
+
+    /// Whether every accepted connection has an outcome recorded.
+    fn all_ended(&self) -> bool {
+        let ended = Self::get(&self.closed_by_client)
+            + Self::get(&self.held_by_client)
+            + Self::get(&self.reused_after_close);
+        ended >= Self::get(&self.accepted)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -92,8 +100,10 @@ fn wait_for_accepted(counts: &Counts, target: usize) {
 
 /// Close our side of an idle connection and record what the client does.
 fn close_idle(stream: &TcpStream, reader: &mut BufReader<&TcpStream>, counts: &Counts) {
-    let _ = stream.shutdown(Shutdown::Write);
+    // Before the shutdown: once both directions are shut, which a prompt
+    // client close completes, macOS refuses `SO_RCVTIMEO` with `EINVAL`.
     stream.set_read_timeout(Some(LINGER)).expect("timeout");
+    let _ = stream.shutdown(Shutdown::Write);
     let outcome = match reader.read(&mut [0; 64]) {
         Ok(0) => &counts.closed_by_client,
         Ok(_) => &counts.reused_after_close,
@@ -157,9 +167,13 @@ fn fake_store(behaviour: Behaviour) -> (Store, Arc<Counts>) {
 
 const IDLE: Duration = Duration::from_millis(100);
 
-/// Let every idle close run its course, including the linger.
-fn settle() {
-    std::thread::sleep(IDLE * 3 + LINGER);
+/// Let every idle close run its course, including the linger: wait until
+/// each connection has an outcome, which a held one has after `LINGER`.
+fn settle(counts: &Counts) {
+    let deadline = Instant::now() + IDLE + LINGER + Duration::from_secs(10);
+    while !counts.all_ended() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn assert_every_close_observed(counts: &Counts) {
@@ -199,7 +213,7 @@ fn an_idle_caller_runtime_strands_no_connection() {
             .expect("raw get");
         std::thread::sleep(IDLE * 3);
     }
-    settle();
+    settle(&counts);
 
     assert_every_close_observed(&counts);
 }
@@ -215,7 +229,7 @@ fn bridged_calls_strand_no_connection() {
         store.get_blocking("k").expect("get");
         std::thread::sleep(IDLE * 3);
     }
-    settle();
+    settle(&counts);
 
     assert_every_close_observed(&counts);
 }

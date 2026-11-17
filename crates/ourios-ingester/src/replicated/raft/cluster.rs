@@ -113,6 +113,22 @@ pub(crate) fn bind() -> (TcpIncoming, SocketAddr) {
     (incoming, addr)
 }
 
+/// Bind `addr` again for a node coming back on it. Another process on the
+/// host can hold the port for a moment in between, so a refused bind is
+/// retried for a while.
+pub(crate) async fn rebind(addr: SocketAddr) -> TcpIncoming {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpIncoming::bind(addr) {
+            Ok(incoming) => return incoming,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("rebind {addr}: {e}"),
+        }
+    }
+}
+
 pub(crate) type Serving = (oneshot::Sender<()>, JoinHandle<()>);
 
 /// Serve `server` on `incoming` until the returned sender fires or drops.
@@ -594,7 +610,7 @@ impl Cluster {
         let Slot::Down(replica) = self.slots.remove(i) else {
             panic!("node {i} is up");
         };
-        let incoming = TcpIncoming::bind(self.addrs[i]).expect("rebind");
+        let incoming = rebind(self.addrs[i]).await;
         let server = ReplicationServer::default();
         let node = Node::open(replica, incoming, &self.peers, server).await;
         self.slots.insert(i, Slot::Up(node));
@@ -617,6 +633,29 @@ impl Cluster {
                 None => panic!("no leader of group {group}"),
             }
         }
+    }
+
+    /// Wait until node `follower` follows `leader` in group 0 and holds its
+    /// node. A commit needs one follower's ack, not this one's, so it may
+    /// not yet have heard from the leader it is to name; the name comes
+    /// from its membership, which a heartbeat can precede.
+    pub(crate) async fn follows(&self, follower: usize, leader: usize) {
+        let leader_id = self.id(leader);
+        self.node(follower)
+            .raft(0)
+            .wait(WAIT)
+            .metrics(
+                |m| {
+                    m.current_leader == Some(leader_id)
+                        && m.membership_config
+                            .membership()
+                            .get_node(&leader_id)
+                            .is_some()
+                },
+                "the follower follows the leader and holds its node",
+            )
+            .await
+            .expect("following");
     }
 
     pub(crate) async fn shutdown(mut self) {

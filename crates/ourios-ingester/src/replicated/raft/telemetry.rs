@@ -701,6 +701,6 @@ fn lags(metrics: &RaftMetrics<RaftTypes>) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod state_machine_tests;
 #[cfg(test)]
-pub(in crate::replicated::raft) mod storage_tests;
+pub(in crate::replicated) mod storage_tests;
 #[cfg(test)]
 pub(crate) mod tests;

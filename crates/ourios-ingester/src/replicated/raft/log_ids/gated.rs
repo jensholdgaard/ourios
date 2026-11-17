@@ -57,7 +57,7 @@ pub(in crate::replicated::raft) enum Point {
 
 /// One call on the lock, the object or `data` that fails, once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Fault {
+pub(in crate::replicated) enum Fault {
     /// The first create of the lock commits, and its caller sees an error.
     LoseCreateReply,
     /// The first create of the high-water object commits, and its caller
@@ -70,6 +70,8 @@ pub(super) enum Fault {
     FailSwapDeletingObject,
     /// The first delimited listing of `data` fails.
     FailFirstDataListing,
+    /// The first create of the voting layout fails without committing.
+    FailLayoutCreate,
 }
 
 /// A call a [`Fault`] may hit.
@@ -91,6 +93,9 @@ impl Fault {
                 on_lock
             }
             (Self::FailFirstDataListing, Call::ListDelimited) => location.as_ref() == "data",
+            (Self::FailLayoutCreate, Call::Put(PutMode::Create)) => {
+                location.as_ref() == crate::replicated::layout::LAYOUT_KEY
+            }
             _ => false,
         }
     }
@@ -132,7 +137,7 @@ pub(in crate::replicated) fn with_outage(store: Store) -> (Store, Outage) {
 }
 
 /// `store`, failing one write of the lock as `fault` says.
-pub(super) fn faulty(store: Store, fault: Fault) -> Store {
+pub(in crate::replicated) fn faulty(store: Store, fault: Fault) -> Store {
     wrap(store, Arc::default(), Hold::default(), Some(fault))
 }
 
@@ -238,7 +243,9 @@ impl ObjectStore for Gated {
             self.hold.at(Point::CreateLock, location).await;
         }
         let put = match self.fault_at(location, Call::Put(&opts.mode)) {
-            Some(Fault::FailFirstSwap | Fault::FailFirstDataListing) => Err(unreachable()),
+            Some(Fault::FailFirstSwap | Fault::FailFirstDataListing | Fault::FailLayoutCreate) => {
+                Err(unreachable())
+            }
             Some(Fault::FailSwapDeletingObject) => self
                 .inner
                 .delete(&Key::from(HIGH_WATER_KEY))

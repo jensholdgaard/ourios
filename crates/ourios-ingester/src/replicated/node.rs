@@ -100,12 +100,19 @@ pub async fn start(
         scan,
         retry,
     } = start;
-    let (raft_state, replica) = {
+    let Prepared {
+        held: raft_state,
+        replica,
+        unchecked,
+    } = {
         let (root, groups, store) = (wal.root.clone(), groups.clone(), store.clone());
         tokio::task::spawn_blocking(move || prepare(&root, &groups, &store, &layout))
             .await
             .map_err(|e| NodeError::RaftState(io::Error::other(e)))??
     };
+    if unchecked {
+        report_unchecked();
+    }
     let lock = LockStart {
         store: &store,
         node_id: &node_id,
@@ -139,23 +146,42 @@ fn prepare(
     groups: &[u32],
     store: &Store,
     layout: &VotingLayout,
-) -> Result<(RaftState, ReplicaId), NodeError> {
+) -> Result<Prepared, NodeError> {
     let held = log_ids::raft_state(wal_root, groups).map_err(NodeError::RaftState)?;
-    match (layout::record_or_check(store, layout), held) {
+    let unchecked = match (layout::record_or_check(store, layout), held) {
         // RFC0065.31: holding its groups' state, it opens them with the store
-        // unreachable; a start that can read the layout checks it.
-        (Err(LayoutError::Store { .. }), RaftState::Held) => {
-            tracing::warn!(
-                "the voting layout is not checked: the store cannot be read, and this node \
-                 opens the groups whose Raft state it holds"
-            );
-        }
+        // unreachable; a start that can read the layout checks it. A layout
+        // it read but could not record still fails it.
+        (Err(LayoutError::Store { op: "read", .. }), RaftState::Held) => true,
         (checked, _) => {
             checked.map_err(NodeError::Layout)?;
+            false
         }
-    }
+    };
     let identity = replica_id::load_or_create(wal_root).map_err(NodeError::Identity)?;
-    Ok((held, identity.id()))
+    Ok(Prepared {
+        held,
+        replica: identity.id(),
+        unchecked,
+    })
+}
+
+/// What the steps before the lock found.
+struct Prepared {
+    held: RaftState,
+    replica: ReplicaId,
+    /// The layout was not checked: the store could not be read.
+    unchecked: bool,
+}
+
+/// Report a start that did not check its voting layout.
+fn report_unchecked() {
+    tracing::warn!(
+        name: ourios_semconv::EVENT_OURIOS_WAL_REPLICATION_LAYOUT_UNCHECKED,
+        { { crate::metrics::ERROR_TYPE } = "store_read" },
+        "the voting layout is not checked: the store cannot be read, and this node \
+         opens the groups whose Raft state it holds"
+    );
 }
 
 #[cfg(test)]

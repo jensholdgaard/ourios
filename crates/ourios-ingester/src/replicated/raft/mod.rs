@@ -32,7 +32,7 @@ mod reporting;
 mod restoring;
 mod snapshot_record;
 pub mod state_machine;
-mod telemetry;
+pub(in crate::replicated) mod telemetry;
 pub mod transport;
 pub mod types;
 pub mod vote_log;

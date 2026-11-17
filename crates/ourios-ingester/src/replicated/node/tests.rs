@@ -10,7 +10,7 @@ use super::{NodeError, NodeStart, start};
 use crate::replicated::layout::{LAYOUT_KEY, VotingLayout, record_or_check};
 use crate::replicated::raft::cluster::{test_timings, wal_config};
 use crate::replicated::raft::host::HostRole;
-use crate::replicated::raft::log_ids::gated::with_outage;
+use crate::replicated::raft::log_ids::gated::{Fault, faulty, with_outage};
 use crate::replicated::raft::log_ids::{LOG_IDS_KEY, RaftState, raft_state};
 use crate::replicated::raft::log_store::group_dir;
 use crate::replicated::raft::transport::Peers;
@@ -129,6 +129,7 @@ async fn a_node_holding_raft_state_starts_while_the_store_is_unreachable() {
         .await
         .expect("a node holding Raft state starts while the store is out");
     node.host.shutdown().await.expect("shutdown");
+    drop(node);
 
     let fresh = tempfile::tempdir().expect("tempdir");
     let refused = start(n0(fresh.path(), &store), &mut |_| {}).await;
@@ -137,4 +138,66 @@ async fn a_node_holding_raft_state_starts_while_the_store_is_unreachable() {
         "{:?}",
         refused.err()
     );
+}
+
+/// The outage exception covers only a layout the node cannot read: one it
+/// cannot record, the store read but `cluster.json` gone, still fails the
+/// start, so a node never runs without a recorded layout to be checked
+/// against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_layout_the_node_cannot_record_still_fails_its_start() {
+    let wal_root = tempfile::tempdir().expect("tempdir");
+    let store = Store::in_memory();
+    let node = start(n0(wal_root.path(), &store), &mut |_| {})
+        .await
+        .expect("started");
+    node.host.shutdown().await.expect("shutdown");
+    drop(node);
+    store
+        .delete_blocking(LAYOUT_KEY)
+        .expect("delete the layout");
+
+    let failing = faulty(store.clone(), Fault::FailLayoutCreate);
+    let refused = start(n0(wal_root.path(), &failing), &mut |_| {}).await;
+
+    assert!(
+        matches!(refused, Err(NodeError::Layout(_))),
+        "{:?}",
+        refused.err()
+    );
+}
+
+/// The unchecked start is reported once, as the registered event with
+/// `error.type` `store_read`.
+#[test]
+fn an_unchecked_layout_is_reported_once() {
+    let wal_root = tempfile::tempdir().expect("tempdir");
+    let (store, outage) = with_outage(Store::in_memory());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let node = start(n0(wal_root.path(), &store), &mut |_| {})
+            .await
+            .expect("started");
+        node.host.shutdown().await.expect("shutdown");
+    });
+    outage.begin();
+
+    let logged = crate::replicated::raft::telemetry::storage_tests::events(|| {
+        runtime.block_on(async {
+            let node = start(n0(wal_root.path(), &store), &mut |_| {})
+                .await
+                .expect("started");
+            node.host.shutdown().await.expect("shutdown");
+        });
+    });
+
+    let unchecked: Vec<_> = logged
+        .into_iter()
+        .filter(|(name, _)| name == ourios_semconv::EVENT_OURIOS_WAL_REPLICATION_LAYOUT_UNCHECKED)
+        .collect();
+    assert_eq!(unchecked.len(), 1, "{unchecked:?}");
+    assert_eq!(unchecked[0].1, ["error.type=store_read".to_owned()]);
 }

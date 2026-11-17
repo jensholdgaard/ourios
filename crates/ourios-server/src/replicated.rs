@@ -182,5 +182,9 @@ fn publishing((layout, groups): (&VotingLayout, u32), config: &ReceiverConfig) -
     }
 }
 
+pub(crate) mod serve;
+
+#[cfg(test)]
+mod serve_tests;
 #[cfg(test)]
 mod tests;

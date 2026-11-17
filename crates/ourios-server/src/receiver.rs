@@ -27,7 +27,7 @@ use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::{AuthLayer, logs_service};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedIngest, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_ingester::template_ids::{TemplateIds, TemplateIdsError};
@@ -843,7 +843,7 @@ type Acceptors = (Option<ReloadingAcceptor>, Option<ReloadingAcceptor>);
 
 /// Serve the OTLP/HTTP router on `listener`, over TLS when `acceptor` is
 /// set, until `shutdown` fires; the task returns once the listener drains.
-fn spawn_http(
+pub(crate) fn spawn_http(
     listener: TcpListener,
     acceptor: Option<ReloadingAcceptor>,
     router: axum::Router,
@@ -874,7 +874,7 @@ fn spawn_http(
     })
 }
 
-fn build_acceptors(
+pub(crate) fn build_acceptors(
     grpc_tls: Option<&TlsSettings>,
     http_tls: Option<&TlsSettings>,
 ) -> Result<Acceptors, String> {
@@ -1022,7 +1022,7 @@ fn snapshot_post_recovery(
 
 /// Bind both listeners before serving, so a `:0` request resolves to the
 /// real port in the returned handle. gRPC first, then HTTP.
-async fn bind_listeners(
+pub(crate) async fn bind_listeners(
     grpc: SocketAddr,
     http: SocketAddr,
 ) -> Result<(TcpIncoming, SocketAddr, TcpListener, SocketAddr), String> {
@@ -1126,11 +1126,11 @@ async fn recover_off_runtime(
 // `tokio::spawn` heap-allocates the task, so tonic's large serve future
 // never sits on the caller's stack — the lint's concern.
 #[allow(clippy::large_futures)]
-fn spawn_grpc(
+pub(crate) fn spawn_grpc(
     incoming: TcpIncoming,
     acceptor: Option<ReloadingAcceptor>,
     auth: AuthResolver,
-    (pipeline, max_request_bytes): (SharedPipeline, usize),
+    (pipeline, max_request_bytes): (SharedIngest, usize),
     mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<Result<(), tonic::transport::Error>> {
     // Gzip is accepted, as a stock Collector sends it

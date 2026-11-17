@@ -314,6 +314,8 @@ pub const LISTENER_GRPC: &str = "grpc";
 pub const LISTENER_HTTP: &str = "http";
 /// The querier HTTP listener (distinct from the receiver HTTP listener).
 pub const LISTENER_QUERIER: &str = "querier";
+/// A replicated node's peer listener (RFC 0065 §3.8).
+pub const LISTENER_REPLICATION: &str = "replication";
 /// `ourios.tls.failure` values.
 const FAILURE_HANDSHAKE: &str = "handshake";
 const FAILURE_TIMEOUT: &str = "timeout";

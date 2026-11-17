@@ -142,5 +142,10 @@ fn a_tail_replica_hosts_its_placed_groups_and_mines_them() {
     };
     let publishing = publishing.as_ref().expect("publishes");
     assert_eq!(publishing.voters.len(), 4);
+    // An event count, as the local receiver's audit sink takes it.
+    assert_eq!(
+        publishing.audit_ceiling,
+        crate::receiver::AUDIT_SINK_CEILING_EVENTS
+    );
     assert!(planned.mined.is_some());
 }

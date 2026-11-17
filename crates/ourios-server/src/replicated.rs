@@ -11,7 +11,7 @@ use ourios_ingester::replicated::layout::VotingLayout;
 use ourios_ingester::replicated::node::{Background, NodeStart};
 use ourios_ingester::replicated::raft::flushing::Publishing;
 use ourios_ingester::replicated::raft::host::{GroupMined, HostRole};
-use ourios_ingester::replicated::raft::kept::{AUDIT_CEILING, Bounds};
+use ourios_ingester::replicated::raft::kept::Bounds;
 use ourios_ingester::replicated::raft::learners::TailPool;
 use ourios_ingester::replicated::raft::transport::Peers;
 use ourios_ingester::template_ids::ScanOptions;
@@ -178,7 +178,7 @@ fn publishing((layout, groups): (&VotingLayout, u32), config: &ReceiverConfig) -
         voters,
         flush: crate::receiver::flush_config(config.max_buffer_age),
         promoted: config.promoted.clone(),
-        audit_ceiling: AUDIT_CEILING,
+        audit_ceiling: crate::receiver::AUDIT_SINK_CEILING_EVENTS,
     }
 }
 

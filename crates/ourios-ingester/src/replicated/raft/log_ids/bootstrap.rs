@@ -21,6 +21,43 @@ pub enum RaftState {
     Empty,
 }
 
+/// Whether this node holds any of `groups`' Raft state under `wal_root`:
+/// a group log's segments or its snapshot record (RFC 0065 §6.6).
+///
+/// # Errors
+///
+/// The [`std::io::Error`] that kept it from reading `wal_root`: a node that
+/// cannot tell fails its start rather than bootstrap over state it holds.
+pub fn raft_state(wal_root: &std::path::Path, groups: &[u32]) -> std::io::Result<RaftState> {
+    for &group in groups {
+        if holds_state(&super::super::log_store::group_dir(wal_root, group))? {
+            return Ok(RaftState::Held);
+        }
+    }
+    Ok(RaftState::Empty)
+}
+
+/// Whether the group directory `dir` holds a log segment or a snapshot
+/// record; one that does not exist holds neither.
+fn holds_state(dir: &std::path::Path) -> std::io::Result<bool> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let segment = path.extension().is_some_and(|x| x == "wal");
+        let record = path
+            .file_name()
+            .is_some_and(|name| name == super::super::snapshot_record::FILE);
+        if segment || record {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// One replicated start.
 #[derive(Debug, Clone, Copy)]
 pub struct LockStart<'a> {

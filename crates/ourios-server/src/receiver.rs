@@ -92,7 +92,7 @@ const BARRIER_TICK: Duration = SINK_MAX_BUFFER_AGE;
 /// event is small and the normal driver is the cadence, not this signal.
 const AUDIT_SINK_CEILING_EVENTS: usize = 100_000;
 
-fn flush_config(max_buffer_age: Duration) -> FlushConfig {
+pub(crate) fn flush_config(max_buffer_age: Duration) -> FlushConfig {
     FlushConfig {
         target_bytes: SINK_TARGET_BYTES,
         max_buffer_age,

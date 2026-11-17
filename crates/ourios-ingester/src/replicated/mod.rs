@@ -11,6 +11,7 @@
 pub mod forward;
 pub mod ingest;
 pub mod layout;
+pub mod node;
 pub mod placement;
 pub mod raft;
 pub mod replica_id;

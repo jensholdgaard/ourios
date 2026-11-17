@@ -13,6 +13,7 @@ use super::checkpointing::{Checkpoint, Checkpoints};
 use super::flushing::Flushing;
 use super::kept::Kept;
 use super::mining::{Captured, GroupMiner};
+use super::proposer::Delivered;
 use super::proposing::Proposing;
 use super::publication::Publication;
 
@@ -121,7 +122,11 @@ impl Checkpointer {
             // (§6.5); a proposal not taken is dropped, and the next barrier
             // proposes a later cut.
             if let Some(proposing) = proposing {
-                proposing.propose(&cut.captured).await;
+                // A defect fails the checkpoint as a failed write does, so
+                // the next barrier tries again (§6.8).
+                if let Some(Delivered::Malformed(_)) = proposing.propose(&cut.captured).await {
+                    return None;
+                }
             }
             Some(cut.captured.bundle.cut().seq)
         }));

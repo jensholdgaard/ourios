@@ -482,24 +482,7 @@ impl Flushing {
 
     /// The log id `formed.json` records for this group.
     fn log_id(&self) -> Result<u32, Unread> {
-        let bytes = match self.source.store.get_blocking_opt(&formed_key(self.group)) {
-            Ok(Some(bytes)) => bytes,
-            // Expected until the group forms.
-            Ok(None) => return Err(Unread::Absent),
-            Err(error) => {
-                return Err(Unread::Failed {
-                    error_type: "store_read",
-                    error: error.to_string(),
-                });
-            }
-        };
-        let voters: Vec<&str> = self.source.voters.iter().map(String::as_str).collect();
-        Formation::decode(&bytes, self.group, &voters)
-            .map(|formation| formation.log())
-            .map_err(|refused| Unread::Failed {
-                error_type: refused.error_type(),
-                error: refused.to_string(),
-            })
+        formed_log(&self.source, self.group)
     }
 
     /// Report being held for `error_type`, once until the reason changes.
@@ -521,13 +504,35 @@ impl Flushing {
 }
 
 /// Why the log id was not read.
-enum Unread {
+pub(super) enum Unread {
     /// No record yet.
     Absent,
     Failed {
         error_type: &'static str,
         error: String,
     },
+}
+
+/// The log id `formed.json` records for `group`.
+pub(super) fn formed_log(source: &Source, group: u32) -> Result<u32, Unread> {
+    let bytes = match source.store.get_blocking_opt(&formed_key(group)) {
+        Ok(Some(bytes)) => bytes,
+        // Expected until the group forms.
+        Ok(None) => return Err(Unread::Absent),
+        Err(error) => {
+            return Err(Unread::Failed {
+                error_type: "store_read",
+                error: error.to_string(),
+            });
+        }
+    };
+    let voters: Vec<&str> = source.voters.iter().map(String::as_str).collect();
+    Formation::decode(&bytes, group, &voters)
+        .map(|formation| formation.log())
+        .map_err(|refused| Unread::Failed {
+            error_type: refused.error_type(),
+            error: refused.to_string(),
+        })
 }
 
 mod rebuild;

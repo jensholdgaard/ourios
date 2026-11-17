@@ -28,6 +28,8 @@ use super::mining::{GroupMiner, GroupMinerError, Mined, SharedLog};
 use super::proposer::Proposer;
 use super::proposing::Proposing;
 use super::reporting::Reporting;
+use super::restoring::Restoring;
+use super::snapshot_record::GroupState;
 use super::state_machine::{Applied, AppliedEvent, GroupSm};
 use super::telemetry::{KeptDrops, Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
@@ -188,6 +190,13 @@ impl Launch<'_> {
                 Flushing::new(self.spec.id, group, source, log).with_replays(self.meters.replays());
             Some((flushing, publishing.sweep(), (checkpointer, reporting)))
         });
+        let restoring = publishing
+            .and_then(|publishing| publishing.source(group))
+            .map(|source| Restoring {
+                group,
+                source,
+                log: tail.log.clone(),
+            });
         let sweep = flushing.as_ref().map(|(f, every, _)| (f.current(), *every));
         let (flushing, flusher) = flushing.map(|(f, _, c)| (f, c)).unzip();
         let (checkpointer, reporting) = flusher.unzip();
@@ -204,6 +213,7 @@ impl Launch<'_> {
             storage: self.meters.storage(),
             checkpointer,
             reporting,
+            restoring,
         }
     }
 
@@ -381,7 +391,7 @@ async fn ticked(barrier: &mut Option<tokio::time::Interval>) {
 }
 
 /// Resolves once the host stops the miner, or drops the means to.
-async fn stopped(stop: &mut watch::Receiver<bool>) {
+pub(super) async fn stopped(stop: &mut watch::Receiver<bool>) {
     stop.wait_for(|stopped| *stopped).await.ok();
 }
 
@@ -401,6 +411,9 @@ struct Follow {
     /// The flusher's reports to its leader, when it can be published from
     /// this replica.
     reporting: Option<Reporting>,
+    /// Where the miner restores from at a snapshot, when this replica
+    /// reads the group's store; without one, a snapshot stops the miner.
+    restoring: Option<Restoring<GroupLogReader>>,
 }
 
 /// What a tail replica's settings say of its groups' output.
@@ -564,6 +577,9 @@ impl Follow {
         event: Applied,
         stop: &mut watch::Receiver<bool>,
     ) -> Option<GroupMiner> {
+        if let (AppliedEvent::Installed(state), Some(restoring)) = (&event.event, &self.restoring) {
+            return self.restore(restoring, (event.at, *state), stop).await;
+        }
         let index = event.at.index;
         let mut work = Some(event);
         while work.is_some() || miner.holds() {
@@ -582,6 +598,36 @@ impl Follow {
             }
         }
         Some(miner)
+    }
+
+    /// The miner restored at the snapshot through `at`, whose record holds
+    /// `state`, its kept output through the cut dropped and the flusher
+    /// the record names assigned. `None` once the host says to stop, or
+    /// with the miner stopped when the store holds nothing that restores.
+    async fn restore(
+        &self,
+        restoring: &Restoring<GroupLogReader>,
+        (at, state): (LogId, GroupState),
+        stop: &mut watch::Receiver<bool>,
+    ) -> Option<GroupMiner> {
+        match restoring.restore(at, state, stop).await? {
+            Ok(miner) => {
+                let keeping = self.keeping.clone();
+                let applying = Applying {
+                    cut: Some(at.index),
+                    assigned: state.flusher,
+                };
+                let keep = move || keeping.keep(at.index, &Mined::default(), applying);
+                tokio::task::spawn_blocking(keep).await.ok()?;
+                Some(miner)
+            }
+            Err(unrestored) => {
+                let detail = unrestored.to_string();
+                let error = GroupMinerError::Unrestorable { at, detail };
+                self.storage.miner_stopped(self.group, &error);
+                None
+            }
+        }
     }
 
     /// One step of `miner` off the runtime's workers: follow `event`, or
@@ -974,6 +1020,7 @@ mod tests {
             storage: Storage::global(),
             checkpointer: None,
             reporting: None,
+            restoring: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         let GroupEntry::Batch(batch) = batch_at(time(1), "acme", &["a b c"]) else {
@@ -1132,6 +1179,7 @@ mod tests {
             storage: Storage::global(),
             checkpointer: None,
             reporting: None,
+            restoring: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         Following {

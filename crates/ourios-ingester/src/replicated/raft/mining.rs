@@ -88,6 +88,9 @@ pub enum GroupMinerError {
     /// The first configuration applied at `at`, and the group's log no
     /// longer holds the entry at `index`, applied before it.
     Purged { at: LogId, index: u64 },
+    /// A snapshot replaced the log through `at`, and the store holds no
+    /// bundle at its cut that restores.
+    Unrestorable { at: LogId, detail: String },
 }
 
 impl fmt::Display for GroupMinerError {
@@ -107,6 +110,12 @@ impl fmt::Display for GroupMinerError {
                 write!(
                     f,
                     "a snapshot through {at} replaced the log the miner follows"
+                )
+            }
+            Self::Unrestorable { at, detail } => {
+                write!(
+                    f,
+                    "the miner does not restore at the snapshot through {at}: {detail}"
                 )
             }
             Self::Purged { at, index } => write!(
@@ -136,6 +145,7 @@ impl GroupMinerError {
             Self::OutOfOrder { .. } => "out_of_order",
             Self::Installed { .. } => "installed",
             Self::Purged { .. } => "purged",
+            Self::Unrestorable { .. } => "unrestorable",
         }
     }
 }

@@ -29,6 +29,7 @@ mod proposing;
 pub mod publication;
 pub mod replay;
 mod reporting;
+mod restoring;
 mod snapshot_record;
 pub mod state_machine;
 mod telemetry;

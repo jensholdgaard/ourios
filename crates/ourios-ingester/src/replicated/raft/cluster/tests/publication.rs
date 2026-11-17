@@ -11,10 +11,12 @@ use std::time::Duration;
 use ourios_core::record::{IngestPosition, MinedRecord};
 use ourios_parquet::{PromotedAttributes, Reader, Store};
 use ourios_wal::Control;
+use tokio::sync::mpsc;
 
 use super::super::super::bundle::{Bundle, CutId, bundle_key, pointer, snapshot_key};
 use super::super::super::flushing::Publishing;
 use super::super::super::formation::{Formation, formed_key};
+use super::super::super::host::GroupMined;
 use super::super::super::mining::Mined;
 use super::super::super::mining::tests::{batch_at, block, corpus, time};
 use super::super::super::proposals::Proposals;
@@ -155,7 +157,7 @@ fn pointer(store: &Store) -> Option<CutId> {
 
 /// The checkpoint `checkpoint.json` in `store` names once it reaches
 /// `last`: an earlier one may cut before the first batch is mined.
-async fn checkpointed_through(store: &Store, last: u64) -> CutId {
+pub(super) async fn checkpointed_through(store: &Store, last: u64) -> CutId {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(cut) = pointer(store).filter(|cut| cut.seq >= last) {
@@ -253,6 +255,18 @@ async fn checkpointing_group() -> (Cluster, [Store; 2], u64) {
 /// As [`checkpointing_group`], with its leader and each node's `Propose`
 /// target.
 async fn reporting_group() -> (Cluster, [Store; 2], u64, (usize, Vec<Arc<Proposals>>)) {
+    let (cluster, stores, last, proposals, _) = mining_group().await;
+    (cluster, stores, last, proposals)
+}
+
+/// As [`reporting_group`], with what each tail replica mines.
+pub(super) async fn mining_group() -> (
+    Cluster,
+    [Store; 2],
+    u64,
+    (usize, Vec<Arc<Proposals>>),
+    Vec<mpsc::Receiver<GroupMined>>,
+) {
     let stores = [formed_store(), formed_store()];
     let shape = Shape {
         publishing: stores
@@ -289,7 +303,7 @@ async fn reporting_group() -> (Cluster, [Store; 2], u64, (usize, Vec<Arc<Proposa
         .map(|position| position.seq)
         .max()
         .expect("mined rows");
-    (cluster, stores, last, (leader, targets))
+    (cluster, stores, last, (leader, targets), mined)
 }
 
 /// The `bundle.bin` keys `store` holds for [`LOG`].
@@ -303,7 +317,7 @@ fn bundles(store: &Store) -> Vec<String> {
 }
 
 /// Every node applies a checkpoint at or past `seq`; fails after 20 s.
-async fn applied_everywhere(cluster: &Cluster, seq: u64) {
+pub(super) async fn applied_everywhere(cluster: &Cluster, seq: u64) {
     for i in 0..5 {
         let sm = cluster.node(i).host.state_machine(GROUP).expect("hosted");
         let mut cuts = sm.checkpoints();

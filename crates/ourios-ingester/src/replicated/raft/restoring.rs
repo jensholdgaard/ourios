@@ -60,7 +60,12 @@ pub(super) struct Restoring<L> {
     /// Set while a restore runs, which holds the replica's snapshot
     /// builds, and so its purges, at the cut.
     pub(super) hold: Arc<watch::Sender<bool>>,
+    /// The replica's snapshot now: its last entry and its record's state.
+    pub(super) installed: Installed,
 }
+
+/// Reads a replica's current snapshot.
+pub(super) type Installed = Arc<dyn Fn() -> Option<(LogId, GroupState)> + Send + Sync>;
 
 /// A miner restored at the snapshot through `at`, whose record holds
 /// `state`, and the last entry the replica applied while it restored,
@@ -89,8 +94,9 @@ impl<L: GroupLogRead + Clone + Send + 'static> Restoring<L> {
     }
 
     /// The miner restored at the snapshot through `at`, taking what
-    /// `applied` carries meanwhile without holding it: a later snapshot
-    /// starts the restore again at its cut. `None` once `stop` says so or
+    /// `applied` carries meanwhile without holding it, from past `through`,
+    /// the last entry the replica applied: a later snapshot starts the
+    /// restore again at its cut. `None` once `stop` says so or
     /// the group ends.
     ///
     /// # Errors
@@ -98,11 +104,11 @@ impl<L: GroupLogRead + Clone + Send + 'static> Restoring<L> {
     /// The cut and why, when the store holds no bundle there that restores.
     pub(super) async fn restore_taking(
         &self,
-        (mut at, mut state): (LogId, GroupState),
+        (mut at, mut state, mut through): (LogId, GroupState, u64),
         applied: &mut mpsc::Receiver<Applied>,
         stop: &mut watch::Receiver<bool>,
     ) -> Option<Result<Restored, (LogId, Unrestored)>> {
-        let mut through = at.index;
+        through = through.max(at.index);
         loop {
             let mut stopping = stop.clone();
             let restoring = self.restore(at, state, &mut stopping);
@@ -118,7 +124,8 @@ impl<L: GroupLogRead + Clone + Send + 'static> Restoring<L> {
                     }
                     event = next(applied, stop) => match event? {
                         Applied { at: later, event: AppliedEvent::Installed(installed) } => {
-                            (at, state, through) = (later, installed, later.index);
+                            (at, state) = (later, installed);
+                            through = through.max(later.index);
                             break;
                         }
                         Applied { at: taken, .. } => through = through.max(taken.index),

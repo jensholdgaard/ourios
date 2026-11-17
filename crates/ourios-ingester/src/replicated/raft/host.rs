@@ -191,12 +191,7 @@ impl Launch<'_> {
         });
         let restoring = publishing
             .and_then(|publishing| publishing.source(group))
-            .map(|source| Restoring {
-                group,
-                source,
-                log: tail.log.clone(),
-                hold: Arc::clone(&tail.hold),
-            });
+            .map(|source| reinstall::restoring(group, source, tail, sm));
         let sweep = flushing.as_ref().map(|(f, every, _)| (f.current(), *every));
         let (flushing, flusher) = flushing.map(|(f, _, c)| (f, c)).unzip();
         let (checkpointer, reporting) = flusher.unzip();
@@ -416,7 +411,7 @@ struct Follow {
     reporting: Option<Reporting>,
     /// Where the miner restores from at a snapshot, when this replica
     /// reads the group's store; without one, a snapshot stops the miner.
-    restoring: Option<Restoring<GroupLogReader>>,
+    restoring: Option<Restoring<SharedLog>>,
 }
 
 /// What a tail replica's settings say of its groups' output.
@@ -544,13 +539,18 @@ impl Follow {
             let Some(work) = work else {
                 return;
             };
-            if let Some(installed) = self.installing(&work) {
-                let Some(restored) = self.reinstall(installed, &mut applied, &mut stop).await
-                else {
-                    return;
-                };
-                miner = restored;
-                continue;
+            match self.installing(&work, &miner) {
+                Some(Install::At(at, state)) => {
+                    let installed = (at, state);
+                    let Some(restored) = self.reinstall(installed, &mut applied, &mut stop).await
+                    else {
+                        return;
+                    };
+                    miner = restored;
+                    continue;
+                }
+                Some(Install::Passed) => continue,
+                None => {}
             }
             let forced = matches!(work, Work::Report);
             let Some(back) = self
@@ -899,6 +899,8 @@ impl GroupHost {
 }
 
 mod reinstall;
+
+use reinstall::Install;
 
 #[cfg(test)]
 mod tests {

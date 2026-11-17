@@ -85,6 +85,7 @@ fn restoring(store: Store) -> (Restoring<HeldLog>, Outage) {
                 .collect(),
         ),
         hold: std::sync::Arc::new(watch::channel(false).0),
+        installed: std::sync::Arc::new(|| None),
     };
     (restoring, outage)
 }

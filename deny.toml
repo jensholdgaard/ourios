@@ -15,6 +15,17 @@ ignore = [
     # into the integration tests' containers; even testcontainers 0.28 needs
     # it, so nothing ships with it. Remove when testcontainers moves off it.
     "RUSTSEC-2026-0440",
+    # reason: `chrono`, `chrono-tz`, `chrono-tz-build` and `humantime` are
+    # declared unmaintained (RUSTSEC-2026-0543, -0555, -0559, -0542): no
+    # vulnerability, and "no safe upgrade is available". `chrono` and
+    # `chrono-tz` are load-bearing across arrow, DataFusion, object_store and
+    # openraft, and `humantime` comes in through object_store, so nothing we
+    # control removes them. Remove each entry once those crates move off it
+    # (the advisories recommend `jiff` or `time`).
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
+    "RUSTSEC-2026-0559",
+    "RUSTSEC-2026-0542",
     # reason: quick-xml < 0.41 DoS advisories (quadratic duplicate-attribute
     # check; unbounded namespace-declaration allocation). Transitive via
     # object_store — no upgrade path exists yet: datafusion 55 still pins

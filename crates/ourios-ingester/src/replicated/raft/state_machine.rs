@@ -242,6 +242,20 @@ impl Replay {
         }
     }
 
+    /// The state machine as it opened from a snapshot through `at` that
+    /// holds `state`: the events it returns for the entries after `at` are
+    /// the ones the live state machine sent for them.
+    #[must_use]
+    pub fn from_snapshot(at: LogId, state: GroupState) -> Self {
+        let meta = SnapshotMeta {
+            last_log_id: Some(at),
+            last_membership: StoredMembershipOf::<RaftTypes>::default(),
+        };
+        Self {
+            state: State::opened(Some(GroupSnapshot { meta, state })),
+        }
+    }
+
     /// Apply `entry`, the next in the log; returns what it changed for the
     /// miner.
     ///

@@ -6,7 +6,7 @@ use tokio::sync::watch;
 
 use super::super::bundle::write::write;
 use super::super::formation::{Formation, formed_key};
-use super::super::log_ids::gated::{Outage, with_outage};
+use super::super::log_ids::gated::{Outage, Point, pausing, with_outage};
 use super::super::mining::tests::{
     HeldLog, batch, block, configured, events_of, in_force, logged, miner_of, with_threshold,
 };
@@ -84,6 +84,7 @@ fn restoring(store: Store) -> (Restoring<HeldLog>, Outage) {
                 .map(|e| (e.log_id.index, e))
                 .collect(),
         ),
+        hold: std::sync::Arc::new(watch::channel(false).0),
     };
     (restoring, outage)
 }
@@ -171,6 +172,36 @@ fn a_restore_waiting_on_the_store_stops_when_told() {
     });
 
     assert_eq!(restored, None, "stopped, not restored");
+}
+
+/// A restore whose read of the store hangs still stops when the host says
+/// to, rather than holding the host's shutdown until the read returns.
+#[test]
+fn a_restore_with_a_stalled_read_stops_when_told() {
+    let (captured, cut) = captured();
+    let (store, paused) = pausing(written(&captured), Point::AfterFormedRead);
+    let (restoring, _outage) = restoring(store);
+    let mut stopped_restore = false;
+    run(false, async {
+        let (stop, mut stopped) = watch::channel(false);
+        let restoring = tokio::spawn(async move {
+            restoring
+                .restore(cut, state(&captured), &mut stopped)
+                .await
+                .is_none()
+        });
+        paused.reached.await.expect("the read is held");
+        stop.send_replace(true);
+        let returned = tokio::time::timeout(Duration::from_secs(5), restoring).await;
+        stopped_restore = matches!(returned, Ok(Ok(true)));
+        // A runtime waits for its blocking tasks as it shuts down.
+        let _ = paused.release.send(());
+    });
+
+    assert!(
+        stopped_restore,
+        "the restore stops without its read returning"
+    );
 }
 
 /// RFC0065.31: with no bundle at the cut, or no formation, the group

@@ -35,7 +35,7 @@ fn voters() -> Vec<String> {
 }
 
 /// A store holding `GROUP`'s `formed.json` with log id [`LOG`].
-fn formed_store() -> Store {
+pub(super) fn formed_store() -> Store {
     let store = Store::in_memory();
     let voters = voters();
     let names: Vec<&str> = voters.iter().map(String::as_str).collect();
@@ -267,7 +267,19 @@ pub(super) async fn mining_group() -> (
     (usize, Vec<Arc<Proposals>>),
     Vec<mpsc::Receiver<GroupMined>>,
 ) {
-    let stores = [formed_store(), formed_store()];
+    mining_group_over([formed_store(), formed_store()]).await
+}
+
+/// As [`mining_group`], its tail replicas publishing to `stores`.
+pub(super) async fn mining_group_over(
+    stores: [Store; 2],
+) -> (
+    Cluster,
+    [Store; 2],
+    u64,
+    (usize, Vec<Arc<Proposals>>),
+    Vec<mpsc::Receiver<GroupMined>>,
+) {
     let shape = Shape {
         publishing: stores
             .iter()

@@ -29,7 +29,6 @@ use super::proposer::Proposer;
 use super::proposing::Proposing;
 use super::reporting::Reporting;
 use super::restoring::Restoring;
-use super::snapshot_record::GroupState;
 use super::state_machine::{Applied, AppliedEvent, GroupSm};
 use super::telemetry::{KeptDrops, Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
@@ -196,6 +195,7 @@ impl Launch<'_> {
                 group,
                 source,
                 log: tail.log.clone(),
+                hold: Arc::clone(&tail.hold),
             });
         let sweep = flushing.as_ref().map(|(f, every, _)| (f.current(), *every));
         let (flushing, flusher) = flushing.map(|(f, _, c)| (f, c)).unzip();
@@ -237,6 +237,7 @@ impl Launch<'_> {
         log.count_takeovers(self.meters.takeovers(self.spec.id, group));
         let gate = Arc::clone(&self.gate);
         let cell: Arc<OnceLock<GroupRaft>> = Arc::default();
+        let (hold, builds_held) = watch::channel(false);
         let (sm, applied) = match &self.spec.role {
             HostRole::Voter => (blocking(move || GroupSm::open(&dir, gate)).await, None),
             HostRole::Tail {
@@ -251,6 +252,7 @@ impl Launch<'_> {
                     publishing: publishing.clone(),
                     log: reader.clone(),
                     raft: Arc::clone(&cell),
+                    hold: Arc::new(hold),
                 };
                 (sm, Some((applied, mined.clone(), tail)))
             }
@@ -276,7 +278,7 @@ impl Launch<'_> {
         };
         // Set once: this is the group's only open.
         let _ = cell.set(raft.clone());
-        build_at_checkpoints(&raft, &sm);
+        build_at_checkpoints(&raft, &sm, builds_held);
         Ok(Hosted {
             raft,
             sm,
@@ -288,13 +290,14 @@ impl Launch<'_> {
     }
 }
 
-/// Build `raft`'s snapshot at each checkpoint `sm` applies.
-fn build_at_checkpoints(raft: &GroupRaft, sm: &GroupSm) {
+/// Build `raft`'s snapshot at each checkpoint `sm` applies, while `held`
+/// does not say a restore holds them.
+fn build_at_checkpoints(raft: &GroupRaft, sm: &GroupSm, held: watch::Receiver<bool>) {
     let builds = RaftBuilds {
         raft: raft.clone(),
         metrics: raft.metrics(),
     };
-    tokio::spawn(snapshot_at_checkpoints(builds, sm.checkpoints()));
+    tokio::spawn(snapshot_at_checkpoints(builds, sm.checkpoints(), held));
 }
 
 /// How many applied entries a tail replica's state machine hands its
@@ -352,7 +355,7 @@ impl Mining {
 
 /// The next applied event, or `None` once the group has ended or the host
 /// stops the miner.
-async fn next(
+pub(super) async fn next(
     applied: &mut mpsc::Receiver<Applied>,
     stop: &mut watch::Receiver<bool>,
 ) -> Option<Applied> {
@@ -425,6 +428,8 @@ struct Tail {
     /// This replica's raft once it runs, which a flusher learns its leader
     /// from.
     raft: Arc<OnceLock<GroupRaft>>,
+    /// Held while its miner restores, which holds its snapshot builds.
+    hold: Arc<watch::Sender<bool>>,
 }
 
 /// What a tail replica keeps of `group`'s mined output for a takeover,
@@ -539,6 +544,14 @@ impl Follow {
             let Some(work) = work else {
                 return;
             };
+            if let Some(installed) = self.installing(&work) {
+                let Some(restored) = self.reinstall(installed, &mut applied, &mut stop).await
+                else {
+                    return;
+                };
+                miner = restored;
+                continue;
+            }
             let forced = matches!(work, Work::Report);
             let Some(back) = self
                 .work(work, miner, (checkpointer.as_mut(), &mut stop))
@@ -577,9 +590,6 @@ impl Follow {
         event: Applied,
         stop: &mut watch::Receiver<bool>,
     ) -> Option<GroupMiner> {
-        if let (AppliedEvent::Installed(state), Some(restoring)) = (&event.event, &self.restoring) {
-            return self.restore(restoring, (event.at, *state), stop).await;
-        }
         let index = event.at.index;
         let mut work = Some(event);
         while work.is_some() || miner.holds() {
@@ -598,36 +608,6 @@ impl Follow {
             }
         }
         Some(miner)
-    }
-
-    /// The miner restored at the snapshot through `at`, whose record holds
-    /// `state`, its kept output through the cut dropped and the flusher
-    /// the record names assigned. `None` once the host says to stop, or
-    /// with the miner stopped when the store holds nothing that restores.
-    async fn restore(
-        &self,
-        restoring: &Restoring<GroupLogReader>,
-        (at, state): (LogId, GroupState),
-        stop: &mut watch::Receiver<bool>,
-    ) -> Option<GroupMiner> {
-        match restoring.restore(at, state, stop).await? {
-            Ok(miner) => {
-                let keeping = self.keeping.clone();
-                let applying = Applying {
-                    cut: Some(at.index),
-                    assigned: state.flusher,
-                };
-                let keep = move || keeping.keep(at.index, &Mined::default(), applying);
-                tokio::task::spawn_blocking(keep).await.ok()?;
-                Some(miner)
-            }
-            Err(unrestored) => {
-                let detail = unrestored.to_string();
-                let error = GroupMinerError::Unrestorable { at, detail };
-                self.storage.miner_stopped(self.group, &error);
-                None
-            }
-        }
     }
 
     /// One step of `miner` off the runtime's workers: follow `event`, or
@@ -757,13 +737,14 @@ impl Builds for RaftBuilds {
 async fn snapshot_at_checkpoints(
     mut builds: impl Builds,
     mut cuts: watch::Receiver<Option<LogId>>,
+    mut held: watch::Receiver<bool>,
 ) {
     let mut built = builds.snapshot();
     let mut retry = tokio::time::interval(TRIGGER_RETRY);
     retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        let cut = *cuts.borrow_and_update();
-        if built < cut {
+        let due = due(built, *cuts.borrow_and_update(), &mut held);
+        if due {
             if !builds.trigger().await {
                 return;
             }
@@ -777,9 +758,17 @@ async fn snapshot_at_checkpoints(
                 Some(snapshot) => built = snapshot,
                 None => return,
             },
-            _ = retry.tick(), if built < cut => {}
+            _ = retry.tick(), if due => {}
+            // A closed hold holds nothing.
+            Ok(()) = held.changed() => {}
         }
     }
+}
+
+/// Whether a snapshot is due: the replica has applied a checkpoint past the
+/// last one `built`, and no restore holds its builds.
+fn due(built: Option<LogId>, cut: Option<LogId>, held: &mut watch::Receiver<bool>) -> bool {
+    built < cut && !*held.borrow_and_update()
 }
 
 /// The node's running groups.
@@ -908,6 +897,8 @@ impl GroupHost {
         Ok(())
     }
 }
+
+mod reinstall;
 
 #[cfg(test)]
 mod tests {
@@ -1427,7 +1418,7 @@ mod tests {
             snapshots,
             triggers: Arc::clone(&triggers),
         };
-        let task = tokio::spawn(snapshot_at_checkpoints(held, cuts));
+        let task = tokio::spawn(snapshot_at_checkpoints(held, cuts, watch::channel(false).1));
         let churning = Arc::clone(&snapshots_tx);
         let churn = tokio::spawn(async move {
             loop {

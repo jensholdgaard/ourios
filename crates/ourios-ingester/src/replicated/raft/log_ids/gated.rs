@@ -35,22 +35,24 @@ impl Outage {
 
 /// The first call on the lock at a [`Point`] through the store returned
 /// with it, held.
-pub(super) struct Paused {
+pub(in crate::replicated::raft) struct Paused {
     /// Fires once that create has been called.
-    pub(super) reached: oneshot::Receiver<()>,
+    pub(in crate::replicated::raft) reached: oneshot::Receiver<()>,
     /// Lets it go on.
-    pub(super) release: oneshot::Sender<()>,
+    pub(in crate::replicated::raft) release: oneshot::Sender<()>,
 }
 
 /// Where a start is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Point {
+pub(in crate::replicated::raft) enum Point {
     /// Before its create of the lock.
     CreateLock,
     /// After its first read of the lock has returned.
     AfterLockRead,
     /// After its create of the lock has committed, before it returns.
     AfterCreateLock,
+    /// After its first read of a group's `formed.json` has returned.
+    AfterFormedRead,
 }
 
 /// One call on the lock, the object or `data` that fails, once.
@@ -103,7 +105,11 @@ struct Hold(Mutex<Vec<(Point, Channels)>>);
 impl Hold {
     /// Wait for the release if this call is the first at a held point.
     async fn at(&self, point: Point, location: &Key) {
-        if location.as_ref() != LOG_IDS_KEY {
+        let watched = match point {
+            Point::AfterFormedRead => location.as_ref().ends_with("/formed.json"),
+            _ => location.as_ref() == LOG_IDS_KEY,
+        };
+        if !watched {
             return;
         }
         let held = {
@@ -131,7 +137,7 @@ pub(super) fn faulty(store: Store, fault: Fault) -> Store {
 }
 
 /// `store`, pausing its first call on the lock at `point`.
-pub(super) fn pausing(store: Store, point: Point) -> (Store, Paused) {
+pub(in crate::replicated::raft) fn pausing(store: Store, point: Point) -> (Store, Paused) {
     pausing_faulty(store, point, None)
 }
 
@@ -268,6 +274,7 @@ impl ObjectStore for Gated {
         self.reachable()?;
         let got = self.inner.get_opts(location, options).await;
         self.hold.at(Point::AfterLockRead, location).await;
+        self.hold.at(Point::AfterFormedRead, location).await;
         got
     }
 

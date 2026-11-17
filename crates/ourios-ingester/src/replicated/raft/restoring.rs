@@ -4,19 +4,29 @@
 //! cut's checkpoint wrote. It restores from that bundle, never a later
 //! one, and mines on from the entry after; while the store cannot be read
 //! it retries, and a bundle refused or not there fails the group closed.
+//!
+//! The replica keeps applying meanwhile: it opens even while the store is
+//! out, as its log replays the entries past the snapshot. The miner does not
+//! hold what the replica applies while it restores, only how far it got,
+//! and once restored it mines those entries back from the log, which keeps
+//! them: the replica builds no snapshot past the cut, so purges nothing
+//! above it, until the miner has caught up.
 
 use std::fmt;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use std::sync::Arc;
+
+use tokio::sync::{mpsc, watch};
 
 use super::bundle::read::{ReadError, read};
 use super::bundle::{Cut, CutId};
 use super::codec::wal_id;
 use super::flushing::{Source, Unread, formed_log};
-use super::host::stopped;
+use super::host::{next, stopped};
 use super::mining::{GroupLogRead, GroupMiner};
 use super::snapshot_record::GroupState;
+use super::state_machine::{Applied, AppliedEvent};
 use super::types::LogId;
 
 /// The first wait before another attempt, doubling to [`MOST`].
@@ -47,9 +57,77 @@ pub(super) struct Restoring<L> {
     pub(super) source: Source,
     /// The group's log, which the restored miner reads back from.
     pub(super) log: L,
+    /// Set while a restore runs, which holds the replica's snapshot
+    /// builds, and so its purges, at the cut.
+    pub(super) hold: Arc<watch::Sender<bool>>,
+}
+
+/// A miner restored at the snapshot through `at`, whose record holds
+/// `state`, and the last entry the replica applied while it restored,
+/// which it mines back from the log.
+pub(super) struct Restored {
+    pub(super) miner: GroupMiner,
+    pub(super) at: LogId,
+    pub(super) state: GroupState,
+    pub(super) through: u64,
+}
+
+/// Holds the replica's snapshot builds until dropped.
+pub(super) struct Held(Arc<watch::Sender<bool>>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
 }
 
 impl<L: GroupLogRead + Clone + Send + 'static> Restoring<L> {
+    /// Hold the replica's snapshot builds at the cut until the guard drops.
+    pub(super) fn hold(&self) -> Held {
+        self.hold.send_replace(true);
+        Held(Arc::clone(&self.hold))
+    }
+
+    /// The miner restored at the snapshot through `at`, taking what
+    /// `applied` carries meanwhile without holding it: a later snapshot
+    /// starts the restore again at its cut. `None` once `stop` says so or
+    /// the group ends.
+    ///
+    /// # Errors
+    ///
+    /// The cut and why, when the store holds no bundle there that restores.
+    pub(super) async fn restore_taking(
+        &self,
+        (mut at, mut state): (LogId, GroupState),
+        applied: &mut mpsc::Receiver<Applied>,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Option<Result<Restored, (LogId, Unrestored)>> {
+        let mut through = at.index;
+        loop {
+            let mut stopping = stop.clone();
+            let restoring = self.restore(at, state, &mut stopping);
+            tokio::pin!(restoring);
+            loop {
+                tokio::select! {
+                    restored = &mut restoring => {
+                        return restored.map(|restored| {
+                            restored
+                                .map(|miner| Restored { miner, at, state, through })
+                                .map_err(|why| (at, why))
+                        });
+                    }
+                    event = next(applied, stop) => match event? {
+                        Applied { at: later, event: AppliedEvent::Installed(installed) } => {
+                            (at, state, through) = (later, installed, later.index);
+                            break;
+                        }
+                        Applied { at: taken, .. } => through = through.max(taken.index),
+                    },
+                }
+            }
+        }
+    }
+
     /// The miner at the snapshot through `at`, whose record holds `state`,
     /// once the bundle at its cut restores; `None` once `stop` says so.
     ///
@@ -67,9 +145,13 @@ impl<L: GroupLogRead + Clone + Send + 'static> Restoring<L> {
         loop {
             let restoring = self.clone();
             let attempt = tokio::task::spawn_blocking(move || restoring.attempt(at, state));
-            let attempted = attempt
-                .await
-                .unwrap_or_else(|e| Err(Unrestored::Refused(e.to_string())));
+            // A read can hang until the store's client gives up; the stop
+            // does not wait for it.
+            let attempted = tokio::select! {
+                attempted = attempt => attempted
+                    .unwrap_or_else(|e| Err(Unrestored::Refused(e.to_string()))),
+                () = stopped(stop) => return None,
+            };
             match attempted {
                 Err(Unrestored::Unreachable(why)) => {
                     tracing::warn!(

@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ourios_core::audit::AuditSink;
 use ourios_parquet::Store;
 use ourios_serving::AuthResolver;
 use ourios_serving::tls_serve::ReloadingAcceptor;
@@ -92,18 +93,20 @@ pub struct Node {
 }
 
 impl Node {
-    /// Answer the peers' forwarded exports, authenticated by `auth`, and
-    /// the flushers' proposals, then serve replication over mutual TLS on
+    /// Answer the peers' forwarded exports, authenticated by `auth` and with
+    /// each tenant denial recorded on `denials` (RFC 0026 §3.4), and the
+    /// flushers' proposals, then serve replication over mutual TLS on
     /// `incoming` through `acceptor` until `shutdown` (RFC 0065 §6.8, B21).
     pub fn serve(
         &self,
-        auth: AuthResolver,
+        (auth, denials): (AuthResolver, Box<dyn AuditSink + Send>),
         (incoming, acceptor): (TcpIncoming, ReloadingAcceptor),
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> JoinHandle<Result<(), tonic::transport::Error>> {
         let server = self.host.server();
         let writer = GroupWriter::new(self.layout.clone(), &self.host);
-        server.serve_forwards(Arc::new(LeaderTarget::new(writer, auth)));
+        let forwards = LeaderTarget::new(writer, auth).with_denial_audit_sink(denials);
+        server.serve_forwards(Arc::new(forwards));
         server.serve_proposals(Arc::new(Proposals::new(&self.host)));
         tokio::spawn(server.serve(incoming, acceptor, shutdown))
     }

@@ -3,11 +3,14 @@
 //! commits on its group's leader.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use ourios_core::audit::{AuditPayload, AuditSink, SharedAuditSink};
+use ourios_core::auth::{TokenSpec, build_token_store};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::Store;
 use ourios_serving::AuthResolver;
@@ -50,9 +53,30 @@ fn export(line: &str) -> Export<'static> {
     }
 }
 
+/// Three nodes serving, their shutdown senders, and the directories they
+/// keep.
+struct Served {
+    nodes: Vec<Node>,
+    stops: Vec<oneshot::Sender<()>>,
+    /// Kept for the nodes' lifetime: dropping one deletes it.
+    dirs: Vec<tempfile::TempDir>,
+}
+
+impl Served {
+    async fn stop(self) {
+        for stop in self.stops {
+            let _ = stop.send(());
+        }
+        for node in self.nodes {
+            node.host.shutdown().await.expect("shutdown");
+        }
+    }
+}
+
 /// Three nodes started on one store, each serving over mutual TLS with a
-/// certificate from one CA; their shutdown senders.
-async fn three_served() -> (Vec<Node>, Vec<oneshot::Sender<()>>, Vec<tempfile::TempDir>) {
+/// certificate from one CA, authenticating forwards with `auth` and
+/// recording tenant denials on `denials`.
+async fn three_served(auth: &AuthResolver, denials: &SharedAuditSink) -> Served {
     let ca = Ca::new();
     let store = Store::in_memory();
     let certs = tempfile::tempdir().expect("tempdir");
@@ -70,7 +94,11 @@ async fn three_served() -> (Vec<Node>, Vec<oneshot::Sender<()>>, Vec<tempfile::T
             )
         })
         .collect();
-    let (mut nodes, mut stops, mut roots) = (Vec::new(), Vec::new(), Vec::new());
+    let mut served = Served {
+        nodes: Vec::new(),
+        stops: Vec::new(),
+        dirs: Vec::new(),
+    };
     for (name, listener) in NAMES.iter().zip(listeners) {
         let tls = ca.node(certs.path(), name);
         let peers = Peers::mutual_tls(&tls)
@@ -85,23 +113,21 @@ async fn three_served() -> (Vec<Node>, Vec<oneshot::Sender<()>>, Vec<tempfile::T
         let shutdown = async {
             let _ = stopped.await;
         };
-        let incoming = TcpIncoming::from(listener);
-        drop(node.serve(
-            AuthResolver::static_only(None),
-            (incoming, acceptor),
-            shutdown,
-        ));
-        nodes.push(node);
-        stops.push(stop);
-        roots.push(root);
+        let answer = (
+            auth.clone(),
+            Box::new(denials.clone()) as Box<dyn AuditSink + Send>,
+        );
+        drop(node.serve(answer, (TcpIncoming::from(listener), acceptor), shutdown));
+        served.nodes.push(node);
+        served.stops.push(stop);
+        served.dirs.push(root);
     }
-    roots.push(certs);
-    (nodes, stops, roots)
+    served.dirs.push(certs);
+    served
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_export_to_a_follower_commits_on_the_leader_over_mutual_tls() {
-    let (nodes, stops, _roots) = three_served().await;
+/// Form the nodes' group 0 and return the index of a follower.
+async fn formed(nodes: &[Node]) -> usize {
     let members: BTreeMap<NodeId, String> = nodes
         .iter()
         .zip(NAMES)
@@ -116,18 +142,57 @@ async fn an_export_to_a_follower_commits_on_the_leader_over_mutual_tls() {
         .expect("a leader")
         .current_leader
         .expect("a leader");
-    let follower = nodes.iter().find(|n| n.id != leader).expect("a follower");
+    nodes
+        .iter()
+        .position(|n| n.id != leader)
+        .expect("a follower")
+}
 
-    let ingested = follower.ingest().ingest_with(export("served"), None).await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_export_to_a_follower_commits_on_the_leader_over_mutual_tls() {
+    let served = three_served(&AuthResolver::static_only(None), &SharedAuditSink::new()).await;
+    let follower = formed(&served.nodes).await;
+
+    let ingested = served.nodes[follower]
+        .ingest()
+        .ingest_with(export("served"), None)
+        .await;
 
     assert!(
         matches!(ingested, Ok(Ingested::Committed { .. })),
         "{ingested:?}"
     );
-    for stop in stops {
-        let _ = stop.send(());
-    }
-    for node in nodes {
-        node.host.shutdown().await.expect("shutdown");
-    }
+    served.stop().await;
+}
+
+/// RFC 0026 §3.4: the leader that denies a forwarded export for its tenant
+/// binding records the `IngestDenied` audit event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_export_the_leader_denies_is_audited() {
+    let tokens = build_token_store(Some(&[TokenSpec {
+        name: Some("edge".to_owned()),
+        token: Some("tok-other".to_owned()),
+        tenants: vec!["other".to_owned()],
+    }]))
+    .expect("valid spec")
+    .expect("enabled store");
+    let auth = AuthResolver::static_only(Some(Arc::new(tokens)));
+    let denials = SharedAuditSink::new();
+    let served = three_served(&auth, &denials).await;
+    let follower = formed(&served.nodes).await;
+
+    let denied = served.nodes[follower]
+        .ingest()
+        .ingest_with(export("denied"), Some("Bearer tok-other"))
+        .await;
+
+    assert!(denied.is_err(), "{denied:?}");
+    let events = denials.drain();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.payload, AuditPayload::IngestDenied { .. })),
+        "{events:?}"
+    );
+    served.stop().await;
 }

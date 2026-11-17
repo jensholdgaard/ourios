@@ -56,7 +56,7 @@ fn vote(term: u64) -> Vote {
 
 /// Each event `run` logs on this thread: its name and its fields but the
 /// message, as `key=value`, in key order.
-fn events(run: impl FnOnce()) -> Vec<(String, Vec<String>)> {
+pub(in crate::replicated::raft) fn events(run: impl FnOnce()) -> Vec<(String, Vec<String>)> {
     use std::sync::{Mutex, PoisonError};
     use tracing_subscriber::prelude::*;
 
@@ -93,6 +93,7 @@ fn events(run: impl FnOnce()) -> Vec<(String, Vec<String>)> {
         }
     }
 
+    crate::global_subscriber();
     let captured = Captured::default();
     let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&captured)));
     tracing::subscriber::with_default(subscriber, run);

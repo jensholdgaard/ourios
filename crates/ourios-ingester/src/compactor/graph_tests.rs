@@ -573,6 +573,7 @@ async fn rfc0048_4_completion_event_carries_the_registry_name() {
         use tracing_subscriber::prelude::*;
         tracing_subscriber::registry().with(CaptureEvents(Arc::clone(&events)))
     };
+    crate::global_subscriber();
     let guard = tracing::subscriber::set_default(subscriber);
     let (result, _) = graph.sweep(sink).await;
     drop(guard);

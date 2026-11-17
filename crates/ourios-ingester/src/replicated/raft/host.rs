@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use openraft::async_runtime::WatchReceiver as _;
@@ -19,17 +19,23 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use super::checkpointer::Checkpointer;
 use super::flushing::{self, Current, Flushing, Need, Publishing};
 use super::gate::SyncGate;
 use super::kept::{Bounds, Kept};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
 use super::mining::{GroupMiner, GroupMinerError, Mined, SharedLog};
+use super::proposer::Proposer;
+use super::proposing::Proposing;
+use super::reporting::Reporting;
+use super::restoring::Restoring;
 use super::state_machine::{Applied, AppliedEvent, GroupSm};
 use super::telemetry::{KeptDrops, Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
 use super::types::{LogId, NodeId, RaftTypes};
 use super::vote_log::VoteLog;
 use super::{RaftTimings, group_config};
+use crate::replicated::write::COMMIT_TIMEOUT;
 
 pub type GroupRaft = Raft<RaftTypes, GroupSm>;
 
@@ -145,18 +151,50 @@ struct Launch<'a> {
 impl Launch<'_> {
     /// Where a tail replica's miner for `group` hands its output and keeps
     /// it within `bounds`, its gauges registered.
-    fn follow(&self, group: u32, mined: mpsc::Sender<GroupMined>, tail: &Tail) -> Follow {
+    fn follow(
+        &self,
+        group: u32,
+        mined: mpsc::Sender<GroupMined>,
+        (tail, sm): (&Tail, &GroupSm),
+    ) -> Follow {
         let kept = Arc::new(Mutex::new(Kept::new(tail.kept)));
         self.meters.keep(group, &kept);
         let publishing = tail.publishing.as_ref();
         let flushing = publishing.and_then(|publishing| {
             let source = publishing.source(group)?;
             let log: SharedLog = Arc::new(tail.log.clone());
+            let proposing = Proposing {
+                group,
+                proposer: Proposer::new(
+                    self.spec.peers.clone(),
+                    group,
+                    source.voters.clone(),
+                    COMMIT_TIMEOUT,
+                ),
+                replica: self.spec.id,
+                raft: Arc::clone(&tail.raft),
+                log: tail.log.clone(),
+                sm: sm.clone(),
+                refused: Arc::default(),
+            };
+            let reporting = Reporting::new(proposing.clone());
+            let checkpointer = Checkpointer::new(
+                group,
+                publishing.barrier(),
+                source.store.clone(),
+                self.meters.checkpoints(),
+            )
+            .proposing(proposing);
             let flushing =
                 Flushing::new(self.spec.id, group, source, log).with_replays(self.meters.replays());
-            Some((flushing, publishing.sweep()))
+            Some((flushing, publishing.sweep(), (checkpointer, reporting)))
         });
-        let sweep = flushing.as_ref().map(|(f, every)| (f.current(), *every));
+        let restoring = publishing
+            .and_then(|publishing| publishing.source(group))
+            .map(|source| reinstall::restoring(group, source, tail, sm));
+        let sweep = flushing.as_ref().map(|(f, every, _)| (f.current(), *every));
+        let (flushing, flusher) = flushing.map(|(f, _, c)| (f, c)).unzip();
+        let (checkpointer, reporting) = flusher.unzip();
         Follow {
             group,
             mined,
@@ -164,10 +202,13 @@ impl Launch<'_> {
                 group,
                 kept,
                 drops: self.meters.kept(),
-                flushing: flushing.map(|(f, _)| Arc::new(Mutex::new(f))),
+                flushing: flushing.map(|f| Arc::new(Mutex::new(f))),
             },
             sweep,
             storage: self.meters.storage(),
+            checkpointer,
+            reporting,
+            restoring,
         }
     }
 
@@ -190,6 +231,8 @@ impl Launch<'_> {
         let probe = probe::Probe::of(&log);
         log.count_takeovers(self.meters.takeovers(self.spec.id, group));
         let gate = Arc::clone(&self.gate);
+        let cell: Arc<OnceLock<GroupRaft>> = Arc::default();
+        let (hold, builds_held) = watch::channel(false);
         let (sm, applied) = match &self.spec.role {
             HostRole::Voter => (blocking(move || GroupSm::open(&dir, gate)).await, None),
             HostRole::Tail {
@@ -203,6 +246,8 @@ impl Launch<'_> {
                     kept: *kept,
                     publishing: publishing.clone(),
                     log: reader.clone(),
+                    raft: Arc::clone(&cell),
+                    hold: Arc::new(hold),
                 };
                 (sm, Some((applied, mined.clone(), tail)))
             }
@@ -212,7 +257,7 @@ impl Launch<'_> {
         // `Raft::new` applies the committed entries the log replays before
         // it returns, so the miner must already be taking them.
         let mining = applied.map(|(applied, mined, tail)| {
-            let follow = self.follow(group, mined, &tail);
+            let follow = self.follow(group, mined, (&tail, &sm));
             Mining::start(follow, GroupMiner::new(reader.clone()), applied)
         });
         let (id, network) = (self.spec.id, self.spec.peers.network(self.spec.id, group));
@@ -226,11 +271,9 @@ impl Launch<'_> {
                 return Err(HostError::Raft { group, source });
             }
         };
-        let builds = RaftBuilds {
-            raft: raft.clone(),
-            metrics: raft.metrics(),
-        };
-        tokio::spawn(snapshot_at_checkpoints(builds, sm.checkpoints()));
+        // Set once: this is the group's only open.
+        let _ = cell.set(raft.clone());
+        build_at_checkpoints(&raft, &sm, builds_held);
         Ok(Hosted {
             raft,
             sm,
@@ -240,6 +283,16 @@ impl Launch<'_> {
             probe,
         })
     }
+}
+
+/// Build `raft`'s snapshot at each checkpoint `sm` applies, while `held`
+/// does not say a restore holds them.
+fn build_at_checkpoints(raft: &GroupRaft, sm: &GroupSm, held: watch::Receiver<bool>) {
+    let builds = RaftBuilds {
+        raft: raft.clone(),
+        metrics: raft.metrics(),
+    };
+    tokio::spawn(snapshot_at_checkpoints(builds, sm.checkpoints(), held));
 }
 
 /// How many applied entries a tail replica's state machine hands its
@@ -297,7 +350,7 @@ impl Mining {
 
 /// The next applied event, or `None` once the group has ended or the host
 /// stops the miner.
-async fn next(
+pub(super) async fn next(
     applied: &mut mpsc::Receiver<Applied>,
     stop: &mut watch::Receiver<bool>,
 ) -> Option<Applied> {
@@ -308,8 +361,35 @@ async fn next(
     }
 }
 
+/// What the miner's task does next.
+enum Work {
+    Event(Applied),
+    /// The checkpoint barrier's tick.
+    Barrier,
+    /// The report tick, which forces a report, so one goes out at least
+    /// every patience; reports are checked after every piece of work.
+    Report,
+}
+
+/// A tick every `every`, delayed rather than bunched after a slow step.
+fn interval(every: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(every);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval
+}
+
+/// Resolves at `barrier`'s next tick, never without one.
+async fn ticked(barrier: &mut Option<tokio::time::Interval>) {
+    match barrier {
+        Some(barrier) => {
+            barrier.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// Resolves once the host stops the miner, or drops the means to.
-async fn stopped(stop: &mut watch::Receiver<bool>) {
+pub(super) async fn stopped(stop: &mut watch::Receiver<bool>) {
     stop.wait_for(|stopped| *stopped).await.ok();
 }
 
@@ -323,6 +403,15 @@ struct Follow {
     /// can be published from this replica.
     sweep: Option<(Current, Duration)>,
     storage: Storage,
+    /// The group's checkpoint cadence, when it can be published from this
+    /// replica.
+    checkpointer: Option<Checkpointer>,
+    /// The flusher's reports to its leader, when it can be published from
+    /// this replica.
+    reporting: Option<Reporting>,
+    /// Where the miner restores from at a snapshot, when this replica
+    /// reads the group's store; without one, a snapshot stops the miner.
+    restoring: Option<Restoring<SharedLog>>,
 }
 
 /// What a tail replica's settings say of its groups' output.
@@ -331,6 +420,11 @@ struct Tail {
     publishing: Option<Arc<Publishing>>,
     /// The group's log, which a flusher replays a gap from.
     log: GroupLogReader,
+    /// This replica's raft once it runs, which a flusher learns its leader
+    /// from.
+    raft: Arc<OnceLock<GroupRaft>>,
+    /// Held while its miner restores, which holds its snapshot builds.
+    hold: Arc<watch::Sender<bool>>,
 }
 
 /// What a tail replica keeps of `group`'s mined output for a takeover,
@@ -425,32 +519,95 @@ impl Follow {
     /// Ends with the group or once `stop` says so, never in the middle of
     /// a step.
     async fn run(
-        self,
+        mut self,
         mut miner: GroupMiner,
         mut applied: mpsc::Receiver<Applied>,
         mut stop: watch::Receiver<bool>,
     ) {
-        while let Some(event) = next(&mut applied, &mut stop).await {
-            let index = event.at.index;
-            let mut work = Some(event);
-            while work.is_some() || miner.holds() {
-                let Some((back, followed)) = self.mine(miner, index, work.take()).await else {
-                    return;
-                };
-                miner = back;
-                let handed_on = match followed {
-                    None => break,
-                    Some(Ok(out)) => self.hand_on(out, &mut stop).await,
-                    Some(Err(error)) => {
-                        self.storage.miner_stopped(self.group, &error);
-                        false
-                    }
-                };
-                if !handed_on || *stop.borrow() {
-                    return;
+        let mut checkpointer = self.checkpointer.take();
+        let mut reporting = self.reporting.take();
+        let mut barrier = checkpointer.as_ref().map(|c| interval(c.every()));
+        let mut reports = reporting.as_ref().map(|_| interval(Reporting::every()));
+        loop {
+            // Unbiased, so a queue that is never empty does not starve the
+            // ticks; `next` still puts a stop before another event.
+            let work = tokio::select! {
+                event = next(&mut applied, &mut stop) => event.map(Work::Event),
+                () = ticked(&mut barrier) => Some(Work::Barrier),
+                () = ticked(&mut reports) => Some(Work::Report),
+            };
+            let Some(work) = work else {
+                return;
+            };
+            match self.installing(&work, &miner) {
+                Some(Install::At(at, state)) => {
+                    let installed = (at, state);
+                    let Some(restored) = self.reinstall(installed, &mut applied, &mut stop).await
+                    else {
+                        return;
+                    };
+                    miner = restored;
+                    continue;
                 }
+                Some(Install::Passed) => continue,
+                None => {}
+            }
+            let forced = matches!(work, Work::Report);
+            let Some(back) = self
+                .work(work, miner, (checkpointer.as_mut(), &mut stop))
+                .await
+            else {
+                return;
+            };
+            miner = back;
+            if let Some(reporting) = reporting.as_mut() {
+                reporting.maybe(&miner, forced);
             }
         }
+    }
+
+    /// Do one piece of `work` with `miner`; `None` once the miner has
+    /// stopped or the host says to.
+    async fn work(
+        &self,
+        work: Work,
+        miner: GroupMiner,
+        (checkpointer, stop): (Option<&mut Checkpointer>, &mut watch::Receiver<bool>),
+    ) -> Option<GroupMiner> {
+        match (work, checkpointer) {
+            (Work::Event(event), _) => self.follow(miner, event, stop).await,
+            (Work::Barrier, Some(checkpointer)) => self.checkpoint(checkpointer, miner).await,
+            (Work::Barrier | Work::Report, _) => Some(miner),
+        }
+    }
+
+    /// Follow `event`, then mine the batches a first configuration holds,
+    /// handing on each output. `None` once the miner has stopped or the
+    /// host says to.
+    async fn follow(
+        &self,
+        mut miner: GroupMiner,
+        event: Applied,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Option<GroupMiner> {
+        let index = event.at.index;
+        let mut work = Some(event);
+        while work.is_some() || miner.holds() {
+            let (back, followed) = self.mine(miner, index, work.take()).await?;
+            miner = back;
+            let handed_on = match followed {
+                None => break,
+                Some(Ok(out)) => self.hand_on(out, stop).await,
+                Some(Err(error)) => {
+                    self.storage.miner_stopped(self.group, &error);
+                    false
+                }
+            };
+            if !handed_on || *stop.borrow() {
+                return None;
+            }
+        }
+        Some(miner)
     }
 
     /// One step of `miner` off the runtime's workers: follow `event`, or
@@ -478,6 +635,40 @@ impl Follow {
             (miner, followed)
         });
         mining.await.ok()
+    }
+
+    /// Cut a checkpoint at `miner`'s last entry, off the runtime's
+    /// workers, and start writing it, unless one is still writing or the
+    /// cut would not pass the last one written. `None` if the capture
+    /// panicked; the panic is reported where it happened.
+    async fn checkpoint(
+        &self,
+        checkpointer: &mut Checkpointer,
+        miner: GroupMiner,
+    ) -> Option<GroupMiner> {
+        let Some(flushing) = self
+            .keeping
+            .flushing
+            .as_ref()
+            .filter(|_| checkpointer.ready())
+        else {
+            return Some(miner);
+        };
+        let written = checkpointer.written();
+        let (target, kept, flushing) = (
+            checkpointer.target(),
+            Arc::clone(&self.keeping.kept),
+            Arc::clone(flushing),
+        );
+        let capturing = tokio::task::spawn_blocking(move || {
+            let cut = target.capture(&miner, (&kept, &flushing), written);
+            (miner, cut)
+        });
+        let (miner, cut) = capturing.await.ok()?;
+        if let Some(cut) = cut {
+            checkpointer.start(cut);
+        }
+        Some(miner)
     }
 
     /// Send `out` on, unless it is empty; `false` once told to stop. With
@@ -546,13 +737,14 @@ impl Builds for RaftBuilds {
 async fn snapshot_at_checkpoints(
     mut builds: impl Builds,
     mut cuts: watch::Receiver<Option<LogId>>,
+    mut held: watch::Receiver<bool>,
 ) {
     let mut built = builds.snapshot();
     let mut retry = tokio::time::interval(TRIGGER_RETRY);
     retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        let cut = *cuts.borrow_and_update();
-        if built < cut {
+        let due = due(built, *cuts.borrow_and_update(), &mut held);
+        if due {
             if !builds.trigger().await {
                 return;
             }
@@ -566,9 +758,17 @@ async fn snapshot_at_checkpoints(
                 Some(snapshot) => built = snapshot,
                 None => return,
             },
-            _ = retry.tick(), if built < cut => {}
+            _ = retry.tick(), if due => {}
+            // A closed hold holds nothing.
+            Ok(()) = held.changed() => {}
         }
     }
+}
+
+/// Whether a snapshot is due: the replica has applied a checkpoint past the
+/// last one `built`, and no restore holds its builds.
+fn due(built: Option<LogId>, cut: Option<LogId>, held: &mut watch::Receiver<bool>) -> bool {
+    built < cut && !*held.borrow_and_update()
 }
 
 /// The node's running groups.
@@ -698,6 +898,10 @@ impl GroupHost {
     }
 }
 
+mod reinstall;
+
+use reinstall::Install;
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -807,6 +1011,9 @@ mod tests {
             },
             sweep: None,
             storage: Storage::global(),
+            checkpointer: None,
+            reporting: None,
+            restoring: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         let GroupEntry::Batch(batch) = batch_at(time(1), "acme", &["a b c"]) else {
@@ -963,6 +1170,9 @@ mod tests {
             },
             sweep: None,
             storage: Storage::global(),
+            checkpointer: None,
+            reporting: None,
+            restoring: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         Following {
@@ -1210,7 +1420,7 @@ mod tests {
             snapshots,
             triggers: Arc::clone(&triggers),
         };
-        let task = tokio::spawn(snapshot_at_checkpoints(held, cuts));
+        let task = tokio::spawn(snapshot_at_checkpoints(held, cuts, watch::channel(false).1));
         let churning = Arc::clone(&snapshots_tx);
         let churn = tokio::spawn(async move {
             loop {

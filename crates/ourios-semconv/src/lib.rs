@@ -819,6 +819,16 @@ pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE_DESCRIPTION: &str =
 /// `ourios.wal.recovery.truncated.size` unit (UCUM).
 pub const OURIOS_WAL_RECOVERY_TRUNCATED_SIZE_UNIT: &str = "By";
 
+/// `ourios.wal.replication.checkpoint.duration` (histogram, unit `s`).
+pub const OURIOS_WAL_REPLICATION_CHECKPOINT_DURATION: &str =
+    "ourios.wal.replication.checkpoint.duration";
+
+/// `ourios.wal.replication.checkpoint.duration` description (the registry `brief`).
+pub const OURIOS_WAL_REPLICATION_CHECKPOINT_DURATION_DESCRIPTION: &str = "Wall-clock duration of a flusher's checkpoint, from its cut until its bundle and `checkpoint.json` are written or the attempt fails (RFC 0065 §6.5).";
+
+/// `ourios.wal.replication.checkpoint.duration` unit (UCUM).
+pub const OURIOS_WAL_REPLICATION_CHECKPOINT_DURATION_UNIT: &str = "s";
+
 /// `ourios.wal.replication.control.holds` (counter, unit `{hold}`).
 pub const OURIOS_WAL_REPLICATION_CONTROL_HOLDS: &str = "ourios.wal.replication.control.holds";
 
@@ -1389,9 +1399,16 @@ pub const EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED: &str =
 /// `ourios.wal.recovery.tail.truncated` log event name.
 pub const EVENT_OURIOS_WAL_RECOVERY_TAIL_TRUNCATED: &str = "ourios.wal.recovery.tail.truncated";
 
+/// `ourios.wal.replication.checkpoint.failed` log event name.
+pub const EVENT_OURIOS_WAL_REPLICATION_CHECKPOINT_FAILED: &str =
+    "ourios.wal.replication.checkpoint.failed";
+
 /// `ourios.wal.replication.publication.held` log event name.
 pub const EVENT_OURIOS_WAL_REPLICATION_PUBLICATION_HELD: &str =
     "ourios.wal.replication.publication.held";
+
+/// `ourios.wal.replication.restore.held` log event name.
+pub const EVENT_OURIOS_WAL_REPLICATION_RESTORE_HELD: &str = "ourios.wal.replication.restore.held";
 
 /// `ourios.wal.replication.stopped` log event name.
 pub const EVENT_OURIOS_WAL_REPLICATION_STOPPED: &str = "ourios.wal.replication.stopped";

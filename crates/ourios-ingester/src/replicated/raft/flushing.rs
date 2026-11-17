@@ -63,6 +63,9 @@ pub struct Publishing {
 /// (RFC 0063 §3.2, as the local receiver's sweep).
 const SWEEP_TICK: Duration = Duration::from_secs(30);
 
+/// The barrier's least, as RFC 0052 §3.1 validates `barrier_secs`.
+const BARRIER_FLOOR: Duration = Duration::from_secs(1);
+
 /// The age sweep's least, so an age of zero does not spin.
 const SWEEP_FLOOR: Duration = Duration::from_millis(10);
 
@@ -77,6 +80,13 @@ impl Publishing {
             promoted: self.promoted.clone(),
             audit_ceiling: self.audit_ceiling,
         })
+    }
+
+    /// How often a group's flusher checkpoints: RFC 0052's barrier runs
+    /// at the sink's age trigger, here at least once a second.
+    #[must_use]
+    pub fn barrier(&self) -> Duration {
+        self.flush.max_buffer_age.max(BARRIER_FLOOR)
     }
 
     /// How often a group's age sweep runs: at most 30 s and
@@ -235,6 +245,20 @@ impl Flushing {
     #[must_use]
     pub fn current(&self) -> Current {
         self.current.subscribe()
+    }
+
+    /// The publication a checkpoint publishes through, while this replica
+    /// is named and has handed it everything `kept` holds, with no gap to
+    /// rebuild: only then are all the rows through its miner's last entry
+    /// published or buffered there (RFC 0065 §6.5).
+    #[must_use]
+    pub fn checkpointable(&self, kept: &Kept) -> Option<Arc<Publication>> {
+        let publishing_all = self.named
+            && self.active
+            && self.caught_up
+            && self.rebuilding.is_none()
+            && kept.gap().is_none();
+        publishing_all.then(|| self.publication.clone()).flatten()
     }
 
     /// Why a named replica is not publishing, as the `error.type` it last
@@ -458,24 +482,7 @@ impl Flushing {
 
     /// The log id `formed.json` records for this group.
     fn log_id(&self) -> Result<u32, Unread> {
-        let bytes = match self.source.store.get_blocking_opt(&formed_key(self.group)) {
-            Ok(Some(bytes)) => bytes,
-            // Expected until the group forms.
-            Ok(None) => return Err(Unread::Absent),
-            Err(error) => {
-                return Err(Unread::Failed {
-                    error_type: "store_read",
-                    error: error.to_string(),
-                });
-            }
-        };
-        let voters: Vec<&str> = self.source.voters.iter().map(String::as_str).collect();
-        Formation::decode(&bytes, self.group, &voters)
-            .map(|formation| formation.log())
-            .map_err(|refused| Unread::Failed {
-                error_type: refused.error_type(),
-                error: refused.to_string(),
-            })
+        formed_log(&self.source, self.group)
     }
 
     /// Report being held for `error_type`, once until the reason changes.
@@ -497,13 +504,35 @@ impl Flushing {
 }
 
 /// Why the log id was not read.
-enum Unread {
+pub(super) enum Unread {
     /// No record yet.
     Absent,
     Failed {
         error_type: &'static str,
         error: String,
     },
+}
+
+/// The log id `formed.json` records for `group`.
+pub(super) fn formed_log(source: &Source, group: u32) -> Result<u32, Unread> {
+    let bytes = match source.store.get_blocking_opt(&formed_key(group)) {
+        Ok(Some(bytes)) => bytes,
+        // Expected until the group forms.
+        Ok(None) => return Err(Unread::Absent),
+        Err(error) => {
+            return Err(Unread::Failed {
+                error_type: "store_read",
+                error: error.to_string(),
+            });
+        }
+    };
+    let voters: Vec<&str> = source.voters.iter().map(String::as_str).collect();
+    Formation::decode(&bytes, group, &voters)
+        .map(|formation| formation.log())
+        .map_err(|refused| Unread::Failed {
+            error_type: refused.error_type(),
+            error: refused.to_string(),
+        })
 }
 
 mod rebuild;

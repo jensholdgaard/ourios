@@ -768,3 +768,38 @@ fn a_replay_held_for_a_bundle_records_when_a_later_checkpoint_ends_it() {
     f.step(8..9, None);
     assert_eq!(reader.counts(REPLAY_DURATION), [(vec!["3".to_owned()], 1)]);
 }
+
+/// RFC 0065 §6.5: a checkpoint may publish through a replica only while
+/// it is named and has every row it keeps published or buffered.
+#[test]
+fn only_a_named_flusher_publishing_all_it_keeps_may_checkpoint() {
+    let mut f = fixture(true, Bounds::default());
+    f.step(0..3, None);
+    assert!(f.flushing.checkpointable(&f.kept).is_none(), "not named");
+
+    f.step(3..5, Some(me()));
+    assert!(
+        f.flushing.checkpointable(&f.kept).is_some(),
+        "named, caught up"
+    );
+
+    f.step(5..6, Some(other()));
+    assert!(
+        f.flushing.checkpointable(&f.kept).is_none(),
+        "another named"
+    );
+}
+
+/// A named flusher still rebuilding a gap has not published every row
+/// through its miner's last entry, so it may not checkpoint until the
+/// replay reaches the gap.
+#[test]
+fn a_flusher_rebuilding_its_gap_may_not_checkpoint() {
+    let mut f = fixture_sliced(true, Bounds::default(), 1);
+    f.replay_one_slice();
+    assert!(f.flushing.checkpointable(&f.kept).is_none(), "replaying");
+
+    f.step(7..10, None);
+    assert_eq!(f.kept.gap(), None, "the replay reached the gap");
+    assert!(f.flushing.checkpointable(&f.kept).is_some());
+}

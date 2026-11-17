@@ -874,6 +874,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureDeferrals {
 
 /// The deferral events `run` logs.
 fn deferrals(run: impl FnOnce()) -> Vec<Deferred> {
+    crate::global_subscriber();
     let events: Arc<Mutex<Vec<Deferred>>> = Arc::default();
     let subscriber = {
         use tracing_subscriber::prelude::*;

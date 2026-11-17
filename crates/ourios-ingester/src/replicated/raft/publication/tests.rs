@@ -11,13 +11,13 @@ use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use crate::record_sink::{FlushConfig, ParquetRecordSink};
 
 /// The log id the tests publish under.
-const LOG: u32 = 7;
+pub(in crate::replicated::raft) const LOG: u32 = 7;
 
-struct Stores {
+pub(in crate::replicated::raft) struct Stores {
     _tmp: tempfile::TempDir,
-    data: PathBuf,
+    pub(in crate::replicated::raft) data: PathBuf,
     audit: PathBuf,
-    publication: Publication,
+    pub(in crate::replicated::raft) publication: Publication,
 }
 
 /// A publication over local data and audit stores whose record sink
@@ -53,12 +53,12 @@ const HELD_BACK: FlushConfig = FlushConfig {
 };
 
 /// [`stores_with`] [`HELD_BACK`].
-fn stores() -> Stores {
+pub(in crate::replicated::raft) fn stores() -> Stores {
     stores_with(HELD_BACK)
 }
 
 /// Every record in the files under `root`.
-fn published(root: &Path) -> Vec<MinedRecord> {
+pub(in crate::replicated::raft) fn published(root: &Path) -> Vec<MinedRecord> {
     parquet_files(root)
         .iter()
         .flat_map(|file| {
@@ -71,7 +71,7 @@ fn published(root: &Path) -> Vec<MinedRecord> {
 }
 
 /// Make the audit store refuse every write.
-fn fail_audit(stores: &Stores) {
+pub(in crate::replicated::raft) fn fail_audit(stores: &Stores) {
     std::fs::remove_dir_all(&stores.audit).expect("remove audit root");
     std::fs::write(&stores.audit, b"not a directory").expect("sabotage");
 }
@@ -95,7 +95,7 @@ fn parquet_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn kept_of(log: &[(u64, super::super::mining::Mined)]) -> Kept {
+pub(in crate::replicated::raft) fn kept_of(log: &[(u64, super::super::mining::Mined)]) -> Kept {
     let mut kept = Kept::default();
     for (index, mined) in log {
         kept.keep(*index, mined.clone());

@@ -88,6 +88,9 @@ pub enum GroupMinerError {
     /// The first configuration applied at `at`, and the group's log no
     /// longer holds the entry at `index`, applied before it.
     Purged { at: LogId, index: u64 },
+    /// A snapshot replaced the log through `at`, and the store holds no
+    /// bundle at its cut that restores.
+    Unrestorable { at: LogId, detail: String },
 }
 
 impl fmt::Display for GroupMinerError {
@@ -107,6 +110,12 @@ impl fmt::Display for GroupMinerError {
                 write!(
                     f,
                     "a snapshot through {at} replaced the log the miner follows"
+                )
+            }
+            Self::Unrestorable { at, detail } => {
+                write!(
+                    f,
+                    "the miner does not restore at the snapshot through {at}: {detail}"
                 )
             }
             Self::Purged { at, index } => write!(
@@ -136,6 +145,7 @@ impl GroupMinerError {
             Self::OutOfOrder { .. } => "out_of_order",
             Self::Installed { .. } => "installed",
             Self::Purged { .. } => "purged",
+            Self::Unrestorable { .. } => "unrestorable",
         }
     }
 }
@@ -148,21 +158,49 @@ impl std::error::Error for GroupMinerError {}
 /// [`IdReserver`]. Nothing refills it, so every replica runs out at the
 /// same position.
 #[derive(Debug, Clone, Default)]
-pub struct LogBlocks(Arc<Mutex<VecDeque<IdBlock>>>);
+pub struct LogBlocks(Arc<Mutex<Blocks>>);
+
+#[derive(Debug, Default)]
+struct Blocks {
+    queue: VecDeque<IdBlock>,
+    /// The block drawn last, which the allocator's ids come from; its
+    /// range alone cannot show which block that was (RFC 0065 §6.5).
+    current: Option<IdBlock>,
+}
 
 impl LogBlocks {
-    fn queue(&self) -> MutexGuard<'_, VecDeque<IdBlock>> {
+    fn blocks(&self) -> MutexGuard<'_, Blocks> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn push(&self, block: IdBlock) {
-        self.queue().push_back(block);
+        self.blocks().queue.push_back(block);
     }
 
     /// The blocks not yet drawn.
     #[must_use]
     pub fn remaining(&self) -> usize {
-        self.queue().len()
+        self.blocks().queue.len()
+    }
+
+    /// The block drawn last, which the allocator's ids come from.
+    #[must_use]
+    pub fn current(&self) -> Option<IdBlock> {
+        self.blocks().current
+    }
+
+    /// Hold `current` as the block drawn last and `pending` as those not
+    /// yet drawn, as a bundle records them.
+    fn seat(&self, current: Option<IdBlock>, pending: &[IdBlock]) {
+        let mut blocks = self.blocks();
+        blocks.current = current;
+        blocks.queue = pending.iter().copied().collect();
+    }
+
+    /// The block drawn last and those not yet drawn, in log order.
+    fn state(&self) -> (Option<IdBlock>, Vec<IdBlock>) {
+        let blocks = self.blocks();
+        (blocks.current, blocks.queue.iter().copied().collect())
     }
 }
 
@@ -182,10 +220,13 @@ impl IdReserver for LogBlocks {
     /// The next block in log order; the allocator refuses one below
     /// `floor`, which the state machine's ordering of blocks rules out.
     fn reserve(&mut self, _floor: u64) -> Result<cluster::IdBlock, IdReservationError> {
-        let block = self
-            .queue()
+        let mut blocks = self.blocks();
+        let block = blocks
+            .queue
             .pop_front()
             .ok_or_else(|| IdReservationError::new(NoBlockLeft))?;
+        blocks.current = Some(block);
+        drop(blocks);
         cluster::IdBlock::new(block.after(), block.through()).ok_or_else(|| {
             IdReservationError::new(format!(
                 "empty id block ({}, {}]",
@@ -299,6 +340,8 @@ enum Stage {
     Mining {
         miner: Box<MinerCluster>,
         held: Option<Held>,
+        /// The configuration in force.
+        config: GroupMinerConfig,
     },
     Stopped(GroupMinerError),
 }
@@ -311,6 +354,8 @@ pub struct GroupMiner {
     audit: SharedAuditSink,
     clock: BatchClock,
     last: Option<LogId>,
+    /// The index of the last entry that changed what a bundle holds.
+    changed: Option<u64>,
 }
 
 impl GroupMiner {
@@ -325,7 +370,17 @@ impl GroupMiner {
             audit: SharedAuditSink::new(),
             clock: BatchClock::default(),
             last: None,
+            changed: None,
         }
+    }
+
+    /// A cluster under `config`, emitting its audit events to this miner
+    /// at the batch's time and drawing ids from the group's blocks.
+    fn cluster_under(&self, config: GroupMinerConfig) -> MinerCluster {
+        let audit = Box::new(self.audit.clone());
+        MinerCluster::with_audit_sink(config.config(), audit)
+            .with_clock(Box::new(self.clock.clone()))
+            .with_id_reserver(Box::new(self.blocks.clone()))
     }
 
     /// The id blocks applied and not yet drawn.
@@ -427,6 +482,12 @@ impl GroupMiner {
             }
             _ => self.last = Some(at),
         }
+        if !matches!(
+            event,
+            AppliedEvent::Flusher(_) | AppliedEvent::Checkpoint(_)
+        ) {
+            self.changed = Some(at.index);
+        }
         match event {
             AppliedEvent::Batch(batch) => self.batch(at, &batch),
             AppliedEvent::IdBlock(block) => {
@@ -453,7 +514,7 @@ impl GroupMiner {
     /// The rows of the next held batch in the group's log, or `None`
     /// once the configuration holds none.
     fn read_held(&mut self) -> Option<Result<Vec<MinedRow>, GroupMinerError>> {
-        let Stage::Mining { miner, held } = &mut self.stage else {
+        let Stage::Mining { miner, held, .. } = &mut self.stage else {
             return None;
         };
         let Held { next, at } = held.as_mut()?;
@@ -482,27 +543,36 @@ impl GroupMiner {
         config: GroupMinerConfig,
     ) -> Result<Vec<MinedRow>, GroupMinerError> {
         match &mut self.stage {
-            Stage::Mining { miner, .. } => {
+            Stage::Mining {
+                miner,
+                config: in_force,
+                ..
+            } => {
                 let refused = |source| GroupMinerError::ShapeChanged { at, source };
                 miner.reconfigure(config.config()).map_err(refused)?;
+                *in_force = config;
                 Ok(Vec::new())
             }
             Stage::Unconfigured { first } => {
                 let held = first.map(|next| Held { next, at });
-                let audit = Box::new(self.audit.clone());
-                let reserver = Box::new(self.blocks.clone());
-                let miner = Box::new(
-                    MinerCluster::with_audit_sink(config.config(), audit)
-                        .with_clock(Box::new(self.clock.clone()))
-                        .with_id_reserver(reserver),
-                );
-                self.stage = Stage::Mining { miner, held };
+                let miner = Box::new(self.cluster_under(config));
+                self.stage = Stage::Mining {
+                    miner,
+                    held,
+                    config,
+                };
                 Ok(Vec::new())
             }
             Stage::Stopped(error) => Err(error.clone()),
         }
     }
 }
+
+mod checkpoint;
+mod restore;
+
+pub use checkpoint::{CaptureError, Captured};
+pub use restore::RestoreError;
 
 #[cfg(test)]
 pub(super) mod tests;

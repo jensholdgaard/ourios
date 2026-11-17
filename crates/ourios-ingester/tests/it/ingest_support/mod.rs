@@ -543,3 +543,17 @@ pub fn gzip(bytes: &[u8]) -> Vec<u8> {
     encoder.write_all(bytes).expect("gzip write");
     encoder.finish().expect("gzip finish")
 }
+
+/// Install a process-wide default subscriber once, for a test that
+/// captures under a scoped one. Without it, a callsite first reached by a
+/// test running with no subscriber can cache a `never` interest while
+/// another test's scoped subscriber is being registered, and that
+/// subscriber then misses the span. A default interested in everything
+/// keeps every callsite enabled, so each scoped subscriber decides what it
+/// records.
+pub fn global_subscriber() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}

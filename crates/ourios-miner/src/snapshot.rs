@@ -96,7 +96,8 @@ pub struct SnapshotState {
     /// its own last frame this state folds — never another tenant's —
     /// or `None` if no offset was recorded. On the known-version
     /// recovery path the driver replays only this tenant's frames
-    /// above it (RFC 0008 §6.7 offset-resume).
+    /// above it (RFC 0008 §6.7 offset-resume). In a replicated
+    /// checkpoint bundle it is the group's cut instead (RFC 0065 §6.5).
     pub wal_high_water: Option<WalHighWater>,
     /// RFC 0050 §3.3 adopted-template map entries.
     /// `#[serde(default)]` — absent in pre-RFC snapshots, which had
@@ -330,9 +331,51 @@ fn slot_types_to_record(s: SlotTypes) -> Vec<ParamTypeRecord> {
 /// textual form; the miner only needs to record and round-trip it,
 /// not to compare WAL offsets, so a string is sufficient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WalHighWater {
+#[serde(deny_unknown_fields)]
+pub struct SegmentMark {
     pub segment: String,
     pub byte: u64,
+}
+
+/// A replicated group's cut (RFC 0065 §6.5): the state folds every entry
+/// of the group's log `log` through index `seq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogMark {
+    pub log: u32,
+    pub seq: u64,
+}
+
+/// Where a snapshot's state stops. The two shapes are told apart by
+/// their keys alone, so the local backend's bytes are unchanged and no
+/// version is raised (RFC 0065 §6.5); unknown keys are refused, so an
+/// object with the keys of both, or of neither, is corrupt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WalHighWater {
+    /// The local backend's: the tenant's own last frame.
+    Local(SegmentMark),
+    /// The replicated backend's, read only from a checkpoint bundle.
+    Replicated(LogMark),
+}
+
+impl From<SegmentMark> for WalHighWater {
+    fn from(mark: SegmentMark) -> Self {
+        Self::Local(mark)
+    }
+}
+
+impl SnapshotState {
+    /// The highest template id the state holds, `None` when it holds none.
+    #[must_use]
+    pub fn highest_template_id(&self) -> Option<u64> {
+        self.leaves
+            .iter()
+            .map(|leaf| leaf.template_id)
+            .chain(self.structured_templates.iter().map(|s| s.template_id))
+            .chain(self.adopted_templates.iter().map(|a| a.template_id))
+            .max()
+    }
 }
 
 /// Errors from [`load_snapshot`]. Enum-carried states (no panicking
@@ -420,7 +463,7 @@ const LEGACY_V1: u8 = 1;
 /// The one field RFC 0052 §3.2 still reads from a version-1 artefact.
 #[derive(Deserialize)]
 struct LegacyPayload {
-    wal_high_water: Option<WalHighWater>,
+    wal_high_water: Option<SegmentMark>,
 }
 
 /// What a snapshot artefact offers RFC 0052 §3.2's legacy stale-gap
@@ -430,7 +473,7 @@ pub enum LegacyMark {
     /// Not a version-1 artefact: the check has nothing to read here.
     NotLegacy,
     /// A version-1 artefact and the global mark it recorded.
-    Recorded(WalHighWater),
+    Recorded(SegmentMark),
     /// A version-1 artefact whose payload does not decode even for its
     /// mark, or that recorded none. There is no horizon to compare, so
     /// the check fails closed on it.
@@ -561,10 +604,10 @@ mod tests {
                 event_name: Some("gen_ai.client.inference.operation.details".to_string()),
                 template_id: 3,
             }],
-            wal_high_water: Some(WalHighWater {
+            wal_high_water: Some(WalHighWater::Local(SegmentMark {
                 segment: "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0".to_string(),
                 byte: 4096,
-            }),
+            })),
             adopted_templates: vec![AdoptedTemplateRecord {
                 canonical: "copy <*> done".to_string(),
                 severity_number: 9,
@@ -726,8 +769,11 @@ mod tests {
         v1[0] = 1;
 
         assert_eq!(
-            Some(legacy_v1_mark(&v1)),
-            sample_state().wal_high_water.map(LegacyMark::Recorded)
+            legacy_v1_mark(&v1),
+            LegacyMark::Recorded(SegmentMark {
+                segment: "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0".to_string(),
+                byte: 4096,
+            })
         );
         assert_eq!(
             recover(Some(&v1)),
@@ -767,6 +813,75 @@ mod tests {
 
         // Assert
         assert!(matches!(err, SnapshotError::Corrupt(_)));
+    }
+
+    fn mark_json(state: &SnapshotState) -> serde_json::Value {
+        let bytes = snapshot(state).expect("snapshot encodes");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes[1..]).expect("payload is JSON");
+        payload["wal_high_water"].clone()
+    }
+
+    fn with_mark(mark: &str) -> Vec<u8> {
+        let mut payload: serde_json::Value =
+            serde_json::to_value(sample_state()).expect("state encodes");
+        payload["wal_high_water"] = serde_json::from_str(mark).expect("test mark");
+        let mut bytes = vec![SNAPSHOT_VERSION];
+        bytes.extend(serde_json::to_vec(&payload).expect("payload encodes"));
+        bytes
+    }
+
+    #[test]
+    fn the_local_mark_keeps_its_bytes() {
+        assert_eq!(
+            mark_json(&sample_state()),
+            serde_json::json!({"segment": "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0", "byte": 4096})
+        );
+    }
+
+    #[test]
+    fn a_replicated_mark_round_trips_as_log_and_seq() {
+        let mut state = sample_state();
+        state.wal_high_water = Some(WalHighWater::Replicated(LogMark { log: 3, seq: 200 }));
+
+        assert_eq!(mark_json(&state), serde_json::json!({"log": 3, "seq": 200}));
+        let bytes = snapshot(&state).expect("snapshot encodes");
+        assert_eq!(load_snapshot(&bytes).expect("decodes"), state);
+    }
+
+    #[test]
+    fn a_mark_with_keys_of_both_shapes_is_corrupt() {
+        let bytes = with_mark(r#"{"segment": "s", "byte": 1, "log": 3, "seq": 200}"#);
+
+        assert!(matches!(
+            load_snapshot(&bytes),
+            Err(SnapshotError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn a_mark_with_neither_shape_is_corrupt() {
+        for mark in [r"{}", r#"{"byte": 1}"#, r#"{"log": 3}"#] {
+            assert!(
+                matches!(
+                    load_snapshot(&with_mark(mark)),
+                    Err(SnapshotError::Corrupt(_))
+                ),
+                "{mark}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_highest_template_id_spans_leaves_structured_and_adopted() {
+        let state = sample_state();
+        let mut empty = sample_state();
+        empty.leaves.clear();
+        empty.structured_templates.clear();
+        empty.adopted_templates.clear();
+
+        assert_eq!(state.highest_template_id(), Some(4));
+        assert_eq!(empty.highest_template_id(), None);
     }
 
     #[test]

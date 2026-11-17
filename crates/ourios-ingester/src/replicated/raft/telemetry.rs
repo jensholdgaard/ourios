@@ -46,6 +46,7 @@ pub(crate) struct Meters {
     storage: Storage,
     kept: KeptDrops,
     replays: Replays,
+    checkpoints: Checkpoints,
 }
 
 impl Meters {
@@ -75,6 +76,7 @@ impl Meters {
             storage: Storage::on(meter),
             kept: KeptDrops::on(meter),
             replays: Replays::on(meter),
+            checkpoints: Checkpoints::on(meter),
         }
     }
 
@@ -91,6 +93,11 @@ impl Meters {
     /// What a named flusher's gap replays record.
     pub(crate) fn replays(&self) -> Replays {
         self.replays.clone()
+    }
+
+    /// What a flusher's checkpoints record.
+    pub(crate) fn checkpoints(&self) -> Checkpoints {
+        self.checkpoints.clone()
     }
 
     /// What the storage writers record.
@@ -400,6 +407,35 @@ impl Replays {
     }
 }
 
+/// How long a flusher's checkpoints take (§6.5, §6.9).
+#[derive(Clone, Debug)]
+pub struct Checkpoints {
+    duration: Histogram<f64>,
+}
+
+impl Checkpoints {
+    /// The instrument on `meter`.
+    #[must_use]
+    pub fn on(meter: &Meter) -> Self {
+        let (name, description, unit) = CHECKPOINT_DURATION;
+        let duration = meter
+            .f64_histogram(name)
+            .with_description(description)
+            .with_unit(unit)
+            .with_boundaries(ourios_core::histogram_buckets::LONG_DURATION_S.to_vec())
+            .build();
+        Self { duration }
+    }
+
+    /// A checkpoint of `group` ended after `elapsed`, failed with
+    /// `error_type` if it did.
+    pub(crate) fn ended(&self, group: u32, elapsed: Duration, error_type: Option<&'static str>) {
+        let mut attributes = vec![group_kv(group)];
+        attributes.extend(error_type.map(|e| KeyValue::new(crate::metrics::ERROR_TYPE, e)));
+        self.duration.record(elapsed.as_secs_f64(), &attributes);
+    }
+}
+
 /// A counter's name, description and unit.
 type Spec = (&'static str, &'static str, &'static str);
 
@@ -437,6 +473,12 @@ const KEPT_ROW_DROPPED: Spec = (
     semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED,
     semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_DESCRIPTION,
     semconv::OURIOS_WAL_REPLICATION_KEPT_ROW_DROPPED_UNIT,
+);
+
+const CHECKPOINT_DURATION: Spec = (
+    semconv::OURIOS_WAL_REPLICATION_CHECKPOINT_DURATION,
+    semconv::OURIOS_WAL_REPLICATION_CHECKPOINT_DURATION_DESCRIPTION,
+    semconv::OURIOS_WAL_REPLICATION_CHECKPOINT_DURATION_UNIT,
 );
 
 const REPLAY_DURATION: Spec = (
@@ -659,6 +701,6 @@ fn lags(metrics: &RaftMetrics<RaftTypes>) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod state_machine_tests;
 #[cfg(test)]
-mod storage_tests;
+pub(in crate::replicated::raft) mod storage_tests;
 #[cfg(test)]
 pub(crate) mod tests;

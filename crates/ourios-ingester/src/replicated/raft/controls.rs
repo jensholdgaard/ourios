@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use ourios_wal::{Control, MinerConfigV1};
+use ourios_wal::{Control, MinerConfigV1, RaftLogId};
 use uuid::Uuid;
 
 use super::id_blocks::Ahead;
@@ -77,6 +77,73 @@ impl HeldControls {
                 | Control::Checkpoint { .. }
                 | Control::MinerConfig(_) => ahead,
             })
+    }
+}
+
+/// What a log, over its snapshot, says at an entry above the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AtEntry {
+    /// The highest control kind through the entry.
+    pub(super) highest_kind: u8,
+    /// Whether a miner configuration is in force there.
+    pub(super) configured: bool,
+}
+
+impl HeldControls {
+    /// What the log over `snapshot` says at `index`, an entry after the
+    /// snapshot.
+    pub(super) fn at(&self, snapshot: Option<&GroupSnapshot>, index: u64) -> AtEntry {
+        let from = first_after(snapshot);
+        // An entry the snapshot covers reads as the snapshot's state.
+        let through = || {
+            let range = (from <= index).then(|| self.controls.range(from..=index));
+            range.into_iter().flatten().map(|(_, c)| *c)
+        };
+        let snapshot_kind = snapshot.map_or(0, |s| s.state.highest_kind);
+        AtEntry {
+            highest_kind: through()
+                .map(Control::kind)
+                .fold(snapshot_kind.max(self.purged_kind), u8::max),
+            configured: snapshot.is_some_and(|s| s.state.miner_config.is_some())
+                || through().any(|c| matches!(c, Control::MinerConfig(_))),
+        }
+    }
+
+    /// The id blocks after the entry at `mined` that a replica would apply,
+    /// over `snapshot`'s latest: those a flusher that mined through it has
+    /// not reached.
+    pub(super) fn blocks_after(&self, snapshot: Option<&GroupSnapshot>, mined: u64) -> u32 {
+        let start = Ahead::starting(snapshot.and_then(|s| s.state.id_block));
+        let (_, after) = self.controls.range(first_after(snapshot)..).fold(
+            (start, 0_u32),
+            |(ahead, after), (&index, control)| match *control {
+                Control::IdBlock {
+                    after: from,
+                    through,
+                } => {
+                    let next = ahead.then(IdBlock::new(from, through));
+                    let applied = next.blocks > ahead.blocks && index > mined;
+                    (next, after + u32::from(applied))
+                }
+                Control::FlusherAssignment(_)
+                | Control::Checkpoint { .. }
+                | Control::MinerConfig(_) => (ahead, after),
+            },
+        );
+        after
+    }
+
+    /// The highest cut a checkpoint entry after `snapshot` proposes.
+    pub(super) fn proposed_after(&self, snapshot: Option<&GroupSnapshot>) -> Option<RaftLogId> {
+        self.controls
+            .range(first_after(snapshot)..)
+            .filter_map(|(_, c)| match *c {
+                Control::Checkpoint { cut, .. } => Some(cut),
+                Control::FlusherAssignment(_)
+                | Control::IdBlock { .. }
+                | Control::MinerConfig(_) => None,
+            })
+            .max()
     }
 }
 

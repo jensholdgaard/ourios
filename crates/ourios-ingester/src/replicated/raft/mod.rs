@@ -6,7 +6,10 @@
 //! the writer's reply, so one fsync completes every record queued while
 //! the previous one ran.
 
+pub mod bundle;
 mod checkpoint;
+mod checkpointer;
+pub mod checkpointing;
 mod codec;
 mod controls;
 pub mod flusher;
@@ -20,8 +23,13 @@ pub mod log_ids;
 pub mod log_store;
 mod miner_config;
 pub mod mining;
+pub mod proposals;
+pub mod proposer;
+mod proposing;
 pub mod publication;
 pub mod replay;
+mod reporting;
+mod restoring;
 mod snapshot_record;
 pub mod state_machine;
 mod telemetry;

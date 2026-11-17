@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
+use ourios_semconv as semconv;
 use tokio::sync::{mpsc, watch};
 
 use super::bundle::read::{ReadError, read};
@@ -148,7 +149,7 @@ impl<L: GroupLogRead + Clone + Send + 'static> Restoring<L> {
         state: GroupState,
         stop: &mut watch::Receiver<bool>,
     ) -> Option<Result<GroupMiner, Unrestored>> {
-        let mut wait = FIRST;
+        let (mut wait, mut held) = (FIRST, false);
         loop {
             let restoring = self.clone();
             let attempt = tokio::task::spawn_blocking(move || restoring.attempt(at, state));
@@ -161,11 +162,10 @@ impl<L: GroupLogRead + Clone + Send + 'static> Restoring<L> {
             };
             match attempted {
                 Err(Unrestored::Unreachable(why)) => {
-                    tracing::warn!(
-                        group = self.group,
-                        error.type = "store_read",
-                        "cannot read the bundle at {at} to restore the miner: {why}"
-                    );
+                    if !held {
+                        held = true;
+                        self.report_held(at, &why);
+                    }
                 }
                 done => return Some(done),
             }
@@ -175,6 +175,19 @@ impl<L: GroupLogRead + Clone + Send + 'static> Restoring<L> {
             }
             wait = (wait * 2).min(MOST);
         }
+    }
+
+    /// Report the restore at `at` held: the store could not be read.
+    fn report_held(&self, at: LogId, why: &str) {
+        tracing::warn!(
+            name: semconv::EVENT_OURIOS_WAL_REPLICATION_RESTORE_HELD,
+            {
+                { semconv::OURIOS_WAL_GROUP } = i64::from(self.group),
+                { crate::metrics::ERROR_TYPE } = "store_read",
+            },
+            "group {} cannot restore its miner at {at} until the store is read: {why}",
+            self.group,
+        );
     }
 
     /// One attempt, blocking: the group's log id, then the bundle at the

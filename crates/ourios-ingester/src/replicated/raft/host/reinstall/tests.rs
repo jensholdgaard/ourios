@@ -242,7 +242,8 @@ fn events_queued_below_a_restored_cut_are_passed_over() {
         expected,
         ..
     } = mined_through(&entries, &events);
-    let store = store_of(&[&later]);
+    // The restore's read waits until the test sees its hold.
+    let (store, paused) = pausing(store_of(&[&later]), Point::AfterFormedRead);
     let log = HeldLog(
         logged(&entries)
             .into_iter()
@@ -263,13 +264,14 @@ fn events_queued_below_a_restored_cut_are_passed_over() {
             };
             events_to.send(installed).await.expect("send");
             // The restore holds the replica's builds until it has caught up.
-            let restored = async {
-                held.wait_for(|held| *held).await.expect("held");
-                held.wait_for(|held| !*held).await.expect("released");
-            };
+            paused.reached.await.expect("the restore reads the store");
+            assert!(*held.borrow(), "the restore holds the replica's builds");
+            paused.release.send(()).expect("release");
+            let restored = held.wait_for(|held| !*held);
             tokio::time::timeout(Duration::from_secs(10), restored)
                 .await
-                .expect("the miner restores");
+                .expect("the miner restores")
+                .expect("released");
             // Index 5, below the restored cut at 6, then 7 and 8.
             for event in [&events[4], &events[6], &events[7]] {
                 events_to.send(event.clone()).await.expect("send");

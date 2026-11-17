@@ -11,6 +11,7 @@ use super::super::mining::tests::{
     HeldLog, batch, block, configured, events_of, in_force, logged, miner_of, with_threshold,
 };
 use super::super::snapshot_record::GroupState;
+use super::super::telemetry::storage_tests::events;
 use super::super::types::{GroupEntry, LogId, NodeId};
 use super::{Restoring, Unrestored};
 use crate::record_sink::FlushConfig;
@@ -163,6 +164,29 @@ fn a_replica_retries_while_the_store_is_out() {
     let (restored, cut) = through_an_outage(|outage, _| outage.end());
 
     assert_eq!(restored, Some(Ok(Some(cut))));
+}
+
+/// RFC 0065 §6.5: a replica that cannot read the store reports why, once
+/// for the outage rather than once per attempt.
+#[test]
+fn a_restore_held_by_the_store_reports_it_once() {
+    let mut restored = None;
+    let logged = events(|| restored = Some(through_an_outage(|outage, _| outage.end())));
+
+    let (restored, cut) = restored.expect("ran");
+    assert_eq!(restored, Some(Ok(Some(cut))));
+    let held: Vec<_> = logged
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("ourios.wal.replication"))
+        .collect();
+    let fields = ["error.type=store_read", "ourios.wal.group=3"];
+    assert_eq!(
+        held,
+        [(
+            ourios_semconv::EVENT_OURIOS_WAL_REPLICATION_RESTORE_HELD.to_owned(),
+            fields.map(str::to_owned).to_vec(),
+        )]
+    );
 }
 
 /// A replica waiting out an outage stops when the host says to.

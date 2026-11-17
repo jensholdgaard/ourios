@@ -23,6 +23,7 @@ pub mod log_ids;
 pub mod log_store;
 mod miner_config;
 pub mod mining;
+pub mod proposals;
 pub mod publication;
 pub mod replay;
 mod snapshot_record;

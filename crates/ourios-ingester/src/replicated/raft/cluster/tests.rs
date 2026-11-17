@@ -21,6 +21,7 @@ use super::{
 };
 
 mod mining;
+mod propose;
 mod publication;
 
 const GROUP: u32 = 0;

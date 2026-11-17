@@ -8,6 +8,7 @@ use std::time::Duration;
 use openraft::async_runtime::WatchReceiver as _;
 use ourios_wal::Control;
 
+use super::super::super::id_blocks::Reported;
 use super::super::super::mining::GroupLogRead as _;
 use super::super::super::mining::tests::{batch_at, block, corpus, time};
 use super::super::super::proposals::Proposals;
@@ -222,5 +223,38 @@ async fn a_queued_proposal_is_refused_once_its_leader_is_replaced() {
     let outcome = queued(&cluster, (leader, &targets[leader]), &report_only, replace).await;
 
     assert!(matches!(outcome, Outcome::NotLeader { .. }), "{outcome:?}");
+    cluster.shutdown().await;
+}
+
+/// RFC 0065 §6.8: an accepted report, with or without an entry, is what
+/// the leader tops the group's id blocks up from; one refused as `stale`
+/// is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_leader_keeps_the_report_it_accepts_for_the_top_up() {
+    let (cluster, leader, cut, targets) = proposing_with_targets().await;
+    let reports = targets[leader].reports(GROUP).expect("hosted");
+    let accepted = Report {
+        unstarted: 1,
+        checkpoint: None,
+        ..report(cluster.id(3), cut)
+    };
+
+    let outcome = propose(&cluster, leader, &accepted).await;
+
+    assert_eq!(outcome, Outcome::Accepted { appended: None });
+    let kept = Reported {
+        proposer: cluster.id(3),
+        mined: cut,
+        unstarted: 1,
+    };
+    assert_eq!(reports.latest(), Some(kept));
+    let stale = Report {
+        mined: None,
+        unstarted: 0,
+        ..accepted
+    };
+    let refused = propose(&cluster, leader, &stale).await;
+    assert!(matches!(refused, Outcome::Stale(_)), "{refused:?}");
+    assert_eq!(reports.latest(), Some(kept), "a stale report is not kept");
     cluster.shutdown().await;
 }

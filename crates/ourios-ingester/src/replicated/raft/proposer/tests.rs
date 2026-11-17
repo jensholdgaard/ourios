@@ -180,7 +180,12 @@ async fn it_resends_after_an_uncertain_outcome() {
 #[tokio::test]
 async fn a_leaders_refusal_ends_the_sending() {
     for (refusal, expected) in [
-        (Refusal::NotFlusher, Delivered::NotFlusher),
+        (
+            Refusal::NotFlusher,
+            Delivered::NotFlusher {
+                leader: "v1".to_owned(),
+            },
+        ),
         (
             Refusal::Stale("behind".to_owned()),
             Delivered::Stale("behind".to_owned()),
@@ -235,4 +240,25 @@ async fn a_hint_that_is_no_voter_is_passed_over() {
 
     assert_eq!(delivered, Delivered::Accepted { appended: None });
     assert_eq!(count(&calls), [1, 0, 0]);
+}
+
+/// RFC 0065 §6.8: the flusher stops proposing to the leader that refused
+/// it as `not_flusher` in that term, so the answer names that node, also
+/// when a hint led there.
+#[tokio::test]
+async fn not_flusher_names_the_node_that_refused() {
+    let (peers, _calls, _serving) = voters([
+        Some(vec![not_leader(Some("v2"))]),
+        Some(vec![Err(Refusal::NotFlusher)]),
+        Some(vec![Ok(None)]),
+    ]);
+
+    let delivered = proposer(peers).send(&report(), Some("v1".to_owned())).await;
+
+    assert_eq!(
+        delivered,
+        Delivered::NotFlusher {
+            leader: "v2".to_owned()
+        }
+    );
 }

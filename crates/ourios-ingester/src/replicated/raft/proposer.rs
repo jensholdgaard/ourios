@@ -20,9 +20,9 @@ use super::types::LogId;
 pub enum Delivered {
     /// The leader counted the report and committed the entry, if any.
     Accepted { appended: Option<LogId> },
-    /// The leader's log names another flusher: stop proposing to it in
-    /// this term.
-    NotFlusher,
+    /// The log of `leader`, the node that refused it, names another
+    /// flusher: stop proposing to that node in this term.
+    NotFlusher { leader: String },
     /// Behind the leader's log: drop it, and report afresh at the next
     /// trigger.
     Stale(String),
@@ -72,7 +72,7 @@ impl Proposer {
                 .await;
             match outcome {
                 Outcome::Accepted { appended } => return Delivered::Accepted { appended },
-                Outcome::NotFlusher => return Delivered::NotFlusher,
+                Outcome::NotFlusher => return Delivered::NotFlusher { leader: target },
                 Outcome::Stale(why) => return Delivered::Stale(why),
                 Outcome::Malformed(why) => return Delivered::Malformed(why),
                 // The same node again: it may have appended it, and a copy

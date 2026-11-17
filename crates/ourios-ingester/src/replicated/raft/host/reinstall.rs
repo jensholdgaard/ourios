@@ -46,27 +46,23 @@ enum Caught {
 }
 
 impl Follow {
-    /// The snapshot `work` installs, when this replica restores at one:
-    /// not one `miner` has already mined past, whose log it still holds.
+    /// What `work` asks of a replica that restores: an event `miner` has
+    /// already mined past, after a restore moved it on, is passed over, and
+    /// a snapshot past it is restored at.
     pub(super) fn installing(&self, work: &Work, miner: &GroupMiner) -> Option<Install> {
-        let (
-            Work::Event(Applied {
-                at,
-                event: AppliedEvent::Installed(state),
-            }),
-            Some(_),
-        ) = (work, &self.restoring)
-        else {
+        let (Work::Event(Applied { at, event }), Some(_)) = (work, &self.restoring) else {
             return None;
         };
-        let passed = miner
+        if miner
             .applied_through()
-            .is_some_and(|mined| mined >= at.index);
-        Some(if passed {
-            Install::Passed
-        } else {
-            Install::At(*at, *state)
-        })
+            .is_some_and(|mined| mined >= at.index)
+        {
+            return Some(Install::Passed);
+        }
+        match event {
+            AppliedEvent::Installed(state) => Some(Install::At(*at, *state)),
+            _ => None,
+        }
     }
 
     /// The miner restored at the snapshot `installed` names and caught up
@@ -150,7 +146,7 @@ impl Follow {
 pub(super) enum Install {
     /// Restore at the snapshot through this entry, holding this state.
     At(LogId, GroupState),
-    /// The miner has mined past it, and the log still holds what follows.
+    /// The miner has mined past it.
     Passed,
 }
 

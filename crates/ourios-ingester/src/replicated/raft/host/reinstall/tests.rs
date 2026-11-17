@@ -65,7 +65,12 @@ fn following(
     store: Store,
     log: HeldLog,
     installed: (LogId, GroupState),
-) -> (mpsc::Sender<Applied>, mpsc::Receiver<GroupMined>, Mining) {
+) -> (
+    mpsc::Sender<Applied>,
+    mpsc::Receiver<GroupMined>,
+    Mining,
+    watch::Receiver<bool>,
+) {
     let (events, applied) = mpsc::channel(16);
     let (mined, handed) = mpsc::channel(16);
     let meters = Meters::global();
@@ -73,6 +78,8 @@ fn following(
         audit: 1_000,
         rows: 1_000,
     })));
+    let hold = Arc::new(watch::channel(false).0);
+    let restores = hold.subscribe();
     let restoring = Restoring {
         group: 0,
         source: Source {
@@ -87,7 +94,7 @@ fn following(
             audit_ceiling: usize::MAX,
         },
         log: Arc::new(log.clone()) as SharedLog,
-        hold: Arc::new(watch::channel(false).0),
+        hold: Arc::clone(&hold),
         installed: Arc::new(move || Some(installed)),
     };
     let follow = Follow {
@@ -106,7 +113,7 @@ fn following(
         restoring: Some(restoring),
     };
     let mining = Mining::start(follow, GroupMiner::new(log), applied);
-    (events, handed, mining)
+    (events, handed, mining, restores)
 }
 
 /// The rows `handed` carries, until `rows` of them; fails after 10 s.
@@ -181,7 +188,7 @@ fn a_purge_past_the_cut_restores_again_at_the_later_snapshot() {
     tokio::runtime::Runtime::new()
         .expect("runtime")
         .block_on(async {
-            let (events_to, mut handed, mining) = following(store, log, (later_at, later_state));
+            let (events_to, mut handed, mining, _) = following(store, log, (later_at, later_state));
             let install = |at, state| Applied {
                 at,
                 event: AppliedEvent::Installed(state),
@@ -219,6 +226,58 @@ fn a_purge_past_the_cut_restores_again_at_the_later_snapshot() {
             let more = tokio::time::timeout(Duration::from_millis(500), handed.recv()).await;
             assert!(more.is_err(), "nothing mined again: {more:?}");
             assert!(mining.is_running(), "the miner restored and runs on");
+            mining.stop().await;
+        });
+}
+
+/// A restore can land past events still queued, as when a purge restores
+/// again at a later snapshot: those events are passed over, not mined out
+/// of order, and the miner mines on from the entry after its cut.
+#[test]
+fn events_queued_below_a_restored_cut_are_passed_over() {
+    let entries = entries();
+    let events = events_of(&entries, 32);
+    let Mined {
+        cuts: [_, (later, later_at)],
+        expected,
+        ..
+    } = mined_through(&entries, &events);
+    let store = store_of(&[&later]);
+    let log = HeldLog(
+        logged(&entries)
+            .into_iter()
+            .filter(|e| e.log_id.index > later_at.index)
+            .map(|e| (e.log_id.index, e))
+            .collect(),
+    );
+    let later_state = state(&later);
+
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async {
+            let (events_to, mut handed, mining, mut held) =
+                following(store, log, (later_at, later_state));
+            let installed = Applied {
+                at: later_at,
+                event: AppliedEvent::Installed(later_state),
+            };
+            events_to.send(installed).await.expect("send");
+            // The restore holds the replica's builds until it has caught up.
+            let restored = async {
+                held.wait_for(|held| *held).await.expect("held");
+                held.wait_for(|held| !*held).await.expect("released");
+            };
+            tokio::time::timeout(Duration::from_secs(10), restored)
+                .await
+                .expect("the miner restores");
+            // Index 5, below the restored cut at 6, then 7 and 8.
+            for event in [&events[4], &events[6], &events[7]] {
+                events_to.send(event.clone()).await.expect("send");
+            }
+
+            let mined = rows_of(&mut handed, expected.len()).await;
+            assert_eq!(mined, expected, "the entries past the cut");
+            assert!(mining.is_running(), "the miner mines on");
             mining.stop().await;
         });
 }

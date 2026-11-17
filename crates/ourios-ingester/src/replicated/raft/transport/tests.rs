@@ -33,7 +33,7 @@ use super::{
     STREAM_APPEND, VERSION,
 };
 
-mod mtls;
+pub(in crate::replicated) mod mtls;
 mod pipelining;
 mod shutdown;
 mod snapshot;

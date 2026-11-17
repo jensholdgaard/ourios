@@ -25,14 +25,19 @@ fn layout(voters: &[&str]) -> VotingLayout {
 
 /// Node `n0`'s start, under `wal_root`, against `store`.
 fn n0(wal_root: &Path, store: &Store) -> NodeStart {
+    n0_named("n0", wal_root, store, Peers::plaintext())
+}
+
+/// Node `name`'s start among [`VOTERS`], reaching them through `peers`.
+pub(super) fn n0_named(name: &str, wal_root: &Path, store: &Store, peers: Peers) -> NodeStart {
     let layout = layout(&VOTERS);
     NodeStart {
-        node_id: "n0".to_owned(),
+        node_id: name.to_owned(),
         wal: wal_config(wal_root),
-        groups: layout.groups_of("n0"),
+        groups: layout.groups_of(name),
         layout,
         role: HostRole::Voter,
-        peers: Peers::plaintext(),
+        peers,
         timings: test_timings(),
         store: store.clone(),
         allow_bootstrap: true,

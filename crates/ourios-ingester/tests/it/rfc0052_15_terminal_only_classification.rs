@@ -101,7 +101,7 @@ async fn over_grpc(pipeline: IngestPipeline) -> (Code, String, bool) {
 /// spec requires on every 5xx.
 async fn over_http(pipeline: IngestPipeline) -> (StatusCode, String, bool) {
     let (status, headers, body) = send_full(
-        router(pipeline.into(), &HttpConfig::default()),
+        router(Arc::new(pipeline), &HttpConfig::default()),
         post_request(
             "/v1/logs",
             Some(PROTOBUF),

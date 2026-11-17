@@ -40,7 +40,8 @@ use tonic::{Code, Request, Response, Status};
 
 use opentelemetry::context::FutureExt as _;
 
-use crate::receiver::pipeline::{Export, IngestFailure, ReceiveError, SharedPipeline};
+use crate::receiver::ingest::SharedIngest;
+use crate::receiver::pipeline::{Export, IngestFailure, ReceiveError};
 use crate::receiver::selector;
 use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
 use ourios_serving::propagation::extract_context_from_metadata;
@@ -166,7 +167,7 @@ where
 /// wrapped in [`RequestSizeService`].
 #[must_use]
 pub fn logs_service(
-    pipeline: SharedPipeline,
+    pipeline: SharedIngest,
     max_request_bytes: usize,
 ) -> RequestSizeService<LogsServiceServer<LogsReceiver>> {
     RequestSizeService::new(
@@ -260,15 +261,15 @@ fn mark_too_large<B>(response: &mut http::Response<B>, metrics: &crate::metrics:
     }
 }
 
-/// The gRPC `LogsService` over a shared `IngestPipeline`.
+/// The gRPC `LogsService` over a shared [`Ingest`](crate::receiver::Ingest).
 pub struct LogsReceiver {
-    pipeline: SharedPipeline,
+    pipeline: SharedIngest,
 }
 
 impl LogsReceiver {
     /// Build a gRPC receiver over the shared pipeline.
     #[must_use]
-    pub fn new(pipeline: SharedPipeline) -> Self {
+    pub fn new(pipeline: SharedIngest) -> Self {
         Self { pipeline }
     }
 }
@@ -288,6 +289,9 @@ impl LogsService for LogsReceiver {
         // The [`AuthInterceptor`]'s binding, when auth is enabled — the
         // pipeline enforces the §3.2 tenant binding against it.
         let binding = request.extensions().get::<Arc<AuthBinding>>().cloned();
+        // RFC 0065 §6.8: a replicated node forwards an export it does not
+        // lead with the client's credential, which the leader authenticates.
+        let credential = credential(request.metadata().get("authorization"));
         // RFC 0046 §3.1: the tenant selector — required, exactly once,
         // visible-ASCII metadata — decided before the set check and before
         // any WAL work; a missing/malformed one is INVALID_ARGUMENT.
@@ -311,6 +315,7 @@ impl LogsService for LogsReceiver {
                             binding: binding.as_deref(),
                             lenient_json: false,
                         },
+                        credential.as_deref(),
                         span_error,
                     )
                     .await
@@ -376,6 +381,15 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
 
 /// The `error.type` the `ingest logs` span fails with for `error`: its gRPC
 /// code, when that code is one the gRPC server convention counts as an error.
+/// An `Authorization` value as text, if it is one.
+fn credential(
+    value: Option<&tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+) -> Option<String> {
+    value
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
 fn span_error(error: &ReceiveError) -> Option<String> {
     server_error_code(ingest_error_status(error).code()).map(str::to_owned)
 }

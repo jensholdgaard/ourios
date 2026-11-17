@@ -358,7 +358,8 @@ enum Work {
     Event(Applied),
     /// The checkpoint barrier's tick.
     Barrier,
-    /// The report tick; reports are checked after every piece of work.
+    /// The report tick, which forces a report, so one goes out at least
+    /// every patience; reports are checked after every piece of work.
     Report,
 }
 
@@ -525,6 +526,7 @@ impl Follow {
             let Some(work) = work else {
                 return;
             };
+            let forced = matches!(work, Work::Report);
             let Some(back) = self
                 .work(work, miner, (checkpointer.as_mut(), &mut stop))
                 .await
@@ -533,7 +535,7 @@ impl Follow {
             };
             miner = back;
             if let Some(reporting) = reporting.as_mut() {
-                reporting.maybe(&miner);
+                reporting.maybe(&miner, forced);
             }
         }
     }

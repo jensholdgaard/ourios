@@ -21,6 +21,7 @@ use tokio::sync::oneshot;
 use tonic::transport::server::TcpIncoming;
 
 use super::super::ingest::Ingested;
+use super::super::raft::cluster::write;
 use super::super::raft::transport::Peers;
 use super::super::raft::transport::tests::mtls::Ca;
 use super::super::raft::types::NodeId;
@@ -142,10 +143,26 @@ async fn formed(nodes: &[Node]) -> usize {
         .expect("a leader")
         .current_leader
         .expect("a leader");
-    nodes
+    // The leader takes writes once its own first entry commits, and a
+    // follower routes to it once it knows it leads.
+    let leading = nodes.iter().find(|n| n.id == leader).expect("the leader");
+    write(leading.host.raft(0).expect("hosted"), 0).await;
+    let follower = nodes
         .iter()
         .position(|n| n.id != leader)
-        .expect("a follower")
+        .expect("a follower");
+    nodes[follower]
+        .host
+        .raft(0)
+        .expect("hosted")
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |m| m.current_leader == Some(leader),
+            "the follower knows the leader",
+        )
+        .await
+        .expect("the follower knows the leader");
+    follower
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -13,6 +13,7 @@ use super::checkpointing::{Checkpoint, Checkpoints};
 use super::flushing::Flushing;
 use super::kept::Kept;
 use super::mining::{Captured, GroupMiner};
+use super::proposing::Proposing;
 use super::publication::Publication;
 
 /// Where one group's checkpoints are written and recorded.
@@ -32,6 +33,8 @@ pub(super) struct Checkpointer {
     written: Option<u64>,
     /// The checkpoint still writing, which yields its cut once written.
     running: Option<JoinHandle<Option<u64>>>,
+    /// How a written checkpoint is proposed; none in tests that only write.
+    proposing: Option<Proposing>,
 }
 
 /// A cut the miner captured, and the publication it publishes through.
@@ -54,6 +57,15 @@ impl Checkpointer {
             every,
             written: None,
             running: None,
+            proposing: None,
+        }
+    }
+
+    /// Propose each checkpoint it writes with `proposing`.
+    pub(super) fn proposing(self, proposing: Proposing) -> Self {
+        Self {
+            proposing: Some(proposing),
+            ..self
         }
     }
 
@@ -92,14 +104,26 @@ impl Checkpointer {
 
     /// Publish and write `cut` off the runtime.
     pub(super) fn start(&mut self, cut: Cut) {
-        let target = self.target.clone();
-        self.running = Some(tokio::task::spawn_blocking(move || {
-            let seq = cut.captured.bundle.cut().seq;
-            target
-                .checkpoint(&cut.publication)
-                .run(&cut.captured, (cut.at, cut.generation))
-                .ok()
-                .map(|_| seq)
+        let (target, proposing) = (self.target.clone(), self.proposing.clone());
+        self.running = Some(tokio::spawn(async move {
+            let writing = tokio::task::spawn_blocking(move || {
+                let written = target
+                    .checkpoint(&cut.publication)
+                    .run(&cut.captured, (cut.at, cut.generation))
+                    .is_ok();
+                (written, cut)
+            });
+            let (written, cut) = writing.await.ok()?;
+            if !written {
+                return None;
+            }
+            // Once its bundle is durable, whatever `checkpoint.json` says
+            // (§6.5); a proposal not taken is dropped, and the next barrier
+            // proposes a later cut.
+            if let Some(proposing) = proposing {
+                proposing.propose(&cut.captured).await;
+            }
+            Some(cut.captured.bundle.cut().seq)
         }));
     }
 }

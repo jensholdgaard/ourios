@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use openraft::async_runtime::WatchReceiver as _;
@@ -25,12 +25,15 @@ use super::gate::SyncGate;
 use super::kept::{Bounds, Kept};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
 use super::mining::{GroupMiner, GroupMinerError, Mined, SharedLog};
+use super::proposer::Proposer;
+use super::proposing::Proposing;
 use super::state_machine::{Applied, AppliedEvent, GroupSm};
 use super::telemetry::{KeptDrops, Meters, ReplicationTelemetry, Storage};
 use super::transport::{Peers, ReplicationServer};
 use super::types::{LogId, NodeId, RaftTypes};
 use super::vote_log::VoteLog;
 use super::{RaftTimings, group_config};
+use crate::replicated::write::COMMIT_TIMEOUT;
 
 pub type GroupRaft = Raft<RaftTypes, GroupSm>;
 
@@ -146,19 +149,39 @@ struct Launch<'a> {
 impl Launch<'_> {
     /// Where a tail replica's miner for `group` hands its output and keeps
     /// it within `bounds`, its gauges registered.
-    fn follow(&self, group: u32, mined: mpsc::Sender<GroupMined>, tail: &Tail) -> Follow {
+    fn follow(
+        &self,
+        group: u32,
+        mined: mpsc::Sender<GroupMined>,
+        (tail, sm): (&Tail, &GroupSm),
+    ) -> Follow {
         let kept = Arc::new(Mutex::new(Kept::new(tail.kept)));
         self.meters.keep(group, &kept);
         let publishing = tail.publishing.as_ref();
         let flushing = publishing.and_then(|publishing| {
             let source = publishing.source(group)?;
             let log: SharedLog = Arc::new(tail.log.clone());
+            let proposing = Proposing {
+                group,
+                proposer: Proposer::new(
+                    self.spec.peers.clone(),
+                    group,
+                    source.voters.clone(),
+                    COMMIT_TIMEOUT,
+                ),
+                replica: self.spec.id,
+                raft: Arc::clone(&tail.raft),
+                log: tail.log.clone(),
+                sm: sm.clone(),
+                refused: Arc::default(),
+            };
             let checkpointer = Checkpointer::new(
                 group,
                 publishing.barrier(),
                 source.store.clone(),
                 self.meters.checkpoints(),
-            );
+            )
+            .proposing(proposing);
             let flushing =
                 Flushing::new(self.spec.id, group, source, log).with_replays(self.meters.replays());
             Some((flushing, publishing.sweep(), checkpointer))
@@ -199,6 +222,7 @@ impl Launch<'_> {
         let probe = probe::Probe::of(&log);
         log.count_takeovers(self.meters.takeovers(self.spec.id, group));
         let gate = Arc::clone(&self.gate);
+        let cell: Arc<OnceLock<GroupRaft>> = Arc::default();
         let (sm, applied) = match &self.spec.role {
             HostRole::Voter => (blocking(move || GroupSm::open(&dir, gate)).await, None),
             HostRole::Tail {
@@ -212,6 +236,7 @@ impl Launch<'_> {
                     kept: *kept,
                     publishing: publishing.clone(),
                     log: reader.clone(),
+                    raft: Arc::clone(&cell),
                 };
                 (sm, Some((applied, mined.clone(), tail)))
             }
@@ -221,7 +246,7 @@ impl Launch<'_> {
         // `Raft::new` applies the committed entries the log replays before
         // it returns, so the miner must already be taking them.
         let mining = applied.map(|(applied, mined, tail)| {
-            let follow = self.follow(group, mined, &tail);
+            let follow = self.follow(group, mined, (&tail, &sm));
             Mining::start(follow, GroupMiner::new(reader.clone()), applied)
         });
         let (id, network) = (self.spec.id, self.spec.peers.network(self.spec.id, group));
@@ -235,11 +260,9 @@ impl Launch<'_> {
                 return Err(HostError::Raft { group, source });
             }
         };
-        let builds = RaftBuilds {
-            raft: raft.clone(),
-            metrics: raft.metrics(),
-        };
-        tokio::spawn(snapshot_at_checkpoints(builds, sm.checkpoints()));
+        // Set once: this is the group's only open.
+        let _ = cell.set(raft.clone());
+        build_at_checkpoints(&raft, &sm);
         Ok(Hosted {
             raft,
             sm,
@@ -249,6 +272,15 @@ impl Launch<'_> {
             probe,
         })
     }
+}
+
+/// Build `raft`'s snapshot at each checkpoint `sm` applies.
+fn build_at_checkpoints(raft: &GroupRaft, sm: &GroupSm) {
+    let builds = RaftBuilds {
+        raft: raft.clone(),
+        metrics: raft.metrics(),
+    };
+    tokio::spawn(snapshot_at_checkpoints(builds, sm.checkpoints()));
 }
 
 /// How many applied entries a tail replica's state machine hands its
@@ -353,6 +385,9 @@ struct Tail {
     publishing: Option<Arc<Publishing>>,
     /// The group's log, which a flusher replays a gap from.
     log: GroupLogReader,
+    /// This replica's raft once it runs, which a flusher learns its leader
+    /// from.
+    raft: Arc<OnceLock<GroupRaft>>,
 }
 
 /// What a tail replica keeps of `group`'s mined output for a takeover,

@@ -10,7 +10,8 @@ use super::{NodeError, NodeStart, start};
 use crate::replicated::layout::{LAYOUT_KEY, VotingLayout, record_or_check};
 use crate::replicated::raft::cluster::{test_timings, wal_config};
 use crate::replicated::raft::host::HostRole;
-use crate::replicated::raft::log_ids::LOG_IDS_KEY;
+use crate::replicated::raft::log_ids::gated::with_outage;
+use crate::replicated::raft::log_ids::{LOG_IDS_KEY, RaftState, raft_state};
 use crate::replicated::raft::log_store::group_dir;
 use crate::replicated::raft::transport::Peers;
 use crate::replicated::replica_id::REPLICA_ID_FILE;
@@ -102,4 +103,38 @@ async fn a_node_whose_layout_differs_creates_no_identity() {
     );
     assert!(!wal_root.path().join(REPLICA_ID_FILE).exists());
     assert!(!exists(&store, LOG_IDS_KEY));
+}
+
+/// RFC0065.31, RFC 0065 §6.6: a replica holding Raft state, restarted with
+/// the store unreachable, opens its groups and keeps taking the log; the
+/// voting layout it cannot read is not checked until a start that can.
+/// One holding none still fails, having nothing to open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_holding_raft_state_starts_while_the_store_is_unreachable() {
+    let wal_root = tempfile::tempdir().expect("tempdir");
+    let (store, outage) = with_outage(Store::in_memory());
+    let node = start(n0(wal_root.path(), &store), &mut |_| {})
+        .await
+        .expect("started");
+    node.host.shutdown().await.expect("shutdown");
+    // Dropping the host releases the vote log the next start takes.
+    drop(node);
+    assert_eq!(
+        raft_state(wal_root.path(), &[0]).ok(),
+        Some(RaftState::Held)
+    );
+    outage.begin();
+
+    let node = start(n0(wal_root.path(), &store), &mut |_| {})
+        .await
+        .expect("a node holding Raft state starts while the store is out");
+    node.host.shutdown().await.expect("shutdown");
+
+    let fresh = tempfile::tempdir().expect("tempdir");
+    let refused = start(n0(fresh.path(), &store), &mut |_| {}).await;
+    assert!(
+        matches!(refused, Err(NodeError::Layout(_))),
+        "{:?}",
+        refused.err()
+    );
 }

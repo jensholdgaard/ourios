@@ -3,7 +3,9 @@
 //! can. Whether it holds Raft state is read first, so a disk it cannot read
 //! changes nothing; the voting layout is recorded or checked before its
 //! identity is created, so a node that could never join leaves no identity;
-//! the bootstrap lock comes before its groups open.
+//! the bootstrap lock comes before its groups open. A node holding Raft
+//! state starts while the store is unreachable, its layout unchecked until
+//! a start that can read it (RFC0065.31).
 
 use std::fmt;
 use std::io;
@@ -139,7 +141,19 @@ fn prepare(
     layout: &VotingLayout,
 ) -> Result<(RaftState, ReplicaId), NodeError> {
     let held = log_ids::raft_state(wal_root, groups).map_err(NodeError::RaftState)?;
-    layout::record_or_check(store, layout).map_err(NodeError::Layout)?;
+    match (layout::record_or_check(store, layout), held) {
+        // RFC0065.31: holding its groups' state, it opens them with the store
+        // unreachable; a start that can read the layout checks it.
+        (Err(LayoutError::Store { .. }), RaftState::Held) => {
+            tracing::warn!(
+                "the voting layout is not checked: the store cannot be read, and this node \
+                 opens the groups whose Raft state it holds"
+            );
+        }
+        (checked, _) => {
+            checked.map_err(NodeError::Layout)?;
+        }
+    }
     let identity = replica_id::load_or_create(wal_root).map_err(NodeError::Identity)?;
     Ok((held, identity.id()))
 }

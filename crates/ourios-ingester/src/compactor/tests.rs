@@ -83,6 +83,7 @@ pub(super) fn traced<T>(run: impl FnOnce() -> T) -> (T, Vec<opentelemetry_sdk::t
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use tracing_subscriber::prelude::*;
 
+    crate::global_subscriber();
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -338,6 +339,7 @@ fn a_failed_sweep_marks_its_span_error() {
     write_sealed_candidate(&store, "a");
     let unlistable = Unreadable::new(bucket.path().join("data"));
 
+    crate::global_subscriber();
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())

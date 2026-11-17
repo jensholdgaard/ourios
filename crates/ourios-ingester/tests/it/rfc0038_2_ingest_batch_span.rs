@@ -12,8 +12,8 @@
 //! `tests/README.md` on the global-installer exclusions).
 
 use crate::ingest_support::{
-    failing_append_pipeline_transient, open_pipeline, oversize_append_pipeline, request,
-    resource_logs,
+    failing_append_pipeline_transient, global_subscriber, open_pipeline, oversize_append_pipeline,
+    request, resource_logs,
 };
 use opentelemetry::trace::{SpanId, SpanKind, Status};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
@@ -36,6 +36,7 @@ async fn ingest_and_collect_spans(record_count: usize) -> Vec<SpanData> {
     let tmp = tempfile::TempDir::new().expect("temp");
     let pipeline = open_pipeline(tmp.path());
 
+    global_subscriber();
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -186,6 +187,7 @@ async fn rfc0038_2_span_count_is_constant_in_record_count() {
 /// Drive one batch through `pipeline`, whose WAL append fails, and return
 /// the finished spans.
 async fn failed_ingest_spans(pipeline: ourios_ingester::receiver::IngestPipeline) -> Vec<SpanData> {
+    global_subscriber();
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())

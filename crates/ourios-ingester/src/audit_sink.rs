@@ -850,6 +850,7 @@ mod tests {
             }
         }
 
+        crate::global_subscriber();
         let events: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
         let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
         tracing::subscriber::with_default(subscriber, run);

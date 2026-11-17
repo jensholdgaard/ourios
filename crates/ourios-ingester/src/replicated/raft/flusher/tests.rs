@@ -7,7 +7,7 @@ use std::time::Duration;
 use openraft::ChangeMembers;
 use openraft::Instant as _;
 use openraft::async_runtime::WatchReceiver as _;
-use ourios_wal::Control;
+use ourios_wal::{Control, MinerConfigV1};
 
 use super::{Assignment, Gate, Hold, Learner, Pass, Reason, Steward, View, plan, verdict};
 use crate::replicated::raft::cluster::{Cluster, WAIT, name, propose, write};
@@ -255,6 +255,33 @@ async fn pass_until_assigned(
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             other => panic!("no assignment: {other:?}"),
+        }
+    }
+}
+
+/// Run passes on `leader` until one appends a miner configuration,
+/// returning it: on a loaded runner an `Identify` can outlast its patience,
+/// which holds the entry back as an unconfirmed member.
+async fn pass_until_configured(
+    steward: &mut Steward,
+    cluster: &Cluster,
+    leader: usize,
+    placed: &[&str],
+) -> MinerConfigV1 {
+    let deadline = tokio::time::Instant::now() + PATIENCE * 10;
+    loop {
+        let pass = steward
+            .pass(group(cluster, leader), tail(placed, cluster))
+            .await;
+        match pass {
+            Ok(Pass {
+                configured: Some(body),
+                ..
+            }) => return body,
+            _ if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("no configuration: {other:?}"),
         }
     }
 }

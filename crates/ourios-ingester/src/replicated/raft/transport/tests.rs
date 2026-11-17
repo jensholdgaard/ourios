@@ -20,7 +20,7 @@ use tonic::transport::server::TcpIncoming;
 use tonic::{Code, Request, Status};
 use tonic_prost::ProstCodec;
 
-use super::super::cluster::{Node, Replica, bind, leader, name, serve, write};
+use super::super::cluster::{Node, Replica, bind, leader, name, rebind, serve, write};
 use super::super::state_machine::GroupSm;
 use super::super::types::{Entry, NodeId, RaftTypes, TenantBatchBytes, Vote};
 use super::trace::Tracing;
@@ -369,6 +369,7 @@ fn capture() -> (
     ));
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
+    crate::global_subscriber();
     let guard = tracing::subscriber::set_default(subscriber);
     (exporter, Tracing::Owned(Arc::new(owned)), guard)
 }
@@ -959,7 +960,7 @@ async fn a_follower_that_rejoins_catches_up_over_the_stream() {
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let incoming = TcpIncoming::bind(addrs[&follower.id]).expect("rebind");
+    let incoming = rebind(addrs[&follower.id]).await;
     let replica = follower.into_replica();
     let back = Node::open(replica, incoming, &peers, ReplicationServer::default()).await;
     back.applied_through(GROUP, last).await;
@@ -977,7 +978,9 @@ async fn a_stream_idle_past_the_soft_ttl_carries_the_next_append() {
     let peers = Peers::plaintext();
     let mut node = start(1, incoming, &peers, ReplicationServer::default()).await;
     let mut client = client_to(&peers, node.id, addr).await;
-    let option = RPCOption::new(Duration::from_millis(200));
+    // Each answer is due within the soft TTL, so it is sized for a loaded
+    // runner; the idle wait below outlasts it all the same.
+    let option = RPCOption::new(Duration::from_secs(1));
     let soft_ttl = option.soft_ttl();
     let (send, input) = futures::channel::mpsc::unbounded();
     let mut appends = consecutive(&[1, 1]).into_iter();

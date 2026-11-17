@@ -27,14 +27,14 @@ use super::{
 };
 
 /// A certificate authority minted for one test.
-struct Ca {
+pub(in crate::replicated) struct Ca {
     issuer: Issuer<'static, KeyPair>,
     pem: String,
     der: rustls::pki_types::CertificateDer<'static>,
 }
 
 impl Ca {
-    fn new() -> Self {
+    pub(in crate::replicated) fn new() -> Self {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -49,7 +49,7 @@ impl Ca {
 
     /// A node's settings: a certificate for the loopback address this CA
     /// signed, with this CA as the peer CA.
-    fn node(&self, dir: &Path, name: &str) -> TlsSettings {
+    pub(in crate::replicated) fn node(&self, dir: &Path, name: &str) -> TlsSettings {
         let key = KeyPair::generate().expect("key");
         let cert = CertificateParams::new(vec!["127.0.0.1".to_owned()])
             .expect("params")

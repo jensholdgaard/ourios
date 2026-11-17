@@ -60,4 +60,4 @@ const IDENTIFY: &str = "/ourios.wal.v1.Replication/Identify";
 const PROPOSE: &str = "/ourios.wal.v1.Replication/Propose";
 
 #[cfg(test)]
-mod tests;
+pub(in crate::replicated) mod tests;

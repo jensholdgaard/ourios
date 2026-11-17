@@ -10,18 +10,28 @@
 use std::fmt;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ourios_parquet::Store;
+use ourios_serving::AuthResolver;
+use ourios_serving::tls_serve::ReloadingAcceptor;
 use ourios_wal::WalConfig;
+use tokio::task::JoinHandle;
+use tonic::transport::server::TcpIncoming;
 
+use super::forward::LeaderTarget;
+use super::ingest::ReplicatedIngest;
 use super::layout::{self, LayoutError, VotingLayout};
 use super::raft::RaftTimings;
 use super::raft::host::{GroupHost, HostError, HostRole, HostSpec};
 use super::raft::log_ids::{self, LockStart, RaftState, StartError, Waiting};
+use super::raft::proposals::Proposals;
 use super::raft::transport::{Identity, Peers};
 use super::raft::types::NodeId;
 use super::replica_id::{self, ReplicaId, ReplicaIdError};
+use super::route::Router;
+use super::write::{COMMIT_TIMEOUT, GroupWriter};
 use crate::template_ids::ScanOptions;
 
 /// What a node starts from.
@@ -75,6 +85,41 @@ impl std::error::Error for NodeError {}
 pub struct Node {
     pub id: NodeId,
     pub host: GroupHost,
+    /// Its configured `node_id`.
+    name: String,
+    layout: VotingLayout,
+    peers: Peers,
+}
+
+impl Node {
+    /// Answer the peers' forwarded exports, authenticated by `auth`, and
+    /// the flushers' proposals, then serve replication over mutual TLS on
+    /// `incoming` through `acceptor` until `shutdown` (RFC 0065 §6.8, B21).
+    pub fn serve(
+        &self,
+        auth: AuthResolver,
+        (incoming, acceptor): (TcpIncoming, ReloadingAcceptor),
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> JoinHandle<Result<(), tonic::transport::Error>> {
+        let server = self.host.server();
+        let writer = GroupWriter::new(self.layout.clone(), &self.host);
+        server.serve_forwards(Arc::new(LeaderTarget::new(writer, auth)));
+        server.serve_proposals(Arc::new(Proposals::new(&self.host)));
+        tokio::spawn(server.serve(incoming, acceptor, shutdown))
+    }
+
+    /// The ingest the OTLP transports hand exports to: committed here for a
+    /// group this node leads, and forwarded to its leader otherwise.
+    #[must_use]
+    pub fn ingest(&self) -> ReplicatedIngest {
+        let router = Router::new(
+            self.peers.clone(),
+            self.layout.clone(),
+            self.name.clone(),
+            COMMIT_TIMEOUT,
+        );
+        ReplicatedIngest::new(GroupWriter::new(self.layout.clone(), &self.host)).with_router(router)
+    }
 }
 
 /// Start the node `start` describes, reporting each wait for the bootstrap
@@ -105,7 +150,12 @@ pub async fn start(
         replica,
         unchecked,
     } = {
-        let (root, groups, store) = (wal.root.clone(), groups.clone(), store.clone());
+        let (root, groups, store, layout) = (
+            wal.root.clone(),
+            groups.clone(),
+            store.clone(),
+            layout.clone(),
+        );
         tokio::task::spawn_blocking(move || prepare(&root, &groups, &store, &layout))
             .await
             .map_err(|e| NodeError::RaftState(io::Error::other(e)))??
@@ -130,12 +180,19 @@ pub async fn start(
         wal,
         groups,
         role,
-        peers,
+        peers: peers.clone(),
         timings,
     };
     let host = GroupHost::open(spec).await.map_err(NodeError::Host)?;
-    host.server().identify_as(Identity::new(node_id, id));
-    Ok(Node { id, host })
+    host.server()
+        .identify_as(Identity::new(node_id.clone(), id));
+    Ok(Node {
+        id,
+        host,
+        name: node_id,
+        layout,
+        peers,
+    })
 }
 
 /// The steps before the lock, blocking, in the order that leaves the
@@ -184,5 +241,7 @@ fn report_unchecked() {
     );
 }
 
+#[cfg(test)]
+mod serving_tests;
 #[cfg(test)]
 mod tests;

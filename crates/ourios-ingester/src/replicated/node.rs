@@ -90,6 +90,11 @@ pub struct Node {
     name: String,
     layout: VotingLayout,
     peers: Peers,
+    /// Whether it votes in its groups, rather than tailing them.
+    voter: bool,
+    /// The flushers' proposals it answers, and the reports its stewards
+    /// top up id blocks from.
+    proposals: Arc<Proposals>,
 }
 
 impl Node {
@@ -107,7 +112,7 @@ impl Node {
         let writer = GroupWriter::new(self.layout.clone(), &self.host);
         let forwards = LeaderTarget::new(writer, auth).with_denial_audit_sink(denials);
         server.serve_forwards(Arc::new(forwards));
-        server.serve_proposals(Arc::new(Proposals::new(&self.host)));
+        server.serve_proposals(Arc::clone(&self.proposals) as _);
         tokio::spawn(server.serve(incoming, acceptor, shutdown))
     }
 
@@ -174,10 +179,9 @@ pub async fn start(
         scan: &scan,
         retry,
     };
-    log_ids::start(&lock, waiting)
-        .await
-        .map_err(NodeError::LogIds)?;
+    pass_lock(&lock, waiting).await?;
     let id = NodeId::from(replica.uuid());
+    let voter = matches!(role, HostRole::Voter);
     let spec = HostSpec {
         id,
         wal,
@@ -189,13 +193,34 @@ pub async fn start(
     let host = GroupHost::open(spec).await.map_err(NodeError::Host)?;
     host.server()
         .identify_as(Identity::new(node_id.clone(), id));
+    let proposals = Arc::new(Proposals::new(&host));
     Ok(Node {
         id,
         host,
         name: node_id,
         layout,
         peers,
+        voter,
+        proposals,
     })
+}
+
+/// Pass the bootstrap lock, reporting each new reason it waits.
+async fn pass_lock(
+    lock: &LockStart<'_>,
+    waiting: &mut impl FnMut(&Waiting),
+) -> Result<(), NodeError> {
+    let mut once = background::Once::default();
+    let mut report = |why: &Waiting| {
+        if let Some(reason) = once.changed(Some(why.as_str())) {
+            background::report_waiting(None, reason, why);
+        }
+        waiting(why);
+    };
+    log_ids::start(lock, &mut report)
+        .await
+        .map(drop)
+        .map_err(NodeError::LogIds)
 }
 
 /// The steps before the lock, blocking, in the order that leaves the
@@ -243,6 +268,10 @@ fn report_unchecked() {
          opens the groups whose Raft state it holds"
     );
 }
+
+mod background;
+
+pub use background::{Background, FORMATION, STEWARD_INTERVAL};
 
 #[cfg(test)]
 mod serving_tests;

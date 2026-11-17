@@ -1414,5 +1414,12 @@ pub const EVENT_OURIOS_WAL_REPLICATION_PUBLICATION_HELD: &str =
 /// `ourios.wal.replication.restore.held` log event name.
 pub const EVENT_OURIOS_WAL_REPLICATION_RESTORE_HELD: &str = "ourios.wal.replication.restore.held";
 
+/// `ourios.wal.replication.start.waiting` log event name.
+pub const EVENT_OURIOS_WAL_REPLICATION_START_WAITING: &str = "ourios.wal.replication.start.waiting";
+
+/// `ourios.wal.replication.steward.failed` log event name.
+pub const EVENT_OURIOS_WAL_REPLICATION_STEWARD_FAILED: &str =
+    "ourios.wal.replication.steward.failed";
+
 /// `ourios.wal.replication.stopped` log event name.
 pub const EVENT_OURIOS_WAL_REPLICATION_STOPPED: &str = "ourios.wal.replication.stopped";

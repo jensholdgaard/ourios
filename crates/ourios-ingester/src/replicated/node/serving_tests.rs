@@ -56,15 +56,17 @@ fn export(line: &str) -> Export<'static> {
 
 /// Three nodes serving, their shutdown senders, and the directories they
 /// keep.
-struct Served {
-    nodes: Vec<Node>,
+pub(super) struct Served {
+    pub(super) nodes: Vec<Node>,
+    /// The store they share.
+    pub(super) store: Store,
     stops: Vec<oneshot::Sender<()>>,
     /// Kept for the nodes' lifetime: dropping one deletes it.
     dirs: Vec<tempfile::TempDir>,
 }
 
 impl Served {
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         for stop in self.stops {
             let _ = stop.send(());
         }
@@ -77,7 +79,7 @@ impl Served {
 /// Three nodes started on one store, each serving over mutual TLS with a
 /// certificate from one CA, authenticating forwards with `auth` and
 /// recording tenant denials on `denials`.
-async fn three_served(auth: &AuthResolver, denials: &SharedAuditSink) -> Served {
+pub(super) async fn three_served(auth: &AuthResolver, denials: &SharedAuditSink) -> Served {
     let ca = Ca::new();
     let store = Store::in_memory();
     let certs = tempfile::tempdir().expect("tempdir");
@@ -97,6 +99,7 @@ async fn three_served(auth: &AuthResolver, denials: &SharedAuditSink) -> Served 
         .collect();
     let mut served = Served {
         nodes: Vec::new(),
+        store: store.clone(),
         stops: Vec::new(),
         dirs: Vec::new(),
     };
@@ -128,7 +131,7 @@ async fn three_served(auth: &AuthResolver, denials: &SharedAuditSink) -> Served 
 }
 
 /// Form the nodes' group 0 and return the index of a follower.
-async fn formed(nodes: &[Node]) -> usize {
+pub(super) async fn formed(nodes: &[Node]) -> usize {
     let members: BTreeMap<NodeId, String> = nodes
         .iter()
         .zip(NAMES)

@@ -131,7 +131,7 @@ pub(super) async fn three_served(auth: &AuthResolver, denials: &SharedAuditSink)
 }
 
 /// Form the nodes' group 0 and return the index of a follower.
-async fn formed(nodes: &[Node]) -> usize {
+pub(super) async fn formed(nodes: &[Node]) -> usize {
     let members: BTreeMap<NodeId, String> = nodes
         .iter()
         .zip(NAMES)

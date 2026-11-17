@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use openraft::async_runtime::WatchReceiver as _;
 use ourios_config::MinerConfig;
 use ourios_core::audit::SharedAuditSink;
 use ourios_parquet::Store;
@@ -155,4 +156,77 @@ fn a_start_waiting_on_the_lock_is_reported_once() {
         .collect();
     assert_eq!(waiting.len(), 1, "{waiting:?}");
     assert_eq!(waiting[0].1, ["error.type=log_ids_unseeded".to_owned()]);
+}
+
+/// RFC 0065 §6.1: a group whose formation record does not read stops, its
+/// Raft shut down so no peer's traffic joins it to a membership it refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_that_cannot_form_is_shut_down() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::in_memory();
+    store
+        .put(
+            &crate::replicated::raft::formation::formed_key(0),
+            b"not a formation record".to_vec(),
+        )
+        .await
+        .expect("record");
+    let node = start(
+        n0_named("n0", root.path(), &store, Peers::plaintext()),
+        &mut |_| {},
+    )
+    .await
+    .expect("started");
+    let (_stop, stopped) = watch::channel(false);
+
+    let tasks = node.run(&background(&store), &stopped);
+
+    let raft = node.host.raft(0).expect("hosted");
+    let shut = raft
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |m| m.state == openraft::ServerState::Shutdown,
+            "the group shuts down",
+        )
+        .await;
+    assert!(shut.is_ok(), "{shut:?}");
+    drop(tasks);
+}
+
+/// A stop ends a steward whose pass waits on a proposal that cannot commit,
+/// here with no quorum, rather than holding the node's shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_ends_a_steward_whose_pass_cannot_commit() {
+    let served = three_served(&AuthResolver::static_only(None), &SharedAuditSink::new()).await;
+    let follower = super::super::serving_tests::formed(&served.nodes).await;
+    let leader = served.nodes[follower]
+        .host
+        .raft(0)
+        .expect("hosted")
+        .metrics()
+        .borrow_watched()
+        .current_leader
+        .expect("a leader");
+    for node in served.nodes.iter().filter(|n| n.id != leader) {
+        node.host.shutdown().await.expect("shutdown");
+    }
+    let leading = served
+        .nodes
+        .iter()
+        .find(|n| n.id == leader)
+        .expect("the leader");
+    let (stop, stopped) = watch::channel(false);
+    let tasks = leading.run(&background(&served.store), &stopped);
+    // Long enough for a pass to start proposing the miner configuration.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    stop.send_replace(true);
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        for task in tasks {
+            task.await.expect("stopped");
+        }
+    })
+    .await;
+
+    assert!(ended.is_ok(), "the stop ends every task");
 }

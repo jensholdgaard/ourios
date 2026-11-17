@@ -109,6 +109,10 @@ impl Node {
             tokio::select! {
                 formed = formation::form(voter, &raft, &reach, &mut waiting) => {
                     if let Err(error) = formed {
+                        // A group that cannot form takes no part in one: no
+                        // peer's traffic may join it to the membership the
+                        // record it refused would name.
+                        let _ = raft.shutdown().await;
                         Meters::global().storage().formation_stopped(group, &error);
                     }
                 }
@@ -150,8 +154,14 @@ impl Node {
                     peers: &peers,
                     patience: flusher::PATIENCE,
                 };
+                // The stop races the whole tick and pass: a pass waiting on a
+                // proposal that cannot commit must not hold the node's stop.
+                let ticked = async {
+                    ticks.tick().await;
+                    steward.pass(group_of, tail).await
+                };
                 let passed = tokio::select! {
-                    _ = ticks.tick() => steward.pass(group_of, tail).await,
+                    passed = ticked => passed,
                     () = stopped(&mut stop) => return,
                 };
                 let reason = passed.as_ref().err().map(StewardError::error_type);

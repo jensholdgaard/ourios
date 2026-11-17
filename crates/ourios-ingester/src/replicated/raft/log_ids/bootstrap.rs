@@ -29,12 +29,17 @@ pub enum RaftState {
 /// The [`std::io::Error`] that kept it from reading `wal_root`: a node that
 /// cannot tell fails its start rather than bootstrap over state it holds.
 pub fn raft_state(wal_root: &std::path::Path, groups: &[u32]) -> std::io::Result<RaftState> {
+    // Every group is read, so an unreadable one fails the start whatever
+    // the order of the groups.
+    let mut held = false;
     for &group in groups {
-        if holds_state(&super::super::log_store::group_dir(wal_root, group))? {
-            return Ok(RaftState::Held);
-        }
+        held |= holds_state(&super::super::log_store::group_dir(wal_root, group))?;
     }
-    Ok(RaftState::Empty)
+    Ok(if held {
+        RaftState::Held
+    } else {
+        RaftState::Empty
+    })
 }
 
 /// Whether the group directory `dir` holds a log segment or a snapshot
@@ -47,7 +52,10 @@ fn holds_state(dir: &std::path::Path) -> std::io::Result<bool> {
     };
     for entry in entries {
         let path = entry?.path();
-        let segment = path.extension().is_some_and(|x| x == "wal");
+        // As the WAL reader takes a segment, in any case.
+        let segment = path
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("wal"));
         let record = path
             .file_name()
             .is_some_and(|name| name == super::super::snapshot_record::FILE);

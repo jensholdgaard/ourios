@@ -30,7 +30,12 @@ fn a_node_with_no_group_state_holds_none() {
 
 #[test]
 fn a_group_log_or_snapshot_record_is_raft_state() {
-    for file in ["00000000000000000001.wal", "snapshot"] {
+    // The WAL reader takes a segment's extension in any case.
+    for file in [
+        "00000000000000000001.wal",
+        "00000000000000000001.WAL",
+        "snapshot",
+    ] {
         let root = tempfile::tempdir().expect("tempdir");
         let dir = group_dir(root.path(), 3);
         fs::create_dir_all(&dir).expect("group dir");
@@ -72,5 +77,23 @@ fn an_unreadable_group_directory_is_an_error() {
     let read = raft_state(root.path(), &GROUPS);
 
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("restore");
+    assert!(read.is_err(), "{read:?}");
+}
+
+/// Every group is read: an unreadable group after one holding state still
+/// fails the start, whatever the order of the node's groups.
+#[test]
+fn an_unreadable_group_after_a_held_one_is_still_an_error() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let held = group_dir(root.path(), 0);
+    fs::create_dir_all(&held).expect("group dir");
+    fs::write(held.join("snapshot"), b"").expect("state");
+    let unreadable = group_dir(root.path(), 3);
+    fs::create_dir_all(&unreadable).expect("group dir");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let read = raft_state(root.path(), &GROUPS);
+
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).expect("restore");
     assert!(read.is_err(), "{read:?}");
 }

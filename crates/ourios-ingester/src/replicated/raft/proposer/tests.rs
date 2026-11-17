@@ -113,25 +113,6 @@ fn not_leader(hint: Option<&str>) -> Answer {
     })
 }
 
-/// The leader the flusher's log names takes it at once.
-#[tokio::test]
-async fn the_named_leader_takes_it_first() {
-    let accept = Some(vec![Ok(Some(id(21)))]);
-    let (peers, calls, _serving) = voters([accept.clone(), accept.clone(), accept]);
-
-    let delivered = proposer(peers)
-        .send(&report(), None, Some("v2".to_owned()))
-        .await;
-
-    assert_eq!(
-        delivered,
-        Delivered::Accepted {
-            appended: Some(id(21))
-        }
-    );
-    assert_eq!(count(&calls), [0, 1, 0]);
-}
-
 /// RFC 0065 §6.8: after `not_leader` it goes to the hint, after
 /// `not_hosted` or a call never sent to the voters in placement order.
 #[tokio::test]
@@ -236,20 +217,6 @@ async fn it_gives_up_after_a_bounded_number_of_calls() {
     assert_eq!(count(&calls).iter().sum::<usize>(), 2 * VOTERS.len());
 }
 
-/// A hint naming a node outside the group's voters is passed over.
-#[tokio::test]
-async fn a_hint_that_is_no_voter_is_passed_over() {
-    let accept = Some(vec![Ok(None)]);
-    let (peers, calls, _serving) = voters([accept.clone(), accept.clone(), accept]);
-
-    let delivered = proposer(peers)
-        .send(&report(), None, Some("elsewhere".to_owned()))
-        .await;
-
-    assert_eq!(delivered, Delivered::Accepted { appended: None });
-    assert_eq!(count(&calls), [1, 0, 0]);
-}
-
 /// RFC 0065 §6.8: the flusher stops proposing to the leader that refused
 /// it as `not_flusher` in that term, so the answer names that node, also
 /// when a hint led there.
@@ -289,4 +256,27 @@ async fn a_node_that_refused_it_is_not_tried_again() {
 
     assert_eq!(delivered, Delivered::Accepted { appended: None });
     assert_eq!(count(&calls), [1, 0, 1], "v2 skipped as hint and as voter");
+}
+
+/// The leader the flusher's log names takes it at once; a named node that
+/// is no voter of the group is passed over for the voters in order.
+#[tokio::test]
+async fn the_named_leader_takes_it_first_unless_it_is_no_voter() {
+    for (named, reached) in [("v2", [0, 1, 0]), ("elsewhere", [1, 0, 0])] {
+        let accept = Some(vec![Ok(Some(id(21)))]);
+        let (peers, calls, _serving) = voters([accept.clone(), accept.clone(), accept]);
+
+        let delivered = proposer(peers)
+            .send(&report(), None, Some(named.to_owned()))
+            .await;
+
+        assert_eq!(
+            delivered,
+            Delivered::Accepted {
+                appended: Some(id(21))
+            },
+            "{named}"
+        );
+        assert_eq!(count(&calls), reached, "{named}");
+    }
 }

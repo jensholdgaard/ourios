@@ -293,7 +293,7 @@ impl Steward {
     ///
     /// The membership change or the entry the leader could not commit;
     /// the next pass plans again from the log.
-    pub async fn pass(&mut self, group: Group<'_>, tail: Tail<'_>) -> Result<Pass, String> {
+    pub async fn pass(&mut self, group: Group<'_>, tail: Tail<'_>) -> Result<Pass, StewardError> {
         let learners = learners::reconcile(group, tail).await?;
         let assigned = self.assign(group, tail).await?;
         let configured = self.configure(group, tail).await?;
@@ -308,7 +308,11 @@ impl Steward {
 
     /// Append the assignment [`plan`] gives, held back while the log has
     /// never held its kind and not every member reads it.
-    async fn assign(&mut self, group: Group<'_>, tail: Tail<'_>) -> Result<Option<NodeId>, String> {
+    async fn assign(
+        &mut self,
+        group: Group<'_>,
+        tail: Tail<'_>,
+    ) -> Result<Option<NodeId>, StewardError> {
         let Some((chosen, highest_kind)) = self.choose(group, tail) else {
             return Ok(None);
         };
@@ -340,7 +344,7 @@ impl Steward {
         &mut self,
         group: Group<'_>,
         tail: Tail<'_>,
-    ) -> Result<Option<MinerConfigV1>, String> {
+    ) -> Result<Option<MinerConfigV1>, StewardError> {
         let Some((body, highest_kind)) = self.plan_config(group) else {
             return Ok(None);
         };
@@ -368,7 +372,11 @@ impl Steward {
     /// only once its reservation is durable; a failed reservation appends
     /// nothing. A block appended and not yet committed counts to the next
     /// pass, so no pass appends one beside it.
-    async fn top_up(&mut self, group: Group<'_>, tail: Tail<'_>) -> Result<Option<TopUp>, String> {
+    async fn top_up(
+        &mut self,
+        group: Group<'_>,
+        tail: Tail<'_>,
+    ) -> Result<Option<TopUp>, StewardError> {
         let Some((floor, highest_kind)) = self.plan_block(group) else {
             return Ok(None);
         };
@@ -503,13 +511,13 @@ fn standing(raft: &GroupRaft) -> (u64, Option<LogId>) {
 }
 
 /// Append `control` to the group's log and wait for it to commit.
-async fn propose(group: Group<'_>, control: Control) -> Result<(), String> {
+async fn propose(group: Group<'_>, control: Control) -> Result<(), StewardError> {
     group
         .raft
         .client_write(GroupEntry::Control(control))
         .await
         .map(drop)
-        .map_err(|e| e.to_string())
+        .map_err(StewardError::from)
 }
 
 /// The committed membership's learners, placed ones first in `placed`
@@ -602,6 +610,10 @@ async fn every_member_confirms(metrics: &RaftMetrics<RaftTypes>, tail: Tail<'_>,
 fn membership_settled(metrics: &RaftMetrics<RaftTypes>) -> bool {
     metrics.membership_config.log_id() == metrics.committed_membership_config.log_id()
 }
+
+mod error;
+
+pub use error::StewardError;
 
 #[cfg(test)]
 mod tests;

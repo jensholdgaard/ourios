@@ -19,6 +19,7 @@
 //! [`Bundle::snapshot`]; anything else fails the restore closed.
 
 pub mod pointer;
+pub mod read;
 pub mod write;
 
 use std::fmt;

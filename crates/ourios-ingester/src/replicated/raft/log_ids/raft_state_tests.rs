@@ -5,7 +5,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 
-use super::super::log_store::group_dir;
+use super::super::log_store::{group_dir, holds_segments};
 use super::{RaftState, raft_state};
 
 const GROUPS: [u32; 2] = [0, 3];
@@ -96,4 +96,14 @@ fn an_unreadable_group_after_a_held_one_is_still_an_error() {
 
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).expect("restore");
     assert!(read.is_err(), "{read:?}");
+}
+
+/// The lost-log check on open counts a segment as the WAL reader does, in
+/// any case, so it and this check agree on what a group holds.
+#[test]
+fn the_lost_log_check_takes_a_segment_in_any_case() {
+    let root = tempfile::tempdir().expect("tempdir");
+    fs::write(root.path().join("00000000000000000001.WAL"), b"").expect("segment");
+
+    assert!(holds_segments(root.path()).expect("readable"));
 }

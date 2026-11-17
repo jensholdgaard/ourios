@@ -246,6 +246,13 @@ async fn the_named_flusher_checkpoints_its_group() {
 /// node 3 having mined thirty rows; its stores, and the log id of its last
 /// mined entry.
 async fn checkpointing_group() -> (Cluster, [Store; 2], u64) {
+    let (cluster, stores, last, _) = reporting_group().await;
+    (cluster, stores, last)
+}
+
+/// As [`checkpointing_group`], with its leader and each node's `Propose`
+/// target.
+async fn reporting_group() -> (Cluster, [Store; 2], u64, (usize, Vec<Arc<Proposals>>)) {
     let stores = [formed_store(), formed_store()];
     let shape = Shape {
         publishing: stores
@@ -257,10 +264,12 @@ async fn checkpointing_group() -> (Cluster, [Store; 2], u64) {
         ..Shape::from((3, 2))
     };
     let (cluster, mut mined) = Cluster::start_mining(shape, &[GROUP], |_| Meters::global()).await;
+    let mut targets = Vec::new();
     for i in 0..5 {
         let host = &cluster.node(i).host;
-        host.server()
-            .serve_proposals(Arc::new(Proposals::new(host)));
+        let target = Arc::new(Proposals::new(host));
+        host.server().serve_proposals(Arc::clone(&target) as _);
+        targets.push(target);
     }
     let leader = with_learners(&cluster, 3..5).await;
     let named = *cluster.id(3).uuid().as_bytes();
@@ -280,7 +289,7 @@ async fn checkpointing_group() -> (Cluster, [Store; 2], u64) {
         .map(|position| position.seq)
         .max()
         .expect("mined rows");
-    (cluster, stores, last)
+    (cluster, stores, last, (leader, targets))
 }
 
 /// The `bundle.bin` keys `store` holds for [`LOG`].
@@ -336,5 +345,38 @@ async fn an_idle_group_writes_no_further_checkpoint() {
 
     assert_eq!(pointer(&stores[0]), Some(cut), "checkpoint.json unchanged");
     assert_eq!(bundles(&stores[0]), before, "no further bundle");
+    cluster.shutdown().await;
+}
+
+/// RFC 0065 §6.8: once its checkpoint applies, the named flusher reports
+/// to its leader from the checkpoint entry, past the cut, which only a
+/// report can carry: a checkpoint's own proposal reports from its cut, and
+/// an idle group writes no further checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_named_flusher_reports_to_its_leader() {
+    let (cluster, stores, last, (leader, targets)) = reporting_group().await;
+    let reports = targets[leader].reports(GROUP).expect("hosted");
+    let flusher = cluster.id(3);
+    let reported_from = |at_least: u64| {
+        let reports = reports.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let kept = reports.latest();
+                if kept.is_some_and(|r| r.proposer == flusher && r.mined.index >= at_least) {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no report from {at_least}: {kept:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    let cut = checkpointed_through(&stores[0], last).await;
+    applied_everywhere(&cluster, cut.seq).await;
+    reported_from(cut.seq + 1).await;
     cluster.shutdown().await;
 }

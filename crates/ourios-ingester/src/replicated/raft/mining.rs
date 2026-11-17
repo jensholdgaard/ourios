@@ -173,6 +173,12 @@ impl LogBlocks {
         self.blocks().queue.len()
     }
 
+    /// The block drawn last, which the allocator's ids come from.
+    #[must_use]
+    pub fn current(&self) -> Option<IdBlock> {
+        self.blocks().current
+    }
+
     /// The block drawn last and those not yet drawn, in log order.
     fn state(&self) -> (Option<IdBlock>, Vec<IdBlock>) {
         let blocks = self.blocks();

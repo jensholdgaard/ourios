@@ -78,6 +78,12 @@ impl GroupMiner {
         self.changed
     }
 
+    /// The last entry applied, id blocks included: a report's `mined`.
+    #[must_use]
+    pub fn followed(&self) -> Option<crate::replicated::raft::types::LogId> {
+        self.last
+    }
+
     /// The index of the last entry applied, if any.
     #[must_use]
     pub fn applied_through(&self) -> Option<u64> {

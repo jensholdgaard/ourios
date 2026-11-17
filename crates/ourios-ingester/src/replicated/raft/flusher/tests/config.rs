@@ -8,8 +8,8 @@ use ourios_config::MinerConfig;
 use ourios_wal::{Control, MinerConfigV1};
 
 use super::{
-    PATIENCE, checkpoint_purging, group, log, pass, pass_until_assigned, placement, reads_up_to,
-    ready_leader, strs,
+    PATIENCE, checkpoint_purging, group, log, pass, pass_until_assigned, pass_until_configured,
+    placement, reads_up_to, ready_leader, strs,
 };
 use crate::replicated::raft::cluster::{Cluster, write};
 use crate::replicated::raft::flusher::Steward;
@@ -45,8 +45,8 @@ async fn with_neither_log_nor_snapshot_holding_one_the_leader_appends_its_own() 
     let mine = own(0.8, 3);
     let mut steward = steward(mine);
 
-    let first = pass(&mut steward, &cluster, leader, &[]).await;
-    assert_eq!(first.configured, Some(body_of(&mine)));
+    let first = pass_until_configured(&mut steward, &cluster, leader, &[]).await;
+    assert_eq!(first, body_of(&mine));
     assert_eq!(
         group(&cluster, leader).controls().miner_config,
         Some(body_of(&mine))

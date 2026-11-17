@@ -207,6 +207,7 @@ async fn a_follower_rejects_naming_the_leader() {
     let cluster = Cluster::start(3, &[0]).await;
     let leader = ready_leader(&cluster).await;
     let follower = followers(leader)[0];
+    cluster.follows(follower, leader).await;
     let refused = writer(&cluster, follower).commit("acme", batch(1)).await;
     match refused {
         Err(e @ WriteError::NotLeader { group: 0, .. }) => {

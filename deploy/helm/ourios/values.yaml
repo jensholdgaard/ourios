@@ -209,15 +209,19 @@ receiver:
     backend: local
     replicated:
       # Raft groups the tenants are spread over (RFC 0065 §3.8). Fixed once
-      # the cluster has formed: a different value fails the voting-layout
-      # check at start.
+      # the cluster has formed, as receiver.replicas is (the voters are its
+      # pods): a different value of either fails the voting-layout check at
+      # start. A replicated deployment starts on a fresh bucket or prefix;
+      # switching a store a local WAL has written is not an upgrade.
       groups: 16
       # Voters per group: 3 or 5. Fixed once formed, as `groups` is.
       replicationFactor: 3
       # Tail replicas per group; empty takes the server default (1).
       tailReplicas: ""
       # The queriers' client-certificate identities (URI or DNS subject
-      # alternative names) a tail replica serves tail reads to. Required.
+      # alternative names) a tail replica will serve tail reads to.
+      # Required; not yet enforced, since the tail read path (RFC 0065 §6.7)
+      # is still being built.
       tailClients: []
       # The cluster's DNS domain, which the peers' names end in:
       # <pod>.<service>.<namespace>.svc.<clusterDomain>.
@@ -226,8 +230,10 @@ receiver:
       # Services. existingSecret is a kubernetes.io/tls Secret every voter
       # and tail replica presents: its subject alternative names must cover
       # each pod's name, which one wildcard per Service does:
-      # *.<release>-ourios-receiver-headless.<namespace>.svc.<clusterDomain>
-      # and *.<release>-ourios-wal-tail-headless.<namespace>.svc.<clusterDomain>.
+      # *.<fullname>-receiver-headless.<namespace>.svc.<clusterDomain> and
+      # *.<fullname>-wal-tail-headless.<namespace>.svc.<clusterDomain>, where
+      # <fullname> is <release>-ourios or fullnameOverride (take the Service
+      # names from the rendered chart).
       # clientCA is the CA the peers' client certificates chain to. Both
       # required.
       tls:

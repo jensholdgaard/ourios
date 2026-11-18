@@ -875,13 +875,42 @@ from a release without these keys rendering the local WAL.
 {{- if or (not (regexMatch "^[0-9]+$" (toString $tailReplicas))) (lt (int $tailReplicas) 1) }}
 {{- fail (printf "walTail.replicas must be a positive integer: every group needs a tail replica to mine and publish it (RFC 0065 §6.7), got %v" $tailReplicas) }}
 {{- end }}
-{{- $factor := int ($r.replicationFactor | default 3) }}
+{{- $factor := int (include "ourios.replicationFactor" .) }}
+{{- $groups := include "ourios.setValue" $r.groups }}
+{{- if and $groups (not (regexMatch "^[1-9][0-9]*$" $groups)) }}
+{{- fail (printf "receiver.wal.replicated.groups must be a positive integer, got %v" $r.groups) }}
+{{- end }}
+{{- with include "ourios.setValue" $r.tailReplicas }}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" .)) (gt (int .) (int $tailReplicas)) }}
+{{- fail (printf "receiver.wal.replicated.tailReplicas (%s) must be at least 1 and at most walTail.replicas (%d): each group's tail replicas are pods of the tail pool" . (int $tailReplicas)) }}
+{{- end }}
+{{- end }}
+{{- range $source, $list := dict "extraEnv" (.Values.extraEnv | default list) "receiver.extraEnv" (.Values.receiver.extraEnv | default list) }}
+{{- range $list }}
+{{- if eq (toString .name) "POD_NAME" }}
+{{- fail (printf "%s sets POD_NAME, which the replicated WAL reserves: each pod's node_id is its own name, from the downward API" $source) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if lt (int .Values.receiver.replicas) $factor }}
 {{- fail (printf "receiver.replicas (%d) is below receiver.wal.replicated.replicationFactor (%d): every group needs that many voters" (int .Values.receiver.replicas) $factor) }}
 {{- end }}
 true
 {{- else if ne $backend "local" }}
 {{- fail (printf "receiver.wal.backend must be local or replicated, got %q" $backend) }}
+{{- end }}
+{{- end }}
+
+{{/*
+The replicated WAL's voters per group: 3 unless set, and then 3 or 5
+(RFC 0065 §3.8). A typed 0 is set, so it is refused rather than defaulted.
+*/}}
+{{- define "ourios.replicationFactor" -}}
+{{- $set := include "ourios.setValue" (dig "wal" "replicated" "replicationFactor" "" (.Values.receiver | default dict)) -}}
+{{- if not $set }}3
+{{- else if has $set (list "3" "5") }}{{ $set }}
+{{- else }}
+{{- fail (printf "receiver.wal.replicated.replicationFactor must be 3 or 5, got %v" $set) }}
 {{- end }}
 {{- end }}
 
@@ -917,8 +946,8 @@ wal:
   replicated:
     node_id: "${env:POD_NAME}"
     listen_addr: "0.0.0.0:4320"
-    groups: {{ $r.groups | default 16 | quote }}
-    replication_factor: {{ $r.replicationFactor | default 3 | quote }}
+    groups: {{ include "ourios.setValue" $r.groups | default "16" | quote }}
+    replication_factor: {{ include "ourios.replicationFactor" . | quote }}
     peers: {{ include "ourios.walPeers" (dict "root" . "component" "receiver" "replicas" .Values.receiver.replicas) | quote }}
     tail_peers: {{ include "ourios.walPeers" (dict "root" . "component" "wal-tail" "replicas" (int (dig "replicas" 1 (.Values.walTail | default dict)))) | quote }}
     {{- with include "ourios.setValue" $r.tailReplicas }}

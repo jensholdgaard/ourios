@@ -817,6 +817,27 @@ check "upgrade path: walTail.wal absent renders the tail volume's defaults" \
 check_fails "RFC0065.17: an empty tail pool is refused" \
   "walTail.replicas must be a positive integer" \
   "${replicated_args[@]}" --set walTail.replicas=0
+check_fails "RFC0065.17: a replication factor other than 3 or 5 is refused" \
+  "receiver.wal.replicated.replicationFactor must be 3 or 5" \
+  "${replicated_args[@]}" --set receiver.replicas=4 --set receiver.wal.replicated.replicationFactor=4
+check "RFC0065.17: a replication factor of 5 renders" '"5"' \
+  "$(replicated_leaf replication_factor --set receiver.replicas=5 --set receiver.wal.replicated.replicationFactor=5)"
+check_fails "RFC0065.17: zero groups is refused, not rendered as the default" \
+  "receiver.wal.replicated.groups must be a positive integer" \
+  "${replicated_args[@]}" --set receiver.wal.replicated.groups=0
+check "RFC0065.17: unset groups render the default" '"16"' \
+  "$(replicated_leaf groups --set receiver.wal.replicated.groups=null)"
+check_fails "RFC0065.17: more tail replicas per group than the pool holds is refused" \
+  "receiver.wal.replicated.tailReplicas (2) must be at least 1 and at most walTail.replicas (1)" \
+  "${replicated_args[@]}" --set receiver.wal.replicated.tailReplicas=2
+check "RFC0065.17: tail replicas within the pool render" '"2"' \
+  "$(replicated_leaf tail_replicas --set receiver.wal.replicated.tailReplicas=2 --set walTail.replicas=2)"
+check_fails "RFC0065.17: extraEnv cannot override the node identity" \
+  "POD_NAME, which the replicated WAL reserves" \
+  "${replicated_args[@]}" --set 'extraEnv[0].name=POD_NAME' --set 'extraEnv[0].value=collector'
+check_fails "RFC0065.17: nor can the receiver's extraEnv" \
+  "POD_NAME, which the replicated WAL reserves" \
+  "${replicated_args[@]}" --set 'receiver.extraEnv[0].name=POD_NAME' --set 'receiver.extraEnv[0].value=collector'
 check_fails "RFC0065.17: fewer receivers than the replication factor is refused" \
   "receiver.replicas (2) is below receiver.wal.replicated.replicationFactor (3)" \
   "${replicated_args[@]}" --set receiver.replicas=2

@@ -185,6 +185,44 @@ async fn an_export_to_a_follower_commits_on_the_leader_over_mutual_tls() {
     served.stop().await;
 }
 
+/// RFC 0065 §6.7: a served node answers `ReadIndex` over mutual TLS, the
+/// leader with a read point and a follower by naming the leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_node_answers_read_points_over_mutual_tls() {
+    use openraft::async_runtime::WatchReceiver as _;
+
+    use crate::replicated::raft::transport::read_index::Outcome;
+
+    let served = three_served(&AuthResolver::static_only(None), &SharedAuditSink::new()).await;
+    let follower = formed(&served.nodes).await;
+    let asking = &served.nodes[follower].peers;
+    let leader = served.nodes[follower]
+        .host
+        .raft(0)
+        .expect("hosted")
+        .metrics()
+        .borrow_watched()
+        .current_leader
+        .expect("a leader");
+    let leader = served
+        .nodes
+        .iter()
+        .position(|n| n.id == leader)
+        .expect("the leader");
+    let patience = Duration::from_secs(5);
+
+    let read = asking.read_index(NAMES[leader], 0, patience).await;
+    assert!(matches!(read, Outcome::Read(_)), "{read:?}");
+    let named = asking.read_index(NAMES[follower], 0, patience).await;
+    assert_eq!(
+        named,
+        Outcome::NotLeader {
+            leader: Some(NAMES[leader].to_owned())
+        }
+    );
+    served.stop().await;
+}
+
 /// RFC 0026 §3.4: the leader that denies a forwarded export for its tenant
 /// binding records the `IngestDenied` audit event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

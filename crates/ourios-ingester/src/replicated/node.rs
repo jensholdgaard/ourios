@@ -28,6 +28,7 @@ use super::raft::RaftTimings;
 use super::raft::host::{GroupHost, HostError, HostRole, HostSpec};
 use super::raft::log_ids::{self, LockStart, RaftState, StartError, Waiting};
 use super::raft::proposals::Proposals;
+use super::raft::reads::Reads;
 use super::raft::transport::{Identity, Peers};
 use super::raft::types::NodeId;
 use super::replica_id::{self, ReplicaId, ReplicaIdError};
@@ -99,8 +100,9 @@ pub struct Node {
 
 impl Node {
     /// Answer the peers' forwarded exports, authenticated by `auth` and with
-    /// each tenant denial recorded on `denials` (RFC 0026 §3.4), and the
-    /// flushers' proposals, then serve replication over mutual TLS on
+    /// each tenant denial recorded on `denials` (RFC 0026 §3.4), the
+    /// flushers' proposals and the tail replicas' read points (RFC 0065
+    /// §6.7), then serve replication over mutual TLS on
     /// `incoming` through `acceptor` until `shutdown` (RFC 0065 §6.8, B21).
     pub fn serve(
         &self,
@@ -113,6 +115,7 @@ impl Node {
         let forwards = LeaderTarget::new(writer, auth).with_denial_audit_sink(denials);
         server.serve_forwards(Arc::new(forwards));
         server.serve_proposals(Arc::clone(&self.proposals) as _);
+        server.serve_read_indexes(Arc::new(Reads::new(&self.host)));
         tokio::spawn(server.serve(incoming, acceptor, shutdown))
     }
 

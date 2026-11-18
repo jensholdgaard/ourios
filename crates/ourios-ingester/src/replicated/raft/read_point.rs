@@ -1,7 +1,7 @@
 //! A tail replica's read point (RFC 0065 §6.7, "Read your acks"): the log
 //! index its tail is served at. It asks its group's leader for a
 //! quorum-confirmed read point (`ReadIndex`, not a lease), then waits until
-//! it has applied and mined through it. Without a confirmed point in time
+//! it has applied through it and mined every entry it was handed by then. Without a confirmed point in time
 //! it has none, and its tail is unavailable rather than possibly stale.
 
 use std::fmt;
@@ -43,6 +43,9 @@ pub async fn read_point(
     let deadline = Instant::now() + patience;
     let unavailable = |why: &str| Unavailable(why.to_owned());
     let raft = host.raft(group).ok_or_else(|| unavailable("not hosted"))?;
+    let sm = host
+        .state_machine(group)
+        .ok_or_else(|| unavailable("not hosted"))?;
     let mut mined = host
         .mined_through(group)
         .ok_or_else(|| unavailable("not mined here"))?;
@@ -52,7 +55,11 @@ pub async fn read_point(
         .applied_index_at_least(Some(index), "applied through the read point")
         .await
         .map_err(|e| Unavailable(format!("not applied through {index}: {e}")))?;
-    tokio::time::timeout_at(deadline, mined.wait_for(|through| *through >= Some(index)))
+    // Applied through the point, the miner has been handed every entry
+    // at or below it that it mines; entries it never sees (blank,
+    // membership) need no mining, so the point itself may lie past them.
+    let handed = sm.handed_through();
+    tokio::time::timeout_at(deadline, mined.wait_for(|through| *through >= handed))
         .await
         .map_err(|_| Unavailable(format!("not mined through {index} in time")))?
         .map_err(|_| unavailable("the miner stopped"))?;

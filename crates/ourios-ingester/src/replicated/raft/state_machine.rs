@@ -295,6 +295,10 @@ pub struct GroupSm {
     cuts: Arc<watch::Sender<Option<LogId>>>,
     /// Where a tail replica's miner receives what each entry applied.
     events: Option<mpsc::Sender<Applied>>,
+    /// The index of the last entry it handed the miner: entries the miner
+    /// never sees (blank, membership) lie between, so a read point waits
+    /// for the miner to mine through this, not through the point itself.
+    handed: Arc<watch::Sender<Option<u64>>>,
     /// Where its first failure is counted as the group stopping.
     stops: Option<Arc<Stops>>,
 }
@@ -341,6 +345,7 @@ impl GroupSm {
         let (Some(events), Some(applied)) = (&self.events, installed) else {
             return Ok(());
         };
+        self.handed.send_replace(Some(applied.at.index));
         match events.try_send(applied) {
             Err(TrySendError::Full(_)) => Err(io::Error::other(
                 "the miner's channel is full before the group opened",
@@ -365,6 +370,7 @@ impl GroupSm {
             }),
             cuts: Arc::new(cuts),
             events,
+            handed: Arc::new(watch::Sender::new(None)),
             stops: None,
         })
     }
@@ -376,10 +382,17 @@ impl GroupSm {
             self.cuts.send_replace(Some(cut));
         }
         if let Some(events) = &self.events {
+            self.handed.send_replace(Some(applied.at.index));
             // A miner that stopped has dropped its receiver; the replica
             // applies on without it.
             events.send(applied).await.ok();
         }
+    }
+
+    /// The index of the last entry it handed the miner, if any.
+    #[must_use]
+    pub fn handed_through(&self) -> Option<u64> {
+        *self.handed.borrow()
     }
 
     fn state(&self) -> MutexGuard<'_, State> {

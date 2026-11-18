@@ -577,10 +577,9 @@ impl Follow {
         }
     }
 
-    /// Report how far `miner` has followed the log.
+    /// Report how far `miner` has mined the log.
     fn followed_through(&self, miner: &GroupMiner) {
-        self.followed
-            .send_replace(miner.followed().map(|followed| followed.index));
+        self.followed.send_replace(miner.mined_through());
     }
 
     /// Do one piece of `work` with `miner`; `None` once the miner has

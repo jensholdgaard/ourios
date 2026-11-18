@@ -198,6 +198,7 @@ impl Launch<'_> {
         Follow {
             group,
             mined,
+            followed: watch::Sender::new(None),
             keeping: Keeping {
                 group,
                 kept,
@@ -302,6 +303,8 @@ const APPLIED_CAPACITY: usize = 64;
 /// A tail replica's running miner.
 struct Mining {
     stop: watch::Sender<bool>,
+    /// How far the miner has followed the log.
+    followed: watch::Receiver<Option<u64>>,
     /// Cleared only once the task has ended, so every stop, a concurrent
     /// one or one retried after a cancelled one, waits for it.
     task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
@@ -313,6 +316,7 @@ struct Mining {
 impl Mining {
     fn start(follow: Follow, miner: GroupMiner, applied: mpsc::Receiver<Applied>) -> Self {
         let (stop, stopped) = watch::channel(false);
+        let followed = follow.followed.subscribe();
         let sweep = follow
             .sweep
             .clone()
@@ -320,6 +324,7 @@ impl Mining {
         let task = tokio::spawn(follow.run(miner, applied, stopped));
         Self {
             stop,
+            followed,
             task: tokio::sync::Mutex::new(Some(task)),
             sweep: tokio::sync::Mutex::new(sweep),
         }
@@ -398,6 +403,9 @@ pub(super) async fn stopped(stop: &mut watch::Receiver<bool>) {
 struct Follow {
     group: u32,
     mined: mpsc::Sender<GroupMined>,
+    /// The index of the last entry its miner followed, which a read point
+    /// waits on (RFC 0065 §6.7).
+    followed: watch::Sender<Option<u64>>,
     keeping: Keeping,
     /// The publication the age sweep drives, and how often, when the group
     /// can be published from this replica.
@@ -528,6 +536,7 @@ impl Follow {
         let mut reporting = self.reporting.take();
         let mut barrier = checkpointer.as_ref().map(|c| interval(c.every()));
         let mut reports = reporting.as_ref().map(|_| interval(Reporting::every()));
+        self.followed_through(&miner);
         loop {
             // Unbiased, so a queue that is never empty does not starve the
             // ticks; `next` still puts a stop before another event.
@@ -547,6 +556,7 @@ impl Follow {
                         return;
                     };
                     miner = restored;
+                    self.followed_through(&miner);
                     continue;
                 }
                 Some(Install::Passed) => continue,
@@ -560,10 +570,16 @@ impl Follow {
                 return;
             };
             miner = back;
+            self.followed_through(&miner);
             if let Some(reporting) = reporting.as_mut() {
                 reporting.maybe(&miner, forced);
             }
         }
+    }
+
+    /// Report how far `miner` has mined the log.
+    fn followed_through(&self, miner: &GroupMiner) {
+        self.followed.send_replace(miner.mined_through());
     }
 
     /// Do one piece of `work` with `miner`; `None` once the miner has
@@ -857,6 +873,15 @@ impl GroupHost {
         self.groups.get(&group).map(|hosted| &hosted.raft)
     }
 
+    /// How far a tail replica's miner for `group` has followed its log,
+    /// the index of the last entry it followed; `None` where `group` is
+    /// not mined here (RFC 0065 §6.7).
+    #[must_use]
+    pub fn mined_through(&self, group: u32) -> Option<watch::Receiver<Option<u64>>> {
+        let mining = self.groups.get(&group)?.mining.as_ref()?;
+        Some(mining.followed.clone())
+    }
+
     #[must_use]
     pub fn state_machine(&self, group: u32) -> Option<&GroupSm> {
         self.groups.get(&group).map(|hosted| &hosted.sm)
@@ -1007,6 +1032,7 @@ mod tests {
         let follow = Follow {
             group: 0,
             mined,
+            followed: watch::Sender::new(None),
             keeping: Keeping {
                 group: 0,
                 kept: Arc::default(),
@@ -1166,6 +1192,7 @@ mod tests {
         let follow = Follow {
             group: 0,
             mined,
+            followed: watch::Sender::new(None),
             keeping: Keeping {
                 group: 0,
                 kept: Arc::clone(&kept),

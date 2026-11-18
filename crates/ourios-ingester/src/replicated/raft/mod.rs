@@ -27,6 +27,7 @@ pub mod proposals;
 pub mod proposer;
 mod proposing;
 pub mod publication;
+pub mod read_point;
 pub mod reads;
 pub mod replay;
 mod reporting;

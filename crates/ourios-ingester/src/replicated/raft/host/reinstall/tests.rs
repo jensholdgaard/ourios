@@ -102,6 +102,7 @@ fn following(
     let follow = Follow {
         group: 0,
         mined,
+        followed: watch::Sender::new(None),
         keeping: Keeping {
             group: 0,
             kept,

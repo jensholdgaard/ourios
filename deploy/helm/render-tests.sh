@@ -697,6 +697,151 @@ check "RFC0009.24: role overrides keep one replica and Recreate" \
       --set 'compactor.extraEnv[0].name=X' --set 'compactor.extraEnv[0].value=y' \
       --set 'compactor.podLabels.a=b')"
 
+# --- RFC0065.17: the replicated WAL's shape ---------------------------------
+
+# The namespace is pinned: `helm template` otherwise takes the current kube
+# context's, so the peers' names would depend on the machine.
+replicated_args=(
+  --namespace default
+  --set storage.backend=s3 --set storage.s3.bucket=b
+  --set receiver.replicas=3
+  --set receiver.wal.backend=replicated
+  --set receiver.wal.replicated.tls.existingSecret=peer-tls
+  --set receiver.wal.replicated.tls.clientCA.existingSecret=peer-ca
+  --set 'receiver.wal.replicated.tailClients[0]=spiffe://cluster/querier'
+)
+replicated_leaf() {
+  role_config receiver "${replicated_args[@]}" "${@:2}" \
+    | sed -n "s/^      $1: //p"
+}
+check "RFC0065.17: the three receivers on the headless Service are the peers" \
+  "t-ourios-receiver-0=t-ourios-receiver-0.t-ourios-receiver-headless.default.svc.cluster.local:4320,t-ourios-receiver-1=t-ourios-receiver-1.t-ourios-receiver-headless.default.svc.cluster.local:4320,t-ourios-receiver-2=t-ourios-receiver-2.t-ourios-receiver-headless.default.svc.cluster.local:4320" \
+  "$(replicated_leaf peers | tr -d '"')"
+check "RFC0065.17: node_id is the pod name" '${env:POD_NAME}' \
+  "$(replicated_leaf node_id | tr -d '"')"
+check "RFC0065.17: the tail pool is its own StatefulSet's pods" \
+  "t-ourios-wal-tail-0=t-ourios-wal-tail-0.t-ourios-wal-tail-headless.default.svc.cluster.local:4320" \
+  "$(replicated_leaf tail_peers | tr -d '"')"
+check "RFC0065.17: peer names follow the release namespace and cluster domain" \
+  "t-ourios-wal-tail-0=t-ourios-wal-tail-0.t-ourios-wal-tail-headless.logs.svc.k8s.example:4320" \
+  "$(replicated_leaf tail_peers --namespace logs --set receiver.wal.replicated.clusterDomain=k8s.example | tr -d '"')"
+check "RFC0065.17: tail_clients are the querier identities" \
+  "spiffe://cluster/querier" "$(replicated_leaf tail_clients | tr -d '"')"
+check "RFC0065.17: scaling the tail pool changes tail_peers only (B24)" \
+  "$(replicated_leaf peers)" "$(replicated_leaf peers --set walTail.replicas=2)"
+
+pod_name_env() {
+  helm template t "$CHART" --show-only "templates/$1" "${replicated_args[@]}" \
+    | sed -n '/- name: POD_NAME$/{n;n;n;s/^ *fieldPath: //p;}'
+}
+check "RFC0065.17: receiver pods get POD_NAME from their name" \
+  "metadata.name" "$(pod_name_env receiver-statefulset.yaml)"
+check "RFC0065.17: tail pods get POD_NAME from their name" \
+  "metadata.name" "$(pod_name_env wal-tail-statefulset.yaml)"
+
+service_ports() {
+  helm template t "$CHART" --show-only templates/services.yaml "${replicated_args[@]}" \
+    | sed -n "/^  name: t-ourios-$1$/,/^---/p" | sed -n 's/^ *- name: //p' | tr '\n' ' '
+}
+check "RFC0065.17: the peer port is on the receiver's headless Service" \
+  "otlp-grpc otlp-http replication " "$(service_ports receiver-headless)"
+check "RFC0065.17: the peer port is absent from the public Service" \
+  "otlp-grpc otlp-http " "$(service_ports receiver)"
+check "RFC0065.17: the tail pool's headless Service carries the peer port" \
+  "replication " "$(service_ports wal-tail-headless)"
+not_ready_published() {
+  local service="$1"; shift
+  helm template t "$CHART" --show-only templates/services.yaml "$@" \
+    | sed -n "/^  name: t-ourios-$service$/,/^---/p" | sed -n 's/^ *publishNotReadyAddresses: //p'
+}
+check "RFC0065.17: peers resolve before they are ready, voters" \
+  "true" "$(not_ready_published receiver-headless "${replicated_args[@]}")"
+check "RFC0065.17: peers resolve before they are ready, tail replicas" \
+  "true" "$(not_ready_published wal-tail-headless "${replicated_args[@]}")"
+check "the local backend keeps the headless Service's default" "" \
+  "$(not_ready_published receiver-headless)"
+check "RFC0065.17: the local backend renders no peer port" \
+  "otlp-grpc otlp-http " \
+  "$(helm template t "$CHART" --show-only templates/services.yaml \
+      | sed -n '/^  name: t-ourios-receiver-headless$/,/^---/p' | sed -n 's/^ *- name: //p' | tr '\n' ' ')"
+
+peer_tls_volumes() {
+  helm template t "$CHART" --show-only "templates/$1" "${replicated_args[@]}" \
+    | sed -n '/- name: tls-replication/{n;n;s/^ *secretName: //p;}' | tr -d '"' | tr '\n' ' '
+}
+check "RFC0065.17: the peer TLS secret and client CA are mounted on the voters" \
+  "peer-tls peer-ca " "$(peer_tls_volumes receiver-statefulset.yaml)"
+check "RFC0065.17: and on the tail replicas" \
+  "peer-tls peer-ca " "$(peer_tls_volumes wal-tail-statefulset.yaml)"
+check "RFC0065.17: the config reads the mounted peer certificate" \
+  "/etc/ourios-tls/replication/tls.crt" \
+  "$(role_config receiver "${replicated_args[@]}" | sed -n 's/^        cert_file: //p' | tr -d '"')"
+check "the local backend renders no tail StatefulSet" "" \
+  "$(helm template t "$CHART" | grep 'name: t-ourios-wal-tail' || true)"
+
+# The replicated receiver config, pinned: the server-side test
+# rfc0065_17_the_chart_renders_the_replicated_shape resolves it as each pod
+# would. Regenerated with UPDATE_GOLDEN=1, as the default render is.
+REPLICATED_GOLDEN="$(dirname "${BASH_SOURCE[0]}")/testdata/replicated-config.yaml"
+if [[ -n "${UPDATE_GOLDEN:-}" ]]; then
+  role_config receiver "${replicated_args[@]}" > "$REPLICATED_GOLDEN"
+fi
+if role_config receiver "${replicated_args[@]}" | diff -u "$REPLICATED_GOLDEN" - >/dev/null; then
+  printf 'ok    %s\n' "replicated receiver config matches testdata/replicated-config.yaml"
+else
+  printf 'FAIL  replicated receiver config differs from testdata/replicated-config.yaml:\n'
+  role_config receiver "${replicated_args[@]}" | diff -u "$REPLICATED_GOLDEN" - | sed 's/^/      /' | head -40
+  failures=$((failures + 1))
+fi
+
+check_fails "RFC0065.17: the replicated backend needs the S3 store" \
+  "receiver.wal.backend replicated needs storage.backend s3" \
+  "${replicated_args[@]}" --set storage.backend=local
+check_fails "RFC0065.17: the replicated backend needs the peer certificate" \
+  "receiver.wal.replicated.tls.existingSecret" \
+  "${replicated_args[@]}" --set receiver.wal.replicated.tls.existingSecret=
+check_fails "RFC0065.17: the replicated backend needs the client CA" \
+  "receiver.wal.replicated.tls.clientCA.existingSecret" \
+  "${replicated_args[@]}" --set receiver.wal.replicated.tls.clientCA.existingSecret=
+check_fails "RFC0065.17: the replicated backend needs the querier identities" \
+  "receiver.wal.replicated.tailClients" \
+  "${replicated_args[@]}" --set 'receiver.wal.replicated.tailClients=null'
+tail_volume() {
+  helm template t "$CHART" --show-only templates/wal-tail-statefulset.yaml "${replicated_args[@]}" "$@" \
+    | sed -n 's/^ *storage: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p'
+}
+check "upgrade path: walTail absent renders the tail pool's defaults" \
+  "4Gi" "$(tail_volume --set walTail=null)"
+check "upgrade path: walTail.wal absent renders the tail volume's defaults" \
+  "4Gi" "$(tail_volume --set walTail.wal=null)"
+check_fails "RFC0065.17: an empty tail pool is refused" \
+  "walTail.replicas must be a positive integer" \
+  "${replicated_args[@]}" --set walTail.replicas=0
+check_fails "RFC0065.17: a replication factor other than 3 or 5 is refused" \
+  "receiver.wal.replicated.replicationFactor must be 3 or 5" \
+  "${replicated_args[@]}" --set receiver.replicas=4 --set receiver.wal.replicated.replicationFactor=4
+check "RFC0065.17: a replication factor of 5 renders" '"5"' \
+  "$(replicated_leaf replication_factor --set receiver.replicas=5 --set receiver.wal.replicated.replicationFactor=5)"
+check_fails "RFC0065.17: zero groups is refused, not rendered as the default" \
+  "receiver.wal.replicated.groups must be a positive integer" \
+  "${replicated_args[@]}" --set receiver.wal.replicated.groups=0
+check "RFC0065.17: unset groups render the default" '"16"' \
+  "$(replicated_leaf groups --set receiver.wal.replicated.groups=null)"
+check_fails "RFC0065.17: more tail replicas per group than the pool holds is refused" \
+  "receiver.wal.replicated.tailReplicas (2) must be at least 1 and at most walTail.replicas (1)" \
+  "${replicated_args[@]}" --set receiver.wal.replicated.tailReplicas=2
+check "RFC0065.17: tail replicas within the pool render" '"2"' \
+  "$(replicated_leaf tail_replicas --set receiver.wal.replicated.tailReplicas=2 --set walTail.replicas=2)"
+check_fails "RFC0065.17: extraEnv cannot override the node identity" \
+  "POD_NAME, which the replicated WAL reserves" \
+  "${replicated_args[@]}" --set 'extraEnv[0].name=POD_NAME' --set 'extraEnv[0].value=collector'
+check_fails "RFC0065.17: nor can the receiver's extraEnv" \
+  "POD_NAME, which the replicated WAL reserves" \
+  "${replicated_args[@]}" --set 'receiver.extraEnv[0].name=POD_NAME' --set 'receiver.extraEnv[0].value=collector'
+check_fails "RFC0065.17: fewer receivers than the replication factor is refused" \
+  "receiver.replicas (2) is below receiver.wal.replicated.replicationFactor (3)" \
+  "${replicated_args[@]}" --set receiver.replicas=2
+
 if ((failures)); then
   printf '\n%d assertion(s) failed\n' "$failures" >&2
   exit 1

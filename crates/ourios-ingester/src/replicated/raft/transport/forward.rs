@@ -19,7 +19,7 @@ use tonic::{Code, Request, Status};
 use tonic_prost::ProstCodec;
 
 use super::super::types::TenantBatchBytes;
-use super::trace::{Call, Peer, Traced, Tracing};
+use super::trace::{Call, Peer, Traced, Tracing, inject_current};
 use super::wire::MAX_MESSAGE_BYTES;
 use super::{FORWARD, VERSION};
 
@@ -261,6 +261,7 @@ async fn call(channel: Channel, request: ForwardRequest, deadlines: Deadlines) -
     }
     let deadline = commit_timeout + connect_timeout;
     let mut request = Request::new(request);
+    inject_current(&mut request);
     // The peer stops work a little after the sender gives up, so the
     // sender's own deadline is the one that ends the call.
     request.set_timeout(deadline + connect_timeout);

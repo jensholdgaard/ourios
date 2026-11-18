@@ -352,7 +352,7 @@ fn attr(span: &SpanData, key: &str) -> Option<String> {
 /// Spans for this thread until the guard drops, from the `tracing` layer
 /// and from the returned [`Tracing`] alike. The tests run on a
 /// current-thread runtime, so every task is covered.
-fn capture() -> (
+pub(super) fn capture() -> (
     InMemorySpanExporter,
     Tracing,
     tracing::subscriber::DefaultGuard,
@@ -370,12 +370,17 @@ fn capture() -> (
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
     crate::global_subscriber();
+    // As `ourios-telemetry` installs it in production: the W3C propagator
+    // every peer call's context crosses the wire through.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
     let guard = tracing::subscriber::set_default(subscriber);
     (exporter, Tracing::Owned(Arc::new(owned)), guard)
 }
 
 /// The peer-RPC spans exported, not `openraft`'s own.
-fn peer_spans(exporter: &InMemorySpanExporter) -> Vec<SpanData> {
+pub(super) fn peer_spans(exporter: &InMemorySpanExporter) -> Vec<SpanData> {
     let spans = exporter.get_finished_spans().expect("spans");
     spans
         .into_iter()
@@ -411,7 +416,7 @@ fn expected_rpc(method: &str, code: &str) -> (String, [Option<String>; 3]) {
     (name, attrs)
 }
 
-fn of_kind(spans: &[SpanData], kind: &SpanKind) -> SpanData {
+pub(super) fn of_kind(spans: &[SpanData], kind: &SpanKind) -> SpanData {
     spans
         .iter()
         .find(|s| &s.span_kind == kind)
@@ -439,6 +444,33 @@ async fn a_peer_rpc_is_traced_as_grpc_client_and_server_spans() {
     let local = Some("127.0.0.1".to_owned());
     assert_eq!(failure_of(&client), (true, not_found, local));
     assert_eq!(failure_of(&server), (false, None, None));
+}
+
+/// RFC 0065 §6.9: a peer RPC's server span continues its client span's
+/// trace, the client span its parent, as the RPC conventions pair them.
+#[tokio::test]
+async fn a_peer_rpc_server_span_is_the_child_of_its_client_span() {
+    let (exporter, _tracing, _default) = capture();
+    let (incoming, addr) = bind();
+    let (_stop, _serving) = serve(ReplicationServer::default(), incoming);
+    let mut client = client_to(&Peers::plaintext(), NodeId::from(1), addr).await;
+    assert!(client.vote(vote_request(), option()).await.is_err());
+
+    let spans = peer_spans(&exporter);
+    assert_child_of_client(&spans);
+}
+
+/// The server span of `spans` is in the client span's trace, its parent
+/// the client span.
+pub(super) fn assert_child_of_client(spans: &[SpanData]) {
+    let client = of_kind(spans, &SpanKind::Client);
+    let server = of_kind(spans, &SpanKind::Server);
+    assert_eq!(
+        server.span_context.trace_id(),
+        client.span_context.trace_id(),
+        "one trace"
+    );
+    assert_eq!(server.parent_span_id, client.span_context.span_id());
 }
 
 /// A heartbeat is an append without entries: a successful one leaves no

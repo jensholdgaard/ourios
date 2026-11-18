@@ -37,7 +37,7 @@ use super::forward;
 use super::identify::{self, IdentifyError, Identity};
 use super::links::{Link, Links};
 use super::propose;
-use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing};
+use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing, inject_current};
 use super::wire::{
     AppendRequest, AppendResponse, MAX_MESSAGE_BYTES, Malformed, Pieces, Recipient, Reply,
     SnapshotRequest, StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
@@ -335,6 +335,7 @@ impl PeerClient {
                 .await
                 .map_err(|e| Status::unavailable(e.to_string()))?;
             let mut request = Request::new(message);
+            inject_current(&mut request);
             request.set_timeout(ttl);
             let codec = ProstCodec::<Req, Resp>::default();
             grpc.unary(request, PathAndQuery::from_static(rpc.path), codec)

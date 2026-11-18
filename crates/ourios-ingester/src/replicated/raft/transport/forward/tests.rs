@@ -190,3 +190,19 @@ async fn a_call_that_cannot_connect_was_never_sent() {
     let unknown = peers.forward("n9", request(), COMMIT).await;
     assert!(matches!(unknown, Outcome::Unreached(_)), "{unknown:?}");
 }
+
+/// RFC 0065 §6.9: the leader's span of a forwarded export continues the
+/// forwarding node's trace, so the export is one trace across the hop.
+#[tokio::test]
+async fn a_forward_continues_the_senders_trace_on_the_leader() {
+    use crate::replicated::raft::transport::tests::{assert_child_of_client, capture, peer_spans};
+
+    let (exporter, _tracing, _default) = capture();
+    let (peers, _serving) = node(Fake::Answer(Ok(42)));
+    assert_eq!(
+        peers.forward("n1", request(), COMMIT).await,
+        Outcome::Committed(42)
+    );
+
+    assert_child_of_client(&peer_spans(&exporter));
+}

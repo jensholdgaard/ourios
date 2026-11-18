@@ -12,7 +12,7 @@ use tonic_prost::ProstCodec;
 use uuid::Uuid;
 
 use super::super::types::NodeId;
-use super::trace::{Call, Peer, Traced, Tracing};
+use super::trace::{Call, Peer, Traced, Tracing, inject_current};
 use super::wire::MAX_MESSAGE_BYTES;
 use super::{IDENTIFY, VERSION};
 
@@ -117,6 +117,7 @@ async fn ask(channel: Channel, timeout: Duration) -> Result<IdentifyResponse, St
             .await
             .map_err(|e| Status::unavailable(e.to_string()))?;
         let mut request = Request::new(IdentifyRequest { version: VERSION });
+        inject_current(&mut request);
         request.set_timeout(timeout);
         let codec = ProstCodec::<IdentifyRequest, IdentifyResponse>::default();
         grpc.unary(request, PathAndQuery::from_static(IDENTIFY), codec)

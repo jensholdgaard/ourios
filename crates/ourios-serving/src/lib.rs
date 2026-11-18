@@ -38,6 +38,7 @@ pub use auth::{AuthBinding, AuthError, AuthResolver, GraphIdentity, authenticate
 pub use client::HttpClient;
 pub use metrics::AuthMetrics;
 pub use propagation::{
-    HeaderExtractor, MetadataExtractor, extract_context, extract_context_from_metadata,
+    HeaderExtractor, MetadataExtractor, MetadataInjector, extract_context,
+    extract_context_from_metadata, inject_context_into_metadata,
 };
 pub use tls::TlsSettings;

@@ -4,6 +4,7 @@
 //! re-created.
 
 use std::fmt;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ourios_parquet::{IdMaxError, Store, StoreError};
@@ -241,6 +242,11 @@ async fn passed(
             Pass::Wait(why) => {
                 waiting(&why);
                 tokio::time::sleep(start.retry).await;
+                // As the template-id scan stops between reads, writing nothing.
+                if start.scan.shutdown.load(Ordering::Relaxed) {
+                    let interrupted = TemplateIdsError::Interrupted { files_scanned: 0 };
+                    return Err(StartError::HighWater(interrupted));
+                }
             }
         }
     }

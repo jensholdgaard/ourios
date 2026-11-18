@@ -223,6 +223,30 @@ async fn pass_lock(
         .map_err(NodeError::LogIds)
 }
 
+/// What would refuse a start of the node holding `groups` under
+/// `wal_root`, checked writing nothing, so a server can refuse before it
+/// binds: Raft state it cannot read, a voting layout other than the
+/// recorded one, an identity it cannot read. As at the start, a node
+/// holding Raft state passes with the layout unreadable (RFC0065.31).
+///
+/// # Errors
+///
+/// The [`NodeError`] the start would fail with.
+pub fn preflight(
+    wal_root: &Path,
+    groups: &[u32],
+    store: &Store,
+    layout: &VotingLayout,
+) -> Result<(), NodeError> {
+    let held = log_ids::raft_state(wal_root, groups).map_err(NodeError::RaftState)?;
+    match (layout::check_recorded(store, layout), held) {
+        (Err(LayoutError::Store { op: "read", .. }), RaftState::Held) => {}
+        (checked, _) => checked.map_err(NodeError::Layout)?,
+    }
+    replica_id::load_existing(wal_root).map_err(NodeError::Identity)?;
+    Ok(())
+}
+
 /// The steps before the lock, blocking, in the order that leaves the
 /// least behind a start that fails: whether this node holds Raft state,
 /// then the voting layout, then its identity.

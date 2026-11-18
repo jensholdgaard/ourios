@@ -777,3 +777,36 @@ async fn a_store_without_conditional_updates_takes_no_lock() {
     );
     assert_eq!(stored_lock(&store).await, None, "the lock was created");
 }
+
+/// A start waiting on the lock stops once the process is asked to: its
+/// shutdown flag fails it as an interrupted scan, writing nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_start_stops_at_shutdown() {
+    let store = Store::in_memory();
+    let (down, outage) = with_outage(store.clone());
+    outage.begin();
+    let scan = ScanOptions::default();
+    let shutdown = std::sync::Arc::clone(&scan.shutdown);
+    let lock_start = LockStart {
+        store: &down,
+        node_id: A,
+        raft_state: RaftState::Empty,
+        allow_bootstrap: false,
+        scan: &scan,
+        retry: RETRY,
+    };
+    let mut waiting = |_: &Waiting| shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let stopped = tokio::time::timeout(PATIENCE, start(&lock_start, &mut waiting))
+        .await
+        .expect("the start stops at shutdown");
+
+    assert!(
+        matches!(
+            stopped,
+            Err(StartError::HighWater(TemplateIdsError::Interrupted { .. }))
+        ),
+        "{stopped:?}"
+    );
+    assert_eq!(stored_lock(&store).await, None);
+}

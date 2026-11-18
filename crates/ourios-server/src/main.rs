@@ -40,8 +40,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use ourios_ingester::Compactor;
-use ourios_ingester::replicated::layout::{self, VotingLayout};
-use ourios_ingester::replicated::replica_id;
+use ourios_ingester::replicated::layout::VotingLayout;
 
 use ourios_parquet::{CompactionPolicy, ParquetAuditSink, StoreConfig};
 use ourios_server::config::resolve::{
@@ -597,9 +596,10 @@ async fn serve_replicated(
             ))
         })?;
     let peer_addr = listener.local_addr().map_err(|e| failed(e.to_string()))?;
+    let stopped = std::sync::Arc::clone(&stopping);
     let handle = replicated::serve::serve_replicated(replicated, config, (listener, stopping))
         .await
-        .map_err(failed)?;
+        .map_err(|e| replicated_start_error(e, &stopped))?;
     println!("receiver replication listening on {peer_addr}");
     Ok(ReceiverRole::Replicated(handle))
 }
@@ -674,6 +674,19 @@ fn listen_for_shutdown(
     (stopping, signalled)
 }
 
+/// A replicated start's failure: a requested stop when the process was
+/// asked to stop meanwhile, as an interrupted bootstrap scan is.
+fn replicated_start_error(
+    message: String,
+    stopping: &std::sync::atomic::AtomicBool,
+) -> receiver::StartError {
+    if stopping.load(std::sync::atomic::Ordering::Relaxed) {
+        receiver::StartError::Interrupted(message)
+    } else {
+        receiver::StartError::Failed(message)
+    }
+}
+
 /// Before a replicated receiver (RFC 0065) binds or writes anything, check
 /// what would refuse it later: a store without conditional updates, a
 /// voting layout other than the recorded one, an unreadable identity. A
@@ -699,15 +712,15 @@ fn check_replicated_layout(
     store: &ourios_parquet::Store,
     wal_root: &Path,
 ) -> Result<(), receiver::StartError> {
-    let failed = |e: &dyn std::fmt::Display| receiver::StartError::Failed(e.to_string());
     let configured = VotingLayout::new(
         replicated.peers.iter().map(|peer| peer.id.as_str()),
         replicated.groups,
         replicated.replication_factor.voters(),
     );
-    layout::check_recorded(store, &configured).map_err(|e| failed(&e))?;
-    replica_id::load_existing(wal_root).map_err(|e| failed(&e))?;
-    Ok(())
+    // Every group: a tail replica holds the state of groups it votes in none of.
+    let groups: Vec<u32> = (0..replicated.groups.get()).collect();
+    ourios_ingester::replicated::node::preflight(wal_root, &groups, store, &configured)
+        .map_err(|e| receiver::StartError::Failed(e.to_string()))
 }
 
 /// What a failed receiver startup means for the process: a bootstrap scan
@@ -912,6 +925,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ourios_ingester::replicated::{layout, replica_id};
 
     /// Tests a later behaviour superseded, kept as their record.
     mod superseded;
@@ -1108,6 +1122,18 @@ receiver:
       tail_peers: t=t:4320
       tail_clients: querier
 ";
+
+    /// A replicated start that fails after the process was asked to stop is
+    /// a requested stop, not a failed start.
+    #[test]
+    fn a_replicated_start_stopped_by_a_signal_is_a_requested_stop() {
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+        let failed = replicated_start_error("unreachable".to_owned(), &stopping);
+        assert_eq!(startup_exit(failed), Err("unreachable".to_owned()));
+        stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stopped = replicated_start_error("interrupted".to_owned(), &stopping);
+        assert_eq!(startup_exit(stopped), Ok("interrupted".to_owned()));
+    }
 
     /// The pre-flight passes the local backend and a valid replicated one,
     /// and writes nothing for either: the replicated start that follows

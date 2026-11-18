@@ -89,6 +89,11 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # ourios-telemetry's layer already uses. Tests also bridge spans onto the
 # in-memory exporter with it (RFC0038.2).
 tracing-opentelemetry = { version = "=0.33.0", default-features = false }
+# RFC 0065 §6.7 / RFC0065.13: the Tail gate reads a querier's client
+# certificate's URI and DNS subject alternative names, which rustls-webpki
+# cannot list; the certificate is already verified by the handshake. The
+# version rcgen already locks.
+x509-parser = { version = "=0.18.1", default-features = false }
 # The ingest pipeline's WAL-before-ack durability (RFC 0003 §6.5 /
 # AGENTS.md §3.4): append the OtlpBatch frame + fsync before acking.
 ourios-wal = { path = "../ourios-wal" }

@@ -1,6 +1,7 @@
 //! The `ourios.wal.v1.Replication` server: one per node, handing each
 //! request to the `Raft` of the group it names.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
@@ -33,6 +34,10 @@ use super::forward::{self, ForwardTarget};
 use super::identify::{self, Identity};
 use super::propose::{self, ProposeTarget};
 use super::read_index::{self, ReadIndexTarget};
+use super::tail::{self, Clients, TailTarget};
+
+/// A tail target and who may read it.
+type Tails = (Arc<dyn TailTarget>, Clients);
 use super::trace::{Call, Carried, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, Malformed, SnapshotRequest,
@@ -40,7 +45,7 @@ use super::wire::{
 };
 use super::{
     APPEND, FORWARD, IDENTIFY, INSTALL_SNAPSHOT, PRE_VOTE, PROPOSE, READ_INDEX, SERVICE,
-    STREAM_APPEND, VERSION, VOTE,
+    STREAM_APPEND, TAIL, VERSION, VOTE,
 };
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
@@ -60,6 +65,9 @@ where
     /// The node's groups for `ReadIndex`; until it is set, every read is
     /// refused as not hosted.
     reads: Arc<RwLock<Option<Arc<dyn ReadIndexTarget>>>>,
+    /// The node's tail for `Tail`, and who may read it; until it is set,
+    /// every read is refused.
+    tails: Arc<RwLock<Option<Tails>>>,
     /// Who this node is, for `Identify`; until it is set the call is
     /// unavailable.
     identity: Arc<RwLock<Option<Identity>>>,
@@ -80,6 +88,7 @@ where
             forwards: Arc::clone(&self.forwards),
             proposals: Arc::clone(&self.proposals),
             reads: Arc::clone(&self.reads),
+            tails: Arc::clone(&self.tails),
             identity: Arc::clone(&self.identity),
             tracing: self.tracing.clone(),
             closing: Arc::clone(&self.closing),
@@ -97,6 +106,7 @@ where
             forwards: Arc::default(),
             proposals: Arc::default(),
             reads: Arc::default(),
+            tails: Arc::default(),
             identity: Arc::default(),
             tracing: Tracing::default(),
             closing: Arc::new(watch::Sender::new(false)),
@@ -172,6 +182,21 @@ where
         target.clone()
     }
 
+    /// Serve the tail with `target` to `clients`, replacing any earlier one.
+    pub fn serve_tails(&self, target: Arc<dyn TailTarget>, clients: Clients) {
+        *self.tails.write().unwrap_or_else(PoisonError::into_inner) = Some((target, clients));
+    }
+
+    /// The tail target, and whether the caller whose certificate names
+    /// `identities` is one of its clients.
+    fn tail_target(&self, identities: &BTreeSet<String>) -> (Option<Arc<dyn TailTarget>>, bool) {
+        let tails = self.tails.read().unwrap_or_else(PoisonError::into_inner);
+        match tails.as_ref() {
+            Some((target, clients)) => (Some(Arc::clone(target)), clients.admits(identities)),
+            None => (None, false),
+        }
+    }
+
     fn read_index_target(&self) -> Option<Arc<dyn ReadIndexTarget>> {
         let target = self.reads.read().unwrap_or_else(PoisonError::into_inner);
         target.clone()
@@ -188,6 +213,7 @@ where
             forwards: Arc::default(),
             proposals: Arc::default(),
             reads: Arc::default(),
+            tails: Arc::default(),
             identity: Arc::default(),
             tracing,
             closing: Arc::new(watch::Sender::new(false)),
@@ -664,6 +690,12 @@ where
                 let target = server.propose_target();
                 propose::serve(target, r)
             }),
+            TAIL => {
+                let (target, admitted) = server.tail_target(&tail::client_identities(&request));
+                unary(TAIL, tracing, request, move |r| {
+                    tail::serve(target.clone(), admitted, r)
+                })
+            }
             READ_INDEX => unary(READ_INDEX, tracing, request, move |r| {
                 let target = server.read_index_target();
                 read_index::serve(target, r)

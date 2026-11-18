@@ -55,6 +55,17 @@ impl Ca {
             .expect("params")
             .signed_by(&key, &self.issuer)
             .expect("leaf");
+        self.settings(dir, name, (&cert, &key))
+    }
+
+    /// Settings over `cert` and its `key`, written under `dir` as `name`,
+    /// with this CA as the peer CA.
+    fn settings(
+        &self,
+        dir: &Path,
+        name: &str,
+        (cert, key): (&rcgen::Certificate, &KeyPair),
+    ) -> TlsSettings {
         let cert_file = dir.join(format!("{name}.crt"));
         let key_file = dir.join(format!("{name}.key"));
         let ca_file = dir.join(format!("{name}-ca.crt"));
@@ -68,6 +79,18 @@ impl Ca {
             min_version: TlsMinVersion::V1_2,
             reload_interval: None,
         }
+    }
+}
+
+impl Ca {
+    /// A client's settings: a certificate this CA signed naming `uri` as
+    /// its only subject alternative name, as a querier's does.
+    fn client(&self, dir: &Path, name: &str, uri: &str) -> TlsSettings {
+        let key = KeyPair::generate().expect("key");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.subject_alt_names = vec![rcgen::SanType::URI(uri.try_into().expect("uri"))];
+        let cert = params.signed_by(&key, &self.issuer).expect("leaf");
+        self.settings(dir, name, (&cert, &key))
     }
 }
 
@@ -348,4 +371,56 @@ async fn a_forward_whose_caller_certificate_is_refused_is_uncertain() {
         .await;
     assert!(matches!(outcome, Outcome::Uncertain(_)), "{outcome:?}");
     node.kill().await;
+}
+
+/// RFC0065.13: over mutual TLS a tail replica serves only a caller whose
+/// certificate names one of its `tail_clients`; another replica, whose
+/// certificate the same CA signed, is denied.
+#[tokio::test]
+async fn only_a_listed_client_reads_the_tail_over_mutual_tls() {
+    use super::super::tail::{
+        Clients, Outcome as TailOutcome, TailAnswer, TailQuery, TailTarget, Tailing,
+    };
+
+    struct Fixed;
+    impl TailTarget for Fixed {
+        fn tail(&self, _: TailQuery) -> Tailing {
+            Box::pin(async {
+                Ok(TailAnswer {
+                    read: 1,
+                    rows: Vec::new(),
+                    templates: Vec::new(),
+                    published: Vec::new(),
+                })
+            })
+        }
+    }
+
+    let ca = Ca::new();
+    let dir = TempDir::new().expect("temp");
+    let server = ReplicationServer::<GroupSm>::default();
+    server.serve_tails(Arc::new(Fixed), Clients::only(["spiffe://cluster/querier"]));
+    let (incoming, addr) = bind();
+    let _serving = serve_tls(server, incoming, &ca.node(dir.path(), "tail"));
+    let peers = |tls: &TlsSettings| {
+        Peers::mutual_tls(tls)
+            .expect("peers")
+            .with_addresses([("t".to_owned(), addr.to_string())])
+    };
+    let query = || TailQuery {
+        group: 0,
+        tenant: "acme".to_owned(),
+        from: 0,
+        range: None,
+    };
+    let patience = Duration::from_secs(5);
+
+    let querier = peers(&ca.client(dir.path(), "querier", "spiffe://cluster/querier"));
+    let read = querier.tail("t", query(), patience).await;
+    assert!(matches!(read, TailOutcome::Answered(_)), "{read:?}");
+    let replica = peers(&ca.node(dir.path(), "replica"));
+    assert_eq!(
+        replica.tail("t", query(), patience).await,
+        TailOutcome::Denied
+    );
 }

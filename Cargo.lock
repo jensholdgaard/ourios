@@ -3875,6 +3875,7 @@ dependencies = [
  "tracing-subscriber",
  "twox-hash",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

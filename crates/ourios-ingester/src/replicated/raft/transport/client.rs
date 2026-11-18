@@ -38,6 +38,7 @@ use super::identify::{self, IdentifyError, Identity};
 use super::links::{Link, Links};
 use super::propose;
 use super::read_index;
+use super::tail;
 use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing, inject_current};
 use super::wire::{
     AppendRequest, AppendResponse, MAX_MESSAGE_BYTES, Malformed, Pieces, Recipient, Reply,
@@ -194,6 +195,22 @@ impl Peers {
             group,
         };
         read_index::traced_call(channel, (&addr, self.tracing.clone()), request, patience).await
+    }
+
+    /// Read `query`'s tail from the tail replica named `node_id` (RFC 0065
+    /// §6.7), within `patience`.
+    pub async fn tail(
+        &self,
+        node_id: &str,
+        query: tail::TailQuery,
+        patience: Duration,
+    ) -> tail::Outcome {
+        let (addr, channel) = self.resolve(node_id);
+        let channel = match channel {
+            Ok(channel) => channel,
+            Err(e) => return tail::Outcome::Unreached(e.to_string()),
+        };
+        tail::traced_call(channel, (&addr, self.tracing.clone()), &query, patience).await
     }
 
     /// Ask the peer configured as `node_id` who it is (RFC 0065 §6.8),

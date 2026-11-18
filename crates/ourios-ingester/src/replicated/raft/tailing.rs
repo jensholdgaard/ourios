@@ -8,18 +8,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ourios_core::record::{IngestPosition, MinedRecord};
+use ourios_core::record::{BodyKind, IngestPosition, MinedRecord};
 use ourios_core::tenant::TenantId;
+use ourios_miner::cluster::NO_TEMPLATE;
 use tokio::time::Instant;
 
 use super::host::{GroupHost, Tailed};
 use super::kept::{Definitions, Kept, RowPage, RowScan, TemplateKey};
+use super::mining::MinedRow;
 use super::read_point::{caught_up, read_point_of};
 use super::transport::Peers;
 use super::transport::tail::{
     PAGE_BYTES, Refusal, ScanPage, ScanQuery, Scanning, TailPoint, TailQuery, TailTarget, Tailing,
     TemplateDefinition, WirePosition,
 };
+use super::transport::wire::MAX_MESSAGE_BYTES;
 
 /// How long a read waits for its read point, or for the replica to catch
 /// up to one: a starting value.
@@ -131,52 +134,84 @@ fn read_page(
         .ok_or_else(stopped)?
 }
 
-/// The template versions `rows` use.
-fn referenced(rows: &[super::mining::MinedRow]) -> BTreeSet<TemplateKey> {
+/// The template versions `rows` render from: those of rows with a string
+/// body and a template. A structured or absent body, or a parse failure,
+/// renders without one.
+pub(super) fn referenced(rows: &[MinedRow]) -> BTreeSet<TemplateKey> {
     rows.iter()
-        .map(|row| (row.record.template_id, row.record.template_version))
+        .map(|row| &row.record)
+        .filter(|record| record.body_kind == BodyKind::String && record.template_id != NO_TEMPLATE)
+        .map(|record| (record.template_id, record.template_version))
         .collect()
 }
 
 /// `page` as served: its rows under the group's `log` id, encoded to at
-/// most `page_bytes` by giving the rest to the next page, with the
-/// definitions of the templates the rows served reference.
-fn encoded(
+/// most `page_bytes` and the whole answer to within the message limit by
+/// giving the rest to the next page, with the definitions of the templates
+/// the rows served reference. A row that does not fit alone is refused, so
+/// no answer passes the bound.
+pub(super) fn encoded(
     mut page: RowPage,
     definitions: &Definitions,
     (log, page_bytes): (u32, usize),
 ) -> Result<ScanPage, Refusal> {
     loop {
-        let records: Vec<MinedRecord> = page
-            .rows
-            .iter()
-            .map(|row| MinedRecord {
-                ingest_position: Some(IngestPosition {
-                    group: log,
-                    seq: row.position.seq,
-                    index: row.position.index,
-                }),
-                ..row.record.clone()
-            })
-            .collect();
-        let rows = ourios_parquet::ipc::encode(&records)
+        let rows = ourios_parquet::ipc::encode(&stamped(&page.rows, log))
             .map_err(|e| Refusal::Unavailable(e.to_string()))?;
-        if rows.len() > page_bytes && page.rows.len() > 1 {
-            page.rows.truncate(page.rows.len() / 2);
-            page.next = page
-                .rows
-                .last()
-                .map(|row| (row.position.seq, row.position.index));
-            continue;
-        }
         let templates = templates_of(&referenced(&page.rows), definitions)?;
-        let next = page.next.map(|(seq, index)| WirePosition { seq, index });
-        return Ok(ScanPage {
-            rows,
-            templates,
-            next,
-        });
+        let fits = rows.len() <= page_bytes && answer_bytes(&rows, &templates) <= MAX_MESSAGE_BYTES;
+        match (fits, page.rows.len()) {
+            (true, _) => {
+                let next = page.next.map(|(seq, index)| WirePosition { seq, index });
+                return Ok(ScanPage {
+                    rows,
+                    templates,
+                    next,
+                });
+            }
+            (false, 0 | 1) => {
+                return Err(Refusal::Unavailable(format!(
+                    "a row encodes to {} bytes, past the page bound",
+                    rows.len()
+                )));
+            }
+            (false, n) => {
+                page.rows.truncate(n / 2);
+                page.next = page
+                    .rows
+                    .last()
+                    .map(|row| (row.position.seq, row.position.index));
+            }
+        }
     }
+}
+
+/// `rows`' records, each carrying its position under the group's `log` id.
+fn stamped(rows: &[MinedRow], log: u32) -> Vec<MinedRecord> {
+    rows.iter()
+        .map(|row| MinedRecord {
+            ingest_position: Some(IngestPosition {
+                group: log,
+                seq: row.position.seq,
+                index: row.position.index,
+            }),
+            ..row.record.clone()
+        })
+        .collect()
+}
+
+/// What a `TailScan` answer of `rows` and `templates` encodes to, its
+/// framing included.
+fn answer_bytes(rows: &[u8], templates: &[TemplateDefinition]) -> usize {
+    use prost::Message as _;
+
+    // Each field's tag and length prefix, and the message's.
+    const FRAMING: usize = 16;
+    let templates: usize = templates
+        .iter()
+        .map(|template| template.encoded_len() + FRAMING)
+        .sum();
+    rows.len() + templates + 2 * FRAMING
 }
 
 /// The definitions of `wanted`; a version neither the kept events nor the
@@ -206,11 +241,22 @@ fn templates_of(
 
 /// Why `kept` cannot serve a reader holding the checkpoint cut `from`:
 /// a newer cut has dropped rows above `from`, which the reader then finds
-/// in the store from that cut, or a gap has, whose rows only a flusher's
-/// replay or a later checkpoint publishes.
+/// in the store from that cut; a replay has published and dropped rows
+/// above it that the reader's listing may predate; or a gap has dropped
+/// rows only a flusher's replay or a later checkpoint publishes.
 pub(super) fn servable(kept: &Kept, from: u64) -> Result<(), Refusal> {
     match (kept.cut(), kept.gap()) {
         (cut, _) if cut > from => Err(Refusal::TooOld { oldest: cut }),
+        // Restarting from the checkpoint would not help until a cut covers
+        // what the replay published.
+        _ if kept
+            .replayed_through()
+            .is_some_and(|through| through > from) =>
+        {
+            Err(Refusal::Unavailable(
+                "rows a replay published are not yet behind a checkpoint".to_owned(),
+            ))
+        }
         (_, Some(gap)) if gap > from => Err(Refusal::Unavailable(format!(
             "rows through {gap} were dropped from the tail"
         ))),

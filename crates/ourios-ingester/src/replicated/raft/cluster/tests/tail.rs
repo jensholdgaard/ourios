@@ -134,6 +134,10 @@ fn acme_scan(
     }
 }
 
+/// A page bound that holds a few of the corpus' rows: each page's stream
+/// carries the record schema, about 6.5 KiB, as well as its rows.
+const PAGE: usize = 8 * 1024;
+
 /// RFC 0065 §6.7 on a running group: a tail replica fixes a confirmed
 /// read point, then serves the tenant's unpublished rows at it a page at
 /// a time, each row under the group's log id and each page with the
@@ -142,7 +146,7 @@ fn acme_scan(
 async fn a_tail_replica_serves_a_tenants_rows_page_by_page() {
     let (cluster, last) = serving().await;
     let reads =
-        TailReads::new(&cluster.node(4).host, cluster.peers().clone()).with_page_bytes(4096);
+        TailReads::new(&cluster.node(4).host, cluster.peers().clone()).with_page_bytes(PAGE);
     let query = TailQuery {
         group: GROUP,
         tenant: "acme".to_owned(),

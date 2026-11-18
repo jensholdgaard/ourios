@@ -887,14 +887,19 @@ true
 
 {{/*
 The `id=host:4320` list of one StatefulSet's pods on its headless Service;
-pass (dict "root" $ "component" "<component>" "replicas" <n>).
+pass (dict "root" $ "component" "<component>" "replicas" <n>). Each host is
+the pod's fully qualified name, so a peer certificate can cover a Service's
+pods with one wildcard (`*.<service>.<namespace>.svc.<clusterDomain>`):
+rustls, as NSS, refuses a wildcard with fewer than two labels after it.
 */}}
 {{- define "ourios.walPeers" -}}
 {{- $set := printf "%s-%s" (include "ourios.fullname" .root) .component -}}
+{{- $domain := dig "wal" "replicated" "clusterDomain" "cluster.local" (.root.Values.receiver | default dict) -}}
+{{- $suffix := printf "%s-headless.%s.svc.%s" $set .root.Release.Namespace $domain -}}
 {{- $peers := list -}}
 {{- range $i := until (int .replicas) }}
 {{- $pod := printf "%s-%d" $set $i }}
-{{- $peers = append $peers (printf "%s=%s.%s-headless:4320" $pod $pod $set) }}
+{{- $peers = append $peers (printf "%s=%s.%s:4320" $pod $pod $suffix) }}
 {{- end }}
 {{- join "," $peers }}
 {{- end }}

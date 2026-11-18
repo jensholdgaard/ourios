@@ -309,7 +309,8 @@ fn rfc0065_17_the_chart_renders_the_replicated_shape() {
         peers,
         (0..3)
             .map(|i| format!(
-                "t-ourios-receiver-{i}=t-ourios-receiver-{i}.t-ourios-receiver-headless:4320"
+                "t-ourios-receiver-{i}=t-ourios-receiver-{i}.t-ourios-receiver-headless.default.svc.\
+                 cluster.local:4320"
             ))
             .collect::<Vec<_>>()
     );

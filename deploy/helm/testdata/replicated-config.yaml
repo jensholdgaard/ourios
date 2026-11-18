@@ -19,8 +19,8 @@ receiver:
       listen_addr: "0.0.0.0:4320"
       groups: "16"
       replication_factor: "3"
-      peers: "t-ourios-receiver-0=t-ourios-receiver-0.t-ourios-receiver-headless:4320,t-ourios-receiver-1=t-ourios-receiver-1.t-ourios-receiver-headless:4320,t-ourios-receiver-2=t-ourios-receiver-2.t-ourios-receiver-headless:4320"
-      tail_peers: "t-ourios-wal-tail-0=t-ourios-wal-tail-0.t-ourios-wal-tail-headless:4320"
+      peers: "t-ourios-receiver-0=t-ourios-receiver-0.t-ourios-receiver-headless.default.svc.cluster.local:4320,t-ourios-receiver-1=t-ourios-receiver-1.t-ourios-receiver-headless.default.svc.cluster.local:4320,t-ourios-receiver-2=t-ourios-receiver-2.t-ourios-receiver-headless.default.svc.cluster.local:4320"
+      tail_peers: "t-ourios-wal-tail-0=t-ourios-wal-tail-0.t-ourios-wal-tail-headless.default.svc.cluster.local:4320"
       tail_clients: "spiffe://cluster/querier"
       tls:
         cert_file: "/etc/ourios-tls/replication/tls.crt"

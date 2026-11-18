@@ -219,13 +219,17 @@ receiver:
       # The queriers' client-certificate identities (URI or DNS subject
       # alternative names) a tail replica serves tail reads to. Required.
       tailClients: []
+      # The cluster's DNS domain, which the peers' names end in:
+      # <pod>.<service>.<namespace>.svc.<clusterDomain>.
+      clusterDomain: cluster.local
       # Mutual TLS between the replicas, on port 4320 of the headless
       # Services. existingSecret is a kubernetes.io/tls Secret every voter
       # and tail replica presents: its subject alternative names must cover
-      # <release>-ourios-receiver-<i>.<release>-ourios-receiver-headless and
-      # <release>-ourios-wal-tail-<i>.<release>-ourios-wal-tail-headless (a
-      # wildcard per Service will do). clientCA is the CA the peers' client
-      # certificates chain to. Both required.
+      # each pod's name, which one wildcard per Service does:
+      # *.<release>-ourios-receiver-headless.<namespace>.svc.<clusterDomain>
+      # and *.<release>-ourios-wal-tail-headless.<namespace>.svc.<clusterDomain>.
+      # clientCA is the CA the peers' client certificates chain to. Both
+      # required.
       tls:
         existingSecret: ""
         clientCA:

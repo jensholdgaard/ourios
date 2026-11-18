@@ -699,7 +699,10 @@ check "RFC0009.24: role overrides keep one replica and Recreate" \
 
 # --- RFC0065.17: the replicated WAL's shape ---------------------------------
 
+# The namespace is pinned: `helm template` otherwise takes the current kube
+# context's, so the peers' names would depend on the machine.
 replicated_args=(
+  --namespace default
   --set storage.backend=s3 --set storage.s3.bucket=b
   --set receiver.replicas=3
   --set receiver.wal.backend=replicated
@@ -712,13 +715,16 @@ replicated_leaf() {
     | sed -n "s/^      $1: //p"
 }
 check "RFC0065.17: the three receivers on the headless Service are the peers" \
-  "t-ourios-receiver-0=t-ourios-receiver-0.t-ourios-receiver-headless:4320,t-ourios-receiver-1=t-ourios-receiver-1.t-ourios-receiver-headless:4320,t-ourios-receiver-2=t-ourios-receiver-2.t-ourios-receiver-headless:4320" \
+  "t-ourios-receiver-0=t-ourios-receiver-0.t-ourios-receiver-headless.default.svc.cluster.local:4320,t-ourios-receiver-1=t-ourios-receiver-1.t-ourios-receiver-headless.default.svc.cluster.local:4320,t-ourios-receiver-2=t-ourios-receiver-2.t-ourios-receiver-headless.default.svc.cluster.local:4320" \
   "$(replicated_leaf peers | tr -d '"')"
 check "RFC0065.17: node_id is the pod name" '${env:POD_NAME}' \
   "$(replicated_leaf node_id | tr -d '"')"
 check "RFC0065.17: the tail pool is its own StatefulSet's pods" \
-  "t-ourios-wal-tail-0=t-ourios-wal-tail-0.t-ourios-wal-tail-headless:4320" \
+  "t-ourios-wal-tail-0=t-ourios-wal-tail-0.t-ourios-wal-tail-headless.default.svc.cluster.local:4320" \
   "$(replicated_leaf tail_peers | tr -d '"')"
+check "RFC0065.17: peer names follow the release namespace and cluster domain" \
+  "t-ourios-wal-tail-0=t-ourios-wal-tail-0.t-ourios-wal-tail-headless.logs.svc.k8s.example:4320" \
+  "$(replicated_leaf tail_peers --namespace logs --set receiver.wal.replicated.clusterDomain=k8s.example | tr -d '"')"
 check "RFC0065.17: tail_clients are the querier identities" \
   "spiffe://cluster/querier" "$(replicated_leaf tail_clients | tr -d '"')"
 check "RFC0065.17: scaling the tail pool changes tail_peers only (B24)" \

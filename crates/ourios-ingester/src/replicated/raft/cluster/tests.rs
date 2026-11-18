@@ -23,6 +23,7 @@ use super::{
 mod mining;
 mod propose;
 mod publication;
+mod read_index;
 mod restore;
 
 const GROUP: u32 = 0;

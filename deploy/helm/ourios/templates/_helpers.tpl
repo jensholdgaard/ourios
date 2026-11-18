@@ -216,6 +216,9 @@ receiver:
   {{- with include "ourios.tlsConfig" . }}
   {{- . | trim | nindent 2 }}
   {{- end }}
+  {{- with include "ourios.replicatedWalConfig" $ }}
+  {{- . | trim | nindent 2 }}
+  {{- end }}
 compaction:
   enabled: false
 {{- else if eq $role "querier" }}
@@ -843,5 +846,105 @@ annotations and role-specific ones both apply). Pass a dict with "global" and
 {{- $merged := merge (deepCopy (.role | default dict)) (.global | default dict) -}}
 {{- with $merged }}
 {{- toYaml . }}
+{{- end }}
+{{- end }}
+
+{{/*
+"true" when the receivers run the replicated WAL (RFC 0065), after checking
+what it needs; empty for the local WAL. `dig` keeps a --reuse-values upgrade
+from a release without these keys rendering the local WAL.
+*/}}
+{{- define "ourios.replicatedWal" -}}
+{{- $wal := .Values.receiver.wal | default dict -}}
+{{- $backend := $wal.backend | default "local" -}}
+{{- if eq $backend "replicated" }}
+{{- $r := $wal.replicated | default dict -}}
+{{- if ne .Values.storage.backend "s3" }}
+{{- fail (printf "receiver.wal.backend replicated needs storage.backend s3: the replicated WAL records its layout and checkpoints with the store's conditional updates, which the local store lacks (RFC 0065 §6.2), got %q" .Values.storage.backend) }}
+{{- end }}
+{{- if not (dig "tls" "existingSecret" "" $r) }}
+{{- fail "receiver.wal.backend replicated needs receiver.wal.replicated.tls.existingSecret: the replicas talk only over mutual TLS (RFC 0065 B21)" }}
+{{- end }}
+{{- if not (dig "tls" "clientCA" "existingSecret" "" $r) }}
+{{- fail "receiver.wal.backend replicated needs receiver.wal.replicated.tls.clientCA.existingSecret: the CA the replicas' client certificates chain to (RFC 0065 B21)" }}
+{{- end }}
+{{- if not $r.tailClients }}
+{{- fail "receiver.wal.backend replicated needs receiver.wal.replicated.tailClients: the queriers' client-certificate identities a tail replica serves (RFC 0065 §6.7)" }}
+{{- end }}
+{{- $factor := int ($r.replicationFactor | default 3) }}
+{{- if lt (int .Values.receiver.replicas) $factor }}
+{{- fail (printf "receiver.replicas (%d) is below receiver.wal.replicated.replicationFactor (%d): every group needs that many voters" (int .Values.receiver.replicas) $factor) }}
+{{- end }}
+true
+{{- else if ne $backend "local" }}
+{{- fail (printf "receiver.wal.backend must be local or replicated, got %q" $backend) }}
+{{- end }}
+{{- end }}
+
+{{/*
+The `id=host:4320` list of one StatefulSet's pods on its headless Service;
+pass (dict "root" $ "component" "<component>" "replicas" <n>).
+*/}}
+{{- define "ourios.walPeers" -}}
+{{- $set := printf "%s-%s" (include "ourios.fullname" .root) .component -}}
+{{- $peers := list -}}
+{{- range $i := until (int .replicas) }}
+{{- $pod := printf "%s-%d" $set $i }}
+{{- $peers = append $peers (printf "%s=%s.%s-headless:4320" $pod $pod $set) }}
+{{- end }}
+{{- join "," $peers }}
+{{- end }}
+
+{{/*
+The receiver config's `wal` block for the replicated WAL, shared by the
+voters and the tail pool: each pod is the node its name says, a voter when
+`peers` lists it and a tail replica when `tail_peers` does.
+*/}}
+{{- define "ourios.replicatedWalConfig" -}}
+{{- if include "ourios.replicatedWal" . }}
+{{- $r := .Values.receiver.wal.replicated }}
+wal:
+  backend: replicated
+  replicated:
+    node_id: "${env:POD_NAME}"
+    listen_addr: "0.0.0.0:4320"
+    groups: {{ $r.groups | default 16 | quote }}
+    replication_factor: {{ $r.replicationFactor | default 3 | quote }}
+    peers: {{ include "ourios.walPeers" (dict "root" . "component" "receiver" "replicas" .Values.receiver.replicas) | quote }}
+    tail_peers: {{ include "ourios.walPeers" (dict "root" . "component" "wal-tail" "replicas" (dig "replicas" 1 (.Values.walTail | default dict))) | quote }}
+    {{- with include "ourios.setValue" $r.tailReplicas }}
+    tail_replicas: {{ . | quote }}
+    {{- end }}
+    tail_clients: {{ join "," $r.tailClients | quote }}
+    tls:
+      cert_file: "/etc/ourios-tls/replication/tls.crt"
+      key_file: "/etc/ourios-tls/replication/tls.key"
+      client_ca_file: "/etc/ourios-tls/replication-client-ca/{{ dig "tls" "clientCA" "key" "ca.crt" $r }}"
+{{- end }}
+{{- end }}
+
+{{/*
+The replicated WAL's peer certificate volumes and mounts, empty for the
+local WAL.
+*/}}
+{{- define "ourios.replicationTlsVolumes" -}}
+{{- if include "ourios.replicatedWal" . }}
+- name: tls-replication
+  secret:
+    secretName: {{ .Values.receiver.wal.replicated.tls.existingSecret | quote }}
+- name: tls-replication-client-ca
+  secret:
+    secretName: {{ .Values.receiver.wal.replicated.tls.clientCA.existingSecret | quote }}
+{{- end }}
+{{- end }}
+
+{{- define "ourios.replicationTlsVolumeMounts" -}}
+{{- if include "ourios.replicatedWal" . }}
+- name: tls-replication
+  mountPath: /etc/ourios-tls/replication
+  readOnly: true
+- name: tls-replication-client-ca
+  mountPath: /etc/ourios-tls/replication-client-ca
+  readOnly: true
 {{- end }}
 {{- end }}

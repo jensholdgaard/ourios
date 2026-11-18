@@ -1,0 +1,9 @@
+{{- /*
+The replicated WAL's tail pool (RFC 0065 §6.10): the receiver StatefulSet
+again, as `wal-tail`, with its own replicas and volumes. Rendered only with
+receiver.wal.backend replicated.
+*/}}
+{{- if and .Values.receiver.enabled (include "ourios.replicatedWal" .) }}
+{{- $tail := .Values.walTail | default dict }}
+{{ include "ourios.walStatefulSet" (dict "root" . "component" "wal-tail" "replicas" ($tail.replicas | default 1) "values" $tail) }}
+{{- end }}

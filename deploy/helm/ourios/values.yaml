@@ -199,6 +199,38 @@ receiver:
     storageClassName: ""
     accessModes:
       - ReadWriteOnce
+    # The WAL backend (RFC 0065): `local` (the default), one WAL per
+    # receiver, or `replicated`, each export acknowledged once a quorum of
+    # the receivers has fsynced it. With `replicated` the receivers are the
+    # voters, named by their pod names on the -receiver-headless Service,
+    # and walTail below is the tail pool that mines and publishes. It needs
+    # storage.backend s3 (the store's conditional updates), at least
+    # replicationFactor receivers, and the peer certificates below.
+    backend: local
+    replicated:
+      # Raft groups the tenants are spread over (RFC 0065 §3.8). Fixed once
+      # the cluster has formed: a different value fails the voting-layout
+      # check at start.
+      groups: 16
+      # Voters per group: 3 or 5. Fixed once formed, as `groups` is.
+      replicationFactor: 3
+      # Tail replicas per group; empty takes the server default (1).
+      tailReplicas: ""
+      # The queriers' client-certificate identities (URI or DNS subject
+      # alternative names) a tail replica serves tail reads to. Required.
+      tailClients: []
+      # Mutual TLS between the replicas, on port 4320 of the headless
+      # Services. existingSecret is a kubernetes.io/tls Secret every voter
+      # and tail replica presents: its subject alternative names must cover
+      # <release>-ourios-receiver-<i>.<release>-ourios-receiver-headless and
+      # <release>-ourios-wal-tail-<i>.<release>-ourios-wal-tail-headless (a
+      # wildcard per Service will do). clientCA is the CA the peers' client
+      # certificates chain to. Both required.
+      tls:
+        existingSecret: ""
+        clientCA:
+          existingSecret: ""
+          key: ca.crt
   # Optional role-scoped ServiceAccount (least-privilege object-store access:
   # give each role its own IAM identity — see "Per-role IAM" in the README).
   # create=false (default) uses the shared serviceAccount below. With IRSA,
@@ -230,6 +262,28 @@ receiver:
   extraEnv: []
     # - name: OTEL_RESOURCE_ATTRIBUTES
     #   value: deployment.environment.name=production,service.namespace=ourios
+
+# The tail pool of the replicated WAL (RFC 0065 §6.7, §6.10): a second
+# StatefulSet, rendered only with receiver.wal.backend replicated. Its
+# replicas follow every group's log, mine it, and publish it to the store
+# when named its flusher. Scaling it changes tail_peers only, never the
+# voters, so the voting-layout check is unaffected (B24). It runs the
+# receiver's configuration and ServiceAccount: it writes Parquet as the
+# receiver does.
+walTail:
+  replicas: 1
+  # Each tail replica's volume holds, for every group it hosts, the group's
+  # log above the checkpoint and the local cache of its rows. RFC 0065
+  # sizes it at twice 24 hours of the ingest rate for a node hosting every
+  # group; set it from your rate.
+  wal:
+    size: 4Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
 
 # Querier role (RFC 0016): a stateless Deployment that reads the configured store
 # (local or s3) and scales freely.

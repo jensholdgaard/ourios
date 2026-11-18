@@ -1,59 +1,69 @@
-{{- if .Values.receiver.enabled }}
 {{- /*
-The OTLP receiver role (RFC 0003) as a StatefulSet: each replica gets its own
-durable WAL PVC via a volumeClaimTemplate (RFC 0008: WAL-before-ack needs a
-durable local WAL, and the WAL is never on S3). The receiver writes Parquet to
-the shared store (the configured backend — local by default, S3 in production);
-compaction is disabled in its config (compaction.enabled: false) so only the
-dedicated compactor sweeps.
+A receiver StatefulSet; pass (dict "root" $ "component" "<component>"
+"replicas" <n> "values" <its values block>). The OTLP receiver role (RFC 0003)
+as a StatefulSet: each replica gets its own durable WAL PVC via a
+volumeClaimTemplate (RFC 0008: WAL-before-ack needs a durable local WAL, and
+the WAL is never on S3). The receiver writes Parquet to the shared store (the
+configured backend — local by default, S3 in production); compaction is
+disabled in its config (compaction.enabled: false) so only the dedicated
+compactor sweeps.
+
+With the replicated WAL (RFC 0065 §6.10) it renders twice from the receiver's
+config: as `receiver`, the voters, and as `wal-tail`, the tail pool. Each pod
+learns its node_id from its own name (POD_NAME) and serves its peers on 4320.
 */}}
+{{- define "ourios.walStatefulSet" -}}
+{{- $ := .root -}}
+{{- $component := .component -}}
+{{- $values := .values -}}
+{{- $replicated := include "ourios.replicatedWal" $ -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "ourios.fullname" . }}-receiver
+  name: {{ include "ourios.fullname" $ }}-{{ $component }}
   labels:
-    {{- include "ourios.labels" . | nindent 4 }}
-    app.kubernetes.io/component: receiver
+    {{- include "ourios.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
 spec:
-  replicas: {{ .Values.receiver.replicas }}
-  serviceName: {{ include "ourios.fullname" . }}-receiver-headless
+  replicas: {{ .replicas }}
+  serviceName: {{ include "ourios.fullname" $ }}-{{ $component }}-headless
   selector:
     matchLabels:
-      {{- include "ourios.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: receiver
+      {{- include "ourios.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $component }}
   template:
     metadata:
       labels:
-        {{- include "ourios.labels" . | nindent 8 }}
-        app.kubernetes.io/component: receiver
-        {{- with .Values.podLabels }}
+        {{- include "ourios.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+        {{- with $.Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        {{- with .Values.receiver.podLabels }}
+        {{- with $values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
         # Roll the pods when the mounted RFC 0020 config changes.
-        checksum/config: {{ include "ourios.config" (dict "root" . "role" "receiver") | trim | sha256sum }}
-        {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.receiver.podAnnotations)) }}
+        checksum/config: {{ include "ourios.config" (dict "root" $ "role" "receiver") | trim | sha256sum }}
+        {{- with (include "ourios.podAnnotations" (dict "global" $.Values.podAnnotations "role" $values.podAnnotations)) }}
         {{- . | nindent 8 }}
         {{- end }}
     spec:
-      {{- with .Values.imagePullSecrets }}
+      {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "ourios.roleServiceAccountName" (dict "root" $ "role" "receiver") }}
-      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
-      {{- with .Values.podSecurityContext }}
+      automountServiceAccountToken: {{ $.Values.serviceAccount.automount }}
+      {{- with $.Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: ourios-server
-          image: {{ include "ourios.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- with .Values.securityContext }}
+          image: {{ include "ourios.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          {{- with $.Values.securityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -61,11 +71,20 @@ spec:
             - --config
             - /etc/ourios/config.yaml
           {{- $env := include "ourios.workloadEnv" (dict "root" $ "role" "receiver") | trim }}
-          {{- if $env }}
+          {{- if or $env $replicated }}
           env:
-            {{- $env | nindent 12 }}
+            {{- if $replicated }}
+            # The replicated WAL's node_id is the pod's name (RFC 0065 §6.10).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
+            {{- with $env }}
+            {{- . | nindent 12 }}
+            {{- end }}
           {{- end }}
-          {{- include "ourios.s3CredentialsEnvFrom" . | nindent 10 }}
+          {{- include "ourios.s3CredentialsEnvFrom" $ | nindent 10 }}
           ports:
             - name: otlp-grpc
               containerPort: 4317
@@ -73,6 +92,11 @@ spec:
             - name: otlp-http
               containerPort: 4318
               protocol: TCP
+            {{- if $replicated }}
+            - name: replication
+              containerPort: 4320
+              protocol: TCP
+            {{- end }}
           {{- /*
           No HTTP health route exists yet (the endpoints are POST-only), so
           probe the listening OTLP/HTTP port over TCP. The port opens only once
@@ -81,7 +105,7 @@ spec:
           other two until then. `default` keeps a --reuse-values upgrade from a
           release without the key rendering.
           */}}
-          {{- $startup := .Values.receiver.startupProbe | default dict }}
+          {{- $startup := $.Values.receiver.startupProbe | default dict }}
           startupProbe:
             tcpSocket:
               port: otlp-http
@@ -97,38 +121,44 @@ spec:
               port: otlp-http
             initialDelaySeconds: 10
             periodSeconds: 20
-          {{- with .Values.receiver.resources }}
+          {{- with $values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
-            {{- include "ourios.configVolumeMount" . | nindent 12 }}
+            {{- include "ourios.configVolumeMount" $ | nindent 12 }}
             - name: wal
-              mountPath: {{ .Values.receiver.wal.mountPath }}
-            {{- include "ourios.dataVolumeMount" . | nindent 12 }}
+              mountPath: {{ $.Values.receiver.wal.mountPath }}
+            {{- include "ourios.dataVolumeMount" $ | nindent 12 }}
             # readOnlyRootFilesystem is on, so give the process a writable /tmp.
             - name: tmp
               mountPath: /tmp
-            {{- with include "ourios.tlsVolumeMounts" (dict "root" . "role" "receiver") }}
+            {{- with include "ourios.tlsVolumeMounts" (dict "root" $ "role" "receiver") }}
+            {{- . | trim | nindent 12 }}
+            {{- end }}
+            {{- with include "ourios.replicationTlsVolumeMounts" $ }}
             {{- . | trim | nindent 12 }}
             {{- end }}
       volumes:
-        {{- include "ourios.configVolume" (dict "root" . "role" "receiver") | nindent 8 }}
+        {{- include "ourios.configVolume" (dict "root" $ "role" "receiver") | nindent 8 }}
         - name: tmp
           emptyDir: {}
-        {{- include "ourios.dataVolume" . | nindent 8 }}
-        {{- with include "ourios.tlsVolumes" (dict "root" . "role" "receiver") }}
+        {{- include "ourios.dataVolume" $ | nindent 8 }}
+        {{- with include "ourios.tlsVolumes" (dict "root" $ "role" "receiver") }}
         {{- . | trim | nindent 8 }}
         {{- end }}
-      {{- with .Values.nodeSelector }}
+        {{- with include "ourios.replicationTlsVolumes" $ }}
+        {{- . | trim | nindent 8 }}
+        {{- end }}
+      {{- with $.Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with $.Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with $.Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -136,15 +166,18 @@ spec:
     - metadata:
         name: wal
         labels:
-          {{- include "ourios.labels" . | nindent 10 }}
-          app.kubernetes.io/component: receiver
+          {{- include "ourios.labels" $ | nindent 10 }}
+          app.kubernetes.io/component: {{ $component }}
       spec:
         accessModes:
-          {{- toYaml .Values.receiver.wal.accessModes | nindent 10 }}
-        {{- with .Values.receiver.wal.storageClassName }}
+          {{- toYaml $values.wal.accessModes | nindent 10 }}
+        {{- with $values.wal.storageClassName }}
         storageClassName: {{ . | quote }}
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.receiver.wal.size | quote }}
+            storage: {{ $values.wal.size | quote }}
+{{- end }}
+{{- if .Values.receiver.enabled }}
+{{ include "ourios.walStatefulSet" (dict "root" . "component" "receiver" "replicas" .Values.receiver.replicas "values" .Values.receiver) }}
 {{- end }}

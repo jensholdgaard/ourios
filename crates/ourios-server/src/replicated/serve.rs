@@ -57,8 +57,8 @@ impl ReplicatedHandle {
     ///
     /// # Errors
     ///
-    /// The groups did not shut down cleanly, or the audit events did not
-    /// all flush.
+    /// A listener failed, the groups did not shut down cleanly, or the
+    /// audit events did not all flush.
     pub(crate) async fn shutdown(self) -> Result<(), String> {
         let _ = self.otlp.send(());
         let grpc = self.grpc.await;
@@ -67,19 +67,33 @@ impl ReplicatedHandle {
         for task in self.tasks {
             let _ = task.await;
         }
-        let _ = self.peers.await;
+        let peers = self.peers.await;
         let groups = self.node.host.shutdown().await;
-        let audit = self.audit;
-        let flushed = tokio::task::spawn_blocking(move || audit.flush())
-            .await
-            .unwrap_or(false);
-        grpc.map_err(|e| format!("the gRPC listener's task: {e}"))?
-            .map_err(|e| format!("the gRPC listener: {e}"))?;
+        let flushed = flushed(self.audit).await;
+        served("gRPC", grpc)?;
+        served("replication", peers)?;
         groups.map_err(|e| format!("the groups did not shut down: {e}"))?;
         flushed
             .then_some(())
             .ok_or_else(|| "the last audit events did not flush".to_owned())
     }
+}
+
+/// How the `name` listener's task ended.
+fn served(
+    name: &str,
+    joined: Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>,
+) -> Result<(), String> {
+    joined
+        .map_err(|e| format!("the {name} listener's task: {e}"))?
+        .map_err(|e| format!("the {name} listener: {e}"))
+}
+
+/// Whether `audit`'s buffered events all reached the store.
+async fn flushed(audit: SharedParquetAuditSink) -> bool {
+    tokio::task::spawn_blocking(move || audit.flush())
+        .await
+        .unwrap_or(false)
 }
 
 /// Serve the replicated node `replicated` and `config` describe, its peers
@@ -232,9 +246,11 @@ impl Started {
         }
         let _ = self.peers.await;
         let _ = self.node.host.shutdown().await;
-        let audit = self.audit;
-        let _ = tokio::task::spawn_blocking(move || audit.flush()).await;
-        error
+        if flushed(self.audit).await {
+            error
+        } else {
+            format!("{error}; the denials it took did not flush")
+        }
     }
 }
 
@@ -286,14 +302,15 @@ pub(super) fn spawn_audit_flush(
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(every);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate, and nothing is buffered yet.
+        ticks.tick().await;
         loop {
             tokio::select! {
                 _ = ticks.tick() => {}
                 () = overflow.notified() => {}
                 _ = stopped.wait_for(|stop| *stop) => return,
             }
-            let audit = audit.clone();
-            let _ = tokio::task::spawn_blocking(move || audit.flush()).await;
+            let _ = flushed(audit.clone()).await;
         }
     })
 }

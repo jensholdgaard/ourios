@@ -149,15 +149,16 @@ async fn three_replicated_receivers_take_an_export_and_stop() {
         .expect("connect");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let accepted = loop {
-        match client.export(export("replicated line")).await {
-            Ok(_) => break true,
-            Err(_) if tokio::time::Instant::now() < deadline => {
+        match tokio::time::timeout_at(deadline, client.export(export("replicated line"))).await {
+            Ok(Ok(_)) => break true,
+            Ok(Err(_)) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            Err(status) => {
+            Ok(Err(status)) => {
                 eprintln!("last refusal: {status:?}");
                 break false;
             }
+            Err(_) => break false,
         }
     };
     assert!(accepted, "an export is acknowledged once the group forms");
@@ -179,12 +180,11 @@ async fn denials_past_the_audit_ceiling_flush_without_waiting_for_the_age() {
     use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
     use tokio::sync::watch;
 
-    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(Store::in_memory(), 2));
+    let store = Store::in_memory();
+    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(store.clone(), 2));
     let (stop, stopped) = watch::channel(false);
     let flushing =
         super::serve::spawn_audit_flush(audit.clone(), Duration::from_secs(3_600), stopped);
-    // The first tick is immediate; let it pass with nothing buffered.
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let mut sink = audit.clone();
     for _ in 0..3 {
         sink.emit(AuditEvent {
@@ -197,7 +197,7 @@ async fn denials_past_the_audit_ceiling_flush_without_waiting_for_the_age() {
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while audit.buffered_events() > 0 {
+    while stored_events(&store) < 3 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the overflow flushes"
@@ -232,7 +232,9 @@ async fn a_start_that_cannot_bind_otlp_releases_its_peer_listener() {
     .await
     .expect("returns in time");
 
-    assert!(refused.is_err(), "the gRPC address is taken");
+    let refusal = refused.err().expect("the gRPC address is taken");
+    let taken_addr = taken.local_addr().expect("addr").to_string();
+    assert!(refusal.contains(&taken_addr), "{refusal}");
     let rebound = TcpListener::bind(peer_addr)
         .await
         .expect("the peer listener is free");
@@ -309,7 +311,11 @@ async fn exported(handle: &ReplicatedHandle, count: usize) {
             tokio::time::Instant::now() < deadline,
             "the group takes the exports"
         );
-        match client.export(export(&format!("line {sent}"))).await {
+        let sending = client.export(export(&format!("line {sent}")));
+        let answered = tokio::time::timeout_at(deadline, sending)
+            .await
+            .expect("the group takes the exports in time");
+        match answered {
             Ok(_) => sent += 1,
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
@@ -356,4 +362,21 @@ async fn a_tail_replica_restarted_with_a_backlog_opens_again() {
     for handle in four.handles {
         handle.shutdown().await.expect("stops");
     }
+}
+
+/// How many audit events `store` holds.
+fn stored_events(store: &Store) -> usize {
+    store
+        .list_blocking(None)
+        .expect("list")
+        .iter()
+        .map(|key| {
+            let bytes = store.get_blocking(key).expect("get");
+            ourios_parquet::AuditReader::open_bytes(bytes.into())
+                .expect("open")
+                .read_all()
+                .expect("read")
+                .len()
+        })
+        .sum()
 }

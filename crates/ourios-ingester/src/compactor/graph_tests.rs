@@ -27,7 +27,7 @@ use crate::graph_emitter::GraphEmitter;
 /// ≤ 100 chunk), `/read` answers by object.
 #[derive(Clone, Default)]
 pub(crate) struct Fake {
-    tuples: Arc<Mutex<Vec<TupleKey>>>,
+    pub(crate) tuples: Arc<Mutex<Vec<TupleKey>>>,
     pub(crate) writes: Arc<Mutex<Vec<usize>>>,
 }
 

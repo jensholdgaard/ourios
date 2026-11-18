@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 use ourios_core::audit::{AuditEvent, AuditSink as _};
-use ourios_core::record::{IngestPosition, MinedRecord, RecordSink as _};
+use ourios_core::record::{IngestPosition, MinedRecord};
 use ourios_core::sync::lock_recover;
 
 use super::kept::Kept;
@@ -98,15 +98,12 @@ impl Publication {
         if !*active {
             return;
         }
-        let (mut events, mut records) = (
-            self.coordinator.audit().clone(),
-            self.coordinator.record().clone(),
-        );
+        let mut events = self.coordinator.audit().clone();
         for event in audit {
             events.emit(event.clone());
         }
         for row in rows {
-            records.emit(self.stamped(row));
+            self.coordinator.emit_published(self.stamped(row));
         }
     }
 

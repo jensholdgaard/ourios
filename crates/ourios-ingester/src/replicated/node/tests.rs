@@ -156,16 +156,18 @@ async fn the_preflight_passes_a_node_holding_raft_state_while_the_store_is_unrea
     let started = n0(wal_root.path(), &store);
     let (groups, voting) = (started.groups.clone(), started.layout.clone());
     let fresh = tempfile::tempdir().expect("tempdir");
-    assert!(preflight(fresh.path(), &groups, &store, &voting).is_ok());
+    assert!(preflight(fresh.path(), || groups.clone(), &store, &voting).is_ok());
     let node = start(started, &mut |_| {}).await.expect("started");
     node.host.shutdown().await.expect("shutdown");
     drop(node);
     outage.begin();
 
-    let passed =
-        tokio::task::block_in_place(|| preflight(wal_root.path(), &groups, &store, &voting));
+    let passed = tokio::task::block_in_place(|| {
+        preflight(wal_root.path(), || groups.clone(), &store, &voting)
+    });
     assert!(passed.is_ok(), "{:?}", passed.err());
-    let refused = tokio::task::block_in_place(|| preflight(fresh.path(), &groups, &store, &voting));
+    let refused =
+        tokio::task::block_in_place(|| preflight(fresh.path(), || groups.clone(), &store, &voting));
     assert!(
         matches!(refused, Err(NodeError::Layout(_))),
         "{:?}",
@@ -173,13 +175,23 @@ async fn the_preflight_passes_a_node_holding_raft_state_while_the_store_is_unrea
     );
     outage.end();
     let other = layout(&["n0", "n1", "n9"]);
-    let mismatched =
-        tokio::task::block_in_place(|| preflight(wal_root.path(), &groups, &store, &other));
+    let mismatched = tokio::task::block_in_place(|| {
+        preflight(wal_root.path(), || groups.clone(), &store, &other)
+    });
     assert!(
         matches!(mismatched, Err(NodeError::Layout(_))),
         "{:?}",
         mismatched.err()
     );
+    let unlisted = tokio::task::block_in_place(|| {
+        preflight(
+            wal_root.path(),
+            || panic!("a readable layout is checked before the groups are listed"),
+            &store,
+            &other,
+        )
+    });
+    assert!(matches!(unlisted, Err(NodeError::Layout(_))));
     assert!(fs::read_dir(fresh.path()).expect("read").next().is_none());
 }
 

@@ -81,6 +81,8 @@ mod served {
     pub(super) struct Server {
         child: Child,
         pub(super) grpc: SocketAddr,
+        /// Its stderr, echoed as it comes.
+        stderr: tokio::task::JoinHandle<Vec<String>>,
     }
 
     impl Server {
@@ -99,6 +101,12 @@ mod served {
                 .expect("exits in time")
                 .expect("exit status");
             assert!(status.success(), "a clean exit: {status:?}");
+            let logged = self.stderr.await.expect("stderr read");
+            let failed: Vec<_> = logged
+                .iter()
+                .filter(|line| line.contains("receiver shutdown error"))
+                .collect();
+            assert!(failed.is_empty(), "its shutdown reported {failed:?}");
         }
     }
 
@@ -162,11 +170,30 @@ mod served {
             .arg("--config")
             .arg(&path)
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .expect("spawn");
+        let stderr = echoed(&mut child);
         let grpc = announced(&mut child, "receiver gRPC listening on ").await;
-        Server { child, grpc }
+        Server {
+            child,
+            grpc,
+            stderr,
+        }
+    }
+
+    /// `child`'s stderr lines, each echoed to the test's own as it comes.
+    fn echoed(child: &mut Child) -> tokio::task::JoinHandle<Vec<String>> {
+        let mut lines = BufReader::new(child.stderr.take().expect("piped")).lines();
+        tokio::spawn(async move {
+            let mut logged = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("{line}");
+                logged.push(line);
+            }
+            logged
+        })
     }
 
     /// The address the server announces after `prefix`. Its stdout is read

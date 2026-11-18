@@ -242,8 +242,11 @@ async fn passed(
             Pass::Wait(why) => {
                 waiting(&why);
                 tokio::time::sleep(start.retry).await;
-                // As the template-id scan stops between reads, writing nothing.
-                if start.scan.shutdown.load(Ordering::Relaxed) {
+                // As the template-id scan stops between reads, writing nothing:
+                // only a start that has written nothing stops. One that may
+                // have created the lock or its object finishes the claim, which
+                // its restart would otherwise refuse.
+                if claim == Claim::Inherited && start.scan.shutdown.load(Ordering::Relaxed) {
                     let interrupted = TemplateIdsError::Interrupted { files_scanned: 0 };
                     return Err(StartError::HighWater(interrupted));
                 }

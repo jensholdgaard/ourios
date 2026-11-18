@@ -346,6 +346,15 @@ impl Mining {
         }
     }
 
+    /// `read` of what the miner keeps, while its task runs. The reader
+    /// never holds it past the call, so only the task keeps it alive and an
+    /// ended task's output is neither served nor reported.
+    fn read_kept<T>(&self, read: impl FnOnce(&Kept) -> T) -> Option<T> {
+        let kept = self.kept.upgrade()?;
+        let kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(read(&kept))
+    }
+
     #[cfg(test)]
     fn is_running(&self) -> bool {
         self.task
@@ -615,10 +624,14 @@ impl Follow {
         match (work, checkpointer) {
             (Work::Event(event), _) => self.follow(miner, event, stop).await,
             (Work::Barrier, Some(checkpointer)) => self.checkpoint(checkpointer, miner).await,
-            (Work::Lookup(lookup), _) => {
+            // Off the runtime's workers, as a step is: an answer formats
+            // templates.
+            (Work::Lookup(lookup), _) => tokio::task::spawn_blocking(move || {
                 lookup.answer(&miner);
-                Some(miner)
-            }
+                miner
+            })
+            .await
+            .ok(),
             (Work::Barrier | Work::Report, _) => Some(miner),
         }
     }
@@ -908,12 +921,11 @@ impl GroupHost {
         Some(mining.followed.clone())
     }
 
-    /// What a tail replica keeps of `group`'s mined output; `None` where
-    /// `group` is not mined here or its miner's task has ended.
-    #[must_use]
-    pub fn kept(&self, group: u32) -> Option<Arc<Mutex<Kept>>> {
-        let mining = self.groups.get(&group)?.mining.as_ref()?;
-        mining.kept.upgrade()
+    /// `read` of what a tail replica keeps of `group`'s mined output,
+    /// under its lock; `None` where `group` is not mined here or its
+    /// miner's task has ended.
+    pub fn read_kept<T>(&self, group: u32, read: impl FnOnce(&Kept) -> T) -> Option<T> {
+        self.groups.get(&group)?.mining.as_ref()?.read_kept(read)
     }
 
     /// The definitions of `wanted` that `group`'s miner holds for
@@ -1413,6 +1425,33 @@ mod tests {
         mining.stop().await;
         assert_eq!(reader.points(gap), [], "an ended task reports no gap");
         assert_eq!(reader.points(usage), [], "nor kept audit bytes");
+    }
+
+    /// A tail read reaches what the miner keeps only while its task runs,
+    /// and holds none of it past the call: once the task has ended, there
+    /// is nothing to read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kept_output_is_read_only_while_mining_runs() {
+        let Following {
+            events,
+            mut handed,
+            mining,
+            kept,
+        } = following(Bounds::default(), &Meters::global());
+        drop(kept);
+        through_a_cut(&events).await;
+        assert!(
+            mining.read_kept(Kept::cut).is_some(),
+            "a running task's output"
+        );
+
+        drop(events);
+        while handed.recv().await.is_some() {}
+        mining.stop().await;
+        assert!(
+            mining.read_kept(Kept::cut).is_none(),
+            "an ended task's output"
+        );
     }
 
     /// The kept gauges read `Kept` under its lock, so a step must not hold

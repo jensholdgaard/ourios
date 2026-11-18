@@ -41,6 +41,13 @@ pub struct RowPage {
 }
 
 impl RowScan<'_> {
+    /// Whether `row` is past where the scan starts: above `from` and after
+    /// `after`.
+    fn starts_after(&self, row: &MinedRow) -> bool {
+        let at = (row.position.seq, row.position.index);
+        at.0 > self.from && self.after.is_none_or(|after| at > after)
+    }
+
     fn selects(&self, row: &MinedRow) -> bool {
         let at = (row.position.seq, row.position.index);
         &row.record.tenant_id == self.tenant
@@ -67,7 +74,15 @@ impl Kept {
     pub fn page(&self, scan: &RowScan<'_>, budget: usize) -> RowPage {
         let mut rows: Vec<MinedRow> = Vec::new();
         let mut bytes = 0usize;
-        for row in self.rows.iter().filter(|row| scan.selects(row)) {
+        // Kept rows are in position order: seek past `from` and `after`,
+        // and stop past the read point, so a page costs its own rows.
+        let start = self.rows.partition_point(|row| !scan.starts_after(row));
+        let selected = self
+            .rows
+            .range(start..)
+            .take_while(|row| row.position.seq <= scan.read)
+            .filter(|row| scan.selects(row));
+        for row in selected {
             let size = estimate_bytes(&row.record);
             if !rows.is_empty() && bytes.saturating_add(size) > budget {
                 let next = rows

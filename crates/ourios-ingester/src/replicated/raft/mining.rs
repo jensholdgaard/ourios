@@ -35,7 +35,6 @@ use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{self, IdReservationError, IdReserver, MinerCluster, TreeShapeChanged};
-use ourios_miner::tree::format_template;
 use ourios_wal::{BatchTime, TenantBatch};
 use prost::Message as _;
 
@@ -385,31 +384,17 @@ impl GroupMiner {
             .with_id_reserver(Box::new(self.blocks.clone()))
     }
 
-    /// The definitions of `wanted` that the miner's current templates for
-    /// `tenant` hold: each mined leaf at its version, and each template
-    /// adoption interned.
+    /// The definitions of `wanted` that the miner's templates for
+    /// `tenant` hold: each mined leaf at its version, and each adoption at
+    /// the version it binds.
     #[must_use]
     pub fn definitions(&self, tenant: &TenantId, wanted: &BTreeSet<TemplateKey>) -> Definitions {
         let Stage::Mining { miner, .. } = &self.stage else {
             return Definitions::new();
         };
-        let leaves = miner.templates_for(tenant).into_iter().map(|leaf| {
-            let key = (leaf.template_id, leaf.template_version);
-            (key, format_template(&leaf.template))
-        });
-        let adopted = miner
-            .adopted_templates_for(tenant)
+        miner
+            .template_definitions(tenant, wanted)
             .into_iter()
-            .filter(|adopted| adopted.owned)
-            .map(|adopted| {
-                (
-                    (adopted.template_id, adopted.template_version),
-                    adopted.canonical,
-                )
-            });
-        leaves
-            .chain(adopted)
-            .filter(|(key, _)| wanted.contains(key))
             .collect()
     }
 

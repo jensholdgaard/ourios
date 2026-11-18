@@ -22,14 +22,14 @@ async fn a_tail_replica_defines_every_template_its_kept_rows_use() {
         .expect("still mining");
     let tenant = TenantId::new("acme");
 
-    let kept = tail.kept(GROUP).expect("a tail replica keeps");
-    let wanted: BTreeSet<_> = kept
-        .lock()
-        .expect("kept")
-        .rows()
-        .filter(|row| row.record.tenant_id == tenant)
-        .map(|row| (row.record.template_id, row.record.template_version))
-        .collect();
+    let wanted: BTreeSet<_> = tail
+        .read_kept(GROUP, |kept| {
+            kept.rows()
+                .filter(|row| row.record.tenant_id == tenant)
+                .map(|row| (row.record.template_id, row.record.template_version))
+                .collect()
+        })
+        .expect("a tail replica keeps");
     assert!(!wanted.is_empty(), "rows kept");
     let defined = tail
         .definitions(GROUP, &tenant, wanted.clone())
@@ -38,7 +38,7 @@ async fn a_tail_replica_defines_every_template_its_kept_rows_use() {
 
     assert_eq!(defined.keys().copied().collect::<BTreeSet<_>>(), wanted);
     assert!(
-        cluster.node(0).host.kept(GROUP).is_none(),
+        cluster.node(0).host.read_kept(GROUP, |_| ()).is_none(),
         "a voter keeps nothing"
     );
     cluster.shutdown().await;

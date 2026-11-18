@@ -780,6 +780,14 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `receiver.wal.size` | `2Gi` | WAL PVC size (`OURIOS_WAL_ROOT`, always local). |
 | `receiver.wal.storageClassName` | `""` | WAL StorageClass (`""` = cluster default). |
 | `receiver.wal.mountPath` / `.accessModes` | `/var/lib/ourios/wal` / `[ReadWriteOnce]` | WAL mount path and access modes. |
+| `receiver.wal.backend` | `local` | `local`, one WAL per receiver, or `replicated` (RFC 0065): an export is acknowledged once a quorum of the receivers has fsynced it. `replicated` needs `storage.backend: s3`, at least `replicationFactor` receivers, the peer certificates and `tailClients`, and renders the `walTail` pool. |
+| `receiver.wal.replicated.groups` / `.replicationFactor` | `16` / `3` | Raft groups and voters per group (3 or 5). Both are fixed once the cluster has formed: a change fails the voting-layout check at start. |
+| `receiver.wal.replicated.tailReplicas` | `""` | Tail replicas per group; empty = the server default (1). |
+| `receiver.wal.replicated.tailClients` | `[]` | The queriers' client-certificate identities (URI or DNS SANs) a tail replica serves. Required with `replicated`. |
+| `receiver.wal.replicated.tls.existingSecret` / `.clientCA.existingSecret` / `.clientCA.key` | `""` / `""` / `ca.crt` | Mutual TLS between the replicas on port 4320, which only the headless Services expose. The certificate's SANs must cover `<release>-ourios-receiver-<i>.<release>-ourios-receiver-headless` and `<release>-ourios-wal-tail-<i>.<release>-ourios-wal-tail-headless`. Required with `replicated`. |
+| `walTail.replicas` | `1` | The replicated WAL's tail pool, a second StatefulSet (`-wal-tail`) that mines and publishes. Scaling it changes `tail_peers` only, never the voters. |
+| `walTail.wal.size` / `.storageClassName` / `.accessModes` | `4Gi` / `""` / `[ReadWriteOnce]` | Each tail replica's volume: every hosted group's log above the checkpoint plus its row cache. RFC 0065 sizes it at twice 24 hours of the ingest rate. |
+| `walTail.resources` / `.podAnnotations` / `.podLabels` | `{}` | As the receiver's, for the tail pool. |
 | `receiver.encodeWorkers` | `""` | Encode pool size (RFC 0035); empty = available cores, the node's count without a CPU limit. |
 | `querier.enabled` | `true` | Querier Deployment (HTTP `:4319`). |
 | `querier.replicas` | `2` | Querier replicas (scales independently, no PVC). |

@@ -269,15 +269,53 @@ fn rfc0065_14_require_complete_fails_when_parquet_is_unavailable() {
 }
 
 /// Scenario RFC0065.17 — the chart renders the replicated shape (B20, B21).
-/// Given `receiver.wal.backend: replicated` and `receiver.replicas: 3`, then
-/// the config carries the three headless-Service peers and `node_id` from
-/// the pod name, the peer port is not on the public Service, and the peer
-/// TLS secret is mounted. Lands in `deploy/helm/render-tests.sh`.
+/// Given `receiver.wal.backend: replicated` and `receiver.replicas: 3`, the
+/// receiver config the chart renders (pinned by `deploy/helm/render-tests.sh`
+/// as `testdata/replicated-config.yaml`, which also checks the Services, the
+/// pods' `POD_NAME` and the mounted peer secrets) resolves, for each pod,
+/// to the node its name says: the three voters on the headless Service, and
+/// the tail replica on its own.
 #[test]
-#[ignore = "RFC0065.17 stub — implemented with the chart's replicated shape in render-tests.sh"]
 fn rfc0065_17_the_chart_renders_the_replicated_shape() {
-    todo!(
-        "RFC0065.17 — three peers on the headless Service, `node_id` from the pod \
-         name, no peer port on the public Service, the peer TLS secret mounted"
+    use ourios_server::config::wal::NodeRole;
+
+    let rendered = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/helm/testdata/replicated-config.yaml"),
+    )
+    .expect("the pinned render");
+    let resolve = |pod: &str| {
+        let lookup = |name: &str| (name == "POD_NAME").then(|| pod.to_owned());
+        let file = parse(&rendered, &lookup).expect("parses");
+        match server_config_from_file(&file)
+            .expect("resolves")
+            .receiver
+            .map(|r| r.wal)
+        {
+            Some(WalBackend::Replicated(wal)) => *wal,
+            other => panic!("not a replicated receiver: {other:?}"),
+        }
+    };
+
+    let voter = resolve("t-ourios-receiver-1");
+    assert_eq!(voter.node_id, "t-ourios-receiver-1");
+    assert!(matches!(voter.role, NodeRole::Voter));
+    let peers: Vec<_> = voter
+        .peers
+        .iter()
+        .map(|peer| format!("{}={}:{}", peer.id, peer.host, peer.port))
+        .collect();
+    assert_eq!(
+        peers,
+        (0..3)
+            .map(|i| format!(
+                "t-ourios-receiver-{i}=t-ourios-receiver-{i}.t-ourios-receiver-headless:4320"
+            ))
+            .collect::<Vec<_>>()
     );
+    assert_eq!(voter.listen_addr.port(), 4320);
+    assert!(matches!(
+        resolve("t-ourios-wal-tail-0").role,
+        NodeRole::TailReplica
+    ));
 }

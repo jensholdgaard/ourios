@@ -1,0 +1,30 @@
+storage:
+  backend: "s3"
+  s3:
+    bucket: "b"
+    access_key_id: "${env:OURIOS_S3_ACCESS_KEY_ID:-}"
+    secret_access_key: "${env:OURIOS_S3_SECRET_ACCESS_KEY:-}"
+    session_token: "${env:OURIOS_S3_SESSION_TOKEN:-}"
+receiver:
+  enabled: true
+  grpc_addr: "0.0.0.0:4317"
+  http_addr: "0.0.0.0:4318"
+  wal_root: "/var/lib/ourios/wal"
+  max_buffer_age_secs: "${env:OURIOS_RECEIVER_MAX_BUFFER_AGE_SECS:-}"
+  max_request_bytes: "${env:OURIOS_RECEIVER_MAX_REQUEST_BYTES:-}"
+  wal:
+    backend: replicated
+    replicated:
+      node_id: "${env:POD_NAME}"
+      listen_addr: "0.0.0.0:4320"
+      groups: "16"
+      replication_factor: "3"
+      peers: "t-ourios-receiver-0=t-ourios-receiver-0.t-ourios-receiver-headless:4320,t-ourios-receiver-1=t-ourios-receiver-1.t-ourios-receiver-headless:4320,t-ourios-receiver-2=t-ourios-receiver-2.t-ourios-receiver-headless:4320"
+      tail_peers: "t-ourios-wal-tail-0=t-ourios-wal-tail-0.t-ourios-wal-tail-headless:4320"
+      tail_clients: "spiffe://cluster/querier"
+      tls:
+        cert_file: "/etc/ourios-tls/replication/tls.crt"
+        key_file: "/etc/ourios-tls/replication/tls.key"
+        client_ca_file: "/etc/ourios-tls/replication-client-ca/ca.crt"
+compaction:
+  enabled: false

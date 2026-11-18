@@ -379,8 +379,9 @@ where
     type Future = BoxFuture<Response<Resp>, Status>;
 
     fn call(&mut self, request: Request<Req>) -> Self::Future {
+        let caller = ourios_serving::extract_context_from_metadata(request.metadata());
         let request = request.into_inner();
-        let call = Call::server(self.tracing.clone(), self.path, request.traced());
+        let call = Call::server(self.tracing.clone(), self.path, request.traced(), caller);
         let handled = (self.handler)(request).instrument(call.span());
         Box::pin(async move {
             let result = handled.await;

@@ -23,7 +23,7 @@ use uuid::Uuid;
 use super::super::codec::{raft_id, wal_id};
 use super::super::types::{LogId, NodeId};
 use super::forward::Deadlines;
-use super::trace::{Call, Peer, Traced, Tracing};
+use super::trace::{Call, Peer, Traced, Tracing, inject_current};
 use super::wire::{MAX_MESSAGE_BYTES, WireLogId};
 use super::{PROPOSE, VERSION};
 
@@ -274,6 +274,7 @@ async fn call(channel: Channel, request: ProposeRequest, deadlines: Deadlines) -
     }
     let deadline = commit_timeout + connect_timeout;
     let mut request = Request::new(request);
+    inject_current(&mut request);
     request.set_timeout(deadline + connect_timeout);
     let codec = ProstCodec::<ProposeRequest, ProposeResponse>::default();
     let answer = grpc.unary(request, PathAndQuery::from_static(PROPOSE), codec);

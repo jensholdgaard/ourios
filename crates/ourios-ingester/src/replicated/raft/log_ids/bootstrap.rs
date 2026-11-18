@@ -246,12 +246,23 @@ async fn passed(
                 // only a start that has written nothing stops. One that may
                 // have created the lock or its object finishes the claim, which
                 // its restart would otherwise refuse.
-                if claim == Claim::Inherited && start.scan.shutdown.load(Ordering::Relaxed) {
+                if wrote_nothing(claim, &why) && start.scan.shutdown.load(Ordering::Relaxed) {
                     let interrupted = TemplateIdsError::Interrupted { files_scanned: 0 };
                     return Err(StartError::HighWater(interrupted));
                 }
             }
         }
+    }
+}
+
+/// Whether a start waiting for `why` under `claim` has written nothing: it
+/// never tried to create the lock, or it waits on another start's lock, so
+/// its own create lost the race and never landed.
+fn wrote_nothing(claim: Claim, why: &Waiting) -> bool {
+    match claim {
+        Claim::Inherited => true,
+        Claim::Created => matches!(why, Waiting::Unseeded { .. }),
+        Claim::Owned | Claim::Seated(_) => false,
     }
 }
 

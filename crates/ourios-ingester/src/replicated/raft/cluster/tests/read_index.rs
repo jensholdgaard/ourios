@@ -78,3 +78,41 @@ async fn a_follower_and_a_learner_name_the_leader_instead() {
     }
     cluster.shutdown().await;
 }
+
+/// A leader that has lost its quorum, though it still believes it leads
+/// and still answers, gives no read point: the next read is unavailable,
+/// never one a partitioned leader could serve stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_without_its_quorum_gives_no_read_point() {
+    let (mut cluster, leader, _) = reading().await;
+    for follower in (0..3).filter(|&i| i != leader) {
+        cluster.kill(follower).await;
+    }
+
+    let outcome = cluster
+        .peers()
+        .read_index(&name(cluster.id(leader)), GROUP, Duration::from_secs(1))
+        .await;
+
+    assert!(matches!(outcome, Outcome::Unavailable(_)), "{outcome:?}");
+    cluster.shutdown().await;
+}
+
+/// A leader whose raft has stopped refuses as unconfirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_leader_refuses_as_unconfirmed() {
+    use super::super::super::transport::read_index::{ReadIndexTarget as _, Refusal};
+
+    let (cluster, leader, _) = reading().await;
+    let host = &cluster.node(leader).host;
+    let reads = Reads::new(host);
+    host.shutdown().await.expect("shutdown");
+
+    let refused = reads.read_index(GROUP).await;
+
+    assert!(
+        matches!(refused, Err(Refusal::Unconfirmed(_))),
+        "{refused:?}"
+    );
+    cluster.shutdown().await;
+}

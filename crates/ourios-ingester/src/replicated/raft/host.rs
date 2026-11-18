@@ -4,9 +4,9 @@
 //! [`Peers`] pool. On a tail replica each group's [`GroupMiner`] mines the
 //! entries its state machine applies (§6.5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use openraft::async_runtime::WatchReceiver as _;
@@ -22,7 +22,11 @@ use tokio::time::MissedTickBehavior;
 use super::checkpointer::Checkpointer;
 use super::flushing::{self, Current, Flushing, Need, Publishing};
 use super::gate::SyncGate;
-use super::kept::{Bounds, Kept};
+use ourios_core::tenant::TenantId;
+
+use lookup::{Asker, Lookup};
+
+use super::kept::{Bounds, Definitions, Kept, TemplateKey};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
 use super::mining::{GroupMiner, GroupMinerError, Mined, SharedLog};
 use super::proposer::Proposer;
@@ -210,6 +214,7 @@ impl Launch<'_> {
             checkpointer,
             reporting,
             restoring,
+            lookups: None,
         }
     }
 
@@ -311,11 +316,20 @@ struct Mining {
     /// The group's age sweep, when it can be published from this replica;
     /// it stops with the miner.
     sweep: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// What the miner keeps, which tail reads page through while its task
+    /// runs; held weakly, as the kept gauges hold it, so an ended task's
+    /// output is neither reported nor served.
+    kept: Weak<Mutex<Kept>>,
+    /// Where tail reads ask the miner for template definitions.
+    asker: Asker,
 }
 
 impl Mining {
-    fn start(follow: Follow, miner: GroupMiner, applied: mpsc::Receiver<Applied>) -> Self {
+    fn start(mut follow: Follow, miner: GroupMiner, applied: mpsc::Receiver<Applied>) -> Self {
         let (stop, stopped) = watch::channel(false);
+        let (asker, lookups) = lookup::channel();
+        follow.lookups = Some(lookups);
+        let kept = Arc::downgrade(&follow.keeping.kept);
         let followed = follow.followed.subscribe();
         let sweep = follow
             .sweep
@@ -327,6 +341,8 @@ impl Mining {
             followed,
             task: tokio::sync::Mutex::new(Some(task)),
             sweep: tokio::sync::Mutex::new(sweep),
+            kept,
+            asker,
         }
     }
 
@@ -374,6 +390,8 @@ enum Work {
     /// The report tick, which forces a report, so one goes out at least
     /// every patience; reports are checked after every piece of work.
     Report,
+    /// A tail read's question to the miner.
+    Lookup(Lookup),
 }
 
 /// A tick every `every`, delayed rather than bunched after a slow step.
@@ -420,6 +438,8 @@ struct Follow {
     /// Where the miner restores from at a snapshot, when this replica
     /// reads the group's store; without one, a snapshot stops the miner.
     restoring: Option<Restoring<SharedLog>>,
+    /// Tail reads' questions to the miner, once it runs.
+    lookups: Option<mpsc::Receiver<Lookup>>,
 }
 
 /// What a tail replica's settings say of its groups' output.
@@ -536,6 +556,7 @@ impl Follow {
         let mut reporting = self.reporting.take();
         let mut barrier = checkpointer.as_ref().map(|c| interval(c.every()));
         let mut reports = reporting.as_ref().map(|_| interval(Reporting::every()));
+        let mut lookups = self.lookups.take();
         self.followed_through(&miner);
         loop {
             // Unbiased, so a queue that is never empty does not starve the
@@ -544,6 +565,7 @@ impl Follow {
                 event = next(&mut applied, &mut stop) => event.map(Work::Event),
                 () = ticked(&mut barrier) => Some(Work::Barrier),
                 () = ticked(&mut reports) => Some(Work::Report),
+                lookup = lookup::asked(&mut lookups) => Some(Work::Lookup(lookup)),
             };
             let Some(work) = work else {
                 return;
@@ -593,6 +615,10 @@ impl Follow {
         match (work, checkpointer) {
             (Work::Event(event), _) => self.follow(miner, event, stop).await,
             (Work::Barrier, Some(checkpointer)) => self.checkpoint(checkpointer, miner).await,
+            (Work::Lookup(lookup), _) => {
+                lookup.answer(&miner);
+                Some(miner)
+            }
             (Work::Barrier | Work::Report, _) => Some(miner),
         }
     }
@@ -882,6 +908,27 @@ impl GroupHost {
         Some(mining.followed.clone())
     }
 
+    /// What a tail replica keeps of `group`'s mined output; `None` where
+    /// `group` is not mined here or its miner's task has ended.
+    #[must_use]
+    pub fn kept(&self, group: u32) -> Option<Arc<Mutex<Kept>>> {
+        let mining = self.groups.get(&group)?.mining.as_ref()?;
+        mining.kept.upgrade()
+    }
+
+    /// The definitions of `wanted` that `group`'s miner holds for
+    /// `tenant`, asked of its task between steps; `None` where `group` is
+    /// not mined here or its miner has stopped.
+    pub async fn definitions(
+        &self,
+        group: u32,
+        tenant: &TenantId,
+        wanted: BTreeSet<TemplateKey>,
+    ) -> Option<Definitions> {
+        let mining = self.groups.get(&group)?.mining.as_ref()?;
+        mining.asker.ask(tenant.clone(), wanted).await
+    }
+
     #[must_use]
     pub fn state_machine(&self, group: u32) -> Option<&GroupSm> {
         self.groups.get(&group).map(|hosted| &hosted.sm)
@@ -927,6 +974,7 @@ impl GroupHost {
     }
 }
 
+mod lookup;
 mod reinstall;
 
 use reinstall::Install;
@@ -1044,6 +1092,7 @@ mod tests {
             checkpointer: None,
             reporting: None,
             restoring: None,
+            lookups: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         let GroupEntry::Batch(batch) = batch_at(time(1), "acme", &["a b c"]) else {
@@ -1204,6 +1253,7 @@ mod tests {
             checkpointer: None,
             reporting: None,
             restoring: None,
+            lookups: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         Following {

@@ -21,7 +21,7 @@
 //! with the time the leader wrote into the batch being mined, so replicas
 //! stamp it alike whatever their own clocks say.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -35,9 +35,11 @@ use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{self, IdReservationError, IdReserver, MinerCluster, TreeShapeChanged};
+use ourios_miner::tree::format_template;
 use ourios_wal::{BatchTime, TenantBatch};
 use prost::Message as _;
 
+use super::kept::{Definitions, TemplateKey};
 use super::snapshot_record::{GroupMinerConfig, IdBlock};
 use super::state_machine::{Applied, AppliedEvent};
 use super::types::{Entry, GroupEntry, LogId, TimedBatch};
@@ -381,6 +383,34 @@ impl GroupMiner {
         MinerCluster::with_audit_sink(config.config(), audit)
             .with_clock(Box::new(self.clock.clone()))
             .with_id_reserver(Box::new(self.blocks.clone()))
+    }
+
+    /// The definitions of `wanted` that the miner's current templates for
+    /// `tenant` hold: each mined leaf at its version, and each template
+    /// adoption interned.
+    #[must_use]
+    pub fn definitions(&self, tenant: &TenantId, wanted: &BTreeSet<TemplateKey>) -> Definitions {
+        let Stage::Mining { miner, .. } = &self.stage else {
+            return Definitions::new();
+        };
+        let leaves = miner.templates_for(tenant).into_iter().map(|leaf| {
+            let key = (leaf.template_id, leaf.template_version);
+            (key, format_template(&leaf.template))
+        });
+        let adopted = miner
+            .adopted_templates_for(tenant)
+            .into_iter()
+            .filter(|adopted| adopted.owned)
+            .map(|adopted| {
+                (
+                    (adopted.template_id, adopted.template_version),
+                    adopted.canonical,
+                )
+            });
+        leaves
+            .chain(adopted)
+            .filter(|(key, _)| wanted.contains(key))
+            .collect()
     }
 
     /// The id blocks applied and not yet drawn.

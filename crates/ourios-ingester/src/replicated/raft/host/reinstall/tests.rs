@@ -114,6 +114,7 @@ fn following(
         checkpointer: None,
         reporting: None,
         restoring: Some(restoring),
+        lookups: None,
     };
     let mining = Mining::start(follow, GroupMiner::new(log), applied);
     (events, handed, mining, restores)

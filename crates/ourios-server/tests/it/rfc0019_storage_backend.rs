@@ -150,7 +150,7 @@ fn seed_record(tenant: &str, i: u64) -> MinedRecord {
 /// dropping it stops `LocalStack`), the endpoint URL (passed to the spawned
 /// server as `OURIOS_S3_ENDPOINT` and used to build the assertion `Store`), and
 /// a `Store::s3` pointed at it.
-async fn localstack_s3(bucket: &str) -> (ContainerAsync<LocalStack>, String, Store) {
+pub(crate) async fn localstack_s3(bucket: &str) -> (ContainerAsync<LocalStack>, String, Store) {
     let container = LocalStack::default()
         .with_env_var("SERVICES", "s3")
         .start()

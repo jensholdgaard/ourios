@@ -34,9 +34,9 @@ use super::identify::{self, Identity};
 use super::propose::{self, ProposeTarget};
 use super::read_index::{self, ReadIndexTarget};
 use super::tail::{self, Clients, TailTarget};
+use gate::{Gated, Tails, refuse_undecoded};
 
 /// A tail target and who may read it.
-type Tails = (Arc<dyn TailTarget>, Clients);
 use super::trace::{Call, Carried, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, Malformed, SnapshotRequest,
@@ -46,6 +46,8 @@ use super::{
     APPEND, FORWARD, IDENTIFY, INSTALL_SNAPSHOT, PRE_VOTE, PROPOSE, READ_INDEX, SERVICE,
     STREAM_APPEND, TAIL, TAIL_SCAN, VERSION, VOTE,
 };
+
+mod gate;
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
 
@@ -64,9 +66,9 @@ where
     /// The node's groups for `ReadIndex`; until it is set, every read is
     /// refused as not hosted.
     reads: Arc<RwLock<Option<Arc<dyn ReadIndexTarget>>>>,
-    /// The node's tail for `Tail`, and who may read it; until it is set,
-    /// every read is refused.
-    tails: Arc<RwLock<Option<Tails>>>,
+    /// The node's tail for `Tail` and `TailScan`, and who may read it;
+    /// until a target is set, an admitted read is refused as not hosted.
+    tails: Arc<RwLock<Tails>>,
     /// Who this node is, for `Identify`; until it is set the call is
     /// unavailable.
     identity: Arc<RwLock<Option<Identity>>>,
@@ -181,34 +183,18 @@ where
         target.clone()
     }
 
+    /// Restrict the callers `clients` lists to the tail calls (RFC0065.13),
+    /// whether or not this node serves a tail: every node's listener does.
+    pub fn admit_tail_clients(&self, clients: Clients) {
+        self.tails
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .admit(clients);
+    }
+
     /// Serve the tail with `target` to `clients`, replacing any earlier one.
     pub fn serve_tails(&self, target: Arc<dyn TailTarget>, clients: Clients) {
-        *self.tails.write().unwrap_or_else(PoisonError::into_inner) = Some((target, clients));
-    }
-
-    fn tail_target(&self) -> Option<Arc<dyn TailTarget>> {
-        let tails = self.tails.read().unwrap_or_else(PoisonError::into_inner);
-        tails.as_ref().map(|(target, _)| Arc::clone(target))
-    }
-
-    /// The refusal for a call its caller may not make, before anything of
-    /// it is decoded (RFC0065.13): `Tail` from a caller not among the
-    /// tail's clients, and any other call from one that is, since a
-    /// querier's certificate reads the tail and nothing else.
-    fn gate<B>(&self, request: &http::Request<B>) -> Option<Status> {
-        let identities = tail::client_identities(request);
-        let tails = self.tails.read().unwrap_or_else(PoisonError::into_inner);
-        let clients = tails.as_ref().map(|(_, clients)| clients);
-        let admitted = clients.is_some_and(|clients| clients.admits(&identities));
-        let listed = clients.is_some_and(|clients| clients.lists(&identities));
-        match request.uri().path() {
-            TAIL | TAIL_SCAN if !admitted => Some(tail::denied()),
-            TAIL | TAIL_SCAN => None,
-            _ if listed => Some(Status::permission_denied(
-                "a tail client may only read the tail",
-            )),
-            _ => None,
-        }
+        *self.tails.write().unwrap_or_else(PoisonError::into_inner) = Tails::new(target, clients);
     }
 
     fn read_index_target(&self) -> Option<Arc<dyn ReadIndexTarget>> {
@@ -677,9 +663,18 @@ where
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
-        if let Some(refused) = self.gate(&request) {
-            return Box::pin(async move { Ok(refused.into_http()) });
-        }
+        let gated = self
+            .tails
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .gate(&request);
+        let tail_target = match gated {
+            Gated::Refused(method, status) => {
+                return refuse_undecoded(self.tracing.clone(), method, &request, status);
+            }
+            Gated::Tail(target) => target,
+            Gated::Pass => None,
+        };
         let server = self.clone();
         let tracing = self.tracing.clone();
         match request.uri().path() {
@@ -707,18 +702,12 @@ where
                 let target = server.propose_target();
                 propose::serve(target, r)
             }),
-            TAIL => {
-                let target = server.tail_target();
-                unary(TAIL, tracing, request, move |r| {
-                    tail::serve(target.clone(), r)
-                })
-            }
-            TAIL_SCAN => {
-                let target = server.tail_target();
-                unary(TAIL_SCAN, tracing, request, move |r| {
-                    tail::serve_scan(target.clone(), r)
-                })
-            }
+            TAIL => unary(TAIL, tracing, request, move |r| {
+                tail::serve(tail_target.clone(), r)
+            }),
+            TAIL_SCAN => unary(TAIL_SCAN, tracing, request, move |r| {
+                tail::serve_scan(tail_target.clone(), r)
+            }),
             READ_INDEX => unary(READ_INDEX, tracing, request, move |r| {
                 let target = server.read_index_target();
                 read_index::serve(target, r)

@@ -277,3 +277,30 @@ async fn raw_call(channel: tonic::transport::Channel, body: Vec<u8>) -> Status {
     .await
     .expect_err("refused")
 }
+
+/// A call the gate denies is still traced (RFC 0065 §6.9): its server span
+/// records `PERMISSION_DENIED`, the child of the caller's client span.
+#[tokio::test]
+async fn a_denied_call_records_its_server_span() {
+    use opentelemetry::trace::SpanKind;
+
+    use crate::replicated::raft::transport::tests::{
+        assert_child_of_client, attr, capture, of_kind, peer_spans,
+    };
+
+    let (exporter, tracing, _guard) = capture();
+    let server = ReplicationServer::<GroupSm>::traced_by(tracing.clone());
+    server.serve_tails(Arc::new(Fake(Ok(point()))), Clients::only(["querier"]));
+    let (incoming, addr) = bind();
+    let _serving = serve_on(server, incoming);
+    let peers = Peers::traced_by(tracing).with_addresses([("n1".to_owned(), addr.to_string())]);
+    assert_eq!(peers.tail("n1", query(), PATIENCE).await, Outcome::Denied);
+
+    let spans = peer_spans(&exporter);
+    let server = of_kind(&spans, &SpanKind::Server);
+    assert_eq!(
+        attr(&server, "rpc.response.status_code").as_deref(),
+        Some("PERMISSION_DENIED")
+    );
+    assert_child_of_client(&spans);
+}

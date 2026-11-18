@@ -21,6 +21,7 @@ use tonic::transport::server::TcpIncoming;
 use super::super::super::cluster::Serving;
 use super::super::super::state_machine::GroupSm;
 use super::super::super::types::{NodeId, Vote};
+use super::super::tail::Clients;
 use super::super::{ForwardRequest, Outcome, Peers, ReplicationServer};
 use super::{
     GROUP, Node, Replica, bind, client_to, leader, listeners, option, vote_request, write,
@@ -402,7 +403,7 @@ impl super::super::tail::TailTarget for Fixed {
 /// certificate the same CA signed, is denied.
 #[tokio::test]
 async fn only_a_listed_client_reads_the_tail_over_mutual_tls() {
-    use super::super::tail::{Clients, Outcome as TailOutcome, TailQuery};
+    use super::super::tail::{Outcome as TailOutcome, TailQuery};
 
     let ca = Ca::new();
     let dir = TempDir::new().expect("temp");
@@ -436,15 +437,31 @@ async fn only_a_listed_client_reads_the_tail_over_mutual_tls() {
 /// CA signed it, but a querier may not vote or append (RFC 0065 B21).
 #[tokio::test]
 async fn a_tail_client_cannot_call_the_consensus_rpcs() {
-    use super::super::tail::Clients;
+    a_querier_cannot_vote(|server| {
+        server.serve_tails(Arc::new(Fixed), Clients::only([QUERIER]));
+    })
+    .await;
+}
 
+/// The same holds on a node that serves no tail, a voter's: its
+/// `tail_clients` alone restrict the listed callers.
+#[tokio::test]
+async fn a_tail_client_cannot_vote_where_no_tail_is_served() {
+    a_querier_cannot_vote(|server| server.admit_tail_clients(Clients::only([QUERIER]))).await;
+}
+
+const QUERIER: &str = "spiffe://cluster/querier";
+
+/// A node whose replication server `restrict` set up refuses a vote from
+/// the querier's certificate, and grants one from a replica's.
+async fn a_querier_cannot_vote(restrict: impl FnOnce(&ReplicationServer<GroupSm>)) {
     let ca = Ca::new();
     let dir = TempDir::new().expect("temp");
     let settings = ca.node(dir.path(), "n1");
     let (incoming, addr) = bind();
     let peers = Peers::mutual_tls(&settings).expect("peers");
     let server = ReplicationServer::default();
-    server.serve_tails(Arc::new(Fixed), Clients::only(["spiffe://cluster/querier"]));
+    restrict(&server);
     let mut node = Node::open_on(Replica::new(1, &[GROUP]), &peers, server, |server| {
         serve_tls(server, incoming, &settings)
     })
@@ -452,8 +469,7 @@ async fn a_tail_client_cannot_call_the_consensus_rpcs() {
     let vote_before = node.raft(GROUP).metrics().borrow_watched().vote;
     let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
 
-    let querier = Peers::mutual_tls(&ca.client(dir.path(), "querier", "spiffe://cluster/querier"))
-        .expect("peers");
+    let querier = Peers::mutual_tls(&ca.client(dir.path(), "querier", QUERIER)).expect("peers");
     let refused = client_to(&querier, node.id, addr)
         .await
         .vote(higher.clone(), option())

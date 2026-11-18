@@ -1,7 +1,6 @@
 //! The `ourios.wal.v1.Replication` server: one per node, handing each
 //! request to the `Raft` of the group it names.
 
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
@@ -45,7 +44,7 @@ use super::wire::{
 };
 use super::{
     APPEND, FORWARD, IDENTIFY, INSTALL_SNAPSHOT, PRE_VOTE, PROPOSE, READ_INDEX, SERVICE,
-    STREAM_APPEND, TAIL, VERSION, VOTE,
+    STREAM_APPEND, TAIL, TAIL_SCAN, VERSION, VOTE,
 };
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
@@ -187,13 +186,28 @@ where
         *self.tails.write().unwrap_or_else(PoisonError::into_inner) = Some((target, clients));
     }
 
-    /// The tail target, and whether the caller whose certificate names
-    /// `identities` is one of its clients.
-    fn tail_target(&self, identities: &BTreeSet<String>) -> (Option<Arc<dyn TailTarget>>, bool) {
+    fn tail_target(&self) -> Option<Arc<dyn TailTarget>> {
         let tails = self.tails.read().unwrap_or_else(PoisonError::into_inner);
-        match tails.as_ref() {
-            Some((target, clients)) => (Some(Arc::clone(target)), clients.admits(identities)),
-            None => (None, false),
+        tails.as_ref().map(|(target, _)| Arc::clone(target))
+    }
+
+    /// The refusal for a call its caller may not make, before anything of
+    /// it is decoded (RFC0065.13): `Tail` from a caller not among the
+    /// tail's clients, and any other call from one that is, since a
+    /// querier's certificate reads the tail and nothing else.
+    fn gate<B>(&self, request: &http::Request<B>) -> Option<Status> {
+        let identities = tail::client_identities(request);
+        let tails = self.tails.read().unwrap_or_else(PoisonError::into_inner);
+        let clients = tails.as_ref().map(|(_, clients)| clients);
+        let admitted = clients.is_some_and(|clients| clients.admits(&identities));
+        let listed = clients.is_some_and(|clients| clients.lists(&identities));
+        match request.uri().path() {
+            TAIL | TAIL_SCAN if !admitted => Some(tail::denied()),
+            TAIL | TAIL_SCAN => None,
+            _ if listed => Some(Status::permission_denied(
+                "a tail client may only read the tail",
+            )),
+            _ => None,
         }
     }
 
@@ -663,6 +677,9 @@ where
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if let Some(refused) = self.gate(&request) {
+            return Box::pin(async move { Ok(refused.into_http()) });
+        }
         let server = self.clone();
         let tracing = self.tracing.clone();
         match request.uri().path() {
@@ -691,9 +708,15 @@ where
                 propose::serve(target, r)
             }),
             TAIL => {
-                let (target, admitted) = server.tail_target(&tail::client_identities(&request));
+                let target = server.tail_target();
                 unary(TAIL, tracing, request, move |r| {
-                    tail::serve(target.clone(), admitted, r)
+                    tail::serve(target.clone(), r)
+                })
+            }
+            TAIL_SCAN => {
+                let target = server.tail_target();
+                unary(TAIL_SCAN, tracing, request, move |r| {
+                    tail::serve_scan(target.clone(), r)
                 })
             }
             READ_INDEX => unary(READ_INDEX, tracing, request, move |r| {

@@ -1,20 +1,28 @@
-//! `Tail` (RFC 0065 §6.7): a querier asks a tail replica for a tenant's
-//! **unpublished** rows at or above the group's checkpoint, as of a
-//! quorum-confirmed read point, with the definitions of only the templates
-//! those rows reference, and the keys of the tenant's files published
-//! above the checkpoint as of the same point.
+//! `Tail` and `TailScan` (RFC 0065 §6.7): how a querier reads a group's
+//! **unpublished** rows for one tenant from a tail replica.
+//!
+//! - `Tail` fixes a quorum-confirmed read point and answers with it and the
+//!   keys of the tenant's files published above the querier's checkpoint
+//!   as of that point.
+//! - `TailScan` returns the tenant's rows at or above the checkpoint as of
+//!   a given read point, a page at a time: each page's rows, an Arrow IPC
+//!   stream in the record files' schema, encode to at most [`PAGE_BYTES`],
+//!   with the definitions of only the templates they reference and the
+//!   position to continue after. Any tail replica of the group serves any
+//!   page, once it has mined through the read point, so a backlog of any
+//!   size is read without one answer outgrowing the message limit.
 //!
 //! Only a caller whose client certificate names an identity in the
-//! replica's `tail_clients` (a URI or DNS subject alternative name) gets
-//! rows; any other, another replica included, is refused as denied before
-//! the replica reads anything (RFC0065.13). The call carries the query's
-//! tenant, already authorized by the querier (RFC 0047), and the replica
-//! returns only that tenant's rows.
+//! replica's `tail_clients` (a URI or DNS subject alternative name) may
+//! call either; any other, another replica included, is denied by the
+//! server's gate before anything of its request is decoded (RFC0065.13),
+//! and a caller that is listed may make no other peer call. A call carries
+//! the query's tenant, already authorized by the querier (RFC 0047), and
+//! the replica returns only that tenant's rows.
 //!
 //! A refusal names itself in the `ourios-tail-refused` metadata of its
-//! status. A call may always be asked again: it changes nothing.
+//! status. Either call may be asked again: neither changes anything.
 
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,16 +34,61 @@ use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
 use tonic_prost::ProstCodec;
 
+use super::VERSION;
 use super::trace::{Call, Peer, Traced, Tracing, inject_current};
 use super::wire::MAX_MESSAGE_BYTES;
-use super::{TAIL, VERSION};
+
+pub use gate::Clients;
+pub(super) use gate::client_identities;
+
+mod gate;
 
 const REFUSED: &str = "ourios-tail-refused";
 const OLDEST: &str = "ourios-tail-oldest";
 
-/// A querier's tail read of one group for one tenant.
+/// The most a `TailScan` page's rows may encode to: half the message
+/// limit, leaving the rest for its template definitions and framing.
+pub const PAGE_BYTES: usize = MAX_MESSAGE_BYTES / 2;
+
+/// A querier's request for a group's read point and published keys.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct TailRequest {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(uint32, tag = "2")]
+    pub group: u32,
+    #[prost(string, tag = "3")]
+    pub tenant: String,
+    /// The checkpoint cut the querier read.
+    #[prost(uint64, tag = "4")]
+    pub from: u64,
+}
+
+impl Traced for TailRequest {}
+
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct TailResponse {
+    /// The quorum-confirmed read point.
+    #[prost(uint64, tag = "1")]
+    pub read: u64,
+    /// The tenant's files published above `from` as of `read`.
+    #[prost(string, repeated, tag = "2")]
+    pub published: Vec<String>,
+}
+
+/// A row's ingest position in its group's log (RFC 0065 §6.6), where a
+/// page ends and the next begins.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, prost::Message)]
+pub struct WirePosition {
+    #[prost(uint64, tag = "1")]
+    pub seq: u64,
+    #[prost(uint32, tag = "2")]
+    pub index: u32,
+}
+
+/// A querier's request for one page of a group's tail rows.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct TailScanRequest {
     #[prost(uint32, tag = "1")]
     pub version: u32,
     #[prost(uint32, tag = "2")]
@@ -45,15 +98,21 @@ pub struct TailRequest {
     /// The checkpoint cut the querier read: rows at or above it.
     #[prost(uint64, tag = "4")]
     pub from: u64,
+    /// The read point `Tail` gave: rows at or below it.
+    #[prost(uint64, tag = "5")]
+    pub read: u64,
     /// The query's time range, inclusive start and exclusive end, in Unix
     /// nanoseconds; absent bounds select every row.
-    #[prost(uint64, optional, tag = "5")]
-    pub start_unix_nano: Option<u64>,
     #[prost(uint64, optional, tag = "6")]
+    pub start_unix_nano: Option<u64>,
+    #[prost(uint64, optional, tag = "7")]
     pub end_unix_nano: Option<u64>,
+    /// The position the previous page ended at; absent for the first.
+    #[prost(message, optional, tag = "8")]
+    pub after: Option<WirePosition>,
 }
 
-impl Traced for TailRequest {}
+impl Traced for TailScanRequest {}
 
 /// One template a returned row references, as the audit stream records it.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -68,34 +127,68 @@ pub struct TemplateDefinition {
     pub template: String,
 }
 
-/// The tail as of the read point.
+/// One page of tail rows.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct TailResponse {
-    /// The read point the rows are served at.
-    #[prost(uint64, tag = "1")]
-    pub read: u64,
-    /// The rows, an Arrow IPC stream in the record files' schema.
-    #[prost(bytes = "vec", tag = "2")]
+pub struct TailScanResponse {
+    /// The page's rows, an Arrow IPC stream in the record files' schema,
+    /// in position order; at most [`PAGE_BYTES`].
+    #[prost(bytes = "vec", tag = "1")]
     pub rows: Vec<u8>,
-    #[prost(message, repeated, tag = "3")]
+    #[prost(message, repeated, tag = "2")]
     pub templates: Vec<TemplateDefinition>,
-    /// The tenant's files published above `from` as of the read point.
-    #[prost(string, repeated, tag = "4")]
-    pub published: Vec<String>,
+    /// Where the next page starts after; absent on the last page.
+    #[prost(message, optional, tag = "3")]
+    pub next: Option<WirePosition>,
 }
 
-/// What a tail replica is asked, the request without its framing.
+/// A `Tail` read, the request without its framing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailQuery {
     pub group: u32,
     pub tenant: String,
     pub from: u64,
+}
+
+/// A group's read point and its tenant's published keys above `from`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailPoint {
+    pub read: u64,
+    pub published: Vec<String>,
+}
+
+/// A `TailScan` read, the request without its framing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanQuery {
+    pub group: u32,
+    pub tenant: String,
+    pub from: u64,
+    pub read: u64,
     /// `[start, end)` in Unix nanoseconds, when the query has one.
     pub range: Option<(u64, u64)>,
+    pub after: Option<WirePosition>,
+}
+
+/// One page of rows, its templates, and where the next starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanPage {
+    pub rows: Vec<u8>,
+    pub templates: Vec<TemplateDefinition>,
+    pub next: Option<WirePosition>,
 }
 
 impl TailQuery {
-    fn of(request: &TailRequest) -> Self {
+    pub(super) fn request(&self) -> TailRequest {
+        TailRequest {
+            version: VERSION,
+            group: self.group,
+            tenant: self.tenant.clone(),
+            from: self.from,
+        }
+    }
+}
+
+impl ScanQuery {
+    fn of(request: &TailScanRequest) -> Self {
         let range = match (request.start_unix_nano, request.end_unix_nano) {
             (None, None) => None,
             (start, end) => Some((start.unwrap_or(0), end.unwrap_or(u64::MAX))),
@@ -104,54 +197,27 @@ impl TailQuery {
             group: request.group,
             tenant: request.tenant.clone(),
             from: request.from,
+            read: request.read,
             range,
+            after: request.after,
         }
     }
 
-    fn request(&self) -> TailRequest {
-        TailRequest {
+    pub(super) fn request(&self) -> TailScanRequest {
+        TailScanRequest {
             version: VERSION,
             group: self.group,
             tenant: self.tenant.clone(),
             from: self.from,
+            read: self.read,
             start_unix_nano: self.range.map(|(start, _)| start),
             end_unix_nano: self.range.map(|(_, end)| end),
+            after: self.after,
         }
     }
 }
 
-/// What a tail replica answers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TailAnswer {
-    pub read: u64,
-    pub rows: Vec<u8>,
-    pub templates: Vec<TemplateDefinition>,
-    pub published: Vec<String>,
-}
-
-impl From<TailAnswer> for TailResponse {
-    fn from(answer: TailAnswer) -> Self {
-        Self {
-            read: answer.read,
-            rows: answer.rows,
-            templates: answer.templates,
-            published: answer.published,
-        }
-    }
-}
-
-impl From<TailResponse> for TailAnswer {
-    fn from(response: TailResponse) -> Self {
-        Self {
-            read: response.read,
-            rows: response.rows,
-            templates: response.templates,
-            published: response.published,
-        }
-    }
-}
-
-/// Why a tail replica gave no rows.
+/// Why a tail replica gave no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// It does not mine the group.
@@ -165,112 +231,71 @@ pub enum Refusal {
     Denied,
 }
 
-/// What a tail read comes to.
-pub type Tailing = Pin<Box<dyn Future<Output = Result<TailAnswer, Refusal>> + Send>>;
+/// What a `Tail` read comes to.
+pub type Tailing = Pin<Box<dyn Future<Output = Result<TailPoint, Refusal>> + Send>>;
 
-/// The node's side of `Tail`.
+/// What a `TailScan` read comes to.
+pub type Scanning = Pin<Box<dyn Future<Output = Result<ScanPage, Refusal>> + Send>>;
+
+/// The node's side of `Tail` and `TailScan`.
 pub trait TailTarget: Send + Sync + 'static {
+    /// The group's read point and published keys.
     fn tail(&self, query: TailQuery) -> Tailing;
+    /// One page of rows, each page's rows at most [`PAGE_BYTES`].
+    fn scan(&self, query: ScanQuery) -> Scanning;
 }
 
-/// Who a tail replica serves: the identities its `tail_clients` lists.
-#[derive(Debug, Clone)]
-pub struct Clients(Admit);
-
-#[derive(Debug, Clone)]
-enum Admit {
-    Only(BTreeSet<String>),
-    #[cfg(test)]
-    Anyone,
-}
-
-impl Clients {
-    /// The callers whose certificates name one of `identities`.
-    pub fn only<S: Into<String>>(identities: impl IntoIterator<Item = S>) -> Self {
-        Self(Admit::Only(
-            identities.into_iter().map(Into::into).collect(),
-        ))
-    }
-
-    /// Every caller, certificate or not: plaintext transport tests.
-    #[cfg(test)]
-    pub(crate) fn anyone() -> Self {
-        Self(Admit::Anyone)
-    }
-
-    /// Whether a caller whose certificate names `names` is admitted.
-    #[must_use]
-    pub fn admits(&self, names: &BTreeSet<String>) -> bool {
-        match &self.0 {
-            Admit::Only(listed) => !listed.is_disjoint(names),
-            #[cfg(test)]
-            Admit::Anyone => true,
-        }
-    }
-}
-
-/// The URI and DNS subject alternative names of the client certificate
-/// that opened the connection; none on a plaintext one. The certificate is
-/// already verified against the peer CA by the handshake.
-pub(super) fn client_identities<B>(request: &tonic::codegen::http::Request<B>) -> BTreeSet<String> {
-    use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
-
-    let Some(info) = request.extensions().get::<TlsConnectInfo<TcpConnectInfo>>() else {
-        return BTreeSet::new();
-    };
-    let Some(certs) = info.peer_certs() else {
-        return BTreeSet::new();
-    };
-    certs
-        .first()
-        .map(|leaf| subject_alt_names(leaf.as_ref()))
-        .unwrap_or_default()
-}
-
-/// The URI and DNS names in the subject alternative names of the DER
-/// certificate `der`; none if it does not parse.
-fn subject_alt_names(der: &[u8]) -> BTreeSet<String> {
-    use x509_parser::extensions::GeneralName;
-
-    let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
-        return BTreeSet::new();
-    };
-    let Ok(Some(san)) = cert.subject_alternative_name() else {
-        return BTreeSet::new();
-    };
-    san.value
-        .general_names
-        .iter()
-        .filter_map(|name| match name {
-            GeneralName::URI(uri) => Some((*uri).to_owned()),
-            GeneralName::DNSName(dns) => Some((*dns).to_owned()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Serve one `Tail` call with `target`, the caller already `admitted` or
-/// not by the gate.
+/// Serve one `Tail` call with `target`, its caller admitted by the
+/// server's gate before the request was decoded.
 pub(super) async fn serve(
     target: Option<Arc<dyn TailTarget>>,
-    admitted: bool,
     request: TailRequest,
 ) -> Result<TailResponse, Status> {
-    if request.version != VERSION {
-        let message = format!("peer protocol version {} is not {VERSION}", request.version);
+    let target = hosted(target, request.version)?;
+    let query = TailQuery {
+        group: request.group,
+        tenant: request.tenant,
+        from: request.from,
+    };
+    let point = target.tail(query).await.map_err(refusal)?;
+    Ok(TailResponse {
+        read: point.read,
+        published: point.published,
+    })
+}
+
+/// Serve one `TailScan` call with `target`, as [`serve`] does.
+pub(super) async fn serve_scan(
+    target: Option<Arc<dyn TailTarget>>,
+    request: TailScanRequest,
+) -> Result<TailScanResponse, Status> {
+    let target = hosted(target, request.version)?;
+    let page = target
+        .scan(ScanQuery::of(&request))
+        .await
+        .map_err(refusal)?;
+    Ok(TailScanResponse {
+        rows: page.rows,
+        templates: page.templates,
+        next: page.next,
+    })
+}
+
+/// `target`, for a request on this protocol `version`.
+fn hosted(
+    target: Option<Arc<dyn TailTarget>>,
+    version: u32,
+) -> Result<Arc<dyn TailTarget>, Status> {
+    if version != VERSION {
+        let message = format!("peer protocol version {version} is not {VERSION}");
         return Err(refused(Status::failed_precondition(message), "not_hosted"));
     }
-    if !admitted {
-        return Err(refusal(Refusal::Denied));
-    }
-    let Some(target) = target else {
-        return Err(refusal(Refusal::NotHosted));
-    };
-    target
-        .tail(TailQuery::of(&request))
-        .await
-        .map(TailResponse::from)
-        .map_err(refusal)
+    target.ok_or_else(|| refusal(Refusal::NotHosted))
+}
+
+/// The refusal of a caller that is not one of the tail's clients.
+pub(super) fn denied() -> Status {
+    refusal(Refusal::Denied)
 }
 
 fn refused(mut status: Status, why: &'static str) -> Status {
@@ -302,10 +327,10 @@ fn refusal(refusal: Refusal) -> Status {
     }
 }
 
-/// What a tail read of one replica came to, as the querier sees it.
+/// What a read of one tail replica came to, as the querier sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    Answered(TailAnswer),
+pub enum Outcome<T> {
+    Answered(T),
     NotHosted,
     TooOld {
         oldest: u64,
@@ -317,22 +342,107 @@ pub enum Outcome {
     Unreached(String),
 }
 
-/// Ask `addr` over `channel` for `query`'s tail within `patience`, under
-/// its gRPC client span.
-pub(super) async fn traced_call(
-    channel: Channel,
-    (addr, tracing): (&str, Tracing),
-    query: &TailQuery,
-    patience: Duration,
-) -> Outcome {
-    let trace = Call::client(tracing, TAIL, Peer::parse(addr), true);
-    let asking = call(channel, query.request(), patience);
-    let (outcome, code) = tracing::Instrument::instrument(asking, trace.span()).await;
-    trace.finish(code);
-    outcome
+/// Where a call goes: the peer's address and a channel to it, or why it
+/// cannot be reached.
+pub(super) type Reach = Result<(String, Channel), String>;
+
+/// One of the two tail calls: where it goes, what it sends, and what its
+/// answer is read as.
+pub trait TailCall {
+    #[doc(hidden)]
+    const PATH: &'static str;
+    #[doc(hidden)]
+    type Request: prost::Message + Send + Sync + 'static;
+    #[doc(hidden)]
+    type Response: prost::Message + Default + Send + Sync + 'static;
+    /// What the caller gets back.
+    type Answer: From<Self::Response>;
+    #[doc(hidden)]
+    fn request(&self) -> Self::Request;
 }
 
-async fn call(channel: Channel, request: TailRequest, patience: Duration) -> (Outcome, Code) {
+impl TailCall for TailQuery {
+    const PATH: &'static str = super::TAIL;
+    type Request = TailRequest;
+    type Response = TailResponse;
+    type Answer = TailPoint;
+    fn request(&self) -> TailRequest {
+        TailQuery::request(self)
+    }
+}
+
+impl TailCall for ScanQuery {
+    const PATH: &'static str = super::TAIL_SCAN;
+    type Request = TailScanRequest;
+    type Response = TailScanResponse;
+    type Answer = ScanPage;
+    fn request(&self) -> TailScanRequest {
+        ScanQuery::request(self)
+    }
+}
+
+impl From<TailResponse> for TailPoint {
+    fn from(response: TailResponse) -> Self {
+        Self {
+            read: response.read,
+            published: response.published,
+        }
+    }
+}
+
+impl From<TailScanResponse> for ScanPage {
+    fn from(response: TailScanResponse) -> Self {
+        Self {
+            rows: response.rows,
+            templates: response.templates,
+            next: response.next,
+        }
+    }
+}
+
+/// Send `request` to `path` on the peer `reach` names within `patience`,
+/// under its gRPC client span, the answer read as `answer` says.
+pub(super) async fn traced<Q: TailCall>(
+    (reach, tracing): (Reach, Tracing),
+    query: &Q,
+    patience: Duration,
+) -> Outcome<Q::Answer> {
+    let (path, request) = (Q::PATH, query.request());
+    let (addr, channel) = match reach {
+        Ok(reached) => reached,
+        Err(why) => return Outcome::Unreached(why),
+    };
+    let trace = Call::client(tracing, path, Peer::parse(&addr), true);
+    let asking = call::<Q::Request, Q::Response>(channel, (path, request), patience);
+    let (outcome, code) = tracing::Instrument::instrument(asking, trace.span()).await;
+    trace.finish(code);
+    outcome.map(Q::Answer::from)
+}
+
+impl<T> Outcome<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Outcome<U> {
+        match self {
+            Self::Answered(answer) => Outcome::Answered(f(answer)),
+            Self::NotHosted => Outcome::NotHosted,
+            Self::TooOld { oldest } => Outcome::TooOld { oldest },
+            Self::Unavailable(why) => Outcome::Unavailable(why),
+            Self::Denied => Outcome::Denied,
+            Self::Unreached(why) => Outcome::Unreached(why),
+        }
+    }
+}
+
+/// Send `request` to `path` over `channel`, the connection and the answer
+/// together bounded by `patience`.
+async fn call<Req, Resp>(
+    channel: Channel,
+    (path, request): (&'static str, Req),
+    patience: Duration,
+) -> (Outcome<Resp>, Code)
+where
+    Req: prost::Message + Send + Sync + 'static,
+    Resp: prost::Message + Default + Send + Sync + 'static,
+{
     let asking = async {
         let mut grpc = tonic::client::Grpc::new(channel)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -343,12 +453,12 @@ async fn call(channel: Channel, request: TailRequest, patience: Duration) -> (Ou
         let mut request = Request::new(request);
         inject_current(&mut request);
         request.set_timeout(patience);
-        let codec = ProstCodec::<TailRequest, TailResponse>::default();
+        let codec = ProstCodec::<Req, Resp>::default();
         match grpc
-            .unary(request, PathAndQuery::from_static(TAIL), codec)
+            .unary(request, PathAndQuery::from_static(path), codec)
             .await
         {
-            Ok(response) => (Outcome::Answered(response.into_inner().into()), Code::Ok),
+            Ok(response) => (Outcome::Answered(response.into_inner()), Code::Ok),
             Err(status) if super::connect::never_sent(&status) => (
                 Outcome::Unreached(status.message().to_owned()),
                 status.code(),
@@ -365,8 +475,8 @@ async fn call(channel: Channel, request: TailRequest, patience: Duration) -> (Ou
 }
 
 /// An answer's status: a refusal only if the replica marked it as one, or
-/// an older node that does not serve `Tail` at all.
-fn classify(status: &Status) -> Outcome {
+/// an older node that does not serve the call at all.
+fn classify<T>(status: &Status) -> Outcome<T> {
     let metadata = status.metadata();
     let text = |key| metadata.get(key).and_then(|v| v.to_str().ok());
     match (text(REFUSED), status.code()) {

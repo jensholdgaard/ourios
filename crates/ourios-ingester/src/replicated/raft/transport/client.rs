@@ -197,20 +197,26 @@ impl Peers {
         read_index::traced_call(channel, (&addr, self.tracing.clone()), request, patience).await
     }
 
-    /// Read `query`'s tail from the tail replica named `node_id` (RFC 0065
-    /// §6.7), within `patience`.
-    pub async fn tail(
+    /// Ask the tail replica named `node_id` for `query` (RFC 0065 §6.7),
+    /// within `patience`: a read point with its published keys, or a page
+    /// of rows.
+    pub async fn tail<Q: tail::TailCall>(
         &self,
         node_id: &str,
-        query: tail::TailQuery,
+        query: Q,
         patience: Duration,
-    ) -> tail::Outcome {
+    ) -> tail::Outcome<Q::Answer> {
+        tail::traced(self.reach(node_id), &query, patience).await
+    }
+
+    /// The address of and a channel to `node_id`, or why it cannot be
+    /// reached, with the tracing its calls record under.
+    fn reach(&self, node_id: &str) -> (tail::Reach, Tracing) {
         let (addr, channel) = self.resolve(node_id);
-        let channel = match channel {
-            Ok(channel) => channel,
-            Err(e) => return tail::Outcome::Unreached(e.to_string()),
-        };
-        tail::traced_call(channel, (&addr, self.tracing.clone()), &query, patience).await
+        let reach = channel
+            .map(|channel| (addr, channel))
+            .map_err(|e| e.to_string());
+        (reach, self.tracing.clone())
     }
 
     /// Ask the peer configured as `node_id` who it is (RFC 0065 §6.8),
@@ -233,7 +239,10 @@ impl Peers {
 
     /// The address `node_id` is reached at, and its channel: a peer
     /// with no configured address cannot be reached.
-    fn resolve(&self, node_id: &str) -> (String, Result<Channel, Unreachable<RaftTypes>>) {
+    pub(super) fn resolve(
+        &self,
+        node_id: &str,
+    ) -> (String, Result<Channel, Unreachable<RaftTypes>>) {
         let Some(addr) = self.addresses.get(node_id) else {
             let unknown = io::Error::new(
                 io::ErrorKind::NotFound,

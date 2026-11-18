@@ -373,28 +373,36 @@ async fn a_forward_whose_caller_certificate_is_refused_is_uncertain() {
     node.kill().await;
 }
 
+/// A tail that answers every read with no rows.
+struct Fixed;
+
+impl super::super::tail::TailTarget for Fixed {
+    fn tail(&self, _: super::super::tail::TailQuery) -> super::super::tail::Tailing {
+        Box::pin(async {
+            Ok(super::super::tail::TailPoint {
+                read: 1,
+                published: Vec::new(),
+            })
+        })
+    }
+
+    fn scan(&self, _: super::super::tail::ScanQuery) -> super::super::tail::Scanning {
+        Box::pin(async {
+            Ok(super::super::tail::ScanPage {
+                rows: Vec::new(),
+                templates: Vec::new(),
+                next: None,
+            })
+        })
+    }
+}
+
 /// RFC0065.13: over mutual TLS a tail replica serves only a caller whose
 /// certificate names one of its `tail_clients`; another replica, whose
 /// certificate the same CA signed, is denied.
 #[tokio::test]
 async fn only_a_listed_client_reads_the_tail_over_mutual_tls() {
-    use super::super::tail::{
-        Clients, Outcome as TailOutcome, TailAnswer, TailQuery, TailTarget, Tailing,
-    };
-
-    struct Fixed;
-    impl TailTarget for Fixed {
-        fn tail(&self, _: TailQuery) -> Tailing {
-            Box::pin(async {
-                Ok(TailAnswer {
-                    read: 1,
-                    rows: Vec::new(),
-                    templates: Vec::new(),
-                    published: Vec::new(),
-                })
-            })
-        }
-    }
+    use super::super::tail::{Clients, Outcome as TailOutcome, TailQuery};
 
     let ca = Ca::new();
     let dir = TempDir::new().expect("temp");
@@ -411,7 +419,6 @@ async fn only_a_listed_client_reads_the_tail_over_mutual_tls() {
         group: 0,
         tenant: "acme".to_owned(),
         from: 0,
-        range: None,
     };
     let patience = Duration::from_secs(5);
 
@@ -423,4 +430,46 @@ async fn only_a_listed_client_reads_the_tail_over_mutual_tls() {
         replica.tail("t", query(), patience).await,
         TailOutcome::Denied
     );
+}
+
+/// A tail client's certificate reads the tail and nothing else: the peer
+/// CA signed it, but a querier may not vote or append (RFC 0065 B21).
+#[tokio::test]
+async fn a_tail_client_cannot_call_the_consensus_rpcs() {
+    use super::super::tail::Clients;
+
+    let ca = Ca::new();
+    let dir = TempDir::new().expect("temp");
+    let settings = ca.node(dir.path(), "n1");
+    let (incoming, addr) = bind();
+    let peers = Peers::mutual_tls(&settings).expect("peers");
+    let server = ReplicationServer::default();
+    server.serve_tails(Arc::new(Fixed), Clients::only(["spiffe://cluster/querier"]));
+    let mut node = Node::open_on(Replica::new(1, &[GROUP]), &peers, server, |server| {
+        serve_tls(server, incoming, &settings)
+    })
+    .await;
+    let vote_before = node.raft(GROUP).metrics().borrow_watched().vote;
+    let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
+
+    let querier = Peers::mutual_tls(&ca.client(dir.path(), "querier", "spiffe://cluster/querier"))
+        .expect("peers");
+    let refused = client_to(&querier, node.id, addr)
+        .await
+        .vote(higher.clone(), option())
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        node.raft(GROUP).metrics().borrow_watched().vote,
+        vote_before
+    );
+
+    let replica = Peers::mutual_tls(&ca.node(dir.path(), "n2")).expect("peers");
+    let granted = client_to(&replica, node.id, addr)
+        .await
+        .vote(higher, option())
+        .await
+        .expect("vote");
+    assert!(granted.vote_granted);
+    node.kill().await;
 }

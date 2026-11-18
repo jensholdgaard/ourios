@@ -50,6 +50,11 @@ fn loopback_tls(dir: &Path) -> String {
 
 /// Node `node_id`'s replicated config, its peers at `peers`, over one group.
 fn replicated(node_id: &str, peers: &str, tls: &str) -> ReplicatedWal {
+    replicated_with(node_id, (peers, "t=127.0.0.1:1"), tls)
+}
+
+/// As [`replicated`], with tail replica `tails`.
+fn replicated_with(node_id: &str, (peers, tails): (&str, &str), tls: &str) -> ReplicatedWal {
     let yaml = format!(
         "\
 storage:
@@ -64,7 +69,7 @@ receiver:
       node_id: {node_id}
       groups: 1
       peers: {peers}
-      tail_peers: t=127.0.0.1:1
+      tail_peers: {tails}
       tail_clients: querier
 {tls}"
     );
@@ -162,5 +167,193 @@ async fn three_replicated_receivers_take_an_export_and_stop() {
             .await
             .expect("stops in time")
             .expect("stops cleanly");
+    }
+}
+
+/// RFC 0026 §3.4: a burst of tenant denials past the audit sink's ceiling
+/// flushes at once, not at the next age tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn denials_past_the_audit_ceiling_flush_without_waiting_for_the_age() {
+    use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink as _};
+    use ourios_core::tenant::TenantId;
+    use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+    use tokio::sync::watch;
+
+    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(Store::in_memory(), 2));
+    let (stop, stopped) = watch::channel(false);
+    let flushing =
+        super::serve::spawn_audit_flush(audit.clone(), Duration::from_secs(3_600), stopped);
+    // The first tick is immediate; let it pass with nothing buffered.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut sink = audit.clone();
+    for _ in 0..3 {
+        sink.emit(AuditEvent {
+            tenant_id: TenantId::new("acme"),
+            timestamp: std::time::SystemTime::now(),
+            payload: AuditPayload::IngestDenied {
+                token_name: "edge".to_owned(),
+            },
+        });
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while audit.buffered_events() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the overflow flushes"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop.send_replace(true);
+    flushing.await.expect("stopped");
+}
+
+/// A start that fails to bind its OTLP listeners after the node opened
+/// gives back everything it took before returning: its peer listener, and
+/// its groups' logs and vote log, so the node starts again at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_that_cannot_bind_otlp_releases_its_peer_listener() {
+    let certs = tempfile::tempdir().expect("tempdir");
+    let tls = loopback_tls(certs.path());
+    let peer = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let peer_addr = peer.local_addr().expect("addr");
+    let peers = format!("a={peer_addr},b=127.0.0.1:1,c=127.0.0.1:2");
+    let taken = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::in_memory();
+    let mut config = receiver(root.path(), &store);
+    config.grpc_addr = taken.local_addr().expect("addr");
+    let stopping = Arc::new(AtomicBool::new(false));
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(20),
+        serve_replicated(&replicated("a", &peers, &tls), config, (peer, stopping)),
+    )
+    .await
+    .expect("returns in time");
+
+    assert!(refused.is_err(), "the gRPC address is taken");
+    let rebound = TcpListener::bind(peer_addr)
+        .await
+        .expect("the peer listener is free");
+    let again = serve_replicated(
+        &replicated("a", &peers, &tls),
+        receiver(root.path(), &store),
+        (rebound, Arc::new(AtomicBool::new(false))),
+    )
+    .await
+    .expect("the node starts again at once");
+    again.shutdown().await.expect("stops cleanly");
+}
+
+/// Voters a, b, c and tail replica t, served on one store; their handles,
+/// directories, peer addresses and config strings.
+struct Four {
+    handles: Vec<ReplicatedHandle>,
+    roots: Vec<tempfile::TempDir>,
+    addrs: Vec<std::net::SocketAddr>,
+    peers: String,
+    tails: String,
+    tls: String,
+    store: Store,
+    _certs: tempfile::TempDir,
+}
+
+async fn four_served() -> Four {
+    let certs = tempfile::tempdir().expect("tempdir");
+    let tls = loopback_tls(certs.path());
+    let store = Store::in_memory();
+    let mut listeners = Vec::new();
+    for _ in 0..4 {
+        listeners.push(TcpListener::bind("127.0.0.1:0").await.expect("bind"));
+    }
+    let addrs: Vec<_> = listeners
+        .iter()
+        .map(|l| l.local_addr().expect("addr"))
+        .collect();
+    let peers = format!("a={},b={},c={}", addrs[0], addrs[1], addrs[2]);
+    let tails = format!("t={}", addrs[3]);
+    let (mut handles, mut roots) = (Vec::new(), Vec::new());
+    for (name, listener) in ["a", "b", "c", "t"].iter().zip(listeners) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let wal = replicated_with(name, (&peers, &tails), &tls);
+        let config = receiver(root.path(), &store);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let handle = serve_replicated(&wal, config, (listener, stopping))
+            .await
+            .expect("served");
+        handles.push(handle);
+        roots.push(root);
+    }
+    Four {
+        handles,
+        roots,
+        addrs,
+        peers,
+        tails,
+        tls,
+        store,
+        _certs: certs,
+    }
+}
+
+/// Send `count` exports to `handle`, each retried until the group takes it.
+async fn exported(handle: &ReplicatedHandle, count: usize) {
+    let mut client = LogsServiceClient::connect(format!("http://{}", handle.grpc_addr))
+        .await
+        .expect("connect");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut sent = 0;
+    while sent < count {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the group takes the exports"
+        );
+        match client.export(export(&format!("line {sent}"))).await {
+            Ok(_) => sent += 1,
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+/// RFC 0065 §6.7: a tail replica restarted with more committed entries past
+/// its snapshot than its applied and mined channels hold opens again, its
+/// mined output taken while its groups replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tail_replica_restarted_with_a_backlog_opens_again() {
+    let mut four = four_served().await;
+    exported(&four.handles[0], 200).await;
+    // The tail replica has applied every export before it restarts.
+    let leading = four.handles[0].node().host.raft(0).expect("hosted").clone();
+    let last = leading
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(|m| m.last_log_index.is_some(), "the leader's log")
+        .await
+        .expect("the leader's log")
+        .last_log_index
+        .expect("entries");
+    let tail = four.handles[3].node().host.raft(0).expect("hosted").clone();
+    tail.wait(Some(Duration::from_secs(30)))
+        .applied_index_at_least(Some(last), "the tail catches up")
+        .await
+        .expect("the tail catches up");
+    drop(tail);
+
+    let restarted = four.handles.pop().expect("the tail");
+    restarted.shutdown().await.expect("the tail stops");
+    let listener = TcpListener::bind(four.addrs[3]).await.expect("rebind");
+    let config = receiver(four.roots[3].path(), &four.store);
+    let wal = replicated_with("t", (&four.peers, &four.tails), &four.tls);
+    let reopened = tokio::time::timeout(
+        Duration::from_secs(30),
+        serve_replicated(&wal, config, (listener, Arc::new(AtomicBool::new(false)))),
+    )
+    .await
+    .expect("the tail opens again in time")
+    .expect("served");
+
+    reopened.shutdown().await.expect("stops");
+    for handle in four.handles {
+        handle.shutdown().await.expect("stops");
     }
 }

@@ -1361,6 +1361,8 @@ mod tests {
             },
             promoted: ourios_parquet::PromotedAttributes::default(),
             audit_ceiling: usize::MAX,
+            #[cfg(feature = "openfga")]
+            graph_emitter: None,
         };
         let me = NodeId::from(7);
         let kept: Arc<Mutex<Kept>> = Arc::default();

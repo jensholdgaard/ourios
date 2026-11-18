@@ -10,7 +10,7 @@ use std::time::Duration;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::receiver::SharedIngest;
 use ourios_ingester::receiver::http::{HttpConfig, router};
-use ourios_ingester::replicated::node::{self, Node};
+use ourios_ingester::replicated::node::{self, Node, NodeStart};
 use ourios_ingester::replicated::raft::host::GroupMined;
 use ourios_parquet::store::Caller;
 use ourios_server::config::wal::ReplicatedWal;
@@ -46,6 +46,12 @@ pub(crate) struct ReplicatedHandle {
 }
 
 impl ReplicatedHandle {
+    /// The node it serves.
+    #[cfg(test)]
+    pub(super) fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// Stop taking exports, then the node's background work, its peers and
     /// its groups, then make its last audit events durable.
     ///
@@ -92,14 +98,12 @@ pub(crate) async fn serve_replicated(
         background,
         mined,
     } = plan(replicated, &config, stopping)?;
-    let node = node::start(start, &mut |_| {})
-        .await
-        .map_err(|e| e.to_string())?;
+    let (stop, stopped) = watch::channel(false);
+    let (node, mut tasks) = start_draining(start, mined, (&stop, &stopped)).await?;
     let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
         config.store.clone().with_caller(Caller::AuditSink),
         AUDIT_SINK_CEILING_EVENTS,
     ));
-    let (stop, stopped) = watch::channel(false);
     let peers = match serve_peers(
         &node,
         replicated,
@@ -107,17 +111,17 @@ pub(crate) async fn serve_replicated(
         (peer_listener, &stopped),
     ) {
         Ok(peers) => peers,
-        Err(e) => return Err(stopped_with(node, e).await),
+        Err(e) => {
+            joined(&stop, tasks).await;
+            return Err(stopped_with(node, e).await);
+        }
     };
-    let mut tasks = node.run(&background, &stopped);
+    tasks.extend(node.run(&background, &stopped));
     tasks.push(spawn_audit_flush(
         audit.clone(),
         config.max_buffer_age,
         stopped.clone(),
     ));
-    if let Some(mined) = mined {
-        tasks.push(spawn_mined_drain(mined, stopped.clone()));
-    }
     let ingest: SharedIngest = Arc::new(
         node.ingest()
             .with_denial_audit_sink(Box::new(audit.clone())),
@@ -125,8 +129,14 @@ pub(crate) async fn serve_replicated(
     let otlp = match serve_otlp(&config, ingest).await {
         Ok(otlp) => otlp,
         Err(e) => {
-            stop.send_replace(true);
-            return Err(stopped_with(node, e).await);
+            let started = Started {
+                stop,
+                tasks,
+                peers,
+                node,
+                audit,
+            };
+            return Err(started.abandon(e).await);
         }
     };
     Ok(ReplicatedHandle {
@@ -202,6 +212,61 @@ async fn serve_otlp(config: &ReceiverConfig, ingest: SharedIngest) -> Result<Otl
     })
 }
 
+/// What a start has running once its node serves its peers.
+struct Started {
+    stop: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
+    peers: JoinHandle<Result<(), tonic::transport::Error>>,
+    node: Node,
+    audit: SharedParquetAuditSink,
+}
+
+impl Started {
+    /// Stop all of it, as a shutdown does, and return `error`: the
+    /// background work and the peer listener joined, the groups shut down,
+    /// the denials taken meanwhile made durable.
+    async fn abandon(self, error: String) -> String {
+        self.stop.send_replace(true);
+        for task in self.tasks {
+            let _ = task.await;
+        }
+        let _ = self.peers.await;
+        let _ = self.node.host.shutdown().await;
+        let audit = self.audit;
+        let _ = tokio::task::spawn_blocking(move || audit.flush()).await;
+        error
+    }
+}
+
+/// Start the node, a tail's mined output taken from before it opens: its
+/// groups replay their committed entries through the miner as they open, so
+/// a backlog past the channels would otherwise hold the start forever.
+async fn start_draining(
+    start: NodeStart,
+    mined: Option<mpsc::Receiver<GroupMined>>,
+    (stop, stopped): (&watch::Sender<bool>, &watch::Receiver<bool>),
+) -> Result<(Node, Vec<JoinHandle<()>>), String> {
+    let tasks: Vec<_> = mined
+        .map(|mined| spawn_mined_drain(mined, stopped.clone()))
+        .into_iter()
+        .collect();
+    match node::start(start, &mut |_| {}).await {
+        Ok(node) => Ok((node, tasks)),
+        Err(e) => {
+            joined(stop, tasks).await;
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Signal `stop` and wait for `tasks`.
+async fn joined(stop: &watch::Sender<bool>, tasks: Vec<JoinHandle<()>>) {
+    stop.send_replace(true);
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
 /// `error`, once `node`'s groups have shut down, for a start that failed
 /// after the node started.
 async fn stopped_with(node: Node, error: String) -> String {
@@ -210,17 +275,21 @@ async fn stopped_with(node: Node, error: String) -> String {
 }
 
 /// Flush `audit` every `every` until `stopped`, off the runtime's workers.
-fn spawn_audit_flush(
+pub(super) fn spawn_audit_flush(
     audit: SharedParquetAuditSink,
     every: Duration,
     mut stopped: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
+    // A burst past the sink's ceiling flushes at once, as the local
+    // receiver's age sweep does, rather than growing until the next tick.
+    let overflow = audit.overflow_notify();
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(every);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ticks.tick() => {}
+                () = overflow.notified() => {}
                 _ = stopped.wait_for(|stop| *stop) => return,
             }
             let audit = audit.clone();

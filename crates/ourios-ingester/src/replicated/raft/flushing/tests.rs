@@ -66,6 +66,8 @@ struct Setup {
     /// The group's log from index 1.
     entries: Vec<GroupEntry>,
     replays: Replays,
+    #[cfg(feature = "openfga")]
+    graph: Option<Arc<crate::graph_emitter::GraphEmitter>>,
 }
 
 impl Setup {
@@ -83,6 +85,8 @@ impl Setup {
             target_bytes: usize::MAX,
             entries: entries(8),
             replays: Replays::global(),
+            #[cfg(feature = "openfga")]
+            graph: None,
         }
     }
 }
@@ -93,6 +97,8 @@ fn fixture_with(formed: bool, setup: Setup) -> Fixture {
         target_bytes,
         entries,
         replays,
+        #[cfg(feature = "openfga")]
+        graph,
     } = setup;
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path().to_path_buf();
@@ -111,6 +117,8 @@ fn fixture_with(formed: bool, setup: Setup) -> Fixture {
         },
         promoted: PromotedAttributes::default(),
         audit_ceiling: usize::MAX,
+        #[cfg(feature = "openfga")]
+        graph_emitter: graph,
     };
     let mut held = HeldLog(
         logged(&entries)
@@ -802,4 +810,34 @@ fn a_flusher_rebuilding_its_gap_may_not_checkpoint() {
     f.step(7..10, None);
     assert_eq!(f.kept.gap(), None, "the replay reached the gap");
     assert!(f.flushing.checkpointable(&f.kept).is_some());
+}
+
+/// RFC 0047 §3.3: the rows a named flusher publishes feed the authorization
+/// graph, as the local receiver's do.
+#[cfg(feature = "openfga")]
+#[test]
+fn a_flushers_published_rows_feed_the_graph() {
+    use crate::compactor::graph_tests::{Fake, emitter, serve};
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let fake = Fake::default();
+    let url = runtime.block_on(serve(fake.clone()));
+    // The feed spawns its write onto the runtime it publishes from, as the
+    // flusher's steps run inside the replica's runtime.
+    let _entered = runtime.enter();
+    let mut setup = Setup::bounded(Bounds::default());
+    setup.graph = Some(emitter(&url));
+    let mut f = fixture_with(true, setup);
+
+    f.step(0..8, Some(me()));
+
+    assert!(!f.published().is_empty(), "the flusher published");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fake.writes.lock().expect("lock").is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "its rows fed the graph"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

@@ -78,6 +78,8 @@ fn restoring(store: Store) -> (Restoring<HeldLog>, Outage) {
             },
             promoted: PromotedAttributes::default(),
             audit_ceiling: usize::MAX,
+            #[cfg(feature = "openfga")]
+            graph_emitter: None,
         },
         log: HeldLog(
             logged(&entries())

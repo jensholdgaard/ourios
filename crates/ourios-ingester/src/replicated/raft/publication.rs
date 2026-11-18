@@ -72,6 +72,16 @@ impl Publication {
         }
     }
 
+    /// Feed the RFC 0047 §3.3 graph from the rows it publishes.
+    #[cfg(feature = "openfga")]
+    #[must_use]
+    pub fn with_graph_emitter(self, emitter: Arc<crate::graph_emitter::GraphEmitter>) -> Self {
+        Self {
+            coordinator: self.coordinator.with_graph_emitter(emitter),
+            ..self
+        }
+    }
+
     /// The group's log id it publishes under.
     #[must_use]
     pub fn log(&self) -> u32 {

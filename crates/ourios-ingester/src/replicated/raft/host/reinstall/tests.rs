@@ -92,6 +92,8 @@ fn following(
             },
             promoted: PromotedAttributes::default(),
             audit_ceiling: usize::MAX,
+            #[cfg(feature = "openfga")]
+            graph_emitter: None,
         },
         log: Arc::new(log.clone()) as SharedLog,
         hold: Arc::clone(&hold),

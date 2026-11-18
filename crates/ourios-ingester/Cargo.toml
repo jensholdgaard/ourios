@@ -162,7 +162,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # Collector sends them. `transport` for the RFC 0065 peer transport's
 # server and per-peer client channels; `tls-connect-info` lets its server
 # serve the peer listener's TLS streams (RFC 0065 §6.8).
-tonic = { version = "0.14", default-features = false, features = ["codegen", "gzip", "transport", "tls-connect-info"] }
+# `tls-ring` for `TlsConnectInfo`, which tonic exports only with a TLS
+# backend: the Tail gate reads the client certificate from it (RFC0065.13).
+tonic = { version = "0.14", default-features = false, features = ["codegen", "gzip", "transport", "tls-connect-info", "tls-ring"] }
 # The peer transport's mutual-TLS connector hands tonic its TLS stream
 # through hyper's IO traits. Already in the tree via tonic.
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }

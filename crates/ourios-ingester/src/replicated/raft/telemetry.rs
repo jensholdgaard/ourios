@@ -27,6 +27,7 @@ use ourios_core::sync::lock_recover;
 use ourios_semconv as semconv;
 
 use super::flusher::{Hold, Reason};
+use super::formation::FormError;
 use super::host::GroupRaft;
 use super::kept::{Dropped, Kept};
 use super::mining::GroupMinerError;
@@ -190,6 +191,7 @@ pub(crate) enum Component {
     StateMachine(u32),
     VoteLog,
     Miner(u32),
+    Formation(u32),
 }
 
 impl Component {
@@ -199,6 +201,7 @@ impl Component {
             Self::StateMachine(_) => "state_machine",
             Self::VoteLog => "vote_log",
             Self::Miner(_) => "miner",
+            Self::Formation(_) => "formation",
         }
     }
 
@@ -209,9 +212,10 @@ impl Component {
     /// Its attributes: with its group, unless it is the node's vote log.
     fn attributes(self) -> Vec<KeyValue> {
         match self {
-            Self::LogStore(group) | Self::StateMachine(group) | Self::Miner(group) => {
-                vec![self.kv(), group_kv(group)]
-            }
+            Self::LogStore(group)
+            | Self::StateMachine(group)
+            | Self::Miner(group)
+            | Self::Formation(group) => vec![self.kv(), group_kv(group)],
             Self::VoteLog => vec![self.kv()],
         }
     }
@@ -288,6 +292,17 @@ impl Storage {
         });
     }
 
+    /// `group` cannot form on `error` (RFC 0065 §6.1): logged and counted
+    /// once. The group takes no write.
+    pub(crate) fn formation_stopped(&self, group: u32, error: &FormError) {
+        self.report(&Stop {
+            component: Component::Formation(group),
+            groups: &[group],
+            error_type: error.error_type(),
+            error,
+        });
+    }
+
     fn report(&self, stop: &Stop<'_>) {
         let Stop {
             component,
@@ -298,7 +313,8 @@ impl Storage {
         let group = match component {
             Component::LogStore(group)
             | Component::StateMachine(group)
-            | Component::Miner(group) => Some(i64::from(group)),
+            | Component::Miner(group)
+            | Component::Formation(group) => Some(i64::from(group)),
             Component::VoteLog => None,
         };
         tracing::error!(
@@ -701,6 +717,6 @@ fn lags(metrics: &RaftMetrics<RaftTypes>) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod state_machine_tests;
 #[cfg(test)]
-pub(in crate::replicated::raft) mod storage_tests;
+pub(in crate::replicated) mod storage_tests;
 #[cfg(test)]
 pub(crate) mod tests;

@@ -4,6 +4,7 @@
 //! re-created.
 
 use std::fmt;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ourios_parquet::{IdMaxError, Store, StoreError};
@@ -19,6 +20,51 @@ use crate::template_ids::{
 pub enum RaftState {
     Held,
     Empty,
+}
+
+/// Whether this node holds any of `groups`' Raft state under `wal_root`:
+/// a group log's segments or its snapshot record (RFC 0065 §6.6).
+///
+/// # Errors
+///
+/// The [`std::io::Error`] that kept it from reading `wal_root`: a node that
+/// cannot tell fails its start rather than bootstrap over state it holds.
+pub fn raft_state(wal_root: &std::path::Path, groups: &[u32]) -> std::io::Result<RaftState> {
+    // Every group is read, so an unreadable one fails the start whatever
+    // the order of the groups.
+    let mut held = false;
+    for &group in groups {
+        held |= holds_state(&super::super::log_store::group_dir(wal_root, group))?;
+    }
+    Ok(if held {
+        RaftState::Held
+    } else {
+        RaftState::Empty
+    })
+}
+
+/// Whether the group directory `dir` holds a log segment or a snapshot
+/// record; one that does not exist holds neither.
+fn holds_state(dir: &std::path::Path) -> std::io::Result<bool> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        // As the WAL reader takes a segment, in any case.
+        let segment = path
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("wal"));
+        let record = path
+            .file_name()
+            .is_some_and(|name| name == super::super::snapshot_record::FILE);
+        if segment || record {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// One replicated start.
@@ -196,8 +242,27 @@ async fn passed(
             Pass::Wait(why) => {
                 waiting(&why);
                 tokio::time::sleep(start.retry).await;
+                // As the template-id scan stops between reads, writing nothing:
+                // only a start that has written nothing stops. One that may
+                // have created the lock or its object finishes the claim, which
+                // its restart would otherwise refuse.
+                if wrote_nothing(claim, &why) && start.scan.shutdown.load(Ordering::Relaxed) {
+                    let interrupted = TemplateIdsError::Interrupted { files_scanned: 0 };
+                    return Err(StartError::HighWater(interrupted));
+                }
             }
         }
+    }
+}
+
+/// Whether a start waiting for `why` under `claim` has written nothing: it
+/// never tried to create the lock, or it waits on another start's lock, so
+/// its own create lost the race and never landed.
+fn wrote_nothing(claim: Claim, why: &Waiting) -> bool {
+    match claim {
+        Claim::Inherited => true,
+        Claim::Created => matches!(why, Waiting::Unseeded { .. }),
+        Claim::Owned | Claim::Seated(_) => false,
     }
 }
 

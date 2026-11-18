@@ -178,14 +178,16 @@ fn sync_ancestors(root: &Path, gate: &SyncGate) -> io::Result<()> {
 }
 
 /// Whether `root` holds a WAL segment; a missing root holds none.
-fn holds_segments(root: &Path) -> io::Result<bool> {
+pub(in crate::replicated::raft) fn holds_segments(root: &Path) -> io::Result<bool> {
     let dir = match std::fs::read_dir(root) {
         Ok(dir) => dir,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
+    // In any case, as the WAL reader takes a segment.
+    let segment = |x: &std::ffi::OsStr| x.eq_ignore_ascii_case("wal");
     for entry in dir {
-        if entry?.path().extension().is_some_and(|x| x == "wal") {
+        if entry?.path().extension().is_some_and(segment) {
             return Ok(true);
         }
     }

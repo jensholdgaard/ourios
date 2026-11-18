@@ -32,14 +32,15 @@ use super::super::types::RaftTypes;
 use super::forward::{self, ForwardTarget};
 use super::identify::{self, Identity};
 use super::propose::{self, ProposeTarget};
+use super::read_index::{self, ReadIndexTarget};
 use super::trace::{Call, Carried, StreamCall, Traced, Tracing};
 use super::wire::{
     AppendRequest, AppendResponse, Header, MAX_MESSAGE_BYTES, Malformed, SnapshotRequest,
     StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
 };
 use super::{
-    APPEND, FORWARD, IDENTIFY, INSTALL_SNAPSHOT, PRE_VOTE, PROPOSE, SERVICE, STREAM_APPEND,
-    VERSION, VOTE,
+    APPEND, FORWARD, IDENTIFY, INSTALL_SNAPSHOT, PRE_VOTE, PROPOSE, READ_INDEX, SERVICE,
+    STREAM_APPEND, VERSION, VOTE,
 };
 
 type Groups<SM> = HashMap<u32, Raft<RaftTypes, SM>>;
@@ -56,6 +57,9 @@ where
     /// The node's groups for `Propose`; until it is set, every proposal is
     /// refused as not hosted.
     proposals: Arc<RwLock<Option<Arc<dyn ProposeTarget>>>>,
+    /// The node's groups for `ReadIndex`; until it is set, every read is
+    /// refused as not hosted.
+    reads: Arc<RwLock<Option<Arc<dyn ReadIndexTarget>>>>,
     /// Who this node is, for `Identify`; until it is set the call is
     /// unavailable.
     identity: Arc<RwLock<Option<Identity>>>,
@@ -75,6 +79,7 @@ where
             groups: Arc::clone(&self.groups),
             forwards: Arc::clone(&self.forwards),
             proposals: Arc::clone(&self.proposals),
+            reads: Arc::clone(&self.reads),
             identity: Arc::clone(&self.identity),
             tracing: self.tracing.clone(),
             closing: Arc::clone(&self.closing),
@@ -91,6 +96,7 @@ where
             groups: Arc::default(),
             forwards: Arc::default(),
             proposals: Arc::default(),
+            reads: Arc::default(),
             identity: Arc::default(),
             tracing: Tracing::default(),
             closing: Arc::new(watch::Sender::new(false)),
@@ -135,6 +141,11 @@ where
             .unwrap_or_else(PoisonError::into_inner) = Some(target);
     }
 
+    /// Answer read-point requests with `target`, replacing any earlier one.
+    pub fn serve_read_indexes(&self, target: Arc<dyn ReadIndexTarget>) {
+        *self.reads.write().unwrap_or_else(PoisonError::into_inner) = Some(target);
+    }
+
     /// Answer `Identify` as `identity`, replacing any earlier one.
     pub fn identify_as(&self, identity: Identity) {
         *self
@@ -161,6 +172,11 @@ where
         target.clone()
     }
 
+    fn read_index_target(&self) -> Option<Arc<dyn ReadIndexTarget>> {
+        let target = self.reads.read().unwrap_or_else(PoisonError::into_inner);
+        target.clone()
+    }
+
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Groups<SM>> {
         self.groups.write().unwrap_or_else(PoisonError::into_inner)
     }
@@ -171,6 +187,7 @@ where
             groups: Arc::default(),
             forwards: Arc::default(),
             proposals: Arc::default(),
+            reads: Arc::default(),
             identity: Arc::default(),
             tracing,
             closing: Arc::new(watch::Sender::new(false)),
@@ -379,8 +396,9 @@ where
     type Future = BoxFuture<Response<Resp>, Status>;
 
     fn call(&mut self, request: Request<Req>) -> Self::Future {
+        let caller = ourios_serving::extract_context_from_metadata(request.metadata());
         let request = request.into_inner();
-        let call = Call::server(self.tracing.clone(), self.path, request.traced());
+        let call = Call::server(self.tracing.clone(), self.path, request.traced(), caller);
         let handled = (self.handler)(request).instrument(call.span());
         Box::pin(async move {
             let result = handled.await;
@@ -645,6 +663,10 @@ where
             PROPOSE => unary(PROPOSE, tracing, request, move |r| {
                 let target = server.propose_target();
                 propose::serve(target, r)
+            }),
+            READ_INDEX => unary(READ_INDEX, tracing, request, move |r| {
+                let target = server.read_index_target();
+                read_index::serve(target, r)
             }),
             IDENTIFY => unary(IDENTIFY, tracing, request, move |r| {
                 let identity = server.identity();

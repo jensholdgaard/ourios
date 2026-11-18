@@ -186,7 +186,7 @@ mod erasure_late_tests;
 #[cfg(feature = "openfga")]
 mod graph_phase;
 #[cfg(all(test, feature = "openfga"))]
-mod graph_tests;
+pub(crate) mod graph_tests;
 mod reclaim;
 #[cfg(test)]
 mod reclaim_tests;

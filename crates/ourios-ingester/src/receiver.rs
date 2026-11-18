@@ -38,6 +38,7 @@ pub mod decode;
 mod error;
 pub mod grpc;
 pub mod http;
+pub mod ingest;
 mod journal;
 pub mod materialize;
 pub mod pipeline;
@@ -46,6 +47,7 @@ pub mod tenant;
 
 pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
+pub use ingest::{Ingest, SharedIngest};
 pub use materialize::{materialize_record, materialize_resource_logs};
 pub use pipeline::{Export, IngestPipeline, Journal, ReceiveError, SharedPipeline};
 pub use selector::{SelectorError, TENANT_HEADER};

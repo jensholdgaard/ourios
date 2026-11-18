@@ -243,7 +243,10 @@ jobs:
             --ignored --exact "${tests[@]}"
       # RFC 0019 server-level §5 scenarios (.2/.3/.4/.5): spawn the
       # `ourios-server` binary configured for the S3 backend against the same
-      # LocalStack, driven over HTTP. `--exact` (RFC0019.1/.6/.7 are non-ignored
+      # LocalStack, driven over HTTP. RFC0065.1's start arm serves three
+      # replicated receivers on it, and RFC0065.3 SIGKILLs each voter of a
+      # steady stream in turn: the replicated WAL needs the conditional
+      # updates the local store lacks. `--exact` (RFC0019.1/.6/.7 are non-ignored
       # unit tests that run in the normal `test` job).
       - run: >
           cargo test -p ourios-server --test it --
@@ -252,6 +255,8 @@ jobs:
           rfc0019_storage_backend::rfc0019_3_ingest_query_end_to_end_on_s3
           rfc0019_storage_backend::rfc0019_4_compaction_operates_on_s3
           rfc0019_storage_backend::rfc0019_5_tenant_isolation_on_s3
+          rfc0065_replicated_wal::rfc0065_1_a_valid_replicated_config_starts
+          rfc0065_replicated_wal::rfc0065_3_sigkill_of_the_leader_loses_no_acked_record
 
   # RFC 0029 §5 .7: the Dex end-to-end acceptance arm — a real Dex
   # container (testcontainers) mints client-credentials tokens the served

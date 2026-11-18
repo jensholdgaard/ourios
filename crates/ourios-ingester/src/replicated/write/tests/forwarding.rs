@@ -68,6 +68,39 @@ async fn a_followers_export_commits_on_the_leader() {
     cluster.shutdown().await;
 }
 
+/// The OTLP gRPC transport over a follower's replicated ingest forwards
+/// with the client's credential: the export commits on the leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grpc_export_to_a_follower_commits_on_the_leader() {
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService as _;
+
+    use crate::receiver::SharedIngest;
+    use crate::receiver::grpc::LogsReceiver;
+
+    let cluster = Cluster::start(3, &[0]).await;
+    let leader = ready_leader(&cluster).await;
+    serve_forwards(&cluster, COMMIT_TIMEOUT);
+    let follower = followers(leader)[0];
+    let ingest = forwarding(&cluster, follower, COMMIT_TIMEOUT);
+    let receiver = LogsReceiver::new(Arc::new(ingest) as SharedIngest);
+    let before = cluster.node(leader).log(0).await.len();
+    let mut request = tonic::Request::new(export("over grpc").request);
+    let metadata = request.metadata_mut();
+    metadata.insert(
+        crate::receiver::TENANT_HEADER,
+        "acme".parse().expect("tenant"),
+    );
+    metadata.insert(
+        "authorization",
+        TOKEN.expect("a token").parse().expect("credential"),
+    );
+
+    receiver.export(request).await.expect("acknowledged");
+
+    assert_eq!(cluster.node(leader).log(0).await.len(), before + 1);
+    cluster.shutdown().await;
+}
+
 /// The leader's rejection of a forwarded export reaches the follower's
 /// client as the leader gave it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -92,6 +92,8 @@ fn following(
             },
             promoted: PromotedAttributes::default(),
             audit_ceiling: usize::MAX,
+            #[cfg(feature = "openfga")]
+            graph_emitter: None,
         },
         log: Arc::new(log.clone()) as SharedLog,
         hold: Arc::clone(&hold),
@@ -100,6 +102,7 @@ fn following(
     let follow = Follow {
         group: 0,
         mined,
+        followed: watch::Sender::new(None),
         keeping: Keeping {
             group: 0,
             kept,

@@ -8,23 +8,70 @@
 //! a unit test in `src/main.rs`: the replicated backend needs a store with
 //! conditional updates, and the local store these tests serve on has none.
 
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 use ourios_ingester::replicated::raft::group_config;
 use ourios_server::config::file::parse;
 use ourios_server::config::resolve::server_config_from_file;
 use ourios_server::config::wal::{ReplicatedWal, WalBackend};
 
-/// Scenario RFC0065.1 — the start arm. With `receiver.wal.backend:
-/// replicated` and every field set, the server starts; today
-/// `check_wal_backend` refuses it, as `only_the_local_wal_backend_starts`
-/// pins until the backend is wired.
-#[test]
-#[ignore = "RFC0065.1 stub — the start arm, implemented with the server wiring"]
-fn rfc0065_1_a_valid_replicated_config_starts() {
-    todo!(
-        "RFC0065.1 — a server configured with the replicated backend and every field set \
-         starts and serves its groups"
+/// Scenario RFC0065.1 — the start arm. Three servers configured with
+/// `receiver.wal.backend: replicated` and every field set start on an S3
+/// store, form their group over mutual TLS, record the voting layout,
+/// acknowledge an OTLP export, and stop cleanly on SIGTERM.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC0065.1 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn rfc0065_1_a_valid_replicated_config_starts() {
+    use served::{exported, free_addr, peer_tls, start};
+
+    let bucket = "ourios-rfc0065-1";
+    let (_localstack, endpoint, store) =
+        crate::rfc0019_storage_backend::localstack_s3(bucket).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tls = peer_tls(dir.path());
+    let names = ["a", "b", "c"];
+    let addrs: Vec<_> = names.iter().map(|_| free_addr()).collect();
+    let peers = names
+        .iter()
+        .zip(&addrs)
+        .map(|(name, addr)| format!("{name}={addr}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut servers = Vec::new();
+    for (name, addr) in names.iter().zip(&addrs) {
+        let leaves = format!(
+            "      node_id: {name}\n      listen_addr: {addr}\n      groups: 1\n      \
+             peers: {peers}\n      tail_peers: t=127.0.0.1:1\n      tail_clients: querier\n{tls}"
+        );
+        servers.push(start(dir.path(), name, (&endpoint, bucket), &leaves).await);
+    }
+
+    assert!(
+        exported(servers[0].grpc).await,
+        "an export is acknowledged once the group forms"
     );
+    let keys = tokio::task::spawn_blocking(move || store.list_blocking(None).expect("list"))
+        .await
+        .expect("listed");
+    assert!(
+        keys.iter()
+            .any(|key| key == ourios_ingester::replicated::layout::LAYOUT_KEY),
+        "the voting layout is recorded: {keys:?}"
+    );
+    for server in servers {
+        server.terminate_cleanly().await;
+    }
 }
+
+/// Serving the binary with the replicated backend.
+#[cfg(unix)]
+mod served;
+
+/// RFC0065.3: a leader killed mid-batch.
+#[cfg(unix)]
+mod crash;
 
 /// A replicated `receiver.wal` with every required leaf and the given
 /// timing lines, `${env:…}` resolved from `env`.
@@ -104,18 +151,84 @@ fn rfc0065_1_the_raft_timings_are_configured_and_checked() {
 }
 
 /// Scenario RFC0065.3 — crash recovery on the replicated backend (B2, B7).
-/// Given a three-node cluster ingesting steadily, when the acknowledging
-/// replica is killed with `SIGKILL` mid-batch, then another takes over without an
-/// operator and every acked record is in Parquet after the next
-/// checkpoint. The multi-process crash test RFC 0064 §3.2 requires.
-#[test]
-#[ignore = "RFC0065.3 stub — implemented with the multi-process crash test"]
-fn rfc0065_3_sigkill_of_the_leader_loses_no_acked_record() {
-    todo!(
-        "RFC0065.3 — another replica takes over without an operator, every acked \
-         record is in Parquet after the next checkpoint, and after compaction no \
-         `(tenant, ingest position)` appears twice"
-    );
+/// Given three voters and a tail replica ingesting steadily, when each voter
+/// in turn is killed with `SIGKILL` mid-batch and restarted, then another
+/// takes over without an operator each time, every acked record is in
+/// Parquet after the next checkpoint, and after compaction no
+/// `(tenant, ingest position)` appears twice. The multi-process crash test
+/// RFC 0064 §3.2 requires.
+///
+/// Killing a follower moves no leadership, so killing every voter in turn
+/// kills the leader at least once, whichever it is.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "RFC0065.3 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn rfc0065_3_sigkill_of_the_leader_loses_no_acked_record() {
+    use crash::{Stream, Targets, published};
+    use served::{free_addr, peer_tls, restart, start};
+
+    let bucket = "ourios-rfc0065-3";
+    let (_localstack, endpoint, store) =
+        crate::rfc0019_storage_backend::localstack_s3(bucket).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tls = peer_tls(dir.path());
+    let voters = ["a", "b", "c"];
+    let addrs: Vec<_> = (0..4).map(|_| free_addr()).collect();
+    let peers = voters
+        .iter()
+        .zip(&addrs)
+        .map(|(name, addr)| format!("{name}={addr}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let tail = format!("t={}", addrs[3]);
+    let mut servers = BTreeMap::new();
+    for (name, addr) in voters.iter().chain(&["t"]).zip(&addrs) {
+        let leaves = format!(
+            "      node_id: {name}\n      listen_addr: {addr}\n      groups: 1\n      \
+             peers: {peers}\n      tail_peers: {tail}\n      tail_clients: querier\n{tls}"
+        );
+        let server = start(dir.path(), name, (&endpoint, bucket), &leaves).await;
+        servers.insert(*name, server);
+    }
+    let targets = Targets::default();
+    for name in voters {
+        targets.insert(name, servers[name].grpc);
+    }
+    assert!(served::exported(servers["a"].grpc).await, "the group forms");
+
+    // Hours old, so their partitions are sealed and compacted during the test.
+    let three_hours_ago = std::time::SystemTime::now() - Duration::from_secs(3 * 3_600);
+    let stamped = three_hours_ago
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_nanos();
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let stream = Stream::start(&targets, u64::try_from(stamped).expect("fits"), &stopping);
+    for name in voters {
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        targets.remove(name);
+        servers.remove(name).expect("serving").kill().await;
+        // Before it returns: if it led, one of the other two took over.
+        let after_the_kill = stream.unsent();
+        assert!(
+            stream
+                .acks_from(after_the_kill, Duration::from_secs(30))
+                .await,
+            "an export sent after {name} is killed is acknowledged without an operator"
+        );
+        let server = restart(dir.path(), name).await;
+        targets.insert(name, server.grpc);
+        servers.insert(name, server);
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop.send_replace(true);
+    let acked = stream.finish().await;
+    assert!(acked.len() > 50, "a steady stream: {} acked", acked.len());
+
+    published(&store, &acked, Duration::from_secs(120)).await;
+    for server in servers.into_values() {
+        server.terminate_cleanly().await;
+    }
 }
 
 /// Scenario RFC0065.11 — a record is queryable within the allowance, the
@@ -156,15 +269,54 @@ fn rfc0065_14_require_complete_fails_when_parquet_is_unavailable() {
 }
 
 /// Scenario RFC0065.17 — the chart renders the replicated shape (B20, B21).
-/// Given `receiver.wal.backend: replicated` and `receiver.replicas: 3`, then
-/// the config carries the three headless-Service peers and `node_id` from
-/// the pod name, the peer port is not on the public Service, and the peer
-/// TLS secret is mounted. Lands in `deploy/helm/render-tests.sh`.
+/// Given `receiver.wal.backend: replicated` and `receiver.replicas: 3`, the
+/// receiver config the chart renders (pinned by `deploy/helm/render-tests.sh`
+/// as `testdata/replicated-config.yaml`, which also checks the Services, the
+/// pods' `POD_NAME` and the mounted peer secrets) resolves, for each pod,
+/// to the node its name says: the three voters on the headless Service, and
+/// the tail replica on its own.
 #[test]
-#[ignore = "RFC0065.17 stub — implemented with the chart's replicated shape in render-tests.sh"]
 fn rfc0065_17_the_chart_renders_the_replicated_shape() {
-    todo!(
-        "RFC0065.17 — three peers on the headless Service, `node_id` from the pod \
-         name, no peer port on the public Service, the peer TLS secret mounted"
+    use ourios_server::config::wal::NodeRole;
+
+    let rendered = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/helm/testdata/replicated-config.yaml"),
+    )
+    .expect("the pinned render");
+    let resolve = |pod: &str| {
+        let lookup = |name: &str| (name == "POD_NAME").then(|| pod.to_owned());
+        let file = parse(&rendered, &lookup).expect("parses");
+        match server_config_from_file(&file)
+            .expect("resolves")
+            .receiver
+            .map(|r| r.wal)
+        {
+            Some(WalBackend::Replicated(wal)) => *wal,
+            other => panic!("not a replicated receiver: {other:?}"),
+        }
+    };
+
+    let voter = resolve("t-ourios-receiver-1");
+    assert_eq!(voter.node_id, "t-ourios-receiver-1");
+    assert!(matches!(voter.role, NodeRole::Voter));
+    let peers: Vec<_> = voter
+        .peers
+        .iter()
+        .map(|peer| format!("{}={}:{}", peer.id, peer.host, peer.port))
+        .collect();
+    assert_eq!(
+        peers,
+        (0..3)
+            .map(|i| format!(
+                "t-ourios-receiver-{i}=t-ourios-receiver-{i}.t-ourios-receiver-headless.default.svc.\
+                 cluster.local:4320"
+            ))
+            .collect::<Vec<_>>()
     );
+    assert_eq!(voter.listen_addr.port(), 4320);
+    assert!(matches!(
+        resolve("t-ourios-wal-tail-0").role,
+        NodeRole::TailReplica
+    ));
 }

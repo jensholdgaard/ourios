@@ -33,6 +33,7 @@ mod forward;
 mod identify;
 mod links;
 pub mod propose;
+pub mod read_index;
 mod server;
 mod trace;
 pub mod wire;
@@ -58,6 +59,7 @@ const INSTALL_SNAPSHOT: &str = "/ourios.wal.v1.Replication/InstallSnapshot";
 const FORWARD: &str = "/ourios.wal.v1.Replication/Forward";
 const IDENTIFY: &str = "/ourios.wal.v1.Replication/Identify";
 const PROPOSE: &str = "/ourios.wal.v1.Replication/Propose";
+const READ_INDEX: &str = "/ourios.wal.v1.Replication/ReadIndex";
 
 #[cfg(test)]
-mod tests;
+pub(in crate::replicated) mod tests;

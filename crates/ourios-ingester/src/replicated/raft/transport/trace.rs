@@ -11,14 +11,20 @@
 //! when it ends, and only when it carried entries or failed: what a
 //! stream carries is not known when it opens, and a heartbeat is a stream
 //! of one entry-less append.
+//!
+//! A unary call carries its client span's trace context in its metadata
+//! ([`inject_current`]), and the server's span continues it, the client
+//! span its parent (RFC 0065 §6.9). A stream's client span is built only
+//! when the stream ends, so a stream carries none and its server span is
+//! a root.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use opentelemetry::KeyValue;
 use opentelemetry::global::BoxedSpan;
 use opentelemetry::trace::{Span as _, SpanBuilder, SpanKind, Status, Tracer as _};
+use opentelemetry::{Context, KeyValue};
 use tonic::Code;
 
 use super::wire;
@@ -34,13 +40,23 @@ pub(super) enum Tracing {
 }
 
 impl Tracing {
-    fn start(&self, builder: SpanBuilder) -> BoxedSpan {
+    fn start(&self, builder: SpanBuilder, parent: &Context) -> BoxedSpan {
         match self {
-            Self::Global => ourios_core::telemetry::tracer("ourios.replication").build(builder),
+            Self::Global => ourios_core::telemetry::tracer("ourios.replication")
+                .build_with_context(builder, parent),
             #[cfg(test)]
-            Self::Owned(tracer) => tracer.build(builder),
+            Self::Owned(tracer) => tracer.build_with_context(builder, parent),
         }
     }
+}
+
+/// Carry the current span's trace context in `request`'s metadata, for the
+/// peer's server span to continue.
+pub(super) fn inject_current<T>(request: &mut tonic::Request<T>) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let context = tracing::Span::current().context();
+    ourios_serving::inject_context_into_metadata(&context, request.metadata_mut());
 }
 
 /// Whether a request is traced whether or not it fails.
@@ -158,6 +174,9 @@ pub(super) struct Call<'a> {
     started: SystemTime,
     span: Option<tracing::Span>,
     tracing: Tracing,
+    /// The trace it continues: the current one on the client side, the
+    /// caller's on the server side.
+    parent: Context,
 }
 
 impl<'a> Call<'a> {
@@ -168,14 +187,31 @@ impl<'a> Call<'a> {
         peer: Peer<'a>,
         traced: bool,
     ) -> Self {
-        Self::open(tracing, Side::Client, path, Some(peer)).traced(traced)
+        Self::open(
+            tracing,
+            (Side::Client, Context::current()),
+            path,
+            Some(peer),
+        )
+        .traced(traced)
     }
 
-    pub(super) fn server(tracing: Tracing, path: &'static str, traced: bool) -> Self {
-        Self::open(tracing, Side::Server, path, None).traced(traced)
+    /// A call from a peer whose trace context is `parent`.
+    pub(super) fn server(
+        tracing: Tracing,
+        path: &'static str,
+        traced: bool,
+        parent: Context,
+    ) -> Self {
+        Self::open(tracing, (Side::Server, parent), path, None).traced(traced)
     }
 
-    fn open(tracing: Tracing, side: Side, path: &'static str, peer: Option<Peer<'a>>) -> Self {
+    fn open(
+        tracing: Tracing,
+        (side, parent): (Side, Context),
+        path: &'static str,
+        peer: Option<Peer<'a>>,
+    ) -> Self {
         Self {
             side,
             method: rpc_method(path),
@@ -183,11 +219,15 @@ impl<'a> Call<'a> {
             started: SystemTime::now(),
             span: None,
             tracing,
+            parent,
         }
     }
 
     fn traced(mut self, traced: bool) -> Self {
         if traced {
+            // The span takes its parent from the current context as it opens
+            // (RFC 0039 §3.3), so the caller's is current while it does.
+            let _attached = self.parent.clone().attach();
             self.span = Some(self.tracing_span());
         }
         self
@@ -255,7 +295,7 @@ impl<'a> Call<'a> {
             .with_kind(self.side.kind())
             .with_start_time(self.started)
             .with_attributes(attributes);
-        let mut span = self.tracing.start(builder);
+        let mut span = self.tracing.start(builder, &self.parent);
         if failed {
             span.set_status(Status::error(""));
         }
@@ -295,7 +335,7 @@ impl<'a> StreamCall<'a> {
     }
 
     pub(super) fn server(tracing: Tracing, path: &'static str) -> Self {
-        Self::of(Call::server(tracing, path, false))
+        Self::of(Call::server(tracing, path, false, Context::new()))
     }
 
     fn of(call: Call<'a>) -> Self {

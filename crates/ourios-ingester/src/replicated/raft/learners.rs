@@ -16,6 +16,7 @@ use std::time::Duration;
 use openraft::async_runtime::WatchReceiver as _;
 use openraft::{ChangeMembers, Precondition};
 
+use super::flusher::StewardError;
 use super::host::GroupRaft;
 use super::log_store::{GroupLogReader, LogControls};
 use super::state_machine::GroupSm;
@@ -160,7 +161,7 @@ fn removals(
 ///
 /// The membership change the leader could not commit; the next pass
 /// starts again from the committed membership.
-pub async fn reconcile(group: Group<'_>, tail: Tail<'_>) -> Result<Changes, String> {
+pub async fn reconcile(group: Group<'_>, tail: Tail<'_>) -> Result<Changes, StewardError> {
     let Some((members, planned_at)) = led_members(group) else {
         return Ok(Changes::default());
     };
@@ -196,7 +197,7 @@ pub(super) async fn apply(
     raft: &GroupRaft,
     changes: &Changes,
     planned_at: Option<LogId>,
-) -> Result<(), String> {
+) -> Result<(), StewardError> {
     let edits = [
         (!changes.add.is_empty()).then(|| ChangeMembers::AddNodes(changes.add.clone())),
         (!changes.remove.is_empty()).then(|| ChangeMembers::RemoveNodes(changes.remove.clone())),
@@ -209,7 +210,7 @@ pub(super) async fn apply(
         let committed = raft
             .change_membership_if(edit, false, [guard])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(StewardError::from)?;
         at = Some(committed.log_id);
     }
     Ok(())

@@ -414,10 +414,10 @@ cleanly:
 | Role      | S3 actions (keys under `storage.s3.prefix`)                                                                 | Holds delete? |
 | --------- | ----------------------------------------------------------------------------------------------------------- | ------------- |
 | querier   | `GetObject` on `data/*`, `audit/*`; `ListBucket` for `data/*`, `audit/*` (see cache note)                    | no            |
-| receiver  | `PutObject` on `data/*`, `audit/*`, `miner/*`; `GetObject` on `miner/*`; `ListBucket` for `miner/*`; for a bootstrap only, `ListBucket` and reads on `data/` and `audit/` (see below) | no |
+| receiver  | `PutObject` on `data/*`, `audit/*`, `miner/*`; `GetObject` on `miner/*`; `ListBucket` for `miner/*`; for a bootstrap only, `ListBucket` and reads on `data/` and `audit/` (see below); with the replicated WAL, `GetObject` and `PutObject` on `wal/*` and `DeleteObject` on `wal/log_ids.json` only (see below) | `wal/log_ids.json` only, replicated WAL |
 | compactor | `GetObject`, `PutObject`, `DeleteObject` on `data/*`, `erasure/*`, `backfill/*`; `PutObject` on `audit/*`; `ListBucket` for `data/*`, `erasure/*`, `backfill/*` | **only one** |
 
-Every key lives under one of five top-level prefixes, each written by one
+Every key lives under one of six top-level prefixes, each written by one
 role:
 
 - `data/`: record files and partition manifests. The receiver writes new
@@ -427,6 +427,12 @@ role:
   the erasure events. The querier's template-map cache sits here too.
 - `miner/`: the template-id high-water (RFC 0059). Only the receiver writes it,
   and **nothing may delete it**.
+- `wal/`: the replicated WAL's records (RFC 0065), present only with
+  `receiver.wal.backend: replicated`: the voting layout
+  (`wal/replicated/cluster.json`), each group's formation record, checkpoint
+  bundles and pointer (`wal/replicated/groups/*`, `wal/replicated/logs/*`),
+  and the log-id lock `wal/log_ids.json`. The voters and the tail pool write
+  them, all under the receiver's ServiceAccount.
 - `erasure/` and `backfill/`: the RFC 0048 erasure markers and backfill locks.
   The compactor's sweep advances and removes them; the `graph erase` and
   `graph backfill` verbs create them, so run those with the compactor's
@@ -548,6 +554,42 @@ And its steady-state policy, once the high-water exists:
   ]
 }
 ```
+
+**With the replicated WAL** (`receiver.wal.backend: replicated`), grant the
+receiver these as well, **before** the first start, since the voters
+record the layout and their groups' formation as they form. The tail pool
+runs under the same ServiceAccount, and its flusher writes the checkpoints.
+Conditional puts need only `PutObject`. The listing grant is what makes
+S3 answer a missing key with 404 rather than 403: a first start reads
+`wal/replicated/cluster.json` and `wal/log_ids.json` before they exist. The
+one delete is of the log-id lock a start created over another start's
+object, and only that key:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject", "s3:PutObject"],
+  "Resource": "arn:aws:s3:::<bucket>/<prefix>/wal/*"
+},
+{
+  "Effect": "Allow",
+  "Action": "s3:ListBucket",
+  "Resource": "arn:aws:s3:::<bucket>",
+  "Condition": { "StringLike": { "s3:prefix": ["<prefix>/wal/*"] } }
+},
+{
+  "Effect": "Allow",
+  "Action": "s3:DeleteObject",
+  "Resource": "arn:aws:s3:::<bucket>/<prefix>/wal/log_ids.json"
+}
+```
+
+**Switching an existing deployment to the replicated WAL is not an in-place
+upgrade.** A store a local-WAL receiver has written holds a template-id
+high-water but no `wal/log_ids.json`, and a replicated start refuses that
+store rather than risk reissuing log ids (RFC 0065 §6.6);
+`templateIdsAllowBootstrap` does not lift the refusal. Start a replicated
+deployment on a fresh bucket or `storage.s3.prefix`.
 
 **The upgrade to RFC 0059**, in order:
 
@@ -780,6 +822,15 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `receiver.wal.size` | `2Gi` | WAL PVC size (`OURIOS_WAL_ROOT`, always local). |
 | `receiver.wal.storageClassName` | `""` | WAL StorageClass (`""` = cluster default). |
 | `receiver.wal.mountPath` / `.accessModes` | `/var/lib/ourios/wal` / `[ReadWriteOnce]` | WAL mount path and access modes. |
+| `receiver.wal.backend` | `local` | `local`, one WAL per receiver, or `replicated` (RFC 0065): an export is acknowledged once a quorum of the receivers has fsynced it. `replicated` needs `storage.backend: s3`, at least `replicationFactor` receivers, the peer certificates and `tailClients`, and renders the `walTail` pool. |
+| `receiver.wal.replicated.groups` / `.replicationFactor` | `16` / `3` | Raft groups and voters per group (3 or 5). Both are fixed once the cluster has formed, as `receiver.replicas` is (the voters are its pods): a change to any of the three fails the voting-layout check at start. `walTail.replicas` is not fixed. |
+| `receiver.wal.replicated.tailReplicas` | `""` | Tail replicas per group; empty = the server default (1). |
+| `receiver.wal.replicated.tailClients` | `[]` | The queriers' client-certificate identities (URI or DNS SANs) a tail replica will serve tail reads to. Required with `replicated`; not yet enforced, since the tail read path (RFC 0065 §6.7) is still being built. |
+| `receiver.wal.replicated.tls.existingSecret` / `.clientCA.existingSecret` / `.clientCA.key` | `""` / `""` / `ca.crt` | Mutual TLS between the replicas on port 4320, which only the headless Services expose. The peers are addressed by their fully qualified names, so the certificate's SANs can be one wildcard per Service: `*.<fullname>-receiver-headless.<namespace>.svc.<clusterDomain>` and `*.<fullname>-wal-tail-headless.<namespace>.svc.<clusterDomain>`, where `<fullname>` is the chart's full name (`<release>-ourios`, or `fullnameOverride`); take the Service names from the rendered chart. rustls refuses a wildcard with fewer than two labels after it. Required with `replicated`. |
+| `receiver.wal.replicated.clusterDomain` | `cluster.local` | The cluster's DNS domain, which the peers' names end in. |
+| `walTail.replicas` | `1` | The replicated WAL's tail pool, a second StatefulSet (`-wal-tail`) that mines and publishes. Scaling it changes `tail_peers` only, never the voting layout, but it rolls the voters one at a time, since they read `tail_peers` only at start (#1357). A write quorum stays up; each leader restart costs a moment of retryable rejections. |
+| `walTail.wal.size` / `.storageClassName` / `.accessModes` | `4Gi` / `""` / `[ReadWriteOnce]` | Each tail replica's volume: every hosted group's log above the checkpoint plus its row cache. RFC 0065 sizes it at twice 24 hours of the ingest rate. |
+| `walTail.resources` / `.podAnnotations` / `.podLabels` | `{}` | As the receiver's, for the tail pool. |
 | `receiver.encodeWorkers` | `""` | Encode pool size (RFC 0035); empty = available cores, the node's count without a CPU limit. |
 | `querier.enabled` | `true` | Querier Deployment (HTTP `:4319`). |
 | `querier.replicas` | `2` | Querier replicas (scales independently, no PVC). |

@@ -66,6 +66,8 @@ struct Setup {
     /// The group's log from index 1.
     entries: Vec<GroupEntry>,
     replays: Replays,
+    #[cfg(feature = "openfga")]
+    graph: Option<Arc<crate::graph_emitter::GraphEmitter>>,
 }
 
 impl Setup {
@@ -83,6 +85,8 @@ impl Setup {
             target_bytes: usize::MAX,
             entries: entries(8),
             replays: Replays::global(),
+            #[cfg(feature = "openfga")]
+            graph: None,
         }
     }
 }
@@ -93,6 +97,8 @@ fn fixture_with(formed: bool, setup: Setup) -> Fixture {
         target_bytes,
         entries,
         replays,
+        #[cfg(feature = "openfga")]
+        graph,
     } = setup;
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path().to_path_buf();
@@ -111,6 +117,8 @@ fn fixture_with(formed: bool, setup: Setup) -> Fixture {
         },
         promoted: PromotedAttributes::default(),
         audit_ceiling: usize::MAX,
+        #[cfg(feature = "openfga")]
+        graph_emitter: graph,
     };
     let mut held = HeldLog(
         logged(&entries)
@@ -802,4 +810,88 @@ fn a_flusher_rebuilding_its_gap_may_not_checkpoint() {
     f.step(7..10, None);
     assert_eq!(f.kept.gap(), None, "the replay reached the gap");
     assert!(f.flushing.checkpointable(&f.kept).is_some());
+}
+
+/// RFC 0047 §3.3: the rows a named flusher publishes feed the authorization
+/// graph, as the local receiver's do, whether a full flush publishes them
+/// or the size trigger does as they are handed over.
+#[cfg(feature = "openfga")]
+#[test]
+fn a_flushers_published_rows_feed_the_graph() {
+    for target_bytes in [usize::MAX, 1] {
+        let parent = published_to_the_graph(target_bytes);
+        assert!(
+            parent,
+            "target {target_bytes}: the conversation's parent tuple"
+        );
+    }
+}
+
+/// Whether a conversation's rows, published by a flusher slicing at
+/// `target_bytes`, reach the graph as the conversation's parent tuple.
+#[cfg(feature = "openfga")]
+fn published_to_the_graph(target_bytes: usize) -> bool {
+    use crate::compactor::graph_tests::{Fake, emitter, serve};
+    use ourios_serving::openfga::TupleKey;
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let fake = Fake::default();
+    let url = runtime.block_on(serve(fake.clone()));
+    // The feed spawns its write onto the runtime it publishes from, as the
+    // flusher's steps run inside the replica's runtime.
+    let _entered = runtime.enter();
+    let mut entries = entries(2);
+    entries.push(conversation("acme", "c-1"));
+    let steps = entries.len();
+    let mut setup = Setup::entries(entries);
+    setup.target_bytes = target_bytes;
+    setup.graph = Some(emitter(&url));
+    let mut f = fixture_with(true, setup);
+
+    f.step(0..steps, Some(me()));
+
+    assert!(!f.published().is_empty(), "the flusher published");
+    let parent = TupleKey::new("tenant:acme", "parent", "conversation:acme/c-1");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if fake.tuples.lock().expect("lock").contains(&parent) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// A batch of `tenant`'s holding one record in conversation `id`.
+#[cfg(feature = "openfga")]
+fn conversation(tenant: &str, id: &str) -> GroupEntry {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use prost::Message as _;
+
+    let text = |s: &str| {
+        Some(AnyValue {
+            value: Some(Value::StringValue(s.to_owned())),
+        })
+    };
+    let record = LogRecord {
+        body: text("turn completed"),
+        attributes: vec![KeyValue {
+            key: "gen_ai.conversation.id".to_owned(),
+            value: text(id),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![record],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    super::super::mining::tests::framed(tenant, &request.encode_to_vec())
 }

@@ -178,6 +178,21 @@ impl PublishCoordinator {
         &self.feed
     }
 
+    /// Buffer `record`, publishing through the feed whatever the ceiling
+    /// and size triggers take for it, so those rows reach the RFC 0047
+    /// §3.3 graph as a drained flush's do. The triggers take nothing until
+    /// the audit barrier has made every event emitted so far durable.
+    pub fn emit_published(&self, record: MinedRecord) {
+        for (trigger, taken) in self.record.detach_concurrent(record) {
+            if !taken.is_empty() {
+                let registered = self.record.epochs().current();
+                let _ = self
+                    .feed
+                    .publish(taken.into_partitions(), trigger, registered);
+            }
+        }
+    }
+
     /// The publisher the encode pool hands its detached partitions to
     /// (RFC 0052 §3.1), writing through this coordinator's feed.
     #[must_use]

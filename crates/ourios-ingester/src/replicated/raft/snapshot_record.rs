@@ -38,7 +38,7 @@ use ourios_wal::{Control, MinerConfigV1, RaftLogId};
 
 pub(super) type SnapshotMeta = SnapshotMetaOf<RaftTypes>;
 
-const FILE: &str = "snapshot";
+pub(super) const FILE: &str = "snapshot";
 const LOCK_FILE: &str = "snapshot.lock";
 const VERSION: u8 = 2;
 const ID_LEN: usize = 1 + 8 + 8;

@@ -63,6 +63,8 @@ fn publishing(store: Store) -> Publishing {
         },
         promoted: PromotedAttributes::default(),
         audit_ceiling: 1 << 20,
+        #[cfg(feature = "openfga")]
+        graph_emitter: None,
     }
 }
 

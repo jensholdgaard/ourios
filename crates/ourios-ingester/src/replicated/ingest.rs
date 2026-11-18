@@ -18,8 +18,9 @@ use super::raft::transport::{Forwarded, Rejected};
 use super::raft::types::TenantBatchBytes;
 use super::route::{Routed, Router};
 use super::write::{GroupPosition, GroupWriter, Leading, WriteError};
+use crate::receiver::Ingest;
 use crate::receiver::admission::{Admission, Export, Framed};
-use crate::receiver::pipeline::{ReceiveError, log_record_count, span_error};
+use crate::receiver::pipeline::{ReceiveError, SpanError, log_record_count, span_error};
 
 /// What an acknowledged export did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +109,16 @@ impl ReplicatedIngest {
     /// rejection is counted by the transport, from its response;
     /// [`ReceiveError::Forwarded`] when the leader refused it, already
     /// counted there.
+    pub async fn ingest_with(
+        &self,
+        export: Export<'_>,
+        credential: Option<&str>,
+    ) -> Result<Ingested, ReceiveError> {
+        self.ingest_reported(export, credential, span_error).await
+    }
+
+    /// [`Self::ingest_with`], marking its span failed as `span_error` says
+    /// for the transport.
     // The local path's `ingest logs` span and its `commit wal` child
     // (RFC 0038 §3.5); here the commit is the group's.
     #[tracing::instrument(
@@ -122,10 +133,11 @@ impl ReplicatedIngest {
             error.type = tracing::field::Empty,
         )
     )]
-    pub async fn ingest_with(
+    async fn ingest_reported(
         &self,
         export: Export<'_>,
         credential: Option<&str>,
+        span_error: SpanError,
     ) -> Result<Ingested, ReceiveError> {
         let outcome = self.ingest_batch(export, credential).await;
         if let Err(error) = &outcome
@@ -237,5 +249,21 @@ impl ReplicatedIngest {
                 reason,
             })),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Ingest for ReplicatedIngest {
+    async fn ingest_reported(
+        &self,
+        export: Export<'_>,
+        credential: Option<&str>,
+        span_error: SpanError,
+    ) -> Result<usize, ReceiveError> {
+        let ingested = ReplicatedIngest::ingest_reported(self, export, credential, span_error);
+        Ok(match ingested.await? {
+            Ingested::Empty => 0,
+            Ingested::Committed { records, .. } => records,
+        })
     }
 }

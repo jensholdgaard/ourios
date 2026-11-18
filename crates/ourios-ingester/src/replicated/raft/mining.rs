@@ -443,6 +443,25 @@ impl GroupMiner {
         }
     }
 
+    /// The index through which every entry it followed has been mined: the
+    /// last one followed, but not a batch it still holds unmined (before its
+    /// first configuration, or while it drains what that configuration
+    /// found), nor the entry a stopped miner failed on (RFC 0065 §6.7: a
+    /// read point is served only from what is mined).
+    #[must_use]
+    pub fn mined_through(&self) -> Option<u64> {
+        let last = self.last.map(|last| last.index);
+        match &self.stage {
+            Stage::Unconfigured { first: Some(first) }
+            | Stage::Mining {
+                held: Some(Held { next: first, .. }),
+                ..
+            } => last.map(|last| last.min(first.saturating_sub(1))),
+            Stage::Stopped(_) => last.map(|last| last.saturating_sub(1)),
+            Stage::Unconfigured { first: None } | Stage::Mining { held: None, .. } => last,
+        }
+    }
+
     /// Whether a first configuration still holds batches to mine.
     #[must_use]
     pub fn holds(&self) -> bool {

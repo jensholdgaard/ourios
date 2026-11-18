@@ -83,6 +83,12 @@ object_store = { version = "=0.14.2", default-features = false }
 async-trait = "=0.1.92"
 # Structured per-connection handshake-failure logs on the TLS listeners.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# RFC 0065 §6.9: a peer call's client span hands its OpenTelemetry context
+# to the call's metadata, which needs `OpenTelemetrySpanExt::context()` — the
+# same promotion RFC 0039 §3.5 made for ourios-server, at the pin
+# ourios-telemetry's layer already uses. Tests also bridge spans onto the
+# in-memory exporter with it (RFC0038.2).
+tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 # The ingest pipeline's WAL-before-ack durability (RFC 0003 §6.5 /
 # AGENTS.md §3.4): append the OtlpBatch frame + fsync before acking.
 ourios-wal = { path = "../ourios-wal" }
@@ -239,9 +245,6 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 # RFC0038.2: the `TracerProvider::tracer` trait method + `SpanId`/`TraceId`
 # the batch-span assertions read (the crate's non-dev dep is metrics-only).
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
-# RFC0038.2: bridge the ingest path's `#[tracing::instrument]` spans onto
-# the in-memory span exporter — matches ourios-telemetry's pinned layer.
-tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 # The scoped `registry().with(layer)` subscriber the batch-span test drives
 # ingest under (`WithSubscriber`), so no process-global tracer is installed.
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }

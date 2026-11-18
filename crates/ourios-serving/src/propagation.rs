@@ -22,8 +22,8 @@
 
 use axum::http::HeaderMap;
 use opentelemetry::Context;
-use opentelemetry::propagation::Extractor;
-use tonic::metadata::{KeyRef, MetadataMap};
+use opentelemetry::propagation::{Extractor, Injector};
+use tonic::metadata::{KeyRef, MetadataKey, MetadataMap, MetadataValue};
 
 /// Reads W3C trace-context headers out of an [`axum::http::HeaderMap`].
 pub struct HeaderExtractor<'a>(pub &'a HeaderMap);
@@ -79,6 +79,36 @@ pub fn extract_context_from_metadata(metadata: &MetadataMap) -> Context {
         propagator.extract(&MetadataExtractor(metadata))
     })
 }
+
+/// Writes W3C trace-context entries into tonic gRPC [`MetadataMap`]: the
+/// carrier of an outbound call between Ourios's own nodes (RFC 0065 §6.9),
+/// read back on the far side by [`MetadataExtractor`].
+pub struct MetadataInjector<'a>(pub &'a mut MetadataMap);
+
+impl Injector for MetadataInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        // A propagator's keys and values are ASCII; one that is not is
+        // dropped, and the callee starts a trace of its own.
+        if let (Ok(key), Ok(value)) = (
+            MetadataKey::from_bytes(key.as_bytes()),
+            MetadataValue::try_from(value),
+        ) {
+            self.0.insert(key, value);
+        }
+    }
+}
+
+/// Write `context` into the outbound gRPC `metadata`, via the globally
+/// installed propagator: the counterpart of [`extract_context_from_metadata`]
+/// for a call Ourios makes. A context without a span writes nothing.
+pub fn inject_context_into_metadata(context: &Context, metadata: &mut MetadataMap) {
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(context, &mut MetadataInjector(metadata));
+    });
+}
+
+#[cfg(test)]
+mod inject_tests;
 
 #[cfg(test)]
 mod tests {

@@ -3,6 +3,7 @@
 //! becomes a rejection. "Visible" is committed and applied on every
 //! voter until the tail exists.
 
+mod durability;
 mod failover;
 mod forwarding;
 mod outage;

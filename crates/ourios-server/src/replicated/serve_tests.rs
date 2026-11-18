@@ -18,6 +18,7 @@ use tokio::net::TcpListener;
 
 use super::serve::{ReplicatedHandle, serve_replicated};
 use super::tests::receiver;
+use crate::receiver::StartError;
 
 const NAMES: [&str; 3] = ["a", "b", "c"];
 
@@ -234,7 +235,10 @@ async fn a_start_that_cannot_bind_otlp_releases_its_peer_listener() {
 
     let refusal = refused.err().expect("the gRPC address is taken");
     let taken_addr = taken.local_addr().expect("addr").to_string();
-    assert!(refusal.contains(&taken_addr), "{refusal}");
+    assert!(
+        matches!(&refusal, StartError::Failed(message) if message.contains(&taken_addr)),
+        "{refusal:?}"
+    );
     let rebound = TcpListener::bind(peer_addr)
         .await
         .expect("the peer listener is free");
@@ -379,4 +383,27 @@ fn stored_events(store: &Store) -> usize {
                 .len()
         })
         .sum()
+}
+
+/// Only a node start a shutdown interrupted, having written nothing, is a
+/// requested stop; any other failure fails the process, a stop requested
+/// meanwhile or not.
+#[test]
+fn only_an_interrupted_start_is_a_requested_stop() {
+    use ourios_ingester::replicated::node::NodeError;
+    use ourios_ingester::replicated::raft::log_ids::StartError as LockError;
+    use ourios_ingester::template_ids::TemplateIdsError;
+
+    let interrupted = NodeError::LogIds(LockError::HighWater(TemplateIdsError::Interrupted {
+        files_scanned: 0,
+    }));
+    assert!(matches!(
+        super::serve::start_failed(&interrupted),
+        StartError::Interrupted(_)
+    ));
+    let failed = NodeError::LogIds(LockError::NoConditionalUpdate);
+    assert!(matches!(
+        super::serve::start_failed(&failed),
+        StartError::Failed(_)
+    ));
 }

@@ -777,3 +777,119 @@ async fn a_store_without_conditional_updates_takes_no_lock() {
     );
     assert_eq!(stored_lock(&store).await, None, "the lock was created");
 }
+
+/// A start waiting on the lock stops once the process is asked to: its
+/// shutdown flag fails it as an interrupted scan, writing nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_start_stops_at_shutdown() {
+    let store = Store::in_memory();
+    let (down, outage) = with_outage(store.clone());
+    outage.begin();
+    let scan = ScanOptions::default();
+    let shutdown = std::sync::Arc::clone(&scan.shutdown);
+    let lock_start = LockStart {
+        store: &down,
+        node_id: A,
+        raft_state: RaftState::Empty,
+        allow_bootstrap: false,
+        scan: &scan,
+        retry: RETRY,
+    };
+    let mut waiting = |_: &Waiting| shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let stopped = tokio::time::timeout(PATIENCE, start(&lock_start, &mut waiting))
+        .await
+        .expect("the start stops at shutdown");
+
+    assert!(
+        matches!(
+            stopped,
+            Err(StartError::HighWater(TemplateIdsError::Interrupted { .. }))
+        ),
+        "{stopped:?}"
+    );
+    assert_eq!(stored_lock(&store).await, None);
+}
+
+/// A start shut down after its object is seated, with only the swap to
+/// `seeded` left, finishes that swap rather than stop: its restart would
+/// find its unseeded lock beside the object and refuse the root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_with_its_object_seated_finishes_despite_shutdown() {
+    let store = Store::in_memory();
+    let failing = faulty(store.clone(), Fault::FailFirstSwap);
+    let finished = shut_down_on_wait(&failing, A).await;
+
+    assert_eq!(
+        finished.as_ref().ok(),
+        Some(&bootstrapped(0)),
+        "{finished:?}"
+    );
+    assert_eq!(lock_of(&store).await, Some(lock(A, true, 0)));
+}
+
+/// A start shut down after a create of the lock whose reply was lost stops
+/// before its object, and its restart takes the lock it left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_shut_down_after_a_lost_create_reply_restarts() {
+    let store = Store::in_memory();
+    let lossy = faulty(store.clone(), Fault::LoseCreateReply);
+    let stopped = shut_down_on_wait(&lossy, A).await;
+    assert!(
+        matches!(
+            stopped,
+            Err(StartError::HighWater(TemplateIdsError::Interrupted { .. }))
+        ),
+        "{stopped:?}"
+    );
+    assert_eq!(high_water(&store).await, None);
+
+    let restarted = run(&store, A, RaftState::Empty).await;
+    assert_eq!(restarted.ok(), Some(bootstrapped(0)));
+}
+
+/// Start `node_id` on `store`, the process asked to stop the first time
+/// the start waits.
+async fn shut_down_on_wait(store: &Store, node_id: &str) -> Result<Started, StartError> {
+    let scan = ScanOptions::default();
+    let shutdown = std::sync::Arc::clone(&scan.shutdown);
+    let lock_start = LockStart {
+        store,
+        node_id,
+        raft_state: RaftState::Empty,
+        allow_bootstrap: false,
+        scan: &scan,
+        retry: RETRY,
+    };
+    let mut waiting = |_: &Waiting| shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(PATIENCE, start(&lock_start, &mut waiting))
+        .await
+        .expect("the start returns")
+}
+
+/// A start whose create of the lock lost the race to another start, which
+/// then stopped before seeding, stops at shutdown while it waits on that
+/// lock: its own create never landed, so it has written nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_lost_the_lock_race_stops_at_shutdown() {
+    let store = Store::in_memory();
+    let (paused_store, paused) = pausing(store.clone(), Point::CreateLock);
+    let losing = tokio::spawn(async move { shut_down_on_wait(&paused_store, A).await });
+    tokio::time::timeout(PATIENCE, paused.reached)
+        .await
+        .expect("A reached its create")
+        .expect("A's create is held");
+    put_lock(&store, &lock(B, false, 0)).await;
+    paused.release.send(()).expect("A is held");
+
+    let stopped = losing.await.expect("joined");
+
+    assert!(
+        matches!(
+            stopped,
+            Err(StartError::HighWater(TemplateIdsError::Interrupted { .. }))
+        ),
+        "{stopped:?}"
+    );
+    assert_eq!(lock_of(&store).await, Some(lock(B, false, 0)));
+}

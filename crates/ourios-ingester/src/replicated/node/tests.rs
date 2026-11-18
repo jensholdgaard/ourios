@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ourios_parquet::Store;
 
-use super::{NodeError, NodeStart, start};
+use super::{NodeError, NodeStart, preflight, start};
 use crate::replicated::layout::{LAYOUT_KEY, VotingLayout, record_or_check};
 use crate::replicated::raft::cluster::{test_timings, wal_config};
 use crate::replicated::raft::host::HostRole;
@@ -143,6 +143,56 @@ async fn a_node_holding_raft_state_starts_while_the_store_is_unreachable() {
         "{:?}",
         refused.err()
     );
+}
+
+/// The pre-flight a server runs before it binds anything applies the same
+/// rule as the start, writing nothing: a node holding Raft state passes it
+/// with the store unreachable, one holding none still fails, and a layout
+/// it can read is checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_preflight_passes_a_node_holding_raft_state_while_the_store_is_unreachable() {
+    let wal_root = tempfile::tempdir().expect("tempdir");
+    let (store, outage) = with_outage(Store::in_memory());
+    let started = n0(wal_root.path(), &store);
+    let (groups, voting) = (started.groups.clone(), started.layout.clone());
+    let fresh = tempfile::tempdir().expect("tempdir");
+    assert!(preflight(fresh.path(), || groups.clone(), &store, &voting).is_ok());
+    let node = start(started, &mut |_| {}).await.expect("started");
+    node.host.shutdown().await.expect("shutdown");
+    drop(node);
+    outage.begin();
+
+    let passed = tokio::task::block_in_place(|| {
+        preflight(wal_root.path(), || groups.clone(), &store, &voting)
+    });
+    assert!(passed.is_ok(), "{:?}", passed.err());
+    let refused =
+        tokio::task::block_in_place(|| preflight(fresh.path(), || groups.clone(), &store, &voting));
+    assert!(
+        matches!(refused, Err(NodeError::Layout(_))),
+        "{:?}",
+        refused.err()
+    );
+    outage.end();
+    let other = layout(&["n0", "n1", "n9"]);
+    let mismatched = tokio::task::block_in_place(|| {
+        preflight(wal_root.path(), || groups.clone(), &store, &other)
+    });
+    assert!(
+        matches!(mismatched, Err(NodeError::Layout(_))),
+        "{:?}",
+        mismatched.err()
+    );
+    let unlisted = tokio::task::block_in_place(|| {
+        preflight(
+            wal_root.path(),
+            || panic!("a readable layout is checked before the groups are listed"),
+            &store,
+            &other,
+        )
+    });
+    assert!(matches!(unlisted, Err(NodeError::Layout(_))));
+    assert!(fs::read_dir(fresh.path()).expect("read").next().is_none());
 }
 
 /// The outage exception covers only a layout the node cannot read: one it

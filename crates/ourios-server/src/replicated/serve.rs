@@ -10,8 +10,10 @@ use std::time::Duration;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::receiver::SharedIngest;
 use ourios_ingester::receiver::http::{HttpConfig, router};
-use ourios_ingester::replicated::node::{self, Node, NodeStart};
+use ourios_ingester::replicated::node::{self, Node, NodeError, NodeStart};
 use ourios_ingester::replicated::raft::host::GroupMined;
+use ourios_ingester::replicated::raft::log_ids::StartError as LockError;
+use ourios_ingester::template_ids::TemplateIdsError;
 use ourios_parquet::store::Caller;
 use ourios_server::config::wal::ReplicatedWal;
 use ourios_serving::tls::ALPN_GRPC;
@@ -22,8 +24,8 @@ use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
 use super::super::receiver::{
-    AUDIT_SINK_CEILING_EVENTS, ReceiverConfig, bind_listeners, build_acceptors, spawn_grpc,
-    spawn_http,
+    AUDIT_SINK_CEILING_EVENTS, ReceiverConfig, StartError, bind_listeners, build_acceptors,
+    spawn_grpc, spawn_http,
 };
 use super::{Plan, plan};
 
@@ -101,12 +103,13 @@ async fn flushed(audit: SharedParquetAuditSink) -> bool {
 ///
 /// # Errors
 ///
-/// The node did not plan, start or bind.
+/// The node did not plan, start or bind; [`StartError::Interrupted`] only
+/// when a shutdown interrupted its start, which wrote nothing.
 pub(crate) async fn serve_replicated(
     replicated: &ReplicatedWal,
     config: ReceiverConfig,
     (peer_listener, stopping): (TcpListener, Arc<AtomicBool>),
-) -> Result<ReplicatedHandle, String> {
+) -> Result<ReplicatedHandle, StartError> {
     let Plan {
         start,
         background,
@@ -127,7 +130,7 @@ pub(crate) async fn serve_replicated(
         Ok(peers) => peers,
         Err(e) => {
             joined(&stop, tasks).await;
-            return Err(stopped_with(node, e).await);
+            return Err(stopped_with(node, e).await.into());
         }
     };
     tasks.extend(node.run(&background, &stopped));
@@ -150,7 +153,7 @@ pub(crate) async fn serve_replicated(
                 node,
                 audit,
             };
-            return Err(started.abandon(e).await);
+            return Err(started.abandon(e).await.into());
         }
     };
     Ok(ReplicatedHandle {
@@ -261,7 +264,7 @@ async fn start_draining(
     start: NodeStart,
     mined: Option<mpsc::Receiver<GroupMined>>,
     (stop, stopped): (&watch::Sender<bool>, &watch::Receiver<bool>),
-) -> Result<(Node, Vec<JoinHandle<()>>), String> {
+) -> Result<(Node, Vec<JoinHandle<()>>), StartError> {
     let tasks: Vec<_> = mined
         .map(|mined| spawn_mined_drain(mined, stopped.clone()))
         .into_iter()
@@ -270,8 +273,20 @@ async fn start_draining(
         Ok(node) => Ok((node, tasks)),
         Err(e) => {
             joined(stop, tasks).await;
-            Err(e.to_string())
+            Err(start_failed(&e))
         }
+    }
+}
+
+/// A failed node start as a [`StartError`]: only a start a shutdown
+/// interrupted, having written nothing, is a requested stop.
+pub(super) fn start_failed(error: &NodeError) -> StartError {
+    let message = error.to_string();
+    match error {
+        NodeError::LogIds(LockError::HighWater(TemplateIdsError::Interrupted { .. })) => {
+            StartError::Interrupted(message)
+        }
+        _ => StartError::Failed(message),
     }
 }
 

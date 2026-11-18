@@ -866,3 +866,30 @@ async fn shut_down_on_wait(store: &Store, node_id: &str) -> Result<Started, Star
         .await
         .expect("the start returns")
 }
+
+/// A start whose create of the lock lost the race to another start, which
+/// then stopped before seeding, stops at shutdown while it waits on that
+/// lock: its own create never landed, so it has written nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_lost_the_lock_race_stops_at_shutdown() {
+    let store = Store::in_memory();
+    let (paused_store, paused) = pausing(store.clone(), Point::CreateLock);
+    let losing = tokio::spawn(async move { shut_down_on_wait(&paused_store, A).await });
+    tokio::time::timeout(PATIENCE, paused.reached)
+        .await
+        .expect("A reached its create")
+        .expect("A's create is held");
+    put_lock(&store, &lock(B, false, 0)).await;
+    paused.release.send(()).expect("A is held");
+
+    let stopped = losing.await.expect("joined");
+
+    assert!(
+        matches!(
+            stopped,
+            Err(StartError::HighWater(TemplateIdsError::Interrupted { .. }))
+        ),
+        "{stopped:?}"
+    );
+    assert_eq!(lock_of(&store).await, Some(lock(B, false, 0)));
+}

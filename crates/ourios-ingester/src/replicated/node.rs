@@ -29,6 +29,7 @@ use super::raft::host::{GroupHost, HostError, HostRole, HostSpec};
 use super::raft::log_ids::{self, LockStart, RaftState, StartError, Waiting};
 use super::raft::proposals::Proposals;
 use super::raft::reads::Reads;
+use super::raft::transport::tail::Clients;
 use super::raft::transport::{Identity, Peers};
 use super::raft::types::NodeId;
 use super::replica_id::{self, ReplicaId, ReplicaIdError};
@@ -54,6 +55,9 @@ pub struct NodeStart {
     pub scan: ScanOptions,
     /// How long a start waits before passing the bootstrap lock again.
     pub retry: Duration,
+    /// The querier identities that may read the tail, and make no other
+    /// peer call (RFC0065.13).
+    pub tail_clients: Vec<String>,
 }
 
 /// Why a node did not start.
@@ -155,6 +159,7 @@ pub async fn start(
         allow_bootstrap,
         scan,
         retry,
+        tail_clients,
     } = start;
     let Prepared {
         held: raft_state,
@@ -193,9 +198,8 @@ pub async fn start(
         peers: peers.clone(),
         timings,
     };
-    let host = GroupHost::open(spec).await.map_err(NodeError::Host)?;
-    host.server()
-        .identify_as(Identity::new(node_id.clone(), id));
+    let identity = Identity::new(node_id.clone(), id);
+    let host = open_host(spec, identity, Clients::only(tail_clients)).await?;
     let proposals = Arc::new(Proposals::new(&host));
     Ok(Node {
         id,
@@ -206,6 +210,20 @@ pub async fn start(
         voter,
         proposals,
     })
+}
+
+/// Open the groups `spec` describes, their peer listener answering as
+/// `identity` and restricting `tail_clients` to the tail calls.
+async fn open_host(
+    spec: HostSpec,
+    identity: Identity,
+    tail_clients: Clients,
+) -> Result<GroupHost, NodeError> {
+    let host = GroupHost::open(spec).await.map_err(NodeError::Host)?;
+    let server = host.server();
+    server.identify_as(identity);
+    server.admit_tail_clients(tail_clients);
+    Ok(host)
 }
 
 /// Pass the bootstrap lock, reporting each new reason it waits.

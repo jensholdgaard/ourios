@@ -35,6 +35,7 @@ mod links;
 pub mod propose;
 pub mod read_index;
 mod server;
+pub mod tail;
 mod trace;
 pub mod wire;
 
@@ -60,6 +61,8 @@ const FORWARD: &str = "/ourios.wal.v1.Replication/Forward";
 const IDENTIFY: &str = "/ourios.wal.v1.Replication/Identify";
 const PROPOSE: &str = "/ourios.wal.v1.Replication/Propose";
 const READ_INDEX: &str = "/ourios.wal.v1.Replication/ReadIndex";
+const TAIL: &str = "/ourios.wal.v1.Replication/Tail";
+const TAIL_SCAN: &str = "/ourios.wal.v1.Replication/TailScan";
 
 #[cfg(test)]
 pub(in crate::replicated) mod tests;

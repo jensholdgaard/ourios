@@ -72,7 +72,7 @@ receiver:
     }
 }
 
-fn receiver(wal_root: &Path) -> ReceiverConfig {
+pub(super) fn receiver(wal_root: &Path, store: &Store) -> ReceiverConfig {
     ReceiverConfig {
         grpc_addr: "127.0.0.1:0".parse().expect("addr"),
         grpc_tls: None,
@@ -88,7 +88,7 @@ fn receiver(wal_root: &Path) -> ReceiverConfig {
             rotation_retry_attempts: ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS,
             macos_full_fsync: false,
         },
-        store: Store::in_memory(),
+        store: store.clone(),
         promoted: PromotedAttributes::default(),
         auth: AuthResolver::static_only(None),
         graph_emitter: None,
@@ -105,7 +105,7 @@ fn plan_of(node_id: &str) -> Plan {
     let wal_root = tempfile::tempdir().expect("tempdir");
     plan(
         &replicated(node_id, dir.path()),
-        &receiver(wal_root.path()),
+        &receiver(wal_root.path(), &Store::in_memory()),
         Arc::new(AtomicBool::new(false)),
     )
     .expect("planned")

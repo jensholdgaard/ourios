@@ -179,8 +179,13 @@ fn publishing((layout, groups): (&VotingLayout, u32), config: &ReceiverConfig) -
         flush: crate::receiver::flush_config(config.max_buffer_age),
         promoted: config.promoted.clone(),
         audit_ceiling: crate::receiver::AUDIT_SINK_CEILING_EVENTS,
+        graph_emitter: config.graph_emitter.clone(),
     }
 }
 
+pub(crate) mod serve;
+
+#[cfg(test)]
+mod serve_tests;
 #[cfg(test)]
 mod tests;

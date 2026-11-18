@@ -44,6 +44,10 @@ pub struct Source {
     pub promoted: PromotedAttributes,
     /// The audit sink's soft ceiling, in events.
     pub audit_ceiling: usize,
+    /// The RFC 0047 §3.3 graph the group's published rows feed, when the
+    /// graph is configured.
+    #[cfg(feature = "openfga")]
+    pub graph_emitter: Option<std::sync::Arc<crate::graph_emitter::GraphEmitter>>,
 }
 
 /// How a tail node publishes the groups it is named flusher of.
@@ -57,6 +61,10 @@ pub struct Publishing {
     pub promoted: PromotedAttributes,
     /// The audit sink's soft ceiling, in events.
     pub audit_ceiling: usize,
+    /// The RFC 0047 §3.3 graph the groups' published rows feed, when the
+    /// graph is configured.
+    #[cfg(feature = "openfga")]
+    pub graph_emitter: Option<std::sync::Arc<crate::graph_emitter::GraphEmitter>>,
 }
 
 /// The age sweep's most: a partition flushes within its age plus this
@@ -79,6 +87,8 @@ impl Publishing {
             flush: self.flush.clone(),
             promoted: self.promoted.clone(),
             audit_ceiling: self.audit_ceiling,
+            #[cfg(feature = "openfga")]
+            graph_emitter: self.graph_emitter.clone(),
         })
     }
 
@@ -475,7 +485,15 @@ impl Flushing {
             let records =
                 ParquetRecordSink::new(store.clone(), flush).with_promoted_attributes(promoted);
             let events = SharedParquetAuditSink::new(BufferingAuditSink::new(store, audit_ceiling));
-            self.publication = Some(Arc::new(Publication::new(log, records, events)));
+            let publication = Publication::new(log, records, events);
+            // RFC 0047 §3.3: the rows a flusher publishes feed the graph, as
+            // the local receiver's do.
+            #[cfg(feature = "openfga")]
+            let publication = match &self.source.graph_emitter {
+                Some(emitter) => publication.with_graph_emitter(Arc::clone(emitter)),
+                None => publication,
+            };
+            self.publication = Some(Arc::new(publication));
         }
         self.publication.clone()
     }

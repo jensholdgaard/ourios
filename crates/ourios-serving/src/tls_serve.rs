@@ -46,6 +46,9 @@ use crate::tls::TlsSettings;
 #[derive(Clone)]
 pub struct ReloadingAcceptor {
     current: Arc<RwLock<TlsAcceptor>>,
+    /// The listener it terminates TLS for, which its handshake failures
+    /// are counted under.
+    listener: &'static str,
 }
 
 impl ReloadingAcceptor {
@@ -55,7 +58,14 @@ impl ReloadingAcceptor {
     pub fn fixed(acceptor: TlsAcceptor) -> Self {
         Self {
             current: Arc::new(RwLock::new(acceptor)),
+            listener: LISTENER_GRPC,
         }
+    }
+
+    /// The `ourios.server.listener.name` it serves.
+    #[must_use]
+    pub fn listener(&self) -> &'static str {
+        self.listener
     }
 
     fn current(&self) -> TlsAcceptor {
@@ -176,7 +186,7 @@ pub fn reloading_acceptor(
         let initial = fingerprint(settings);
         tokio::spawn(task.run(interval, initial));
     }
-    Ok(ReloadingAcceptor { current })
+    Ok(ReloadingAcceptor { current, listener })
 }
 
 /// The certificate-reload loop behind a [`ReloadingAcceptor`].
@@ -314,6 +324,8 @@ pub const LISTENER_GRPC: &str = "grpc";
 pub const LISTENER_HTTP: &str = "http";
 /// The querier HTTP listener (distinct from the receiver HTTP listener).
 pub const LISTENER_QUERIER: &str = "querier";
+/// A replicated node's peer listener (RFC 0065 §3.8).
+pub const LISTENER_REPLICATION: &str = "replication";
 /// `ourios.tls.failure` values.
 const FAILURE_HANDSHAKE: &str = "handshake";
 const FAILURE_TIMEOUT: &str = "timeout";
@@ -393,7 +405,7 @@ pub fn tls_incoming<S>(
 where
     S: Stream<Item = io::Result<TcpStream>> + Send + 'static,
 {
-    let metrics = HandshakeFailures::new(LISTENER_GRPC);
+    let metrics = HandshakeFailures::new(acceptor.listener());
     // Successful handshakes flow through this channel; the bound caps
     // in-flight completed-but-unconsumed connections.
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
@@ -528,5 +540,42 @@ impl axum::serve::Listener for TlsListener {
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
         self.inner.local_addr()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LISTENER_GRPC, LISTENER_REPLICATION, ReloadingAcceptor, reloading_acceptor};
+    use crate::tls::{ALPN_GRPC, TlsMinVersion, TlsSettings};
+
+    /// Settings for a certificate minted now, under `dir`.
+    fn settings(dir: &std::path::Path) -> TlsSettings {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mint cert");
+        let cert_file = dir.join("listener.crt");
+        let key_file = dir.join("listener.key");
+        std::fs::write(&cert_file, minted.cert.pem()).expect("cert");
+        std::fs::write(&key_file, minted.signing_key.serialize_pem()).expect("key");
+        TlsSettings {
+            cert_file,
+            key_file,
+            client_ca_file: None,
+            min_version: TlsMinVersion::V1_2,
+            reload_interval: None,
+        }
+    }
+
+    /// An acceptor keeps the listener it was made for, which its handshake
+    /// failures are counted under: a replicated node's peer listener is not
+    /// the OTLP gRPC listener.
+    #[test]
+    fn an_acceptor_names_the_listener_it_serves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers = reloading_acceptor(&settings(dir.path()), ALPN_GRPC, LISTENER_REPLICATION)
+            .expect("acceptor");
+        assert_eq!(peers.listener(), LISTENER_REPLICATION);
+
+        let tls = settings(dir.path()).acceptor(ALPN_GRPC).expect("acceptor");
+        assert_eq!(ReloadingAcceptor::fixed(tls).listener(), LISTENER_GRPC);
     }
 }

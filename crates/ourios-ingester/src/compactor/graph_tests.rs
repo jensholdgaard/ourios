@@ -26,9 +26,9 @@ use crate::graph_emitter::GraphEmitter;
 /// A fake `OpenFGA` store: `/write` applies writes/deletes (asserting the
 /// ≤ 100 chunk), `/read` answers by object.
 #[derive(Clone, Default)]
-struct Fake {
-    tuples: Arc<Mutex<Vec<TupleKey>>>,
-    writes: Arc<Mutex<Vec<usize>>>,
+pub(crate) struct Fake {
+    pub(crate) tuples: Arc<Mutex<Vec<TupleKey>>>,
+    pub(crate) writes: Arc<Mutex<Vec<usize>>>,
 }
 
 fn json(value: &serde_json::Value) -> ([(&'static str, &'static str); 1], String) {
@@ -84,7 +84,7 @@ async fn read(
     json(&json!({ "tuples": matching, "continuation_token": "" }))
 }
 
-async fn serve(fake: Fake) -> String {
+pub(crate) async fn serve(fake: Fake) -> String {
     let app = Router::new()
         .route("/stores/{store}/write", post(write))
         .route("/stores/{store}/read", post(read))
@@ -99,7 +99,7 @@ async fn serve(fake: Fake) -> String {
     url
 }
 
-fn emitter(url: &str) -> Arc<GraphEmitter> {
+pub(crate) fn emitter(url: &str) -> Arc<GraphEmitter> {
     use ourios_core::auth::openfga::{VisibilityObjectSpec, VisibilitySpec};
     let config = build_openfga_config(&OpenFgaSpec {
         api_url: Some(url.to_string()),

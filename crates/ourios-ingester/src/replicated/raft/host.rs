@@ -12,7 +12,7 @@ use std::time::Duration;
 use openraft::async_runtime::WatchReceiver as _;
 use openraft::errors::Fatal;
 use openraft::storage::RaftLogStorage as _;
-use openraft::type_config::alias::{JoinErrorOf, WatchReceiverOf};
+use openraft::type_config::alias::WatchReceiverOf;
 use openraft::{Raft, RaftMetrics};
 use ourios_wal::WalConfig;
 use tokio::sync::{mpsc, watch};
@@ -841,7 +841,7 @@ impl GroupHost {
                     host.groups.insert(group, hosted);
                 }
                 Err(e) => {
-                    // `Raft::shutdown` always returns `Ok`; the open's error is the one to report.
+                    // The open's error is the one to report.
                     let _ = host.shutdown().await;
                     return Err(e);
                 }
@@ -880,21 +880,25 @@ impl GroupHost {
     }
 
     /// Stop every group's `Raft`; their logs' writers finish what they
-    /// hold and exit.
+    /// hold and exit. A group that fails to stop does not keep the others
+    /// running.
     ///
     /// # Errors
     ///
-    /// A group's core task could not be joined.
-    pub async fn shutdown(&self) -> Result<(), JoinErrorOf<RaftTypes>> {
+    /// A group's core or tick task could not be joined.
+    pub async fn shutdown(&self) -> Result<(), openraft::errors::ShutdownError> {
+        let mut stopped = Ok(());
         for hosted in self.groups.values() {
             // First, so a miner waiting on unread output cannot hold up
             // the state machine `Raft` waits for.
             if let Some(mining) = &hosted.mining {
                 mining.stop().await;
             }
-            hosted.raft.shutdown().await?;
+            // `Raft::shutdown` discards the join's result.
+            let joined = hosted.raft.try_shutdown().await;
+            stopped = stopped.and(joined);
         }
-        Ok(())
+        stopped
     }
 }
 
@@ -1361,6 +1365,8 @@ mod tests {
             },
             promoted: ourios_parquet::PromotedAttributes::default(),
             audit_ceiling: usize::MAX,
+            #[cfg(feature = "openfga")]
+            graph_emitter: None,
         };
         let me = NodeId::from(7);
         let kept: Arc<Mutex<Kept>> = Arc::default();

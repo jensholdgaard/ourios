@@ -11,7 +11,7 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use ourios_core::record::MinedRecord;
-use ourios_parquet::{LiveSet, MANIFEST_FILENAME, Manifest, Reader, Store};
+use ourios_parquet::{LiveSet, MANIFEST_FILENAME, Manifest, Reader, Store, compacted_generation};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -265,9 +265,19 @@ fn partition_rows(store: &Store, dir: &str, names: &[&str]) -> Result<Vec<MinedR
     if manifest.is_none() && files.len() > 1 {
         return Err(format!("{dir} not compacted yet: {names:?}"));
     }
+    // As the querier resolves it: the compacted files the manifest names,
+    // whether or not the listing caught them, and the listed flush files it
+    // does not consume.
     let live = LiveSet::new(manifest.as_ref());
+    let compacted = manifest
+        .iter()
+        .flat_map(|m| m.files.iter().map(String::as_str));
+    let flush = files
+        .into_iter()
+        .copied()
+        .filter(|name| compacted_generation(name).is_none() && live.is_live(name));
     let mut rows = Vec::new();
-    for name in files.into_iter().filter(|name| live.is_live(name)) {
+    for name in compacted.chain(flush) {
         rows.extend(file_rows(store, &format!("{dir}/{name}"))?);
     }
     Ok(rows)

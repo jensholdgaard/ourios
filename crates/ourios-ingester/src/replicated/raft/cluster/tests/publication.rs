@@ -27,7 +27,7 @@ use super::mining::{commit_all, mined_rows, with_learners};
 use super::{Cluster, GROUP, name};
 use crate::record_sink::FlushConfig;
 
-const LOG: u32 = 9;
+pub(super) const LOG: u32 = 9;
 
 /// The voters of the cluster's groups, nodes 1 to 3, by name.
 fn voters() -> Vec<String> {
@@ -52,7 +52,7 @@ pub(super) fn formed_store() -> Store {
 }
 
 /// Publishing into `store`, flushing anything buffered for 50 ms.
-fn publishing(store: Store) -> Publishing {
+pub(super) fn publishing(store: Store) -> Publishing {
     Publishing {
         store,
         voters: BTreeMap::from([(GROUP, voters())]),

@@ -304,3 +304,21 @@ async fn a_denied_call_records_its_server_span() {
     );
     assert_child_of_client(&spans);
 }
+
+/// A node admits its tail's clients as its host opens and serves its tail
+/// target later: serving the target keeps the clients it admitted.
+#[tokio::test]
+async fn a_target_served_later_keeps_the_admitted_clients() {
+    for (clients, expected) in [
+        (Clients::only(["querier"]), Outcome::Denied),
+        (Clients::anyone(), Outcome::Answered(point())),
+    ] {
+        let server = ReplicationServer::<GroupSm>::default();
+        server.admit_tail_clients(clients);
+        server.serve_tail_target(Arc::new(Fake(Ok(point()))));
+        let (incoming, addr) = bind();
+        let peers = Peers::plaintext().with_addresses([("n1".to_owned(), addr.to_string())]);
+        let _serving = serve_on(server, incoming);
+        assert_eq!(peers.tail("n1", query(), PATIENCE).await, expected);
+    }
+}

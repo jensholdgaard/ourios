@@ -43,6 +43,10 @@ impl Tails {
         self.clients = clients;
     }
 
+    pub(super) fn serve(&mut self, target: Arc<dyn TailTarget>) {
+        self.target = Some(target);
+    }
+
     /// What the gate makes of a call, before anything of it is decoded
     /// (RFC0065.13): a tail call from a caller among the tail's clients
     /// goes to the target that admitted it, a tail call from any other is

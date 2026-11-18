@@ -462,6 +462,11 @@ impl Flushing {
         self.current.send_replace(None);
     }
 
+    /// Where this group publishes.
+    pub(super) fn source(&self) -> &Source {
+        &self.source
+    }
+
     /// This group's publication, built once its log id is readable.
     fn publication(&mut self) -> Option<Arc<Publication>> {
         if self.publication.is_none() {

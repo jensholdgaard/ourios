@@ -20,11 +20,13 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use super::checkpointer::Checkpointer;
-use super::flushing::{self, Current, Flushing, Need, Publishing};
+use super::flushing::{self, Current, Flushing, Need, Publishing, Source};
 use super::gate::SyncGate;
 use ourios_core::tenant::TenantId;
 
 use lookup::{Asker, Lookup};
+use tailed::FormedLog;
+pub use tailed::Tailed;
 
 use super::kept::{Bounds, Definitions, Kept, TemplateKey};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
@@ -322,6 +324,8 @@ struct Mining {
     kept: Weak<Mutex<Kept>>,
     /// Where tail reads ask the miner for template definitions.
     asker: Asker,
+    /// The group's log id, which served rows' positions carry.
+    formed: Arc<FormedLog>,
 }
 
 impl Mining {
@@ -330,6 +334,7 @@ impl Mining {
         let (asker, lookups) = lookup::channel();
         follow.lookups = Some(lookups);
         let kept = Arc::downgrade(&follow.keeping.kept);
+        let formed = Arc::new(FormedLog::new(follow.source(), follow.group));
         let followed = follow.followed.subscribe();
         let sweep = follow
             .sweep
@@ -343,21 +348,13 @@ impl Mining {
             sweep: tokio::sync::Mutex::new(sweep),
             kept,
             asker,
+            formed,
         }
     }
 
-    /// `read` of what the miner keeps, while its task runs. The reader
-    /// never holds it past the call, so only the task keeps it alive and an
-    /// ended task's output is neither served nor reported.
+    #[cfg(test)]
     fn read_kept<T>(&self, read: impl FnOnce(&Kept) -> T) -> Option<T> {
-        let kept = self.kept.upgrade()?;
-        let kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
-        // A read still running as the task ended can hold `Kept` past the
-        // end; the task's `followed` closes when it ends.
-        if self.followed.has_changed().is_err() {
-            return None;
-        }
-        Some(read(&kept))
+        tailed::read_kept(&self.kept, &self.followed, read)
     }
 
     #[cfg(test)]
@@ -611,6 +608,13 @@ impl Follow {
                 reporting.maybe(&miner, forced);
             }
         }
+    }
+
+    /// Where this group's store is, when it can be published from here.
+    fn source(&self) -> Option<Source> {
+        let flushing = self.keeping.flushing.as_ref()?;
+        let flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(flushing.source().clone())
     }
 
     /// Report how far `miner` has mined the log.
@@ -933,7 +937,7 @@ impl GroupHost {
     /// under its lock; `None` where `group` is not mined here or its
     /// miner's task has ended.
     pub fn read_kept<T>(&self, group: u32, read: impl FnOnce(&Kept) -> T) -> Option<T> {
-        self.groups.get(&group)?.mining.as_ref()?.read_kept(read)
+        self.tailed(group)?.read_kept(read)
     }
 
     /// The definitions of `wanted` for `tenant` that `group`'s tail replica
@@ -946,8 +950,22 @@ impl GroupHost {
         tenant: &TenantId,
         wanted: BTreeSet<TemplateKey>,
     ) -> Option<Definitions> {
-        let mining = self.groups.get(&group)?.mining.as_ref()?;
-        mining.asker.ask(tenant.clone(), wanted).await
+        self.tailed(group)?.definitions(tenant, wanted).await
+    }
+
+    /// `group`'s handles for tail reads; `None` where it is not mined here.
+    #[must_use]
+    pub fn tailed(&self, group: u32) -> Option<Tailed> {
+        let hosted = self.groups.get(&group)?;
+        let mining = hosted.mining.as_ref()?;
+        Some(Tailed {
+            raft: hosted.raft.clone(),
+            sm: hosted.sm.clone(),
+            mined: mining.followed.clone(),
+            kept: mining.kept.clone(),
+            asker: mining.asker.clone(),
+            formed: Arc::clone(&mining.formed),
+        })
     }
 
     #[must_use]
@@ -997,6 +1015,7 @@ impl GroupHost {
 
 mod lookup;
 mod reinstall;
+mod tailed;
 
 use reinstall::Install;
 
@@ -1007,7 +1026,6 @@ mod tests {
     use openraft::vote::leader_id_std::CommittedLeaderId;
     use ourios_wal::Control;
 
-    use super::super::flushing::Source;
     use super::super::formation::{Formation, formed_key};
     use super::super::kept::tests::{entries, mined_log};
     use super::super::mining::GroupLogRead;

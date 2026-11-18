@@ -2749,6 +2749,7 @@ name = "ourios-parquet"
 version = "0.17.0"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "async-trait",
  "bytes",

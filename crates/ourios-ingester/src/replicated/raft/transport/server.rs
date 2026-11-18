@@ -192,6 +192,14 @@ where
             .admit(clients);
     }
 
+    /// Serve the tail with `target`, to the clients already admitted.
+    pub fn serve_tail_target(&self, target: Arc<dyn TailTarget>) {
+        self.tails
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .serve(target);
+    }
+
     /// Serve the tail with `target` to `clients`, replacing any earlier one.
     pub fn serve_tails(&self, target: Arc<dyn TailTarget>, clients: Clients) {
         *self.tails.write().unwrap_or_else(PoisonError::into_inner) = Tails::new(target, clients);

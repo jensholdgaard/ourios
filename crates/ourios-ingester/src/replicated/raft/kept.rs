@@ -61,6 +61,9 @@ pub struct Kept {
     gap: Option<u64>,
     /// The last cut applied; `0` before any.
     cut: u64,
+    /// The highest index a replay has published and dropped through; rows
+    /// at or below it are in the store though no cut may have passed them.
+    replayed: u64,
     dropped: Dropped,
 }
 
@@ -81,6 +84,7 @@ impl Kept {
             row_bytes: 0,
             gap: None,
             cut: 0,
+            replayed: 0,
             dropped: Dropped::default(),
         }
     }
@@ -119,7 +123,15 @@ impl Kept {
     /// Drop everything at or below `through`, which a replay has published,
     /// and clear a gap it reaches. Unlike a checkpoint, it moves no cut.
     pub fn replayed(&mut self, through: u64) {
+        self.replayed = self.replayed.max(through);
         self.drop_through(through);
+    }
+
+    /// The highest index a replay has published and dropped through and no
+    /// applied cut has reached; `None` when every cut has.
+    #[must_use]
+    pub fn replayed_through(&self) -> Option<u64> {
+        (self.replayed > self.cut).then_some(self.replayed)
     }
 
     /// The last cut applied; `0` before any.

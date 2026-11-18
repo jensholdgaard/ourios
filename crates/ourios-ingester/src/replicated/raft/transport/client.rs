@@ -37,13 +37,14 @@ use super::forward;
 use super::identify::{self, IdentifyError, Identity};
 use super::links::{Link, Links};
 use super::propose;
+use super::read_index;
 use super::trace::{Call, Carried, Peer, StreamCall, Traced, Tracing, inject_current};
 use super::wire::{
     AppendRequest, AppendResponse, MAX_MESSAGE_BYTES, Malformed, Pieces, Recipient, Reply,
     SnapshotRequest, StreamAppendResponse, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
     append_result,
 };
-use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, STREAM_APPEND, VOTE};
+use super::{APPEND, INSTALL_SNAPSHOT, PRE_VOTE, STREAM_APPEND, VERSION, VOTE};
 
 type RpcError = RPCError<RaftTypes>;
 
@@ -173,6 +174,26 @@ impl Peers {
             commit: commit_timeout,
         };
         propose::traced_call(channel, (&addr, self.tracing.clone()), request, deadlines).await
+    }
+
+    /// Ask the node named `node_id` for `group`'s quorum-confirmed read
+    /// point (RFC 0065 §6.7), within `patience`.
+    pub async fn read_index(
+        &self,
+        node_id: &str,
+        group: u32,
+        patience: Duration,
+    ) -> read_index::Outcome {
+        let (addr, channel) = self.resolve(node_id);
+        let channel = match channel {
+            Ok(channel) => channel,
+            Err(e) => return read_index::Outcome::Unreached(e.to_string()),
+        };
+        let request = read_index::ReadIndexRequest {
+            version: VERSION,
+            group,
+        };
+        read_index::traced_call(channel, (&addr, self.tracing.clone()), request, patience).await
     }
 
     /// Ask the peer configured as `node_id` who it is (RFC 0065 §6.8),

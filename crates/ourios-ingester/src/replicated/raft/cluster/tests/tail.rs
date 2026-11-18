@@ -6,14 +6,24 @@ use std::collections::BTreeSet;
 
 use ourios_core::tenant::TenantId;
 
+use super::super::super::mining::tests::{batch_at, corpus, time};
 use super::GROUP;
+use super::mining::commit_all;
 use super::read_index::{PATIENCE, reading};
 
 /// A tail replica that has mined through the group's last entry keeps the
-/// tenant's rows, and its miner defines every template version they use.
+/// tenant's rows, and defines every template version they use: a version
+/// a later widening replaced included, which only its kept audit events
+/// still bind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tail_replica_defines_every_template_its_kept_rows_use() {
-    let (cluster, _, last) = reading().await;
+    let (cluster, leader, _) = reading().await;
+    let lines = corpus();
+    let more: Vec<_> = (11..)
+        .zip(lines[10..].chunks(5))
+        .map(|(n, chunk)| batch_at(time(n), "acme", chunk))
+        .collect();
+    let last = commit_all(&cluster, leader, &more).await;
     let tail = &cluster.node(3).host;
     let mut through = tail.mined_through(GROUP).expect("a tail replica mines");
     tokio::time::timeout(PATIENCE, through.wait_for(|mined| *mined >= Some(last)))
@@ -30,7 +40,10 @@ async fn a_tail_replica_defines_every_template_its_kept_rows_use() {
                 .collect()
         })
         .expect("a tail replica keeps");
-    assert!(!wanted.is_empty(), "rows kept");
+    let widened = wanted
+        .iter()
+        .any(|&(id, version)| wanted.contains(&(id, version + 1)));
+    assert!(widened, "rows of a template before and after a widening");
     let defined = tail
         .definitions(GROUP, &tenant, wanted.clone())
         .await

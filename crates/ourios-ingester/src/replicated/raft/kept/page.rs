@@ -106,12 +106,13 @@ impl Kept {
             .filter(|event| &event.tenant_id == tenant)
             .flat_map(bindings)
             .filter(|(key, _)| wanted.contains(key))
+            .map(|(key, template)| (key, template.to_owned()))
             .collect()
     }
 }
 
 /// The template versions `event` binds tokens to.
-fn bindings(event: &AuditEvent) -> Vec<(TemplateKey, String)> {
+fn bindings(event: &AuditEvent) -> Vec<(TemplateKey, &str)> {
     let AuditPayload::Template {
         template_id: id,
         change,
@@ -121,7 +122,7 @@ fn bindings(event: &AuditEvent) -> Vec<(TemplateKey, String)> {
         return Vec::new();
     };
     match change {
-        TemplateChange::Created { new_template } => vec![((*id, 1), new_template.clone())],
+        TemplateChange::Created { new_template } => vec![((*id, 1), new_template.as_str())],
         TemplateChange::Widened {
             old_version,
             new_version,
@@ -136,13 +137,13 @@ fn bindings(event: &AuditEvent) -> Vec<(TemplateKey, String)> {
             new_template,
             ..
         } => vec![
-            ((*id, *old_version), old_template.clone()),
-            ((*id, *new_version), new_template.clone()),
+            ((*id, *old_version), old_template.as_str()),
+            ((*id, *new_version), new_template.as_str()),
         ],
         TemplateChange::Adopted {
             template_version,
             new_template,
-        } => vec![((*id, *template_version), new_template.clone())],
+        } => vec![((*id, *template_version), new_template.as_str())],
         TemplateChange::RejectedDegenerate { .. } => Vec::new(),
     }
 }

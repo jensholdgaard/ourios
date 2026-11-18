@@ -352,6 +352,11 @@ impl Mining {
     fn read_kept<T>(&self, read: impl FnOnce(&Kept) -> T) -> Option<T> {
         let kept = self.kept.upgrade()?;
         let kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+        // A read still running as the task ended can hold `Kept` past the
+        // end; the task's `followed` closes when it ends.
+        if self.followed.has_changed().is_err() {
+            return None;
+        }
         Some(read(&kept))
     }
 
@@ -928,9 +933,10 @@ impl GroupHost {
         self.groups.get(&group)?.mining.as_ref()?.read_kept(read)
     }
 
-    /// The definitions of `wanted` that `group`'s miner holds for
-    /// `tenant`, asked of its task between steps; `None` where `group` is
-    /// not mined here or its miner has stopped.
+    /// The definitions of `wanted` for `tenant` that `group`'s tail replica
+    /// holds: its miner's, asked of its task between steps, and the older
+    /// versions its kept audit events bind. `None` where `group` is not
+    /// mined here or its miner has stopped.
     pub async fn definitions(
         &self,
         group: u32,
@@ -938,7 +944,12 @@ impl GroupHost {
         wanted: BTreeSet<TemplateKey>,
     ) -> Option<Definitions> {
         let mining = self.groups.get(&group)?.mining.as_ref()?;
-        mining.asker.ask(tenant.clone(), wanted).await
+        let older = mining.read_kept(|kept| kept.definitions(tenant, &wanted))?;
+        let mut defined = mining.asker.ask(tenant.clone(), wanted).await?;
+        for (key, template) in older {
+            defined.entry(key).or_insert(template);
+        }
+        Some(defined)
     }
 
     #[must_use]
@@ -1452,6 +1463,49 @@ mod tests {
             mining.read_kept(Kept::cut).is_none(),
             "an ended task's output"
         );
+    }
+
+    /// A read still running as the task ends holds `Kept` for its call,
+    /// so a read that reaches `Kept` through that hold after the task has
+    /// ended must still get nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_after_the_task_ends_gets_nothing_while_another_still_reads() {
+        let Following {
+            events,
+            mut handed,
+            mining,
+            kept,
+        } = following(Bounds::default(), &Meters::global());
+        drop(kept);
+        let (entered, first_in) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let mining = &mining;
+            let first = scope.spawn(move || {
+                mining.read_kept(|_| {
+                    entered.send(()).ok();
+                    released.recv().ok();
+                })
+            });
+            first_in.recv().expect("the first read holds Kept");
+            drop(events);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    while handed.recv().await.is_some() {}
+                    mining.stop().await;
+                });
+            });
+            let second = scope.spawn(move || mining.read_kept(|_| ()));
+            // Let it reach `Kept` through the first read's hold and wait.
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).ok();
+            assert_eq!(first.join().expect("joined"), Some(()));
+            assert_eq!(
+                second.join().expect("joined"),
+                None,
+                "an ended task's output"
+            );
+        });
     }
 
     /// The kept gauges read `Kept` under its lock, so a step must not hold

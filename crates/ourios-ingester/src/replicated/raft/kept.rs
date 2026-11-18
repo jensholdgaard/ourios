@@ -226,5 +226,9 @@ fn audit_bytes(event: &AuditEvent) -> usize {
     96 + triggering_line_sample.as_ref().map_or(0, String::len) + templates
 }
 
+mod page;
+
+pub use page::{Definitions, RowPage, RowScan, TemplateKey};
+
 #[cfg(test)]
 pub(super) mod tests;

@@ -14,11 +14,11 @@ use super::super::Shape;
 use super::mining::{commit_all, with_learners};
 use super::{Cluster, GROUP, name};
 
-const PATIENCE: Duration = Duration::from_secs(5);
+pub(super) const PATIENCE: Duration = Duration::from_secs(5);
 
 /// A group of three voters and two tail learners, every node answering
 /// reads; its leader and the index of the last entry it committed.
-async fn reading() -> (Cluster, usize, u64) {
+pub(super) async fn reading() -> (Cluster, usize, u64) {
     let shape = Shape::from((3, 2));
     let (cluster, _mined) = Cluster::start_mining(shape, &[GROUP], |_| Meters::global()).await;
     for i in 0..5 {

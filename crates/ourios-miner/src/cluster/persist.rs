@@ -2,7 +2,7 @@
 //! API, snapshot flattening, and validated restore. Moved verbatim
 //! from the flat `cluster.rs` (epic #745 wave 2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use ourios_core::audit::{Provenance, ProvenanceSet, SlotTypes};
 use ourios_core::tenant::TenantId;
@@ -58,6 +58,45 @@ impl MinerCluster {
                 })
                 .collect()
         })
+    }
+
+    /// The tokens this tenant's templates hold for each of `wanted`, a
+    /// `(template_id, template_version)`, read without copying the
+    /// templates not wanted: each mined leaf at its version and each
+    /// adoption at the version it binds, as their audit events record
+    /// them (RFC 0065 §6.7).
+    #[must_use]
+    pub fn template_definitions(
+        &self,
+        tenant_id: &TenantId,
+        wanted: &BTreeSet<(u64, u32)>,
+    ) -> Vec<((u64, u32), String)> {
+        let Some(state) = self.tenants.get(tenant_id) else {
+            return Vec::new();
+        };
+        let leaves = state
+            .tree
+            .collect_leaves()
+            .into_iter()
+            .filter(|leaf| wanted.contains(&(leaf.template_id, leaf.template_version)))
+            .map(|leaf| {
+                let key = (leaf.template_id, leaf.template_version);
+                (key, format_template(&leaf.template))
+            });
+        let adopted = state
+            .adopted_templates
+            .iter()
+            .filter_map(|((canonical, _, _), entry)| {
+                let key = match entry {
+                    AdoptedEntry::TreeBacked {
+                        template_id,
+                        template_version,
+                    } => (*template_id, *template_version),
+                    AdoptedEntry::Owned(owned) => (owned.template_id, 1),
+                };
+                wanted.contains(&key).then(|| (key, canonical.clone()))
+            });
+        leaves.chain(adopted).collect()
     }
 
     /// One tenant's adopted-template map (RFC 0050 §3.3), sorted by

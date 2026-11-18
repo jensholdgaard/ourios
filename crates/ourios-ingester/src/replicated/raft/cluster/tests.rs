@@ -25,6 +25,7 @@ mod propose;
 mod publication;
 mod read_index;
 mod restore;
+mod tail;
 
 const GROUP: u32 = 0;
 

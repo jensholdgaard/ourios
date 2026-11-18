@@ -21,7 +21,7 @@
 //! with the time the leader wrote into the batch being mined, so replicas
 //! stamp it alike whatever their own clocks say.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -38,6 +38,7 @@ use ourios_miner::cluster::{self, IdReservationError, IdReserver, MinerCluster, 
 use ourios_wal::{BatchTime, TenantBatch};
 use prost::Message as _;
 
+use super::kept::{Definitions, Kept, TemplateKey};
 use super::snapshot_record::{GroupMinerConfig, IdBlock};
 use super::state_machine::{Applied, AppliedEvent};
 use super::types::{Entry, GroupEntry, LogId, TimedBatch};
@@ -381,6 +382,37 @@ impl GroupMiner {
         MinerCluster::with_audit_sink(config.config(), audit)
             .with_clock(Box::new(self.clock.clone()))
             .with_id_reserver(Box::new(self.blocks.clone()))
+    }
+
+    /// The definitions of `wanted` that the miner's templates for
+    /// `tenant` hold: each mined leaf at its version, and each adoption at
+    /// the version it binds.
+    #[must_use]
+    pub fn definitions(&self, tenant: &TenantId, wanted: &BTreeSet<TemplateKey>) -> Definitions {
+        let Stage::Mining { miner, .. } = &self.stage else {
+            return Definitions::new();
+        };
+        miner
+            .template_definitions(tenant, wanted)
+            .into_iter()
+            .collect()
+    }
+
+    /// The definitions of `wanted` for `tenant` a tail replica holds as one
+    /// state: this miner's, and the older versions `kept`, the output it
+    /// kept, binds in its audit events.
+    #[must_use]
+    pub fn definitions_with(
+        &self,
+        kept: &Kept,
+        tenant: &TenantId,
+        wanted: &BTreeSet<TemplateKey>,
+    ) -> Definitions {
+        let mut defined = self.definitions(tenant, wanted);
+        for (key, template) in kept.definitions(tenant, wanted) {
+            defined.entry(key).or_insert(template);
+        }
+        defined
     }
 
     /// The id blocks applied and not yet drawn.

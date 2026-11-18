@@ -36,6 +36,7 @@ pub mod audit_writer;
 pub mod compaction;
 mod decode;
 pub mod id_max;
+pub mod ipc;
 pub mod manifest;
 mod panic_boundary;
 mod parquet_io;

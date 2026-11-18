@@ -19,6 +19,10 @@ ourios-core = { path = "../ourios-core" }
 # `parquet` carries the actual writer (`arrow` feature pulls in
 # `arrow::array::RecordBatch` integration).
 arrow-array = { version = "59", default-features = false }
+# RFC 0065 §6.7: a tail replica sends unpublished rows as an Arrow IPC
+# stream in the record schema. Already in the tree through `parquet`'s
+# `arrow` feature.
+arrow-ipc = { version = "59", default-features = false }
 arrow-schema = { version = "59", default-features = false }
 parquet = { version = "59", default-features = false, features = ["arrow", "zstd"] }
 # Object-storage backend (RFC 0013) — one trait over LocalFileSystem (dev/

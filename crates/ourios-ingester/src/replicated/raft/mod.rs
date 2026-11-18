@@ -34,6 +34,7 @@ mod reporting;
 mod restoring;
 mod snapshot_record;
 pub mod state_machine;
+pub mod tailing;
 pub(in crate::replicated) mod telemetry;
 pub mod transport;
 pub mod types;

@@ -277,7 +277,10 @@ receiver:
 # StatefulSet, rendered only with receiver.wal.backend replicated. Its
 # replicas follow every group's log, mine it, and publish it to the store
 # when named its flusher. Scaling it changes tail_peers only, never the
-# voters, so the voting-layout check is unaffected (B24). It runs the
+# voters, so the voting-layout check is unaffected (B24). It does roll the
+# voters, one at a time: they read tail_peers only at start (#1357). A write
+# quorum stays up throughout, and each restart of the current leader costs a
+# moment of retryable rejections. It runs the
 # receiver's configuration and ServiceAccount: it writes Parquet as the
 # receiver does.
 walTail:

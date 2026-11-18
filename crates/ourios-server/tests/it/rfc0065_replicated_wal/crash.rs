@@ -230,10 +230,10 @@ fn seq_of(row: &MinedRecord) -> Option<u64> {
 }
 
 /// The rows of every live file under `data/` (RFC 0009 §3.4's live set,
-/// per partition), once every partition published in more than one file
-/// has been compacted, its manifest naming its live set: a position
-/// published twice, by a flusher and by the one that took over, is in two
-/// files until compaction keeps one. Why not, before that or when a file
+/// per partition), once compaction has taken every flush file of a
+/// partition published in more than one: a position published twice, by a
+/// flusher and by the one that took over, is in two files until compaction
+/// keeps one. Why not, before that or when a file
 /// went while it was read, which a compaction's collection does.
 fn live_rows(store: &Store) -> Result<Vec<MinedRecord>, String> {
     let keys = store
@@ -262,9 +262,6 @@ fn partition_rows(store: &Store, dir: &str, names: &[&str]) -> Result<Vec<MinedR
         .iter()
         .filter(|name| name.ends_with(".parquet"))
         .collect();
-    if manifest.is_none() && files.len() > 1 {
-        return Err(format!("{dir} not compacted yet: {names:?}"));
-    }
     // As the querier resolves it: the compacted files the manifest names,
     // whether or not the listing caught them, and the listed flush files it
     // does not consume.
@@ -272,10 +269,17 @@ fn partition_rows(store: &Store, dir: &str, names: &[&str]) -> Result<Vec<MinedR
     let compacted = manifest
         .iter()
         .flat_map(|m| m.files.iter().map(String::as_str));
-    let flush = files
+    let flush: Vec<&str> = files
         .into_iter()
         .copied()
-        .filter(|name| compacted_generation(name).is_none() && live.is_live(name));
+        .filter(|name| compacted_generation(name).is_none() && live.is_live(name))
+        .collect();
+    // Settled once compaction has taken every flush file: a lone flush file
+    // can hold no position twice, but one published beside a manifest, or
+    // beside another, has not been compacted yet.
+    if flush.len() > usize::from(manifest.is_none()) {
+        return Err(format!("{dir} not compacted yet: {flush:?} uncompacted"));
+    }
     let mut rows = Vec::new();
     for name in compacted.chain(flush) {
         rows.extend(file_rows(store, &format!("{dir}/{name}"))?);

@@ -800,6 +800,17 @@ check_fails "RFC0065.17: the replicated backend needs the client CA" \
 check_fails "RFC0065.17: the replicated backend needs the querier identities" \
   "receiver.wal.replicated.tailClients" \
   "${replicated_args[@]}" --set 'receiver.wal.replicated.tailClients=null'
+tail_volume() {
+  helm template t "$CHART" --show-only templates/wal-tail-statefulset.yaml "${replicated_args[@]}" "$@" \
+    | sed -n 's/^ *storage: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p'
+}
+check "upgrade path: walTail absent renders the tail pool's defaults" \
+  "4Gi" "$(tail_volume --set walTail=null)"
+check "upgrade path: walTail.wal absent renders the tail volume's defaults" \
+  "4Gi" "$(tail_volume --set walTail.wal=null)"
+check_fails "RFC0065.17: an empty tail pool is refused" \
+  "walTail.replicas must be a positive integer" \
+  "${replicated_args[@]}" --set walTail.replicas=0
 check_fails "RFC0065.17: fewer receivers than the replication factor is refused" \
   "receiver.replicas (2) is below receiver.wal.replicated.replicationFactor (3)" \
   "${replicated_args[@]}" --set receiver.replicas=2

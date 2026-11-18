@@ -871,6 +871,10 @@ from a release without these keys rendering the local WAL.
 {{- if not $r.tailClients }}
 {{- fail "receiver.wal.backend replicated needs receiver.wal.replicated.tailClients: the queriers' client-certificate identities a tail replica serves (RFC 0065 §6.7)" }}
 {{- end }}
+{{- $tailReplicas := dig "replicas" 1 (.Values.walTail | default dict) }}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $tailReplicas))) (lt (int $tailReplicas) 1) }}
+{{- fail (printf "walTail.replicas must be a positive integer: every group needs a tail replica to mine and publish it (RFC 0065 §6.7), got %v" $tailReplicas) }}
+{{- end }}
 {{- $factor := int ($r.replicationFactor | default 3) }}
 {{- if lt (int .Values.receiver.replicas) $factor }}
 {{- fail (printf "receiver.replicas (%d) is below receiver.wal.replicated.replicationFactor (%d): every group needs that many voters" (int .Values.receiver.replicas) $factor) }}
@@ -911,7 +915,7 @@ wal:
     groups: {{ $r.groups | default 16 | quote }}
     replication_factor: {{ $r.replicationFactor | default 3 | quote }}
     peers: {{ include "ourios.walPeers" (dict "root" . "component" "receiver" "replicas" .Values.receiver.replicas) | quote }}
-    tail_peers: {{ include "ourios.walPeers" (dict "root" . "component" "wal-tail" "replicas" (dig "replicas" 1 (.Values.walTail | default dict))) | quote }}
+    tail_peers: {{ include "ourios.walPeers" (dict "root" . "component" "wal-tail" "replicas" (int (dig "replicas" 1 (.Values.walTail | default dict)))) | quote }}
     {{- with include "ourios.setValue" $r.tailReplicas }}
     tail_replicas: {{ . | quote }}
     {{- end }}

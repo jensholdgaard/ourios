@@ -1,9 +1,12 @@
 {{- /*
 The replicated WAL's tail pool (RFC 0065 §6.10): the receiver StatefulSet
 again, as `wal-tail`, with its own replicas and volumes. Rendered only with
-receiver.wal.backend replicated.
+receiver.wal.backend replicated. The defaults are merged under what is set,
+so a `helm upgrade --reuse-values` from a release without `walTail` still
+renders a complete pool.
 */}}
 {{- if and .Values.receiver.enabled (include "ourios.replicatedWal" .) }}
-{{- $tail := .Values.walTail | default dict }}
-{{ include "ourios.walStatefulSet" (dict "root" . "component" "wal-tail" "replicas" ($tail.replicas | default 1) "values" $tail) }}
+{{- $defaults := dict "replicas" 1 "wal" (dict "size" "4Gi" "storageClassName" "" "accessModes" (list "ReadWriteOnce")) }}
+{{- $tail := merge (deepCopy (.Values.walTail | default dict)) $defaults }}
+{{ include "ourios.walStatefulSet" (dict "root" . "component" "wal-tail" "replicas" (int $tail.replicas) "values" $tail) }}
 {{- end }}

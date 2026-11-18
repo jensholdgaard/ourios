@@ -414,10 +414,10 @@ cleanly:
 | Role      | S3 actions (keys under `storage.s3.prefix`)                                                                 | Holds delete? |
 | --------- | ----------------------------------------------------------------------------------------------------------- | ------------- |
 | querier   | `GetObject` on `data/*`, `audit/*`; `ListBucket` for `data/*`, `audit/*` (see cache note)                    | no            |
-| receiver  | `PutObject` on `data/*`, `audit/*`, `miner/*`; `GetObject` on `miner/*`; `ListBucket` for `miner/*`; for a bootstrap only, `ListBucket` and reads on `data/` and `audit/` (see below) | no |
+| receiver  | `PutObject` on `data/*`, `audit/*`, `miner/*`; `GetObject` on `miner/*`; `ListBucket` for `miner/*`; for a bootstrap only, `ListBucket` and reads on `data/` and `audit/` (see below); with the replicated WAL, `GetObject` and `PutObject` on `wal/*` and `DeleteObject` on `wal/log_ids.json` only (see below) | `wal/log_ids.json` only, replicated WAL |
 | compactor | `GetObject`, `PutObject`, `DeleteObject` on `data/*`, `erasure/*`, `backfill/*`; `PutObject` on `audit/*`; `ListBucket` for `data/*`, `erasure/*`, `backfill/*` | **only one** |
 
-Every key lives under one of five top-level prefixes, each written by one
+Every key lives under one of six top-level prefixes, each written by one
 role:
 
 - `data/`: record files and partition manifests. The receiver writes new
@@ -427,6 +427,12 @@ role:
   the erasure events. The querier's template-map cache sits here too.
 - `miner/`: the template-id high-water (RFC 0059). Only the receiver writes it,
   and **nothing may delete it**.
+- `wal/`: the replicated WAL's records (RFC 0065), present only with
+  `receiver.wal.backend: replicated`: the voting layout
+  (`wal/replicated/cluster.json`), each group's formation record, checkpoint
+  bundles and pointer (`wal/replicated/groups/*`, `wal/replicated/logs/*`),
+  and the log-id lock `wal/log_ids.json`. The voters and the tail pool write
+  them, all under the receiver's ServiceAccount.
 - `erasure/` and `backfill/`: the RFC 0048 erasure markers and backfill locks.
   The compactor's sweep advances and removes them; the `graph erase` and
   `graph backfill` verbs create them, so run those with the compactor's
@@ -546,6 +552,26 @@ And its steady-state policy, once the high-water exists:
       "Resource": "arn:aws:s3:::<bucket>/<prefix>/miner/*"
     }
   ]
+}
+```
+
+**With the replicated WAL** (`receiver.wal.backend: replicated`), grant the
+receiver these as well, **before** the first start, since the voters
+record the layout and their groups' formation as they form. The tail pool
+runs under the same ServiceAccount, and its flusher writes the checkpoints.
+Conditional puts need only `PutObject`. The one delete is of the log-id
+lock a start created over another start's object, and only that key:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject", "s3:PutObject"],
+  "Resource": "arn:aws:s3:::<bucket>/<prefix>/wal/*"
+},
+{
+  "Effect": "Allow",
+  "Action": "s3:DeleteObject",
+  "Resource": "arn:aws:s3:::<bucket>/<prefix>/wal/log_ids.json"
 }
 ```
 

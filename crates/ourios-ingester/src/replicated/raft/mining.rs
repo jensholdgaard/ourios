@@ -38,7 +38,7 @@ use ourios_miner::cluster::{self, IdReservationError, IdReserver, MinerCluster, 
 use ourios_wal::{BatchTime, TenantBatch};
 use prost::Message as _;
 
-use super::kept::{Definitions, TemplateKey};
+use super::kept::{Definitions, Kept, TemplateKey};
 use super::snapshot_record::{GroupMinerConfig, IdBlock};
 use super::state_machine::{Applied, AppliedEvent};
 use super::types::{Entry, GroupEntry, LogId, TimedBatch};
@@ -396,6 +396,23 @@ impl GroupMiner {
             .template_definitions(tenant, wanted)
             .into_iter()
             .collect()
+    }
+
+    /// The definitions of `wanted` for `tenant` a tail replica holds as one
+    /// state: this miner's, and the older versions `kept`, the output it
+    /// kept, binds in its audit events.
+    #[must_use]
+    pub fn definitions_with(
+        &self,
+        kept: &Kept,
+        tenant: &TenantId,
+        wanted: &BTreeSet<TemplateKey>,
+    ) -> Definitions {
+        let mut defined = self.definitions(tenant, wanted);
+        for (key, template) in kept.definitions(tenant, wanted) {
+            defined.entry(key).or_insert(template);
+        }
+        defined
     }
 
     /// The id blocks applied and not yet drawn.

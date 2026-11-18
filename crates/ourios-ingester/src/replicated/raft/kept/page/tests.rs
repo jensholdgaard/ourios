@@ -252,3 +252,45 @@ fn kept_and_mined_definitions_cover_every_kept_row_as_recorded() {
     }
     assert!(from_kept > 0, "some version only the kept events define");
 }
+
+/// RFC 0065 §6.7: once a checkpoint has dropped a template's creation
+/// event, kept rows may still use its first version after the miner has
+/// widened it; one lookup of the replica's state, the miner's and what it
+/// keeps together, still defines that version from the widening's event.
+#[test]
+fn a_version_widened_after_its_creation_was_checkpointed_is_still_defined() {
+    let entries = entries(40);
+    let tenant = acme();
+    let (_, _, log) = mined(&entries, 0);
+    let recorded = recorded(&log, &tenant);
+    let mut covered = 0;
+    for cut in 0..=log.last().map_or(0, |(index, _)| *index) {
+        let (kept, miner, _) = mined(&entries, cut);
+        let wanted: BTreeSet<TemplateKey> = kept
+            .rows()
+            .filter(|row| row.record.tenant_id == tenant)
+            .map(|row| (row.record.template_id, row.record.template_version))
+            .collect();
+        let replaced: BTreeSet<TemplateKey> = wanted
+            .iter()
+            .copied()
+            .filter(|key| {
+                !miner
+                    .definitions(&tenant, &BTreeSet::from([*key]))
+                    .contains_key(key)
+            })
+            .collect();
+        if replaced.is_empty() {
+            continue;
+        }
+        covered += 1;
+        let defined = miner.definitions_with(&kept, &tenant, &wanted);
+        for key in &wanted {
+            assert_eq!(defined.get(key), recorded.get(key), "cut {cut}, {key:?}");
+        }
+    }
+    assert!(
+        covered > 0,
+        "a cut where a kept row uses a replaced version"
+    );
+}

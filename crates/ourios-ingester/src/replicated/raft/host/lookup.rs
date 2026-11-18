@@ -1,14 +1,17 @@
 //! A reader's question to a tail replica's miner (RFC 0065 §6.7): the
 //! definitions of the templates the rows it serves reference. The miner
-//! belongs to the group's task, which answers between steps, so an answer
-//! is the miner's state after some whole step, never part of one.
+//! and what it keeps belong to the group's task, which answers between
+//! steps from both at once, so an answer is the replica's state after
+//! some whole step, never part of one, and a widening cannot fall between
+//! reading one source and the other.
 
 use std::collections::BTreeSet;
+use std::sync::{Mutex, PoisonError};
 
 use ourios_core::tenant::TenantId;
 use tokio::sync::{mpsc, oneshot};
 
-use super::super::kept::{Definitions, TemplateKey};
+use super::super::kept::{Definitions, Kept, TemplateKey};
 use super::super::mining::GroupMiner;
 
 /// Questions a group's task holds before a reader waits to ask.
@@ -22,12 +25,12 @@ pub(super) struct Lookup {
 }
 
 impl Lookup {
-    /// Answer from `miner`.
-    pub(super) fn answer(self, miner: &GroupMiner) {
+    /// Answer from `miner` and what it `kept`.
+    pub(super) fn answer(self, miner: &GroupMiner, kept: &Mutex<Kept>) {
+        let kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let defined = miner.definitions_with(&kept, &self.tenant, &self.wanted);
         // A reader that gave up has dropped its end: there is no one to tell.
-        self.answer
-            .send(miner.definitions(&self.tenant, &self.wanted))
-            .ok();
+        self.answer.send(defined).ok();
     }
 }
 

@@ -631,12 +631,15 @@ impl Follow {
             (Work::Barrier, Some(checkpointer)) => self.checkpoint(checkpointer, miner).await,
             // Off the runtime's workers, as a step is: an answer formats
             // templates.
-            (Work::Lookup(lookup), _) => tokio::task::spawn_blocking(move || {
-                lookup.answer(&miner);
-                miner
-            })
-            .await
-            .ok(),
+            (Work::Lookup(lookup), _) => {
+                let kept = Arc::clone(&self.keeping.kept);
+                tokio::task::spawn_blocking(move || {
+                    lookup.answer(&miner, &kept);
+                    miner
+                })
+                .await
+                .ok()
+            }
             (Work::Barrier | Work::Report, _) => Some(miner),
         }
     }
@@ -934,8 +937,8 @@ impl GroupHost {
     }
 
     /// The definitions of `wanted` for `tenant` that `group`'s tail replica
-    /// holds: its miner's, asked of its task between steps, and the older
-    /// versions its kept audit events bind. `None` where `group` is not
+    /// holds: its miner's and the older versions its kept audit events
+    /// bind, both read by its task in one step. `None` where `group` is not
     /// mined here or its miner has stopped.
     pub async fn definitions(
         &self,
@@ -944,12 +947,7 @@ impl GroupHost {
         wanted: BTreeSet<TemplateKey>,
     ) -> Option<Definitions> {
         let mining = self.groups.get(&group)?.mining.as_ref()?;
-        let older = mining.read_kept(|kept| kept.definitions(tenant, &wanted))?;
-        let mut defined = mining.asker.ask(tenant.clone(), wanted).await?;
-        for (key, template) in older {
-            defined.entry(key).or_insert(template);
-        }
-        Some(defined)
+        mining.asker.ask(tenant.clone(), wanted).await
     }
 
     #[must_use]

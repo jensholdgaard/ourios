@@ -240,40 +240,42 @@ fn live_rows(store: &Store) -> Result<Vec<MinedRecord>, String> {
         .list_blocking(Some("data/"))
         .map_err(|e| e.to_string())?;
     let mut partitions: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for key in &keys {
-        if let Some((dir, name)) = key.rsplit_once('/') {
-            partitions.entry(dir).or_default().push(name);
-        }
+    for (dir, name) in keys.iter().filter_map(|key| key.rsplit_once('/')) {
+        partitions.entry(dir).or_default().push(name);
     }
     if partitions.is_empty() {
         return Err("nothing published under data/ yet".to_owned());
     }
     let mut rows = Vec::new();
     for (dir, names) in partitions {
-        let manifest = Manifest::read_with_etag(store, &format!("{dir}/{MANIFEST_FILENAME}"))
-            .map_err(|e| e.to_string())?
-            .map(|(manifest, _)| manifest);
-        let files = names
-            .iter()
-            .filter(|name| name.ends_with(".parquet"))
-            .count();
-        if manifest.is_none() && files > 1 {
-            return Err(format!("{dir} not compacted yet: {names:?}"));
-        }
-        let live = LiveSet::new(manifest.as_ref());
-        for name in names {
-            if name.ends_with(".parquet") && live.is_live(name) {
-                let read = || -> Result<Vec<MinedRecord>, String> {
-                    let bytes = store
-                        .get_blocking(&format!("{dir}/{name}"))
-                        .map_err(|e| e.to_string())?;
-                    Reader::open_bytes(bytes.into())
-                        .and_then(Reader::read_all)
-                        .map_err(|e| e.to_string())
-                };
-                rows.extend(read()?);
-            }
-        }
+        rows.extend(partition_rows(store, dir, &names)?);
     }
     Ok(rows)
+}
+
+/// The rows of partition `dir`'s live files among `names`.
+fn partition_rows(store: &Store, dir: &str, names: &[&str]) -> Result<Vec<MinedRecord>, String> {
+    let manifest = Manifest::read_with_etag(store, &format!("{dir}/{MANIFEST_FILENAME}"))
+        .map_err(|e| e.to_string())?
+        .map(|(manifest, _)| manifest);
+    let files: Vec<_> = names
+        .iter()
+        .filter(|name| name.ends_with(".parquet"))
+        .collect();
+    if manifest.is_none() && files.len() > 1 {
+        return Err(format!("{dir} not compacted yet: {names:?}"));
+    }
+    let live = LiveSet::new(manifest.as_ref());
+    let mut rows = Vec::new();
+    for name in files.into_iter().filter(|name| live.is_live(name)) {
+        rows.extend(file_rows(store, &format!("{dir}/{name}"))?);
+    }
+    Ok(rows)
+}
+
+fn file_rows(store: &Store, key: &str) -> Result<Vec<MinedRecord>, String> {
+    let bytes = store.get_blocking(key).map_err(|e| e.to_string())?;
+    Reader::open_bytes(bytes.into())
+        .and_then(Reader::read_all)
+        .map_err(|e| e.to_string())
 }

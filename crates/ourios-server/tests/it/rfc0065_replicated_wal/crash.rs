@@ -15,7 +15,7 @@ use ourios_parquet::{LiveSet, MANIFEST_FILENAME, Manifest, Reader, Store, compac
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use super::served::{SEQ, numbered};
+use super::served::{SEQ, TENANT, numbered};
 
 /// Exports sent at once, so a kill lands mid-batch.
 const SENDERS: usize = 4;
@@ -174,28 +174,43 @@ impl Send {
 }
 
 /// Wait until the live rows on `store` hold every `acked` record and no
-/// `(tenant, ingest position)` twice, failing after `patience` with what
-/// was missing or doubled.
+/// `(tenant, ingest position)` twice, on two reads a compaction cycle apart
+/// that found the same live files, failing after `patience` with what was
+/// missing or doubled.
 pub(super) async fn published(store: &Store, acked: &BTreeSet<u64>, patience: Duration) {
     let deadline = tokio::time::Instant::now() + patience;
+    let mut confirming: Option<Vec<String>> = None;
     let mut last = String::new();
     while tokio::time::Instant::now() < deadline {
         let store = store.clone();
-        let rows = tokio::task::spawn_blocking(move || live_rows(&store))
+        let live = tokio::task::spawn_blocking(move || live_rows(&store))
             .await
             .expect("read");
-        last = match rows.and_then(|rows| settled(&rows, acked)) {
-            Ok(()) => return,
-            Err(why) => why,
-        };
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        match live.and_then(|live| settled(&live, acked).map(|()| live.into_keys().collect())) {
+            Ok(files) if confirming.as_ref() == Some(&files) => return,
+            Ok(files) => {
+                confirming = Some(files);
+                "settled once, its live files not confirmed".clone_into(&mut last);
+            }
+            Err(why) => {
+                confirming = None;
+                last = why;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
     panic!("the acknowledged records did not settle in Parquet: {last}");
 }
 
-/// Whether `rows` hold every `acked` record, each position once.
-fn settled(rows: &[MinedRecord], acked: &BTreeSet<u64>) -> Result<(), String> {
-    let stored: BTreeSet<u64> = rows.iter().filter_map(seq_of).collect();
+/// Whether the `live` files' rows hold every record [`TENANT`] was
+/// acknowledged for, each position once.
+fn settled(live: &BTreeMap<String, Vec<MinedRecord>>, acked: &BTreeSet<u64>) -> Result<(), String> {
+    let rows: Vec<&MinedRecord> = live.values().flatten().collect();
+    let stored: BTreeSet<u64> = rows
+        .iter()
+        .filter(|row| row.tenant_id.as_str() == TENANT)
+        .filter_map(|row| seq_of(row))
+        .collect();
     let missing: Vec<_> = acked.difference(&stored).take(10).collect();
     if !missing.is_empty() {
         return Err(format!(
@@ -233,9 +248,9 @@ fn seq_of(row: &MinedRecord) -> Option<u64> {
 /// per partition), once compaction has taken every flush file of a
 /// partition published in more than one: a position published twice, by a
 /// flusher and by the one that took over, is in two files until compaction
-/// keeps one. Why not, before that or when a file
+/// keeps one. Keyed by each file's key. Why not, before that or when a file
 /// went while it was read, which a compaction's collection does.
-fn live_rows(store: &Store) -> Result<Vec<MinedRecord>, String> {
+fn live_rows(store: &Store) -> Result<BTreeMap<String, Vec<MinedRecord>>, String> {
     let keys = store
         .list_blocking(Some("data/"))
         .map_err(|e| e.to_string())?;
@@ -246,15 +261,19 @@ fn live_rows(store: &Store) -> Result<Vec<MinedRecord>, String> {
     if partitions.is_empty() {
         return Err("nothing published under data/ yet".to_owned());
     }
-    let mut rows = Vec::new();
+    let mut live = BTreeMap::new();
     for (dir, names) in partitions {
-        rows.extend(partition_rows(store, dir, &names)?);
+        live.extend(partition_rows(store, dir, &names)?);
     }
-    Ok(rows)
+    Ok(live)
 }
 
 /// The rows of partition `dir`'s live files among `names`.
-fn partition_rows(store: &Store, dir: &str, names: &[&str]) -> Result<Vec<MinedRecord>, String> {
+fn partition_rows(
+    store: &Store,
+    dir: &str,
+    names: &[&str],
+) -> Result<BTreeMap<String, Vec<MinedRecord>>, String> {
     let manifest = Manifest::read_with_etag(store, &format!("{dir}/{MANIFEST_FILENAME}"))
         .map_err(|e| e.to_string())?
         .map(|(manifest, _)| manifest);
@@ -280,11 +299,13 @@ fn partition_rows(store: &Store, dir: &str, names: &[&str]) -> Result<Vec<MinedR
     if flush.len() > usize::from(manifest.is_none()) {
         return Err(format!("{dir} not compacted yet: {flush:?} uncompacted"));
     }
-    let mut rows = Vec::new();
+    let mut live = BTreeMap::new();
     for name in compacted.chain(flush) {
-        rows.extend(file_rows(store, &format!("{dir}/{name}"))?);
+        let key = format!("{dir}/{name}");
+        let rows = file_rows(store, &key)?;
+        live.insert(key, rows);
     }
-    Ok(rows)
+    Ok(live)
 }
 
 fn file_rows(store: &Store, key: &str) -> Result<Vec<MinedRecord>, String> {

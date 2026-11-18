@@ -12,6 +12,9 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 
+/// The tenant every [`numbered`] record is exported under.
+pub(super) const TENANT: &str = "acme";
+
 /// The attribute naming each [`numbered`] record.
 pub(super) const SEQ: &str = "seq";
 
@@ -24,7 +27,8 @@ pub(super) struct Server {
 }
 
 impl Server {
-    /// SIGKILL it: nothing it holds unsynced survives.
+    /// SIGKILL it: a process crash, its shutdown never run. What it wrote
+    /// to the page cache survives, so this is not a lost-fsync crash.
     pub(super) async fn kill(mut self) {
         self.child.start_kill().expect("SIGKILL");
         let _ = self.child.wait().await;
@@ -190,7 +194,7 @@ pub(super) async fn exported(grpc: SocketAddr) -> bool {
     false
 }
 
-/// An export of one record of tenant `acme` at `time_unix_nano`, its
+/// An export of one record of [`TENANT`] at `time_unix_nano`, its
 /// `seq` attribute `seq`.
 pub(super) fn numbered(seq: u64, time_unix_nano: u64) -> tonic::Request<ExportLogsServiceRequest> {
     let text = |s: String| {
@@ -219,6 +223,6 @@ pub(super) fn numbered(seq: u64, time_unix_nano: u64) -> tonic::Request<ExportLo
     });
     request
         .metadata_mut()
-        .insert("x-ourios-tenant", "acme".parse().expect("ascii"));
+        .insert("x-ourios-tenant", TENANT.parse().expect("ascii"));
     request
 }

@@ -349,6 +349,12 @@ type BoxedLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry
 ///   the telemetry from the pinned registry (the live-check gate) while adding
 ///   no Ourios-level signal — Ourios's own `execute_tool` span (target
 ///   `ourios_server::mcp`, untouched by this directive) is the signal.
+///   `openraft` (the replicated WAL's Raft, RFC 0065) is the same case at
+///   volume: its events are named after their source files, a build path,
+///   and made up nearly all of a replicated node's log records. The
+///   replicated WAL's registered `ourios.wal.replication.*` metrics and
+///   events are the signal; openraft's own output still reaches stderr
+///   under `RUST_LOG`.
 ///
 /// The `off` directives win over `RUST_LOG`. Shared by the logs appender bridge
 /// and the traces layer. Directives are compile-time constants; an unparsable
@@ -365,6 +371,7 @@ fn guarded_env_filter() -> EnvFilter {
         "opentelemetry_sdk=off",
         "opentelemetry_otlp=off",
         "rmcp=off",
+        "openraft=off",
     ] {
         if let Ok(directive) = directive.parse() {
             filter = filter.add_directive(directive);
@@ -1339,6 +1346,46 @@ mod tests {
         assert_eq!(
             resource.get(&"service.name".into()),
             Some(opentelemetry::Value::from("ourios-test")),
+        );
+    }
+
+    /// The exported log stream carries Ourios's own events, not the internal
+    /// `tracing` of the libraries the guarded filter mutes: openraft's are
+    /// named after their source paths and carry no registered fields.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_guarded_filter_keeps_library_internals_out_of_exported_logs() {
+        use opentelemetry_sdk::logs::InMemoryLogExporter;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = InMemoryLogExporter::default();
+        let logger = SdkLoggerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .with_resource(resource("ourios-test", DEFAULT_SERVICE_VERSION))
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(OpenTelemetryTracingBridge::new(&logger).with_filter(guarded_env_filter()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "openraft::replication", "replication internals");
+            tracing::info!(target: "openraft::core::raft_core", "raft core internals");
+            tracing::info!(target: "rmcp::service", "mcp session internals");
+            tracing::warn!(target: "ourios_ingester::replicated", "ourios event");
+        });
+        logger.force_flush().expect("force_flush succeeds");
+
+        let bodies: Vec<String> = exporter
+            .get_emitted_logs()
+            .expect("logs exported")
+            .iter()
+            .filter_map(|log| log.record.body().map(|b| format!("{b:?}")))
+            .collect();
+        assert!(
+            bodies.iter().any(|b| b.contains("ourios event")),
+            "Ourios's own event is exported: {bodies:?}"
+        );
+        assert!(
+            !bodies.iter().any(|b| b.contains("internals")),
+            "no muted library's event is exported: {bodies:?}"
         );
     }
 

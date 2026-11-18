@@ -21,8 +21,9 @@ use super::super::super::mining::Mined;
 use super::super::super::mining::tests::{batch_at, block, corpus, time};
 use super::super::super::proposals::Proposals;
 use super::super::super::telemetry::Meters;
-use super::super::super::types::{GroupEntry, NodeId};
+use super::super::super::types::GroupEntry;
 use super::super::Shape;
+use super::super::cluster_node;
 use super::mining::{commit_all, mined_rows, with_learners};
 use super::{Cluster, GROUP, name};
 use crate::record_sink::FlushConfig;
@@ -31,7 +32,7 @@ pub(super) const LOG: u32 = 9;
 
 /// The voters of the cluster's groups, nodes 1 to 3, by name.
 fn voters() -> Vec<String> {
-    (1..=3).map(|n| name(NodeId::from(n))).collect()
+    (1..=3).map(|n| name(cluster_node(n))).collect()
 }
 
 /// A store holding `GROUP`'s `formed.json` with log id [`LOG`].
@@ -41,7 +42,7 @@ pub(super) fn formed_store() -> Store {
     let names: Vec<&str> = voters.iter().map(String::as_str).collect();
     let members = (1..)
         .zip(&voters)
-        .map(|(n, voter)| (voter.clone(), NodeId::from(n)))
+        .map(|(n, voter)| (voter.clone(), cluster_node(n)))
         .collect();
     let formation = Formation::new(GROUP, LOG, members, &names).expect("formation");
     let bytes = formation.encode().expect("encode");

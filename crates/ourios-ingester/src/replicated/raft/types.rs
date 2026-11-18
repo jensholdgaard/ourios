@@ -42,6 +42,16 @@ impl From<u64> for NodeId {
     }
 }
 
+impl NodeId {
+    /// Node `n` of the in-process cluster `cluster`: ids no other cluster
+    /// uses, so a call another test process's cluster still sends to a
+    /// port this one now holds names a node it does not have.
+    #[cfg(test)]
+    pub(crate) fn in_cluster(cluster: u64, n: u64) -> Self {
+        Self(Uuid::from_u64_pair(cluster, n))
+    }
+}
+
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.hyphenated().fmt(f)

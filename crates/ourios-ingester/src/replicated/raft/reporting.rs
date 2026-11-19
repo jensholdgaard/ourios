@@ -23,6 +23,21 @@ struct Seen {
     cut: Option<LogId>,
     block: Option<IdBlock>,
     leadership: Option<(Option<NodeId>, u64)>,
+    /// The index of the assignment naming this replica, so one that names
+    /// it again after another replica (A, B, A) is a change, though it is
+    /// named at every check (#1333).
+    assigned: Option<u64>,
+}
+
+/// What [`Reporting::maybe`] observes of the replica as it decides.
+#[derive(Debug, Clone, Copy)]
+struct Observed {
+    seen: Seen,
+    proposer: NodeId,
+    /// The last entry its miner followed.
+    followed: Option<LogId>,
+    /// The id blocks it holds and has not started.
+    unstarted: u32,
 }
 
 /// One group's reports from its flusher.
@@ -64,26 +79,41 @@ impl Reporting {
         }
         let followed = miner.followed();
         let reported = self.sent.and_then(|sent| sent.cut);
-        let seen = Seen {
-            cut: visible_cut(self.proposing.applied_cut(), followed, reported),
-            block: miner.blocks().current(),
-            leadership: self.proposing.leadership(),
-        };
-        let Some(followed) = followed.filter(|_| due(self.sent, seen, forced)) else {
-            return;
-        };
-        let report = Report {
+        let observed = Observed {
+            seen: Seen {
+                cut: visible_cut(self.proposing.applied_cut(), followed, reported),
+                block: miner.blocks().current(),
+                leadership: self.proposing.leadership(),
+                assigned: self.proposing.assigned_at(),
+            },
             proposer: self.proposing.replica(),
-            mined: Some(followed),
+            followed,
             unstarted: u32::try_from(miner.blocks().remaining()).unwrap_or(u32::MAX),
-            checkpoint: None,
+        };
+        let Some(report) = to_send(self.sent, observed, forced) else {
+            return;
         };
         let proposing = self.proposing.clone();
         self.running = Some(tokio::spawn(async move {
             proposing.report_only(&report).await;
         }));
-        self.sent = Some(seen);
+        self.sent = Some(observed.seen);
     }
+}
+
+/// The report `observed` calls for, given what the last one `sent` saw:
+/// none until the miner has followed an entry, and otherwise one when
+/// [`due`] says so.
+fn to_send(sent: Option<Seen>, observed: Observed, forced: bool) -> Option<Report> {
+    let followed = observed
+        .followed
+        .filter(|_| due(sent, observed.seen, forced))?;
+    Some(Report {
+        proposer: observed.proposer,
+        mined: Some(followed),
+        unstarted: observed.unstarted,
+        checkpoint: None,
+    })
 }
 
 /// The applied cut a report can stand on: `applied` once the miner has
@@ -126,7 +156,77 @@ mod tests {
             cut: Some(id(cut)),
             block: None,
             leadership: None,
+            assigned: Some(1),
         }
+    }
+
+    fn observed(seen: Seen) -> Observed {
+        Observed {
+            seen,
+            proposer: NodeId::from(3),
+            followed: Some(id(20)),
+            unstarted: 2,
+        }
+    }
+
+    fn report(unstarted: u32) -> Report {
+        Report {
+            proposer: NodeId::from(3),
+            mined: Some(id(20)),
+            unstarted,
+            checkpoint: None,
+        }
+    }
+
+    /// RFC 0065 §6.8, #1333: a new allocator block, a new leader or term,
+    /// and an assignment naming this replica again after another each send
+    /// a report at once, carrying what it has mined and the blocks it holds
+    /// unstarted; with nothing changed, none goes until the tick.
+    #[test]
+    fn each_trigger_sends_a_report_before_the_tick() {
+        let before = seen(5);
+        let block = Seen {
+            block: IdBlock::new(100, 199),
+            ..before
+        };
+        let leader = Seen {
+            leadership: Some((Some(NodeId::from(2)), 7)),
+            ..before
+        };
+        let again = Seen {
+            assigned: Some(9),
+            ..before
+        };
+        for (trigger, now) in [
+            ("a new block", block),
+            ("a new leader", leader),
+            ("named again", again),
+        ] {
+            assert_eq!(
+                to_send(Some(before), observed(now), false),
+                Some(report(2)),
+                "{trigger}"
+            );
+        }
+        assert_eq!(
+            to_send(Some(before), observed(before), false),
+            None,
+            "nothing changed"
+        );
+        assert_eq!(
+            to_send(Some(before), observed(before), true),
+            Some(report(2)),
+            "the tick"
+        );
+        let unmined = Observed {
+            followed: None,
+            ..observed(block)
+        };
+        assert_eq!(
+            to_send(Some(before), unmined, false),
+            None,
+            "nothing mined yet"
+        );
     }
 
     /// RFC 0065 §6.8: a checkpoint the state machine applied ahead of the

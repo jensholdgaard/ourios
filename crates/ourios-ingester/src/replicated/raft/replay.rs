@@ -103,13 +103,29 @@ impl<L: GroupLogRead> Replayed<L> {
             .map_or(self.next, |held| held.min(self.next))
     }
 
-    /// The next entry the state machine turns into an event, mined.
-    fn step(&mut self) -> Option<Result<(u64, Mined), ReplayError>> {
+    /// As [`Iterator::next`], reading at most `reads` more of the log,
+    /// what it reads taken from `reads`; `None` once they are spent or the
+    /// replay is done ([`Self::done`] tells which). A run of entries that
+    /// mine nothing, such as blanks and membership changes, then costs a
+    /// caller its budget rather than a step of any length (#1310).
+    pub fn next_within(&mut self, reads: &mut usize) -> Option<Result<(u64, Mined), ReplayError>> {
+        if self.failed {
+            return None;
+        }
+        let item = self.step(reads);
+        self.failed = matches!(item, Some(Err(_)));
+        item
+    }
+
+    /// The next entry the state machine turns into an event, mined,
+    /// reading at most `reads` entries of the log.
+    fn step(&mut self, reads: &mut usize) -> Option<Result<(u64, Mined), ReplayError>> {
         if let Some(held) = self.miner.next_held() {
             let index = self.followed;
             return Some(held.map(|mined| (index, mined)).map_err(ReplayError::Miner));
         }
-        while self.next <= self.through {
+        while self.next <= self.through && *reads > 0 {
+            *reads -= 1;
             let index = self.next;
             self.next += 1;
             let Some(entry) = self.log.entry(index) else {
@@ -132,12 +148,8 @@ impl<L: GroupLogRead> Iterator for Replayed<L> {
     type Item = Result<(u64, Mined), ReplayError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-        let item = self.step();
-        self.failed = matches!(item, Some(Err(_)));
-        item
+        let mut unbounded = usize::MAX;
+        self.next_within(&mut unbounded)
     }
 }
 

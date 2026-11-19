@@ -1,5 +1,6 @@
 use super::super::kept::tests::{entries, mined_log};
 use super::super::mining::tests::{HeldLog, logged};
+use super::super::types::Entry;
 use super::*;
 
 /// A log held in memory with `entries` from index 1.
@@ -107,4 +108,50 @@ fn a_replay_mines_the_batches_held_for_the_first_configuration_one_at_a_time() {
         Some(30),
         "the configuration mined the six held batches"
     );
+}
+
+/// #1310: a replay given a read budget reads no more than it, however
+/// long the run of entries that mine nothing, and goes on from there.
+#[test]
+fn a_replay_reads_no_more_of_the_log_than_its_budget() {
+    use openraft::EntryPayload;
+
+    let mined = entries(4);
+    let mut log = held(&mined[..2]);
+    for index in 3..=52 {
+        log.0.insert(
+            index,
+            Entry {
+                log_id: super::super::mining::tests::log_id(index),
+                payload: EntryPayload::Blank,
+            },
+        );
+    }
+    for (offset, entry) in logged(&mined[2..]).into_iter().enumerate() {
+        let index = 53 + offset as u64;
+        log.0.insert(
+            index,
+            Entry {
+                log_id: super::super::mining::tests::log_id(index),
+                ..entry
+            },
+        );
+    }
+    let last = *log.0.keys().last().expect("entries");
+    let mut replay = Replayed::new(log, 1, last);
+
+    let mut reads = 10;
+    while replay.next_within(&mut reads).is_some() {}
+    assert_eq!(reads, 0, "the budget is spent");
+    assert_eq!(replay.needs_from(), 11, "ten entries read, no more");
+    assert!(!replay.done());
+
+    let mut rest = usize::MAX;
+    let mut events = 0;
+    while let Some(item) = replay.next_within(&mut rest) {
+        item.expect("mined");
+        events += 1;
+    }
+    assert!(replay.done(), "it goes on from where the budget ran out");
+    assert_eq!(events, mined.len() - 2, "the batches after the blanks");
 }

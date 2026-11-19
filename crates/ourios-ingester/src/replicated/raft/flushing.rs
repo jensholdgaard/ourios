@@ -139,7 +139,16 @@ pub struct Backlog {
 /// the live publication's audit buffer reaches its ceiling, until `stop`
 /// says so. A flush that fails leaves its rows buffered for the next one,
 /// and its failure is counted where it happens.
-pub async fn sweep(mut current: Current, every: Duration, mut stop: watch::Receiver<bool>) {
+///
+/// Each wake first runs `drive`, the step an applied entry would take, so
+/// a named flusher of a group that has gone quiet still builds its
+/// publication once the log id reads, publishes what it keeps and moves
+/// its replay on (#1301).
+pub async fn sweep(
+    (mut current, drive): (Current, Drive),
+    every: Duration,
+    mut stop: watch::Receiver<bool>,
+) {
     let mut ticks = tokio::time::interval(every);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -148,7 +157,12 @@ pub async fn sweep(mut current: Current, every: Duration, mut stop: watch::Recei
             // A new publication has a notifier of its own to wait on.
             Wake::Changed => {}
             Wake::Flush => {
-                if !flush_aged(&current).await {
+                let driving = Arc::clone(&drive);
+                if tokio::task::spawn_blocking(move || driving())
+                    .await
+                    .is_err()
+                    || !flush_aged(&current).await
+                {
                     return;
                 }
             }
@@ -200,6 +214,10 @@ async fn flush_aged(current: &Current) -> bool {
 
 /// The publication a group's age loop drives, while there is one.
 pub type Current = watch::Receiver<Option<Arc<Publication>>>;
+
+/// A group's publishing step without an applied entry, which the age loop
+/// runs on each wake; it does store I/O.
+pub type Drive = Arc<dyn Fn() + Send + Sync>;
 
 /// One group's publication on one tail replica.
 pub struct Flushing {

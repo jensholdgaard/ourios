@@ -336,10 +336,11 @@ impl Mining {
         let kept = Arc::downgrade(&follow.keeping.kept);
         let formed = Arc::new(FormedLog::new(follow.source(), follow.group));
         let followed = follow.followed.subscribe();
-        let sweep = follow
-            .sweep
-            .clone()
-            .map(|(current, every)| tokio::spawn(flushing::sweep(current, every, stopped.clone())));
+        let sweep = follow.sweep.clone().map(|(current, every)| {
+            let keeping = follow.keeping.clone();
+            let drive: flushing::Drive = Arc::new(move || keeping.drive());
+            tokio::spawn(flushing::sweep((current, drive), every, stopped.clone()))
+        });
         let task = tokio::spawn(follow.run(miner, applied, stopped));
         Self {
             stop,
@@ -494,6 +495,19 @@ impl Keeping {
             let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
             self.publish(&mut flushing, kept, (applied.assigned, out));
         }
+    }
+
+    /// Take the step an applied entry would, with no output of its own: a
+    /// named flusher of an idle group builds its publication once the log
+    /// id reads, then publishes or replays what it keeps (#1301).
+    fn drive(&self) {
+        let Some(flushing) = &self.flushing else {
+            return;
+        };
+        // In `keep`'s order: what it keeps, then the publication.
+        let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
+        self.publish(&mut flushing, kept, (None, &Mined::default()));
     }
 
     /// Publish as `flushing` plans from `kept`, holding `kept` only while

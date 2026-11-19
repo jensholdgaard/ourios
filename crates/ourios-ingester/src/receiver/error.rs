@@ -34,6 +34,9 @@ pub enum ReceiveError {
     /// The group's leader refused the forwarded export before appending
     /// it; returned to the client as the leader gave it (RFC 0065 §6.8).
     Forwarded(crate::replicated::raft::transport::Rejected),
+    /// The node is shutting down and takes no more exports; the batch was
+    /// not acked and may be retried against another node.
+    ShuttingDown,
 }
 
 /// How a transport classifies a failed batch for the `ingest logs` server
@@ -116,7 +119,8 @@ impl IngestFailure {
             }
             ReceiveError::WalAppend(_)
             | ReceiveError::WalSync(_)
-            | ReceiveError::Replication(_) => Self::Unavailable,
+            | ReceiveError::Replication(_)
+            | ReceiveError::ShuttingDown => Self::Unavailable,
             ReceiveError::TenantFrame(_) => Self::Internal,
             ReceiveError::Forwarded(rejected) => Self::of_rejection(rejected.rejection),
         }
@@ -179,6 +183,7 @@ impl std::fmt::Display for ReceiveError {
             Self::WalSync(e) => write!(f, "{e}"),
             Self::Replication(e) => write!(f, "{e}"),
             Self::Forwarded(rejected) => f.write_str(&rejected.message),
+            Self::ShuttingDown => f.write_str("the node is shutting down"),
         }
     }
 }
@@ -186,7 +191,7 @@ impl std::fmt::Display for ReceiveError {
 impl std::error::Error for ReceiveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::TenantDenied { .. } | Self::Forwarded(_) => None,
+            Self::TenantDenied { .. } | Self::Forwarded(_) | Self::ShuttingDown => None,
             Self::TenantFrame(e) => Some(e),
             Self::WalAppend(e) => Some(e),
             Self::WalSync(e) => Some(e),

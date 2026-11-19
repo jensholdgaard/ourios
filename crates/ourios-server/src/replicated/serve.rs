@@ -2,14 +2,15 @@
 //! receiver's configuration, answering its peers over mutual TLS, running
 //! its background work, and taking OTLP exports into its groups.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
-use ourios_ingester::receiver::SharedIngest;
 use ourios_ingester::receiver::http::{HttpConfig, router};
+use ourios_ingester::receiver::{Drain, SharedIngest, Tracked};
 use ourios_ingester::replicated::node::{self, Node, NodeError, NodeStart};
 use ourios_ingester::replicated::raft::host::GroupMined;
 use ourios_ingester::replicated::raft::log_ids::StartError as LockError;
@@ -19,7 +20,7 @@ use ourios_server::config::wal::ReplicatedWal;
 use ourios_serving::tls::ALPN_GRPC;
 use ourios_serving::tls_serve::{LISTENER_REPLICATION, reloading_acceptor};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
@@ -45,6 +46,9 @@ pub(crate) struct ReplicatedHandle {
     node: Node,
     /// The node's tenant denials (RFC 0026 §3.4).
     audit: SharedParquetAuditSink,
+    /// The exports still ingesting once the listeners stop, a client's
+    /// that disconnected included.
+    drain: Drain,
 }
 
 impl ReplicatedHandle {
@@ -65,6 +69,10 @@ impl ReplicatedHandle {
         let _ = self.otlp.send(());
         let grpc = self.grpc.await;
         let _ = self.http.await;
+        // An ingest whose client went away runs on past its listener; its
+        // denial must reach the audit sink before the last flush.
+        self.drain.close();
+        self.drain.drained().await;
         self.stop.send_replace(true);
         for task in self.tasks {
             let _ = task.await;
@@ -139,10 +147,11 @@ pub(crate) async fn serve_replicated(
         config.max_buffer_age,
         stopped.clone(),
     ));
-    let ingest: SharedIngest = Arc::new(
+    let (ingest, drain) = Tracked::new(Arc::new(
         node.ingest()
             .with_denial_audit_sink(Box::new(audit.clone())),
-    );
+    ));
+    let ingest: SharedIngest = Arc::new(ingest);
     let otlp = match serve_otlp(&config, ingest).await {
         Ok(otlp) => otlp,
         Err(e) => {
@@ -167,6 +176,7 @@ pub(crate) async fn serve_replicated(
         peers,
         node,
         audit,
+        drain,
     })
 }
 
@@ -309,23 +319,41 @@ async fn stopped_with(node: Node, error: String) -> String {
 pub(super) fn spawn_audit_flush(
     audit: SharedParquetAuditSink,
     every: Duration,
-    mut stopped: watch::Receiver<bool>,
+    stopped: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     // A burst past the sink's ceiling flushes at once, as the local
     // receiver's age sweep does, rather than growing until the next tick.
     let overflow = audit.overflow_notify();
+    let flush = move || flushed(audit.clone());
+    spawn_flush_loop((flush, overflow), every, stopped)
+}
+
+/// Run `flush` every `every`, and at once when `overflow` fires, until
+/// `stopped`. After a flush fails, `overflow` is ignored until a tick's
+/// flush succeeds, so a store refusing writes is retried at the tick, not
+/// sent the growing backlog again at every event past the ceiling.
+pub(super) fn spawn_flush_loop<F, Flushing>(
+    (flush, overflow): (F, Arc<Notify>),
+    every: Duration,
+    mut stopped: watch::Receiver<bool>,
+) -> JoinHandle<()>
+where
+    F: Fn() -> Flushing + Send + 'static,
+    Flushing: Future<Output = bool> + Send,
+{
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(every);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick is immediate, and nothing is buffered yet.
         ticks.tick().await;
+        let mut failing = false;
         loop {
             tokio::select! {
                 _ = ticks.tick() => {}
-                () = overflow.notified() => {}
+                () = overflow.notified(), if !failing => {}
                 _ = stopped.wait_for(|stop| *stop) => return,
             }
-            let _ = flushed(audit.clone()).await;
+            failing = !flush().await;
         }
     })
 }

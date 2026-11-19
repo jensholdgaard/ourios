@@ -1172,8 +1172,6 @@ pub(crate) fn spawn_grpc(
     })
 }
 
-/// Start the receiver role: startup recovery, then both listeners. Once
-/// `stopping` is set, a bootstrap scan still in progress (RFC 0059 §3.5)
 /// What a receiver's OTLP listeners are configured with.
 struct Otlp<'a> {
     auth: AuthResolver,
@@ -1229,6 +1227,8 @@ fn spawn_otlp(
     Ok(Listeners { grpc, http, drain })
 }
 
+/// Start the receiver role: startup recovery, then both listeners. Once
+/// `stopping` is set, a bootstrap scan still in progress (RFC 0059 §3.5)
 /// stops between reads with nothing written, and so does this.
 pub async fn serve_until(
     config: ReceiverConfig,

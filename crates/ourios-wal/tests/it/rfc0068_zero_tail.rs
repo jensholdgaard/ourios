@@ -186,7 +186,6 @@ impl Frame {
 }
 
 #[test]
-#[ignore = "RFC0068 red: replay reads a zero header as an unknown kind until §3.1 T2 lands"]
 fn rfc0068_1_zero_tail_at_a_frame_boundary_is_healed() {
     for zeros in [12, 13, 511, 512, 4096, 4096 + 7] {
         let newest = Newest::synced(&PAYLOADS);
@@ -368,7 +367,6 @@ fn shared_sector_case(sector: SharedSector) {
 }
 
 #[test]
-#[ignore = "RFC0068 red: replay reads a zero header as an unknown kind until §3.1 T2 lands"]
 fn rfc0068_6_a_shared_sector_left_old_is_healed_at_x() {
     shared_sector_case(SharedSector::Old);
 }
@@ -477,7 +475,6 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
-    #[ignore = "RFC0068 red: replay reads a zero header as an unknown kind until §3.1 T2 lands"]
     fn rfc0068_healed_exactly_when_t1_or_t2_holds(tail in tails()) {
         let mut newest = Newest::synced(&PAYLOADS);
         forge(&newest, &tail);

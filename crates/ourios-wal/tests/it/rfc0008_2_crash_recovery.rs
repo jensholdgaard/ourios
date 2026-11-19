@@ -184,7 +184,6 @@ fn newest_segment_and_frame_end(root: &Path) -> (std::path::PathBuf, u64) {
 /// a file whose size reached the journal ahead of its data. Recovery
 /// opens, keeps every acknowledged frame, and cuts the zeros.
 #[test]
-#[ignore = "RFC0068 red: replay reads a zero header as an unknown kind until §3.1 T2 lands"]
 fn rfc0068_4_sigkill_then_a_zero_extended_tail_loses_no_fsynced_frame() {
     for zeros in [2 * 512, 2 * 512 + 100] {
         let tmp = tempfile::TempDir::new().expect("temp");

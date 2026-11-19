@@ -155,3 +155,71 @@ fn a_replay_reads_no_more_of_the_log_than_its_budget() {
     assert!(replay.done(), "it goes on from where the budget ran out");
     assert_eq!(events, mined.len() - 2, "the batches after the blanks");
 }
+
+/// A log that counts the entries read from it.
+#[derive(Clone)]
+struct Counted(HeldLog, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl super::super::mining::GroupLogRead for Counted {
+    fn entry(&self, index: u64) -> Option<Entry> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.entry(index)
+    }
+}
+
+/// [`configured_late`]'s four held batches with twenty blanks after
+/// each, then the rest of it.
+fn late_with_blanks() -> HeldLog {
+    use openraft::EntryPayload;
+
+    let late = logged(&configured_late(4));
+    let payloads = late.into_iter().enumerate().flat_map(|(n, entry)| {
+        let blanks = if (1..=4).contains(&n) { 20 } else { 0 };
+        std::iter::once(entry.payload).chain(std::iter::repeat_n(EntryPayload::Blank, blanks))
+    });
+    HeldLog(
+        (1..)
+            .zip(payloads)
+            .map(|(index, payload)| {
+                let log_id = super::super::mining::tests::log_id(index);
+                (index, Entry { log_id, payload })
+            })
+            .collect(),
+    )
+}
+
+/// Everything `replay` yields, read `budget` entries at a time; fails if
+/// any call reads more of the log than its budget, as `reads` counts.
+fn drained_within(
+    mut replay: Replayed<Counted>,
+    reads: &std::sync::atomic::AtomicUsize,
+    budget: usize,
+) -> Vec<(u64, Mined)> {
+    let mut items = Vec::new();
+    while !replay.done() {
+        let before = reads.load(std::sync::atomic::Ordering::SeqCst);
+        let mut left = budget;
+        items.extend(
+            std::iter::from_fn(|| replay.next_within(&mut left)).map(|item| item.expect("mined")),
+        );
+        let read = reads.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(read <= budget, "{read} reads on a budget of {budget}");
+    }
+    items
+}
+
+/// #1310: the budget holds while the batches held for a late first
+/// configuration are drained too, however many blanks lie between them,
+/// and the replay still yields everything the unbounded one does.
+#[test]
+fn a_replay_keeps_its_budget_while_draining_held_batches() {
+    let log = late_with_blanks();
+    let last = *log.0.keys().last().expect("entries");
+    let unbounded: Vec<_> = Replayed::new(log.clone(), 1, last)
+        .collect::<Result<_, _>>()
+        .expect("replayed");
+
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let replay = Replayed::new(Counted(log, std::sync::Arc::clone(&reads)), 1, last);
+    assert_eq!(drained_within(replay, &reads, 5), unbounded);
+}

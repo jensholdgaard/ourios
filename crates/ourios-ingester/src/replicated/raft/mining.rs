@@ -458,7 +458,18 @@ impl GroupMiner {
     ///
     /// The [`GroupMinerError`] that stopped the miner at that batch.
     pub fn next_held(&mut self) -> Option<Result<Mined, GroupMinerError>> {
-        let read = self.read_held()?;
+        let mut unbounded = usize::MAX;
+        self.next_held_within(&mut unbounded)
+    }
+
+    /// As [`Self::next_held`], reading at most `reads` more of the log, what
+    /// it reads taken from `reads`; `None` too once they are spent, while
+    /// it still [holds](Self::holds) batches to drain (#1310).
+    pub fn next_held_within(
+        &mut self,
+        reads: &mut usize,
+    ) -> Option<Result<Mined, GroupMinerError>> {
+        let read = self.read_held(reads)?;
         Some(self.settle(read))
     }
 
@@ -564,12 +575,16 @@ impl GroupMiner {
 
     /// The rows of the next held batch in the group's log, or `None`
     /// once the configuration holds none.
-    fn read_held(&mut self) -> Option<Result<Vec<MinedRow>, GroupMinerError>> {
+    fn read_held(&mut self, reads: &mut usize) -> Option<Result<Vec<MinedRow>, GroupMinerError>> {
         let Stage::Mining { miner, held, .. } = &mut self.stage else {
             return None;
         };
         let Held { next, at } = held.as_mut()?;
         while *next < at.index {
+            if *reads == 0 {
+                return None;
+            }
+            *reads -= 1;
             let index = *next;
             *next += 1;
             match self.log.entry(index) {

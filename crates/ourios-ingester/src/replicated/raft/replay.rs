@@ -120,9 +120,14 @@ impl<L: GroupLogRead> Replayed<L> {
     /// The next entry the state machine turns into an event, mined,
     /// reading at most `reads` entries of the log.
     fn step(&mut self, reads: &mut usize) -> Option<Result<(u64, Mined), ReplayError>> {
-        if let Some(held) = self.miner.next_held() {
+        if let Some(held) = self.miner.next_held_within(reads) {
             let index = self.followed;
             return Some(held.map(|mined| (index, mined)).map_err(ReplayError::Miner));
+        }
+        // The budget ran out with batches still held: they come before
+        // any later entry.
+        if self.miner.holds() {
+            return None;
         }
         while self.next <= self.through && *reads > 0 {
             *reads -= 1;

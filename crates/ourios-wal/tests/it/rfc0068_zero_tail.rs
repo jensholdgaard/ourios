@@ -17,6 +17,7 @@ use proptest::prelude::*;
 
 const FRAME_HEADER_LEN: usize = 12;
 const SECTOR: usize = 512;
+const PAYLOADS: [&[u8]; 2] = [b"acknowledged-one", b"acknowledged-two"];
 
 fn default_config(root: &Path) -> WalConfig {
     WalConfig {
@@ -62,95 +63,130 @@ impl FrameSink for CollectingSink {
     }
 }
 
-/// A root whose only segment holds `payloads` as synced frames. Returns
-/// the segment and `B`, its length.
-fn synced_segment(root: &Path, payloads: &[&[u8]]) -> (PathBuf, u64) {
-    let mut wal = open(root);
-    for p in payloads {
-        wal.append(FrameKind::OtlpBatch, p).expect("append");
-    }
-    wal.sync().expect("sync");
-    drop(wal);
-    let segment = segment_files(root).pop().expect("one segment");
-    let end = std::fs::metadata(&segment).expect("stat").len();
-    (segment, end)
+/// A WAL root whose only segment holds `acknowledged` as synced frames
+/// ending at `boundary`, `B`, the offset every arm forges its tail after.
+struct Newest {
+    root: tempfile::TempDir,
+    segment: PathBuf,
+    boundary: u64,
+    acknowledged: Vec<Vec<u8>>,
 }
 
-fn append_bytes(segment: &Path, bytes: &[u8]) {
+impl Newest {
+    fn synced(payloads: &[&[u8]]) -> Self {
+        let root = tempfile::TempDir::new().expect("temp");
+        let mut wal = open(root.path());
+        for p in payloads {
+            wal.append(FrameKind::OtlpBatch, p).expect("append");
+        }
+        wal.sync().expect("sync");
+        drop(wal);
+        let segment = segment_files(root.path()).pop().expect("one segment");
+        let boundary = std::fs::metadata(&segment).expect("stat").len();
+        Self {
+            root,
+            segment,
+            boundary,
+            acknowledged: payloads.iter().map(|p| p.to_vec()).collect(),
+        }
+    }
+}
+
+fn forge(newest: &Newest, tail: &[u8]) {
     std::fs::OpenOptions::new()
         .append(true)
-        .open(segment)
+        .open(&newest.segment)
         .expect("open segment")
-        .write_all(bytes)
+        .write_all(tail)
         .expect("forge the tail");
 }
 
-fn frame_header(len: u32, kind: u8, crc: u32) -> [u8; FRAME_HEADER_LEN] {
-    let mut h = [0u8; FRAME_HEADER_LEN];
-    h[0..4].copy_from_slice(&len.to_le_bytes());
-    h[4] = kind;
-    h[8..12].copy_from_slice(&crc.to_le_bytes());
-    h
+fn segment_bytes(newest: &Newest) -> Vec<u8> {
+    std::fs::read(&newest.segment).expect("read segment")
 }
 
-fn checksum(kind: u8, payload: &[u8]) -> u32 {
-    crc32c::crc32c_append(crc32c::crc32c(&[kind, 0, 0, 0]), payload)
-}
-
-fn replay(root: &Path) -> (Result<(), RecoveryError>, Vec<Vec<u8>>) {
+fn replay(newest: &Newest) -> (Result<(), RecoveryError>, Vec<Vec<u8>>) {
     let mut sink = CollectingSink::default();
-    let result = open(root).replay(&mut sink);
+    let result = open(newest.root.path()).replay(&mut sink);
     (result, sink.frames)
 }
 
-fn owned(payloads: &[&[u8]]) -> Vec<Vec<u8>> {
-    payloads.iter().map(|p| p.to_vec()).collect()
-}
-
-/// The tail is healed: replay opens with every frame before `boundary`,
-/// and the segment is cut back to `boundary`.
-fn assert_healed(root: &Path, segment: &Path, boundary: u64, payloads: &[&[u8]]) {
-    let (result, frames) = replay(root);
+/// The tail is healed: replay opens with every acknowledged frame, and
+/// the segment is cut back to `B`.
+fn assert_healed(newest: &Newest) {
+    let (result, frames) = replay(newest);
     result.expect("a healable tail must not stop recovery");
-    assert_eq!(frames, owned(payloads), "every frame before B is replayed");
     assert_eq!(
-        std::fs::metadata(segment).expect("stat").len(),
-        boundary,
+        frames, newest.acknowledged,
+        "every frame before B is replayed"
+    );
+    assert_eq!(
+        segment_bytes(newest).len() as u64,
+        newest.boundary,
         "the segment is truncated to B",
     );
 }
 
-/// The tail is corruption: replay stops at `boundary` on this segment
-/// and leaves its bytes as they were.
-fn assert_corrupt_untouched(root: &Path, segment: &Path, boundary: u64) {
-    let before = std::fs::read(segment).expect("read segment");
-    let (result, _) = replay(root);
+/// The tail is corruption: replay stops at `B` on this segment and
+/// leaves its bytes as they were.
+fn assert_corrupt_untouched(newest: &Newest) {
+    let before = segment_bytes(newest);
+    let (result, _) = replay(newest);
     match result {
         Err(RecoveryError::Corrupt { byte, .. }) => {
-            assert_eq!(byte, boundary, "corruption names the tail's offset");
+            assert_eq!(byte, newest.boundary, "corruption names the tail's offset");
         }
-        other => panic!("expected RecoveryError::Corrupt at {boundary}, got {other:?}"),
+        other => panic!(
+            "expected RecoveryError::Corrupt at {}, got {other:?}",
+            newest.boundary
+        ),
     }
     assert_eq!(
-        std::fs::read(segment).expect("read segment"),
+        segment_bytes(newest),
         before,
-        "a corrupt segment is never modified",
+        "a corrupt segment is never modified"
     );
 }
 
-const PAYLOADS: [&[u8]; 2] = [b"acknowledged-one", b"acknowledged-two"];
+/// A forged frame (RFC 0008 §6.2.2): `len`, `kind` and `crc` are written
+/// as given, so a test can make any of them disagree with `payload`.
+#[derive(Clone, Default)]
+struct Frame {
+    len: u32,
+    kind: u8,
+    crc: u32,
+    payload: Vec<u8>,
+}
+
+impl Frame {
+    /// The frame with `len` and `crc` matching its kind and payload.
+    fn sealed(mut self) -> Self {
+        self.len = u32::try_from(self.payload.len()).expect("small payload");
+        let prefix = crc32c::crc32c(&[self.kind, 0, 0, 0]);
+        self.crc = crc32c::crc32c_append(prefix, &self.payload);
+        self
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + self.payload.len());
+        bytes.extend_from_slice(&self.len.to_le_bytes());
+        bytes.extend_from_slice(&[self.kind, 0, 0, 0]);
+        bytes.extend_from_slice(&self.crc.to_le_bytes());
+        bytes.extend_from_slice(&self.payload);
+        bytes
+    }
+}
 
 #[test]
 #[ignore = "RFC0068 red: replay reads a zero header as an unknown kind until §3.1 T2 lands"]
 fn rfc0068_1_zero_tail_at_a_frame_boundary_is_healed() {
     for zeros in [12, 13, 511, 512, 4096, 4096 + 7] {
-        let tmp = tempfile::TempDir::new().expect("temp");
-        let (segment, boundary) = synced_segment(tmp.path(), &PAYLOADS);
-        append_bytes(&segment, &vec![0; zeros]);
+        let newest = Newest::synced(&PAYLOADS);
+        forge(&newest, &vec![0; zeros]);
 
-        assert_healed(tmp.path(), &segment, boundary, &PAYLOADS);
+        assert_healed(&newest);
 
-        let mut wal = open(tmp.path());
+        let mut wal = open(newest.root.path());
         let next = wal
             .append(FrameKind::OtlpBatch, b"after-the-heal")
             .expect("append after the heal");
@@ -158,10 +194,10 @@ fn rfc0068_1_zero_tail_at_a_frame_boundary_is_healed() {
         drop(wal);
         assert_eq!(
             next.byte,
-            boundary + (FRAME_HEADER_LEN + b"after-the-heal".len()) as u64,
+            newest.boundary + (FRAME_HEADER_LEN + b"after-the-heal".len()) as u64,
             "the next append lands at B ({zeros} zero bytes)",
         );
-        let (result, frames) = replay(tmp.path());
+        let (result, frames) = replay(&newest);
         result.expect("replay after the heal");
         assert_eq!(
             frames.last().map(Vec::as_slice),
@@ -174,85 +210,90 @@ fn rfc0068_1_zero_tail_at_a_frame_boundary_is_healed() {
 #[test]
 fn rfc0068_2_a_short_tail_of_any_bytes_is_healed() {
     for (len, byte) in [(1, 0x00), (11, 0x00), (5, 0xAB), (11, 0xFF)] {
-        let tmp = tempfile::TempDir::new().expect("temp");
-        let (segment, boundary) = synced_segment(tmp.path(), &PAYLOADS);
-        append_bytes(&segment, &vec![byte; len]);
-        assert_healed(tmp.path(), &segment, boundary, &PAYLOADS);
+        let newest = Newest::synced(&PAYLOADS);
+        forge(&newest, &vec![byte; len]);
+        assert_healed(&newest);
     }
 }
 
 #[test]
 fn rfc0068_2_a_header_whose_payload_runs_past_eof_is_healed() {
-    let tmp = tempfile::TempDir::new().expect("temp");
-    let (segment, boundary) = synced_segment(tmp.path(), &PAYLOADS);
-    append_bytes(&segment, &frame_header(64, 0x01, 0));
-    append_bytes(&segment, b"only-part-of-it");
-    assert_healed(tmp.path(), &segment, boundary, &PAYLOADS);
+    let newest = Newest::synced(&PAYLOADS);
+    let cut_short = Frame {
+        len: 64,
+        kind: 0x01,
+        payload: b"only-part-of-it".to_vec(),
+        ..Frame::default()
+    };
+    forge(&newest, &cut_short.bytes());
+    assert_healed(&newest);
 }
 
 #[test]
 fn rfc0068_2_a_crc_mismatch_whose_payload_ends_in_zeros_is_corruption() {
-    let tmp = tempfile::TempDir::new().expect("temp");
-    let (segment, boundary) = synced_segment(tmp.path(), &PAYLOADS);
-    let mut payload = b"written-then-zeroed".to_vec();
-    let crc = checksum(0x01, &payload);
-    payload.extend_from_slice(&[0; 32]);
-    let len = u32::try_from(payload.len()).expect("small payload");
-    append_bytes(&segment, &frame_header(len, 0x01, crc));
-    append_bytes(&segment, &payload);
-    assert_corrupt_untouched(tmp.path(), &segment, boundary);
+    let newest = Newest::synced(&PAYLOADS);
+    let mut frame = Frame {
+        kind: 0x01,
+        payload: b"written-then-zeroed".to_vec(),
+        ..Frame::default()
+    }
+    .sealed();
+    frame.payload.extend_from_slice(&[0; 32]);
+    frame.len = u32::try_from(frame.payload.len()).expect("small payload");
+    forge(&newest, &frame.bytes());
+    assert_corrupt_untouched(&newest);
 }
 
 /// §4.2: a frame whose header reached disk and whose payload is zero
 /// from a sector boundary to EOF stays corruption.
 #[test]
 fn rfc0068_2_a_payload_zeroed_from_a_sector_boundary_is_corruption() {
-    let tmp = tempfile::TempDir::new().expect("temp");
-    let (segment, boundary) = synced_segment(tmp.path(), &PAYLOADS);
-    let start = usize::try_from(boundary).expect("small segment");
-    let payload_start = start + FRAME_HEADER_LEN;
+    let newest = Newest::synced(&PAYLOADS);
+    let payload_start = usize::try_from(newest.boundary).expect("small segment") + FRAME_HEADER_LEN;
     let sector_end = (payload_start / SECTOR + 1) * SECTOR;
-    let payload: Vec<u8> = (0..2 * SECTOR)
-        .map(|i| u8::try_from(i % 251 + 1).expect("below 256"))
-        .collect();
-    let mut forged = payload.clone();
-    forged[sector_end - payload_start..].fill(0);
-    let len = u32::try_from(payload.len()).expect("small payload");
-    append_bytes(&segment, &frame_header(len, 0x01, checksum(0x01, &payload)));
-    append_bytes(&segment, &forged);
-    assert_corrupt_untouched(tmp.path(), &segment, boundary);
+    let mut frame = Frame {
+        kind: 0x01,
+        payload: (0..2 * SECTOR)
+            .map(|i| u8::try_from(i % 251 + 1).expect("below 256"))
+            .collect(),
+        ..Frame::default()
+    }
+    .sealed();
+    frame.payload[sector_end - payload_start..].fill(0);
+    forge(&newest, &frame.bytes());
+    assert_corrupt_untouched(&newest);
 }
 
 #[test]
 fn rfc0068_2_zeros_followed_by_a_non_zero_byte_are_corruption() {
     for zeros in [12, 511, 4096] {
-        let tmp = tempfile::TempDir::new().expect("temp");
-        let (segment, boundary) = synced_segment(tmp.path(), &PAYLOADS);
+        let newest = Newest::synced(&PAYLOADS);
         let mut tail = vec![0; zeros];
         tail.push(0x01);
-        append_bytes(&segment, &tail);
-        assert_corrupt_untouched(tmp.path(), &segment, boundary);
+        forge(&newest, &tail);
+        assert_corrupt_untouched(&newest);
     }
 }
 
 #[test]
 fn rfc0068_2_zeros_followed_by_a_valid_frame_are_corruption() {
-    let tmp = tempfile::TempDir::new().expect("temp");
-    let (segment, boundary) = synced_segment(tmp.path(), &PAYLOADS);
-    append_bytes(&segment, &[0; SECTOR]);
-    let payload = b"a-frame-after-the-zeros";
-    let len = u32::try_from(payload.len()).expect("small payload");
-    append_bytes(&segment, &frame_header(len, 0x01, checksum(0x01, payload)));
-    append_bytes(&segment, payload);
-    assert_corrupt_untouched(tmp.path(), &segment, boundary);
+    let newest = Newest::synced(&PAYLOADS);
+    forge(&newest, &[0; SECTOR]);
+    let frame = Frame {
+        kind: 0x01,
+        payload: b"a-frame-after-the-zeros".to_vec(),
+        ..Frame::default()
+    }
+    .sealed();
+    forge(&newest, &frame.bytes());
+    assert_corrupt_untouched(&newest);
 }
 
 #[test]
 fn rfc0068_3_a_zero_tail_on_a_closed_segment_is_corruption() {
-    let tmp = tempfile::TempDir::new().expect("temp");
-    let (older, boundary) = synced_segment(tmp.path(), &PAYLOADS);
-    append_bytes(&older, &[0; SECTOR]);
-    let mut wal = open(tmp.path());
+    let older = Newest::synced(&PAYLOADS);
+    forge(&older, &[0; SECTOR]);
+    let mut wal = open(older.root.path());
     wal.rotate(RotationKind::Owed)
         .expect("rotate to a newer segment");
     wal.append(FrameKind::OtlpBatch, b"on-the-newest")
@@ -260,70 +301,75 @@ fn rfc0068_3_a_zero_tail_on_a_closed_segment_is_corruption() {
     wal.sync().expect("sync");
     drop(wal);
     assert_eq!(
-        segment_files(tmp.path()).len(),
+        segment_files(older.root.path()).len(),
         2,
         "the zero tail is closed"
     );
-    assert_corrupt_untouched(tmp.path(), &older, boundary);
+    assert_corrupt_untouched(&older);
+}
+
+/// What a power cut leaves in the sector the last acknowledged frame
+/// shares with the unsynced append after it (RFC 0068 §3.4).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharedSector {
+    /// Zeros after `X`, as before the append.
+    Old,
+    /// The append's bytes up to the sector's end.
+    New,
 }
 
 /// RFC0068.6: the last acknowledged frame ends at `X` inside a sector,
-/// and an unsynced append starts at `X` and runs past it. A power cut
-/// leaves the shared sector old (zeros after `X`) or new, and every
-/// later byte of the append zero.
-fn shared_sector_case(first: usize, keep_new_sector: bool) {
-    let tmp = tempfile::TempDir::new().expect("temp");
-    let acknowledged = vec![0x5A; first];
-    let (segment, x) = synced_segment(tmp.path(), &[&acknowledged]);
-    let x = usize::try_from(x).expect("small segment");
-    assert_ne!(x % SECTOR, 0, "X sits inside a sector");
+/// and an unsynced append starts at `X` and runs past it. Every byte of
+/// the append past the shared sector is zero.
+fn shared_sector_case(sector: SharedSector) {
+    for first in [1, 100, 300, 470] {
+        let newest = Newest::synced(&[&vec![0x5A; first]]);
+        let x = usize::try_from(newest.boundary).expect("small segment");
+        assert_ne!(x % SECTOR, 0, "X sits inside a sector");
 
-    let mut wal = open(tmp.path());
-    wal.append(FrameKind::OtlpBatch, &[0xC3; 3 * SECTOR])
-        .expect("the append that never synced");
-    wal.sync().expect("sync, only to read its bytes");
-    drop(wal);
-    let mut bytes = std::fs::read(&segment).expect("read segment");
-    let sector_end = (x / SECTOR + 1) * SECTOR;
-    let zero_from = if keep_new_sector { sector_end } else { x };
-    bytes[zero_from..].fill(0);
-    std::fs::write(&segment, &bytes).expect("forge the power cut");
+        let mut wal = open(newest.root.path());
+        wal.append(FrameKind::OtlpBatch, &[0xC3; 3 * SECTOR])
+            .expect("the append that never synced");
+        wal.sync().expect("sync, only to read its bytes");
+        drop(wal);
+        let mut before = segment_bytes(&newest);
+        let zero_from = match sector {
+            SharedSector::Old => x,
+            SharedSector::New => (x / SECTOR + 1) * SECTOR,
+        };
+        before[zero_from..].fill(0);
+        std::fs::write(&newest.segment, &before).expect("forge the power cut");
 
-    let before = bytes;
-    let (result, frames) = replay(tmp.path());
-    let after = std::fs::read(&segment).expect("read segment");
-    match result {
-        Ok(()) => {
-            assert_eq!(
-                frames,
-                vec![acknowledged],
-                "the acknowledged frame is replayed"
-            );
-            assert!(after.len() >= x, "recovery never truncates below X");
+        let (result, frames) = replay(&newest);
+        let after = segment_bytes(&newest);
+        match result {
+            Ok(()) => {
+                assert_eq!(
+                    frames, newest.acknowledged,
+                    "the acknowledged frame is replayed"
+                );
+                assert!(after.len() >= x, "recovery never truncates below X");
+            }
+            Err(RecoveryError::Corrupt { .. }) => {
+                assert_eq!(after, before, "a corrupt segment is never modified");
+            }
+            Err(other) => panic!("expected a heal or corruption, got {other:?}"),
         }
-        Err(RecoveryError::Corrupt { .. }) => {
-            assert_eq!(after, before, "a corrupt segment is never modified");
+        if sector == SharedSector::Old {
+            assert_eq!(after.len(), x, "the old-contents arm is healed as T2 at X");
         }
-        Err(other) => panic!("expected a heal or corruption, got {other:?}"),
-    }
-    if !keep_new_sector {
-        assert_eq!(after.len(), x, "the old-contents arm is healed as T2 at X");
     }
 }
 
 #[test]
 #[ignore = "RFC0068 red: replay reads a zero header as an unknown kind until §3.1 T2 lands"]
 fn rfc0068_6_a_shared_sector_left_old_is_healed_at_x() {
-    for first in [1, 100, 300, 470] {
-        shared_sector_case(first, false);
-    }
+    shared_sector_case(SharedSector::Old);
 }
 
 #[test]
 fn rfc0068_6_a_shared_sector_left_new_never_cuts_below_x() {
-    for first in [1, 100, 300, 470] {
-        shared_sector_case(first, true);
-    }
+    shared_sector_case(SharedSector::New);
 }
 
 #[test]
@@ -338,10 +384,7 @@ fn rfc0068_5_a_heal_is_reported() {
 /// exactly when T1 or T2 holds. `None` is a tail whose first frame is
 /// valid, which is no tail at all.
 fn expected_heal(tail: &[u8]) -> Option<bool> {
-    if tail.len() < FRAME_HEADER_LEN {
-        return Some(true);
-    }
-    if tail.iter().all(|&b| b == 0) {
+    if tail.len() < FRAME_HEADER_LEN || tail.iter().all(|&b| b == 0) {
         return Some(true);
     }
     let len = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as usize;
@@ -353,7 +396,13 @@ fn expected_heal(tail: &[u8]) -> Option<bool> {
         return Some(true);
     };
     let crc = u32::from_le_bytes([tail[8], tail[9], tail[10], tail[11]]);
-    (crc != checksum(tail[4], payload)).then_some(false)
+    let sealed = Frame {
+        kind: tail[4],
+        payload: payload.to_vec(),
+        ..Frame::default()
+    }
+    .sealed();
+    (crc != sealed.crc).then_some(false)
 }
 
 fn tails() -> impl Strategy<Value = Vec<u8>> {
@@ -367,9 +416,13 @@ fn tails() -> impl Strategy<Value = Vec<u8>> {
             t
         }),
         (1u32..64, 1u8..=4, 0usize..64).prop_map(|(len, kind, have)| {
-            let mut t = frame_header(len, kind, 0).to_vec();
-            t.extend(std::iter::repeat_n(0xEE, have));
-            t
+            Frame {
+                len,
+                kind,
+                crc: 0,
+                payload: vec![0xEE; have],
+            }
+            .bytes()
         }),
     ]
 }
@@ -383,13 +436,12 @@ proptest! {
         let Some(healed) = expected_heal(&tail) else {
             return Ok(());
         };
-        let tmp = tempfile::TempDir::new().expect("temp");
-        let (segment, boundary) = synced_segment(tmp.path(), &PAYLOADS);
-        append_bytes(&segment, &tail);
+        let newest = Newest::synced(&PAYLOADS);
+        forge(&newest, &tail);
         if healed {
-            assert_healed(tmp.path(), &segment, boundary, &PAYLOADS);
+            assert_healed(&newest);
         } else {
-            assert_corrupt_untouched(tmp.path(), &segment, boundary);
+            assert_corrupt_untouched(&newest);
         }
     }
 }

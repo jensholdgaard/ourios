@@ -1,7 +1,7 @@
 ---
 rfc: 0068
 title: WAL recovery from a zero-filled tail
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-04
@@ -11,8 +11,12 @@ superseded-by: —
 
 # RFC 0068 — WAL recovery from a zero-filled tail
 
-> **Status: `specified` (2026-11-19, maintainer-approved: the strict
-> rule, which heals only a zero run that reaches EOF).** Tracks #1165. This RFC **amends RFC 0008**
+> **Status: `red`.** Every §5 scenario has a test in `ourios-wal`
+> (`tests/it/rfc0068_zero_tail.rs`, and RFC0068.4 in
+> `tests/it/rfc0008_2_crash_recovery.rs`). The ones the change must turn
+> green are `#[ignore]`d and fail on today's code; the arms that keep
+> today's outcome run and pass. Specified 2026-11-19 (maintainer-approved:
+> the strict rule, which heals only a zero run that reaches EOF). Tracks #1165. This RFC **amends RFC 0008**
 > (`accepted`). It amends the three-bucket rule of §5 RFC0008.2 and
 > §8's testing text for it, and §5 RFC0008.4 and RFC0008.5, and §6.6
 > step 3. RFC 0008 gets a dated pointer here once this RFC is

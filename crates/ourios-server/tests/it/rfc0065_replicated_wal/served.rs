@@ -58,10 +58,39 @@ impl Server {
     }
 }
 
-/// A loopback address free when asked.
+/// Ports below every OS's ephemeral range (Linux's starts at 32768,
+/// macOS's at 49152), so a `bind(:0)` elsewhere cannot be handed one of
+/// them between this harness reserving it and the server binding it
+/// (#1373).
+const RESERVED: std::ops::Range<u16> = 20_000..32_000;
+
+/// A loopback address free when asked, its port outside the ephemeral
+/// range and never one this process has handed out before: a test takes
+/// every address before it starts any node, so a port only probed, not yet
+/// bound, must not be handed out twice. The process starts at its own point
+/// in the range, so parallel test processes rarely try the same port first.
 pub(super) fn free_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr")
+    use std::hash::{BuildHasher as _, RandomState};
+
+    static ISSUED: std::sync::Mutex<Option<(u16, std::collections::BTreeSet<u16>)>> =
+        std::sync::Mutex::new(None);
+    let span = RESERVED.end - RESERVED.start;
+    let mut issued = ISSUED.lock().expect("issued ports");
+    let (start, taken) = issued.get_or_insert_with(|| {
+        let seed = RandomState::new().hash_one(std::process::id());
+        let start = u16::try_from(seed % u64::from(span)).expect("within the span");
+        (start, std::collections::BTreeSet::new())
+    });
+    let addr = (0..span)
+        .map(|offset| RESERVED.start + (*start + offset) % span)
+        .filter(|port| !taken.contains(port))
+        .find_map(|port| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).ok()?;
+            listener.local_addr().ok()
+        })
+        .expect("a free port in the reserved range");
+    taken.insert(addr.port());
+    addr
 }
 
 /// One CA, and one leaf it signed for 127.0.0.1 that every peer

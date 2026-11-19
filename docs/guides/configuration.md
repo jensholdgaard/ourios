@@ -229,6 +229,25 @@ until it ends:
 
 ## The WAL backend
 
+### The disk under `wal_root`
+
+The WAL acknowledges a batch only after an fsync, so the disk under
+`wal_root` must keep what an fsync wrote. Use a local filesystem on a
+volume that also writes each sector atomically: a write cut off by power
+loss leaves the sector's old contents or its new ones, never zeros or a
+mix. Cloud block volumes such as AWS EBS and GCP Hyperdisk, and NVMe
+drives, document this guarantee; consumer drives without power-loss
+protection do not, and can lose data that was already fsynced.
+
+After a crash, recovery cuts a torn tail off the newest WAL segment: a
+partial frame, or a run of zeros from the end of the last valid frame to
+the end of the file
+([RFC 0068](../rfcs/0068-wal-zero-tail-recovery.md)). Those bytes were
+never acknowledged. Each cut logs a `WARN`
+`ourios.wal.recovery.tail.truncated` event and adds the bytes cut to
+`ourios.wal.recovery.truncated.size`. Any other damage stops recovery
+with an error naming the segment and offset.
+
 `receiver.wal.backend` chooses where the receiver's write-ahead log
 lives. `local` (the default) keeps one WAL under `wal_root`. `replicated`
 ([RFC 0065](../rfcs/0065-replicated-wal.md)) is validated at startup but

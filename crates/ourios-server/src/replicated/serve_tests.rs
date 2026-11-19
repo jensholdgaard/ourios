@@ -209,6 +209,51 @@ async fn denials_past_the_audit_ceiling_flush_without_waiting_for_the_age() {
     flushing.await.expect("stopped");
 }
 
+/// #1349: while the store refuses writes, a burst of denials does not
+/// resend the growing backlog at every one: after a failed flush only the
+/// age tick flushes again, until one succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_flush_waits_for_the_tick_not_each_overflow() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::{Notify, watch};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let overflow = Arc::new(Notify::new());
+    let (stop, stopped) = watch::channel(false);
+    let counted = Arc::clone(&attempts);
+    let failing = move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { false }
+    };
+    let flushing = super::serve::spawn_flush_loop(
+        (failing, Arc::clone(&overflow)),
+        Duration::from_secs(3_600),
+        stopped,
+    );
+
+    overflow.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while attempts.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the overflow flushes"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for _ in 0..20 {
+        overflow.notify_one();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no retry before the tick"
+    );
+    stop.send_replace(true);
+    flushing.await.expect("stopped");
+}
+
 /// A start that fails to bind its OTLP listeners after the node opened
 /// gives back everything it took before returning: its peer listener, and
 /// its groups' logs and vote log, so the node starts again at once.

@@ -27,7 +27,9 @@ use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::{AuthLayer, logs_service};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedIngest, SharedPipeline};
+use ourios_ingester::receiver::{
+    CommitCoordinator, Drain, IngestPipeline, SharedIngest, SharedPipeline, Tracked,
+};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_ingester::template_ids::{TemplateIds, TemplateIdsError};
@@ -457,6 +459,8 @@ pub struct ReceiverHandle {
     grpc: JoinHandle<Result<(), tonic::transport::Error>>,
     http: JoinHandle<()>,
     pipeline: SharedPipeline,
+    /// The exports still ingesting once the listeners stop.
+    drain: Drain,
     snapshots_root: PathBuf,
     /// The data sink (RFC 0014). Drained on graceful shutdown, before the
     /// shutdown snapshot, to keep the miner's snapshot horizon at or below the
@@ -502,6 +506,11 @@ impl ReceiverHandle {
         self.http
             .await
             .map_err(|e| format!("HTTP listener task: {e}"))?;
+        // An ingest whose client went away runs on past its listener (#1349):
+        // wait for it, refusing any that start, so what follows sees every
+        // acked batch and every denial.
+        self.drain.close();
+        self.drain.drained().await;
         // Both listeners are stopped, so no more records reach the sink. The
         // `shutdown.send` above already signalled the age-sweep task; await it
         // (rather than abort it) so an in-flight `spawn_blocking` flush runs to
@@ -1163,6 +1172,61 @@ pub(crate) fn spawn_grpc(
     })
 }
 
+/// What a receiver's OTLP listeners are configured with.
+struct Otlp<'a> {
+    auth: AuthResolver,
+    grpc_tls: Option<&'a TlsSettings>,
+    http_tls: Option<&'a TlsSettings>,
+    max_request_bytes: usize,
+}
+
+/// The OTLP listeners a receiver serves `pipeline` on until `shutdown`.
+struct Listeners {
+    grpc: JoinHandle<Result<(), tonic::transport::Error>>,
+    http: JoinHandle<()>,
+    /// The exports still ingesting once they stop.
+    drain: Drain,
+}
+
+/// Serve `pipeline` over OTLP gRPC on `grpc_incoming` and HTTP on
+/// `http_listener` until `shutdown`, every export counted in until it ends
+/// so the shutdown can wait for one whose client went away (#1349).
+fn spawn_otlp(
+    config: &Otlp<'_>,
+    (grpc_incoming, http_listener): (TcpIncoming, TcpListener),
+    pipeline: SharedPipeline,
+    shutdown_rx: watch::Receiver<()>,
+) -> Result<Listeners, StartError> {
+    // RFC 0026 §3.2 / RFC 0029 §3.3: the auth layer resolves before the
+    // message decode (open mode passes through unbound); the handler's
+    // pipeline enforces the tenant binding it attaches. A tower layer
+    // rather than a sync interceptor because OIDC resolution may await a
+    // JWKS refetch.
+    let (grpc_acceptor, http_acceptor) = build_acceptors(config.grpc_tls, config.http_tls)?;
+
+    let (ingest, drain) = Tracked::new(pipeline);
+    let ingest: SharedIngest = Arc::new(ingest);
+    let grpc = spawn_grpc(
+        grpc_incoming,
+        grpc_acceptor,
+        config.auth.clone(),
+        (Arc::clone(&ingest), config.max_request_bytes),
+        shutdown_rx.clone(),
+    );
+
+    let http_router = router(
+        ingest,
+        &HttpConfig {
+            auth: config.auth.clone(),
+            max_body_bytes: config.max_request_bytes,
+            ..HttpConfig::default()
+        },
+    );
+    let http = spawn_http(http_listener, http_acceptor, http_router, shutdown_rx);
+
+    Ok(Listeners { grpc, http, drain })
+}
+
 /// Start the receiver role: startup recovery, then both listeners. Once
 /// `stopping` is set, a bootstrap scan still in progress (RFC 0059 §3.5)
 /// stops between reads with nothing written, and so does this.
@@ -1262,31 +1326,18 @@ pub async fn serve_until(
         &shutdown_rx,
     );
 
-    // RFC 0026 §3.2 / RFC 0029 §3.3: the auth layer resolves before the
-    // message decode (open mode passes through unbound); the handler's
-    // pipeline enforces the tenant binding it attaches. A tower layer
-    // rather than a sync interceptor because OIDC resolution may await a
-    // JWKS refetch.
-    let (grpc_acceptor, http_acceptor) =
-        build_acceptors(config.grpc_tls.as_ref(), config.http_tls.as_ref())?;
-
-    let grpc = spawn_grpc(
-        grpc_incoming,
-        grpc_acceptor,
-        config.auth.clone(),
-        (pipeline.clone(), config.max_request_bytes),
-        shutdown_rx.clone(),
-    );
-
-    let http_router = router(
+    let otlp = Otlp {
+        auth: config.auth.clone(),
+        grpc_tls: config.grpc_tls.as_ref(),
+        http_tls: config.http_tls.as_ref(),
+        max_request_bytes: config.max_request_bytes,
+    };
+    let Listeners { grpc, http, drain } = spawn_otlp(
+        &otlp,
+        (grpc_incoming, http_listener),
         pipeline.clone(),
-        &HttpConfig {
-            auth: config.auth.clone(),
-            max_body_bytes: config.max_request_bytes,
-            ..HttpConfig::default()
-        },
-    );
-    let http = spawn_http(http_listener, http_acceptor, http_router, shutdown_rx);
+        shutdown_rx,
+    )?;
 
     Ok(ReceiverHandle {
         grpc_addr,
@@ -1295,6 +1346,7 @@ pub async fn serve_until(
         grpc,
         http,
         pipeline,
+        drain,
         snapshots_root,
         sink,
         audit_sink,

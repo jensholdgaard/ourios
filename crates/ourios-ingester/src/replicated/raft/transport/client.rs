@@ -20,6 +20,10 @@ use openraft::raft::{
 };
 use openraft::type_config::alias::SnapshotOf;
 use ourios_serving::tls::TlsSettings;
+#[cfg(test)]
+use ourios_serving::tls_reload::ReloadingClientConfig;
+use ourios_serving::tls_reload::reloading_client_config;
+use ourios_serving::tls_serve::LISTENER_REPLICATION;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tonic::codegen::http::uri::PathAndQuery;
@@ -85,12 +89,18 @@ impl Peers {
     /// # Errors
     ///
     /// Whatever [`TlsSettings::client_config`] reports, naming the path.
+    /// With `settings.reload_interval` set, the certificate follows its
+    /// files as the replication listener's does, so it must be called on
+    /// a Tokio runtime.
     pub fn mutual_tls(settings: &TlsSettings) -> Result<Self, String> {
-        Ok(Self::from_client_config(settings.client_config()?))
+        let config = reloading_client_config(settings, LISTENER_REPLICATION)?;
+        Ok(Self::secured(Security::MutualTls(TlsConnector(config))))
     }
 
+    #[cfg(test)]
     pub(super) fn from_client_config(config: rustls::ClientConfig) -> Self {
-        Self::secured(Security::MutualTls(TlsConnector(Arc::new(config).into())))
+        let config = ReloadingClientConfig::fixed(config);
+        Self::secured(Security::MutualTls(TlsConnector(config)))
     }
 
     fn secured(security: Security) -> Self {
@@ -434,6 +444,9 @@ impl PeerClient {
             | Code::Unimplemented
             | Code::OutOfRange
             | Code::ResourceExhausted => RPCError::Unreachable(Unreachable::new(status)),
+            _ if super::connect::refused_by_tls(status) => {
+                RPCError::Unreachable(Unreachable::new(status))
+            }
             _ => RPCError::Network(NetworkError::new(status)),
         }
     }

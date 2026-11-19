@@ -164,7 +164,7 @@ fn rfc0065_1_the_raft_timings_are_configured_and_checked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "RFC0065.3 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
 async fn rfc0065_3_sigkill_of_the_leader_loses_no_acked_record() {
-    use crash::{Stream, Targets, published};
+    use crash::{Stream, Targets, checkpointed, published};
     use served::{free_addr, peer_tls, restart, start};
 
     let bucket = "ourios-rfc0065-3";
@@ -226,6 +226,7 @@ async fn rfc0065_3_sigkill_of_the_leader_loses_no_acked_record() {
     assert!(acked.len() > 50, "a steady stream: {} acked", acked.len());
 
     published(&store, &acked, Duration::from_secs(120)).await;
+    checkpointed(&store, &acked, Duration::from_secs(120)).await;
     for server in servers.into_values() {
         server.terminate_cleanly().await;
     }

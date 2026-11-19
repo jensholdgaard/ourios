@@ -342,7 +342,7 @@ async fn a_batch_over_the_byte_budget_is_matched_through_its_prefix() {
     node.kill().await;
 }
 
-fn attr(span: &SpanData, key: &str) -> Option<String> {
+pub(super) fn attr(span: &SpanData, key: &str) -> Option<String> {
     span.attributes
         .iter()
         .find(|kv| kv.key.as_str() == key)

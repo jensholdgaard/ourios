@@ -21,38 +21,44 @@ use super::super::super::mining::Mined;
 use super::super::super::mining::tests::{batch_at, block, corpus, time};
 use super::super::super::proposals::Proposals;
 use super::super::super::telemetry::Meters;
-use super::super::super::types::{GroupEntry, NodeId};
+use super::super::super::types::GroupEntry;
 use super::super::Shape;
+use super::super::cluster_node;
 use super::mining::{commit_all, mined_rows, with_learners};
 use super::{Cluster, GROUP, name};
 use crate::record_sink::FlushConfig;
 
-const LOG: u32 = 9;
+pub(super) const LOG: u32 = 9;
 
 /// The voters of the cluster's groups, nodes 1 to 3, by name.
 fn voters() -> Vec<String> {
-    (1..=3).map(|n| name(NodeId::from(n))).collect()
+    (1..=3).map(|n| name(cluster_node(n))).collect()
 }
 
 /// A store holding `GROUP`'s `formed.json` with log id [`LOG`].
 pub(super) fn formed_store() -> Store {
     let store = Store::in_memory();
+    form(&store);
+    store
+}
+
+/// Record `GROUP`'s `formed.json` in `store`, with log id [`LOG`].
+pub(super) fn form(store: &Store) {
     let voters = voters();
     let names: Vec<&str> = voters.iter().map(String::as_str).collect();
     let members = (1..)
         .zip(&voters)
-        .map(|(n, voter)| (voter.clone(), NodeId::from(n)))
+        .map(|(n, voter)| (voter.clone(), cluster_node(n)))
         .collect();
     let formation = Formation::new(GROUP, LOG, members, &names).expect("formation");
     let bytes = formation.encode().expect("encode");
     store
         .put_blocking(&formed_key(GROUP), bytes)
         .expect("record");
-    store
 }
 
 /// Publishing into `store`, flushing anything buffered for 50 ms.
-fn publishing(store: Store) -> Publishing {
+pub(super) fn publishing(store: Store) -> Publishing {
     Publishing {
         store,
         voters: BTreeMap::from([(GROUP, voters())]),
@@ -69,7 +75,7 @@ fn publishing(store: Store) -> Publishing {
 }
 
 /// Every row published to `store`'s data files, in position order.
-fn published(store: &Store) -> Vec<MinedRecord> {
+pub(super) fn published(store: &Store) -> Vec<MinedRecord> {
     let keys = store.list_blocking(Some("data")).expect("list");
     let mut rows: Vec<_> = keys
         .iter()

@@ -44,6 +44,7 @@ pub mod materialize;
 pub mod pipeline;
 pub mod selector;
 pub mod tenant;
+pub mod tracked;
 
 pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
@@ -52,6 +53,7 @@ pub use materialize::{materialize_record, materialize_resource_logs};
 pub use pipeline::{Export, IngestPipeline, Journal, ReceiveError, SharedPipeline};
 pub use selector::{SelectorError, TENANT_HEADER};
 pub use tenant::assign;
+pub use tracked::{Drain, Tracked};
 
 /// RFC 0061 §3.1 — the default, and the ceiling, of
 /// `receiver.max_request_bytes`: 4 KiB below the WAL frame ceiling, so an

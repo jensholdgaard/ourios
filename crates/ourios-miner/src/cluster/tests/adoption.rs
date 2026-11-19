@@ -5,7 +5,7 @@ use crate::upstream::LOG_RECORD_TEMPLATE_ATTR;
 
 /// Test helper — a string record carrying a
 /// `log.record.template` attribute.
-fn annotated_record(tenant: &TenantId, body: &str, template: &str) -> OtlpLogRecord {
+pub(super) fn annotated_record(tenant: &TenantId, body: &str, template: &str) -> OtlpLogRecord {
     use ourios_core::otlp::KeyValue;
     let mut record = string_record(tenant, body);
     record.attributes.push(KeyValue {
@@ -18,7 +18,7 @@ fn annotated_record(tenant: &TenantId, body: &str, template: &str) -> OtlpLogRec
     record
 }
 
-fn adopt_config() -> MinerConfig {
+pub(super) fn adopt_config() -> MinerConfig {
     MinerConfig::default().with_upstream_templates(UpstreamTemplates::Adopt)
 }
 

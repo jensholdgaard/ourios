@@ -21,6 +21,7 @@ use tonic::transport::server::TcpIncoming;
 use super::super::super::cluster::Serving;
 use super::super::super::state_machine::GroupSm;
 use super::super::super::types::{NodeId, Vote};
+use super::super::tail::Clients;
 use super::super::{ForwardRequest, Outcome, Peers, ReplicationServer};
 use super::{
     GROUP, Node, Replica, bind, client_to, leader, listeners, option, vote_request, write,
@@ -55,6 +56,17 @@ impl Ca {
             .expect("params")
             .signed_by(&key, &self.issuer)
             .expect("leaf");
+        self.settings(dir, name, (&cert, &key))
+    }
+
+    /// Settings over `cert` and its `key`, written under `dir` as `name`,
+    /// with this CA as the peer CA.
+    fn settings(
+        &self,
+        dir: &Path,
+        name: &str,
+        (cert, key): (&rcgen::Certificate, &KeyPair),
+    ) -> TlsSettings {
         let cert_file = dir.join(format!("{name}.crt"));
         let key_file = dir.join(format!("{name}.key"));
         let ca_file = dir.join(format!("{name}-ca.crt"));
@@ -68,6 +80,18 @@ impl Ca {
             min_version: TlsMinVersion::V1_2,
             reload_interval: None,
         }
+    }
+}
+
+impl Ca {
+    /// A client's settings: a certificate this CA signed naming `uri` as
+    /// its only subject alternative name, as a querier's does.
+    fn client(&self, dir: &Path, name: &str, uri: &str) -> TlsSettings {
+        let key = KeyPair::generate().expect("key");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.subject_alt_names = vec![rcgen::SanType::URI(uri.try_into().expect("uri"))];
+        let cert = params.signed_by(&key, &self.issuer).expect("leaf");
+        self.settings(dir, name, (&cert, &key))
     }
 }
 
@@ -174,6 +198,87 @@ async fn refused_then_granted(server: &TlsSettings, refused: &Peers, trusted: &P
     let mut peer = client_to(trusted, node.id, addr).await;
     let granted = peer.vote(higher, option()).await.expect("vote");
     assert!(granted.vote_granted);
+    node.kill().await;
+}
+
+/// #1175: a refused client certificate is an unreachable peer, which
+/// `openraft` backs off from, not a network error it retries sooner. It
+/// arrives after the handshake, as a TLS alert, and tonic reports it as
+/// `Unknown`.
+#[tokio::test]
+async fn a_refused_certificate_reads_as_an_unreachable_peer() {
+    let (ca, other) = (Ca::new(), Ca::new());
+    let certs = TempDir::new().expect("tempdir");
+    let server = ca.node(certs.path(), "server");
+    let rogue = TlsSettings {
+        client_ca_file: server.client_ca_file.clone(),
+        ..other.node(certs.path(), "rogue")
+    };
+    let (incoming, addr) = bind();
+    let peers = Peers::mutual_tls(&server).expect("peers");
+    let mut node = start_tls(1, incoming, &server, peers).await;
+    let rogue = Peers::mutual_tls(&rogue).expect("peers");
+    let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
+
+    let result = client_to(&rogue, node.id, addr)
+        .await
+        .vote(higher, option())
+        .await;
+    assert!(
+        matches!(result, Err(RPCError::Unreachable(_))),
+        "{result:?}"
+    );
+    node.kill().await;
+}
+
+/// #1175: a node's client certificate follows its files, as its
+/// listener's does: once a refused certificate is replaced by one the peer
+/// CA signed, the node's next connection presents it and is let in, with
+/// no restart and no new pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotated_client_certificate_is_presented_without_a_restart() {
+    let (ca, other) = (Ca::new(), Ca::new());
+    let certs = TempDir::new().expect("tempdir");
+    let server = ca.node(certs.path(), "server");
+    let (incoming, addr) = bind();
+    let mut node = start_tls(
+        1,
+        incoming,
+        &server,
+        Peers::mutual_tls(&server).expect("peers"),
+    )
+    .await;
+    let rotating = TlsSettings {
+        client_ca_file: server.client_ca_file.clone(),
+        reload_interval: Some(Duration::from_millis(50)),
+        ..other.node(certs.path(), "rotating")
+    };
+    let client = Peers::mutual_tls(&rotating).expect("peers");
+    let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
+    let refused = client_to(&client, node.id, addr)
+        .await
+        .vote(higher.clone(), option())
+        .await;
+    assert!(refused.is_err(), "the other CA's certificate is refused");
+
+    let signed = ca.node(certs.path(), "signed");
+    std::fs::copy(&signed.cert_file, &rotating.cert_file).expect("rotate cert");
+    std::fs::copy(&signed.key_file, &rotating.key_file).expect("rotate key");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let vote = client_to(&client, node.id, addr)
+            .await
+            .vote(higher.clone(), option())
+            .await;
+        if vote.is_ok_and(|granted| granted.vote_granted) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rotated certificate was never presented"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     node.kill().await;
 }
 
@@ -347,5 +452,121 @@ async fn a_forward_whose_caller_certificate_is_refused_is_uncertain() {
         .forward("n1", request, Duration::from_millis(200))
         .await;
     assert!(matches!(outcome, Outcome::Uncertain(_)), "{outcome:?}");
+    node.kill().await;
+}
+
+/// A tail that answers every read with no rows.
+struct Fixed;
+
+impl super::super::tail::TailTarget for Fixed {
+    fn tail(&self, _: super::super::tail::TailQuery) -> super::super::tail::Tailing {
+        Box::pin(async {
+            Ok(super::super::tail::TailPoint {
+                read: 1,
+                published: Vec::new(),
+            })
+        })
+    }
+
+    fn scan(&self, _: super::super::tail::ScanQuery) -> super::super::tail::Scanning {
+        Box::pin(async {
+            Ok(super::super::tail::ScanPage {
+                rows: Vec::new(),
+                templates: Vec::new(),
+                next: None,
+            })
+        })
+    }
+}
+
+/// RFC0065.13: over mutual TLS a tail replica serves only a caller whose
+/// certificate names one of its `tail_clients`; another replica, whose
+/// certificate the same CA signed, is denied.
+#[tokio::test]
+async fn only_a_listed_client_reads_the_tail_over_mutual_tls() {
+    use super::super::tail::{Outcome as TailOutcome, TailQuery};
+
+    let ca = Ca::new();
+    let dir = TempDir::new().expect("temp");
+    let server = ReplicationServer::<GroupSm>::default();
+    server.serve_tails(Arc::new(Fixed), Clients::only(["spiffe://cluster/querier"]));
+    let (incoming, addr) = bind();
+    let _serving = serve_tls(server, incoming, &ca.node(dir.path(), "tail"));
+    let peers = |tls: &TlsSettings| {
+        Peers::mutual_tls(tls)
+            .expect("peers")
+            .with_addresses([("t".to_owned(), addr.to_string())])
+    };
+    let query = || TailQuery {
+        group: 0,
+        tenant: "acme".to_owned(),
+        from: 0,
+    };
+    let patience = Duration::from_secs(5);
+
+    let querier = peers(&ca.client(dir.path(), "querier", "spiffe://cluster/querier"));
+    let read = querier.tail("t", query(), patience).await;
+    assert!(matches!(read, TailOutcome::Answered(_)), "{read:?}");
+    let replica = peers(&ca.node(dir.path(), "replica"));
+    assert_eq!(
+        replica.tail("t", query(), patience).await,
+        TailOutcome::Denied
+    );
+}
+
+/// A tail client's certificate reads the tail and nothing else: the peer
+/// CA signed it, but a querier may not vote or append (RFC 0065 B21).
+#[tokio::test]
+async fn a_tail_client_cannot_call_the_consensus_rpcs() {
+    a_querier_cannot_vote(|server| {
+        server.serve_tails(Arc::new(Fixed), Clients::only([QUERIER]));
+    })
+    .await;
+}
+
+/// The same holds on a node that serves no tail, a voter's: its
+/// `tail_clients` alone restrict the listed callers.
+#[tokio::test]
+async fn a_tail_client_cannot_vote_where_no_tail_is_served() {
+    a_querier_cannot_vote(|server| server.admit_tail_clients(Clients::only([QUERIER]))).await;
+}
+
+const QUERIER: &str = "spiffe://cluster/querier";
+
+/// A node whose replication server `restrict` set up refuses a vote from
+/// the querier's certificate, and grants one from a replica's.
+async fn a_querier_cannot_vote(restrict: impl FnOnce(&ReplicationServer<GroupSm>)) {
+    let ca = Ca::new();
+    let dir = TempDir::new().expect("temp");
+    let settings = ca.node(dir.path(), "n1");
+    let (incoming, addr) = bind();
+    let peers = Peers::mutual_tls(&settings).expect("peers");
+    let server = ReplicationServer::default();
+    restrict(&server);
+    let mut node = Node::open_on(Replica::new(1, &[GROUP]), &peers, server, |server| {
+        serve_tls(server, incoming, &settings)
+    })
+    .await;
+    let vote_before = node.raft(GROUP).metrics().borrow_watched().vote;
+    let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
+
+    let querier = Peers::mutual_tls(&ca.client(dir.path(), "querier", QUERIER)).expect("peers");
+    let refused = client_to(&querier, node.id, addr)
+        .await
+        .vote(higher.clone(), option())
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        node.raft(GROUP).metrics().borrow_watched().vote,
+        vote_before
+    );
+
+    let replica = Peers::mutual_tls(&ca.node(dir.path(), "n2")).expect("peers");
+    let granted = client_to(&replica, node.id, addr)
+        .await
+        .vote(higher, option())
+        .await
+        .expect("vote");
+    assert!(granted.vote_granted);
     node.kill().await;
 }

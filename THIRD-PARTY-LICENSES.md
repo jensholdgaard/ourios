@@ -19,8 +19,8 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 378 |
-| `MIT` | 83 |
+| `Apache-2.0` | 386 |
+| `MIT` | 85 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 13 |
 | `ISC` | 6 |
@@ -5134,6 +5134,8 @@ Used by:
 
 - `ahash` 0.8.12 — <https://github.com/tkaitchuck/ahash>
 - `arrayvec` 0.7.8 — <https://github.com/bluss/arrayvec>
+- `asn1-rs-derive` 0.6.0 — <https://github.com/rusticata/asn1-rs.git>
+- `asn1-rs` 0.7.2 — <https://github.com/rusticata/asn1-rs.git>
 - `atomic-waker` 1.1.2 — <https://github.com/smol-rs/atomic-waker>
 - `autocfg` 1.5.1 — <https://github.com/cuviper/autocfg>
 - `base64` 0.22.1 — <https://github.com/marshallpierce/rust-base64>
@@ -5149,6 +5151,7 @@ Used by:
 - `core-foundation` 0.10.1 — <https://github.com/servo/core-foundation-rs>
 - `crossbeam-utils` 0.8.21 — <https://github.com/crossbeam-rs/crossbeam>
 - `curve25519-dalek-derive` 0.1.1 — <https://github.com/dalek-cryptography/curve25519-dalek>
+- `der-parser` 10.0.0 — <https://github.com/rusticata/der-parser.git>
 - `displaydoc` 0.2.6 — <https://github.com/yaahc/displaydoc>
 - `either` 1.16.0 — <https://github.com/rayon-rs/either>
 - `encoding_rs_io` 0.1.8 — <https://github.com/BurntSushi/encoding_rs_io>
@@ -5190,6 +5193,7 @@ Used by:
 - `num-integer` 0.1.46 — <https://github.com/rust-num/num-integer>
 - `num-iter` 0.1.45 — <https://github.com/rust-num/num-iter>
 - `num-traits` 0.2.19 — <https://github.com/rust-num/num-traits>
+- `oid-registry` 0.8.1 — <https://github.com/rusticata/oid-registry.git>
 - `once_cell` 1.21.4 — <https://github.com/matklad/once_cell>
 - `openssl-probe` 0.2.1 — <https://github.com/rustls/openssl-probe>
 - `parking_lot` 0.12.5 — <https://github.com/Amanieu/parking_lot>
@@ -5208,6 +5212,7 @@ Used by:
 - `regex` 1.13.1 — <https://github.com/rust-lang/regex>
 - `ring` 0.17.14 — <https://github.com/briansmith/ring>
 - `rustc_version` 0.4.1 — <https://github.com/djc/rustc-version-rs>
+- `rusticata-macros` 4.1.0 — <https://github.com/rusticata/rusticata-macros.git>
 - `rustix` 1.1.6 — <https://github.com/bytecodealliance/rustix>
 - `rustls-native-certs` 0.8.4 — <https://github.com/rustls/rustls-native-certs>
 - `rustls` 0.23.46 — <https://github.com/rustls/rustls>
@@ -5239,6 +5244,7 @@ Used by:
 - `wasm-bindgen` 0.2.126 — <https://github.com/wasm-bindgen/wasm-bindgen>
 - `web-sys` 0.3.103 — <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys>
 - `wit-bindgen` 0.57.1 — <https://github.com/bytecodealliance/wit-bindgen>
+- `x509-parser` 0.18.1 — <https://github.com/rusticata/x509-parser.git>
 
 <details>
 <summary>Full license text</summary>
@@ -5679,6 +5685,7 @@ Used by:
 - `lexical-util` 1.0.7 — <https://github.com/Alexhuszagh/rust-lexical>
 - `lexical-write-float` 1.0.6 — <https://github.com/Alexhuszagh/rust-lexical>
 - `lexical-write-integer` 1.0.6 — <https://github.com/Alexhuszagh/rust-lexical>
+- `minimal-lexical` 0.2.1 — <https://github.com/Alexhuszagh/minimal-lexical>
 
 <details>
 <summary>Full license text</summary>
@@ -7231,6 +7238,7 @@ Used by:
 - `android_system_properties` 0.1.5 — <https://github.com/nical/android_system_properties>
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>
 - `arraydeque` 0.5.1 — <https://github.com/andylokandy/arraydeque>
+- `asn1-rs-impl` 0.2.0 — <https://github.com/rusticata/asn1-rs.git>
 - `async-trait` 0.1.92 — <https://github.com/dtolnay/async-trait>
 - `aws-lc-sys` 0.46.0 — <https://github.com/aws/aws-lc-rs>
 - `blake3` 1.8.7 — <https://github.com/BLAKE3-team/BLAKE3>
@@ -8867,6 +8875,41 @@ THE SOFTWARE.
 
 Used by:
 
+- `nom` 7.1.3 — <https://github.com/Geal/nom>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+Copyright (c) 2014-2019 Geoffroy Couprie
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
 - `hyper` 1.12.0 — <https://github.com/hyperium/hyper>
 
 <details>
@@ -10474,6 +10517,43 @@ Used by:
 The MIT License (MIT)
 
 Copyright (c) 2015 Vincent Prouillet
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
+- `data-encoding` 2.11.0 — <https://github.com/ia0/data-encoding>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015-2020 Julien Cretin
+Copyright (c) 2017-2020 Google Inc.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

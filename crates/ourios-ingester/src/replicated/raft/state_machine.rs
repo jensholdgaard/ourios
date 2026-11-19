@@ -89,6 +89,10 @@ struct State {
     history: History,
     /// The snapshot recorded last.
     snapshot: Option<GroupSnapshot>,
+    /// The index of the last flusher assignment applied since the state
+    /// opened or a snapshot installed; held in memory only, since a reader
+    /// that lost it reports as one that never saw it (#1333).
+    assigned_at: Option<u64>,
 }
 
 impl State {
@@ -102,6 +106,7 @@ impl State {
             group: snapshot.as_ref().map(|s| s.state).unwrap_or_default(),
             history: History::new(snapshot.clone()),
             snapshot,
+            assigned_at: None,
         }
     }
 
@@ -153,6 +158,7 @@ impl State {
             Control::FlusherAssignment(replica) => {
                 let flusher = NodeId::from(Uuid::from_bytes(replica));
                 self.group.flusher = Some(flusher);
+                self.assigned_at = Some(at.index);
                 self.history.changed(at.index, Change::Flusher(flusher));
                 Ok(Some(AppliedEvent::Flusher(flusher)))
             }
@@ -453,6 +459,13 @@ impl GroupSm {
         self.state().group.flusher
     }
 
+    /// The index of the last flusher assignment applied since this state
+    /// opened or installed a snapshot.
+    #[must_use]
+    pub fn assigned_at(&self) -> Option<u64> {
+        self.state().assigned_at
+    }
+
     /// The latest id block applied, or the snapshot's when none has been
     /// since; the group's miner allocates from it.
     #[must_use]
@@ -620,6 +633,34 @@ mod tests {
     async fn apply(sm: &mut GroupSm, entries: Vec<EntryResponder<RaftTypes>>) {
         let stream = futures_util::stream::iter(entries.into_iter().map(Ok));
         sm.apply(stream).await.expect("apply");
+    }
+
+    /// #1333: each assignment applied records its index, so naming a
+    /// replica again after another (A, B, A) reads as a new assignment
+    /// though the same replica is named; a snapshot install forgets it.
+    #[tokio::test]
+    async fn each_assignment_applied_records_its_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = GroupSm::open(dir.path(), Arc::default()).expect("open");
+        apply(&mut sm, vec![assign(1, 7)]).await;
+        assert_eq!(
+            (sm.flusher(), sm.assigned_at()),
+            (Some(NodeId::from(7)), Some(1))
+        );
+        apply(&mut sm, vec![assign(2, 8), batch(3), assign(4, 7)]).await;
+        assert_eq!(
+            (sm.flusher(), sm.assigned_at()),
+            (Some(NodeId::from(7)), Some(4))
+        );
+
+        let group = GroupState {
+            flusher: Some(NodeId::from(7)),
+            highest_kind: 1,
+            id_block: None,
+            miner_config: None,
+        };
+        sm.install_snapshot(&at(9), group).await.expect("install");
+        assert_eq!(sm.assigned_at(), None);
     }
 
     /// The last assignment names the flusher; batches and blanks leave it.

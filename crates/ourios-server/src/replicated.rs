@@ -99,6 +99,7 @@ pub(crate) fn plan(
             ..ScanOptions::default()
         },
         retry: LOCK_RETRY,
+        tail_clients: replicated.tail_clients.clone(),
     };
     let background = Background {
         store: config.store.clone(),

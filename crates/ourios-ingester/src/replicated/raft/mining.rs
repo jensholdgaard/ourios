@@ -21,7 +21,7 @@
 //! with the time the leader wrote into the batch being mined, so replicas
 //! stamp it alike whatever their own clocks say.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -38,6 +38,7 @@ use ourios_miner::cluster::{self, IdReservationError, IdReserver, MinerCluster, 
 use ourios_wal::{BatchTime, TenantBatch};
 use prost::Message as _;
 
+use super::kept::{Definitions, Kept, TemplateKey};
 use super::snapshot_record::{GroupMinerConfig, IdBlock};
 use super::state_machine::{Applied, AppliedEvent};
 use super::types::{Entry, GroupEntry, LogId, TimedBatch};
@@ -383,6 +384,37 @@ impl GroupMiner {
             .with_id_reserver(Box::new(self.blocks.clone()))
     }
 
+    /// The definitions of `wanted` that the miner's templates for
+    /// `tenant` hold: each mined leaf at its version, and each adoption at
+    /// the version it binds.
+    #[must_use]
+    pub fn definitions(&self, tenant: &TenantId, wanted: &BTreeSet<TemplateKey>) -> Definitions {
+        let Stage::Mining { miner, .. } = &self.stage else {
+            return Definitions::new();
+        };
+        miner
+            .template_definitions(tenant, wanted)
+            .into_iter()
+            .collect()
+    }
+
+    /// The definitions of `wanted` for `tenant` a tail replica holds as one
+    /// state: this miner's, and the older versions `kept`, the output it
+    /// kept, binds in its audit events.
+    #[must_use]
+    pub fn definitions_with(
+        &self,
+        kept: &Kept,
+        tenant: &TenantId,
+        wanted: &BTreeSet<TemplateKey>,
+    ) -> Definitions {
+        let mut defined = self.definitions(tenant, wanted);
+        for (key, template) in kept.definitions(tenant, wanted) {
+            defined.entry(key).or_insert(template);
+        }
+        defined
+    }
+
     /// The id blocks applied and not yet drawn.
     #[must_use]
     pub fn blocks(&self) -> &LogBlocks {
@@ -426,7 +458,18 @@ impl GroupMiner {
     ///
     /// The [`GroupMinerError`] that stopped the miner at that batch.
     pub fn next_held(&mut self) -> Option<Result<Mined, GroupMinerError>> {
-        let read = self.read_held()?;
+        let mut unbounded = usize::MAX;
+        self.next_held_within(&mut unbounded)
+    }
+
+    /// As [`Self::next_held`], reading at most `reads` more of the log, what
+    /// it reads taken from `reads`; `None` too once they are spent, while
+    /// it still [holds](Self::holds) batches to drain (#1310).
+    pub fn next_held_within(
+        &mut self,
+        reads: &mut usize,
+    ) -> Option<Result<Mined, GroupMinerError>> {
+        let read = self.read_held(reads)?;
         Some(self.settle(read))
     }
 
@@ -532,12 +575,16 @@ impl GroupMiner {
 
     /// The rows of the next held batch in the group's log, or `None`
     /// once the configuration holds none.
-    fn read_held(&mut self) -> Option<Result<Vec<MinedRow>, GroupMinerError>> {
+    fn read_held(&mut self, reads: &mut usize) -> Option<Result<Vec<MinedRow>, GroupMinerError>> {
         let Stage::Mining { miner, held, .. } = &mut self.stage else {
             return None;
         };
         let Held { next, at } = held.as_mut()?;
         while *next < at.index {
+            if *reads == 0 {
+                return None;
+            }
+            *reads -= 1;
             let index = *next;
             *next += 1;
             match self.log.entry(index) {

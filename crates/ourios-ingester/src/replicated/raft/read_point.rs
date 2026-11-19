@@ -10,7 +10,7 @@ use std::time::Duration;
 use openraft::async_runtime::WatchReceiver as _;
 use tokio::time::Instant;
 
-use super::host::{GroupHost, GroupRaft};
+use super::host::{GroupHost, GroupRaft, Tailed};
 use super::transport::Peers;
 use super::transport::read_index::Outcome;
 
@@ -40,30 +40,53 @@ pub async fn read_point(
     group: u32,
     patience: Duration,
 ) -> Result<u64, Unavailable> {
+    let tailed = host
+        .tailed(group)
+        .ok_or_else(|| Unavailable("not mined here".to_owned()))?;
+    read_point_of(&tailed, peers, group, patience).await
+}
+
+/// As [`read_point`], on the group `tailed` holds.
+///
+/// # Errors
+///
+/// As [`read_point`].
+pub async fn read_point_of(
+    tailed: &Tailed,
+    peers: &Peers,
+    group: u32,
+    patience: Duration,
+) -> Result<u64, Unavailable> {
     let deadline = Instant::now() + patience;
-    let unavailable = |why: &str| Unavailable(why.to_owned());
-    let raft = host.raft(group).ok_or_else(|| unavailable("not hosted"))?;
-    let sm = host
-        .state_machine(group)
-        .ok_or_else(|| unavailable("not hosted"))?;
-    let mut mined = host
-        .mined_through(group)
-        .ok_or_else(|| unavailable("not mined here"))?;
-    let index = confirmed(raft, peers, group, deadline).await?;
+    let index = confirmed(&tailed.raft, peers, group, deadline).await?;
+    caught_up(tailed, index, deadline).await?;
+    Ok(index)
+}
+
+/// Wait until the replica `tailed` holds has applied through `index` and
+/// mined every entry it was handed by then, before `deadline`.
+///
+/// # Errors
+///
+/// [`Unavailable`] when it has not by `deadline`, or its miner stopped.
+pub async fn caught_up(tailed: &Tailed, index: u64, deadline: Instant) -> Result<(), Unavailable> {
     let left = deadline.saturating_duration_since(Instant::now());
-    raft.wait(Some(left))
+    tailed
+        .raft
+        .wait(Some(left))
         .applied_index_at_least(Some(index), "applied through the read point")
         .await
         .map_err(|e| Unavailable(format!("not applied through {index}: {e}")))?;
     // Applied through the point, the miner has been handed every entry
     // at or below it that it mines; entries it never sees (blank,
     // membership) need no mining, so the point itself may lie past them.
-    let handed = sm.handed_through();
+    let handed = tailed.sm.handed_through();
+    let mut mined = tailed.mined.clone();
     tokio::time::timeout_at(deadline, mined.wait_for(|through| *through >= handed))
         .await
         .map_err(|_| Unavailable(format!("not mined through {index} in time")))?
-        .map_err(|_| unavailable("the miner stopped"))?;
-    Ok(index)
+        .map_err(|_| Unavailable("the miner stopped".to_owned()))?;
+    Ok(())
 }
 
 /// The read point the leader confirms, asking the leader this replica

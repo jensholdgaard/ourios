@@ -43,6 +43,7 @@ pub(super) fn n0_named(name: &str, wal_root: &Path, store: &Store, peers: Peers)
         allow_bootstrap: true,
         scan: ScanOptions::default(),
         retry: Duration::from_millis(10),
+        tail_clients: vec!["querier".to_owned()],
     }
 }
 

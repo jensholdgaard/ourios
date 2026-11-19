@@ -4,9 +4,9 @@
 //! [`Peers`] pool. On a tail replica each group's [`GroupMiner`] mines the
 //! entries its state machine applies (§6.5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use openraft::async_runtime::WatchReceiver as _;
@@ -20,9 +20,15 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use super::checkpointer::Checkpointer;
-use super::flushing::{self, Current, Flushing, Need, Publishing};
+use super::flushing::{self, Current, Flushing, Need, Publishing, Source};
 use super::gate::SyncGate;
-use super::kept::{Bounds, Kept};
+use ourios_core::tenant::TenantId;
+
+use lookup::{Asker, Lookup};
+use tailed::FormedLog;
+pub use tailed::Tailed;
+
+use super::kept::{Bounds, Definitions, Kept, TemplateKey};
 use super::log_store::{Disk, GroupLog, GroupLogReader, group_dir};
 use super::mining::{GroupMiner, GroupMinerError, Mined, SharedLog};
 use super::proposer::Proposer;
@@ -210,6 +216,7 @@ impl Launch<'_> {
             checkpointer,
             reporting,
             restoring,
+            lookups: None,
         }
     }
 
@@ -311,11 +318,23 @@ struct Mining {
     /// The group's age sweep, when it can be published from this replica;
     /// it stops with the miner.
     sweep: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// What the miner keeps, which tail reads page through while its task
+    /// runs; held weakly, as the kept gauges hold it, so an ended task's
+    /// output is neither reported nor served.
+    kept: Weak<Mutex<Kept>>,
+    /// Where tail reads ask the miner for template definitions.
+    asker: Asker,
+    /// The group's log id, which served rows' positions carry.
+    formed: Arc<FormedLog>,
 }
 
 impl Mining {
-    fn start(follow: Follow, miner: GroupMiner, applied: mpsc::Receiver<Applied>) -> Self {
+    fn start(mut follow: Follow, miner: GroupMiner, applied: mpsc::Receiver<Applied>) -> Self {
         let (stop, stopped) = watch::channel(false);
+        let (asker, lookups) = lookup::channel();
+        follow.lookups = Some(lookups);
+        let kept = Arc::downgrade(&follow.keeping.kept);
+        let formed = Arc::new(FormedLog::new(follow.source(), follow.group));
         let followed = follow.followed.subscribe();
         let sweep = follow
             .sweep
@@ -327,7 +346,15 @@ impl Mining {
             followed,
             task: tokio::sync::Mutex::new(Some(task)),
             sweep: tokio::sync::Mutex::new(sweep),
+            kept,
+            asker,
+            formed,
         }
+    }
+
+    #[cfg(test)]
+    fn read_kept<T>(&self, read: impl FnOnce(&Kept) -> T) -> Option<T> {
+        tailed::read_kept(&self.kept, &self.followed, read)
     }
 
     #[cfg(test)]
@@ -374,6 +401,11 @@ enum Work {
     /// The report tick, which forces a report, so one goes out at least
     /// every patience; reports are checked after every piece of work.
     Report,
+    /// A tail read's question to the miner.
+    Lookup(Lookup),
+    /// The publishing tick, which takes an applied entry's publishing step
+    /// with no output, for a group gone quiet.
+    Drive,
 }
 
 /// A tick every `every`, delayed rather than bunched after a slow step.
@@ -420,6 +452,8 @@ struct Follow {
     /// Where the miner restores from at a snapshot, when this replica
     /// reads the group's store; without one, a snapshot stops the miner.
     restoring: Option<Restoring<SharedLog>>,
+    /// Tail reads' questions to the miner, once it runs.
+    lookups: Option<mpsc::Receiver<Lookup>>,
 }
 
 /// What a tail replica's settings say of its groups' output.
@@ -463,6 +497,19 @@ impl Keeping {
             let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
             self.publish(&mut flushing, kept, (applied.assigned, out));
         }
+    }
+
+    /// Take the step an applied entry would, with no output of its own: a
+    /// named flusher of an idle group builds its publication once the log
+    /// id reads, then publishes or replays what it keeps (#1301).
+    fn drive(&self) {
+        let Some(flushing) = &self.flushing else {
+            return;
+        };
+        // In `keep`'s order: what it keeps, then the publication.
+        let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
+        self.publish(&mut flushing, kept, (None, &Mined::default()));
     }
 
     /// Publish as `flushing` plans from `kept`, holding `kept` only while
@@ -536,6 +583,15 @@ impl Follow {
         let mut reporting = self.reporting.take();
         let mut barrier = checkpointer.as_ref().map(|c| interval(c.every()));
         let mut reports = reporting.as_ref().map(|_| interval(Reporting::every()));
+        // A group that can be published from here takes its publishing step
+        // on this task's tick too, so a quiet group still publishes (#1301).
+        let mut drives = self
+            .keeping
+            .flushing
+            .as_ref()
+            .and(self.sweep.as_ref())
+            .map(|(_, every)| interval(*every));
+        let mut lookups = self.lookups.take();
         self.followed_through(&miner);
         loop {
             // Unbiased, so a queue that is never empty does not starve the
@@ -544,6 +600,8 @@ impl Follow {
                 event = next(&mut applied, &mut stop) => event.map(Work::Event),
                 () = ticked(&mut barrier) => Some(Work::Barrier),
                 () = ticked(&mut reports) => Some(Work::Report),
+                () = ticked(&mut drives) => Some(Work::Drive),
+                lookup = lookup::asked(&mut lookups) => Some(Work::Lookup(lookup)),
             };
             let Some(work) = work else {
                 return;
@@ -577,6 +635,13 @@ impl Follow {
         }
     }
 
+    /// Where this group's store is, when it can be published from here.
+    fn source(&self) -> Option<Source> {
+        let flushing = self.keeping.flushing.as_ref()?;
+        let flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(flushing.source().clone())
+    }
+
     /// Report how far `miner` has mined the log.
     fn followed_through(&self, miner: &GroupMiner) {
         self.followed.send_replace(miner.mined_through());
@@ -593,6 +658,29 @@ impl Follow {
         match (work, checkpointer) {
             (Work::Event(event), _) => self.follow(miner, event, stop).await,
             (Work::Barrier, Some(checkpointer)) => self.checkpoint(checkpointer, miner).await,
+            // Off the runtime's workers, as a step is: an answer formats
+            // templates.
+            (Work::Lookup(lookup), _) => {
+                let kept = Arc::clone(&self.keeping.kept);
+                tokio::task::spawn_blocking(move || {
+                    lookup.answer(&miner, &kept);
+                    miner
+                })
+                .await
+                .ok()
+            }
+            (Work::Drive, _) => {
+                // On this task, as an applied entry's step is, so it takes
+                // `Kept` and the publication in the same order as `keep`
+                // and never alongside it.
+                let keeping = self.keeping.clone();
+                tokio::task::spawn_blocking(move || {
+                    keeping.drive();
+                    miner
+                })
+                .await
+                .ok()
+            }
             (Work::Barrier | Work::Report, _) => Some(miner),
         }
     }
@@ -882,6 +970,41 @@ impl GroupHost {
         Some(mining.followed.clone())
     }
 
+    /// `read` of what a tail replica keeps of `group`'s mined output,
+    /// under its lock; `None` where `group` is not mined here or its
+    /// miner's task has ended.
+    pub fn read_kept<T>(&self, group: u32, read: impl FnOnce(&Kept) -> T) -> Option<T> {
+        self.tailed(group)?.read_kept(read)
+    }
+
+    /// The definitions of `wanted` for `tenant` that `group`'s tail replica
+    /// holds: its miner's and the older versions its kept audit events
+    /// bind, both read by its task in one step. `None` where `group` is not
+    /// mined here or its miner has stopped.
+    pub async fn definitions(
+        &self,
+        group: u32,
+        tenant: &TenantId,
+        wanted: BTreeSet<TemplateKey>,
+    ) -> Option<Definitions> {
+        self.tailed(group)?.definitions(tenant, wanted).await
+    }
+
+    /// `group`'s handles for tail reads; `None` where it is not mined here.
+    #[must_use]
+    pub fn tailed(&self, group: u32) -> Option<Tailed> {
+        let hosted = self.groups.get(&group)?;
+        let mining = hosted.mining.as_ref()?;
+        Some(Tailed {
+            raft: hosted.raft.clone(),
+            sm: hosted.sm.clone(),
+            mined: mining.followed.clone(),
+            kept: mining.kept.clone(),
+            asker: mining.asker.clone(),
+            formed: Arc::clone(&mining.formed),
+        })
+    }
+
     #[must_use]
     pub fn state_machine(&self, group: u32) -> Option<&GroupSm> {
         self.groups.get(&group).map(|hosted| &hosted.sm)
@@ -927,7 +1050,9 @@ impl GroupHost {
     }
 }
 
+mod lookup;
 mod reinstall;
+mod tailed;
 
 use reinstall::Install;
 
@@ -938,7 +1063,6 @@ mod tests {
     use openraft::vote::leader_id_std::CommittedLeaderId;
     use ourios_wal::Control;
 
-    use super::super::flushing::Source;
     use super::super::formation::{Formation, formed_key};
     use super::super::kept::tests::{entries, mined_log};
     use super::super::mining::GroupLogRead;
@@ -1044,6 +1168,7 @@ mod tests {
             checkpointer: None,
             reporting: None,
             restoring: None,
+            lookups: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         let GroupEntry::Batch(batch) = batch_at(time(1), "acme", &["a b c"]) else {
@@ -1204,6 +1329,7 @@ mod tests {
             checkpointer: None,
             reporting: None,
             restoring: None,
+            lookups: None,
         };
         let mining = Mining::start(follow, GroupMiner::new(log), applied);
         Following {
@@ -1363,6 +1489,76 @@ mod tests {
         mining.stop().await;
         assert_eq!(reader.points(gap), [], "an ended task reports no gap");
         assert_eq!(reader.points(usage), [], "nor kept audit bytes");
+    }
+
+    /// A tail read reaches what the miner keeps only while its task runs,
+    /// and holds none of it past the call: once the task has ended, there
+    /// is nothing to read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kept_output_is_read_only_while_mining_runs() {
+        let Following {
+            events,
+            mut handed,
+            mining,
+            kept,
+        } = following(Bounds::default(), &Meters::global());
+        drop(kept);
+        through_a_cut(&events).await;
+        assert!(
+            mining.read_kept(Kept::cut).is_some(),
+            "a running task's output"
+        );
+
+        drop(events);
+        while handed.recv().await.is_some() {}
+        mining.stop().await;
+        assert!(
+            mining.read_kept(Kept::cut).is_none(),
+            "an ended task's output"
+        );
+    }
+
+    /// A read still running as the task ends holds `Kept` for its call,
+    /// so a read that reaches `Kept` through that hold after the task has
+    /// ended must still get nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_after_the_task_ends_gets_nothing_while_another_still_reads() {
+        let Following {
+            events,
+            mut handed,
+            mining,
+            kept,
+        } = following(Bounds::default(), &Meters::global());
+        drop(kept);
+        let (entered, first_in) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let mining = &mining;
+            let first = scope.spawn(move || {
+                mining.read_kept(|_| {
+                    entered.send(()).ok();
+                    released.recv().ok();
+                })
+            });
+            first_in.recv().expect("the first read holds Kept");
+            drop(events);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    while handed.recv().await.is_some() {}
+                    mining.stop().await;
+                });
+            });
+            let second = scope.spawn(move || mining.read_kept(|_| ()));
+            // Let it reach `Kept` through the first read's hold and wait.
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).ok();
+            assert_eq!(first.join().expect("joined"), Some(()));
+            assert_eq!(
+                second.join().expect("joined"),
+                None,
+                "an ended task's output"
+            );
+        });
     }
 
     /// The kept gauges read `Kept` under its lock, so a step must not hold

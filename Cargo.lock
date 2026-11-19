@@ -3946,6 +3946,7 @@ dependencies = [
  "tracing-subscriber",
  "twox-hash",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -3972,6 +3973,7 @@ version = "0.17.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
+ "arrow-ipc",
  "arrow-schema",
  "async-trait",
  "bytes",

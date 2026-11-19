@@ -20,11 +20,14 @@ use super::{
     group_dir, name, propose, wal_config, write,
 };
 
+mod idle;
 mod mining;
 mod propose;
 mod publication;
+mod read_faults;
 mod read_index;
 mod restore;
+mod tail;
 
 const GROUP: u32 = 0;
 
@@ -613,4 +616,22 @@ async fn a_crash_keeps_each_group_on_the_node_through_its_own_last_fsync() {
         cluster.node(held).applied_through(group, index).await;
     }
     cluster.shutdown().await;
+}
+
+/// #1353: the in-process clusters' node ids are this process's own, so a
+/// call another test process's cluster sends to a reused port names a
+/// replica no node here hosts and is refused as addressed to another
+/// (`transport::tests::a_request_for_another_replica_at_the_address_is_refused_uncredited`).
+#[test]
+fn cluster_nodes_are_numbered_apart_from_other_processes() {
+    use super::super::types::NodeId;
+    use super::cluster_node;
+
+    assert_eq!(cluster_node(3), cluster_node(3), "stable within a process");
+    assert_ne!(cluster_node(3), cluster_node(4));
+    assert_ne!(
+        cluster_node(3),
+        NodeId::from(3),
+        "not the shared numbering every process used to give node 3"
+    );
 }

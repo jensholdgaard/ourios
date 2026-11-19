@@ -106,15 +106,22 @@ fn segment_bytes(newest: &Newest) -> Vec<u8> {
 }
 
 fn replay(newest: &Newest) -> (Result<(), RecoveryError>, Vec<Vec<u8>>) {
+    let (_, result, frames) = recover(newest);
+    (result, frames)
+}
+
+/// Open the root and replay it, keeping the recovering writer.
+fn recover(newest: &Newest) -> (Wal, Result<(), RecoveryError>, Vec<Vec<u8>>) {
     let mut sink = CollectingSink::default();
-    let result = open(newest.root.path()).replay(&mut sink);
-    (result, sink.frames)
+    let mut wal = open(newest.root.path());
+    let result = wal.replay(&mut sink);
+    (wal, result, sink.frames)
 }
 
 /// The tail is healed: replay opens with every acknowledged frame, and
-/// the segment is cut back to `B`.
-fn assert_healed(newest: &Newest) {
-    let (result, frames) = replay(newest);
+/// the segment is cut back to `B`. Returns the writer that recovered it.
+fn assert_healed(newest: &Newest) -> Wal {
+    let (wal, result, frames) = recover(newest);
     result.expect("a healable tail must not stop recovery");
     assert_eq!(
         frames, newest.acknowledged,
@@ -125,6 +132,7 @@ fn assert_healed(newest: &Newest) {
         newest.boundary,
         "the segment is truncated to B",
     );
+    wal
 }
 
 /// The tail is corruption: replay stops at `B` on this segment and
@@ -184,9 +192,7 @@ fn rfc0068_1_zero_tail_at_a_frame_boundary_is_healed() {
         let newest = Newest::synced(&PAYLOADS);
         forge(&newest, &vec![0; zeros]);
 
-        assert_healed(&newest);
-
-        let mut wal = open(newest.root.path());
+        let mut wal = assert_healed(&newest);
         let next = wal
             .append(FrameKind::OtlpBatch, b"after-the-heal")
             .expect("append after the heal");
@@ -380,32 +386,51 @@ fn rfc0068_5_a_heal_is_reported() {
     );
 }
 
-/// The §3.1 partition, written out independently of the decoder: healed
-/// exactly when T1 or T2 holds. `None` is a tail whose first frame is
-/// valid, which is no tail at all.
-fn expected_heal(tail: &[u8]) -> Option<bool> {
-    if tail.len() < FRAME_HEADER_LEN || tail.iter().all(|&b| b == 0) {
-        return Some(true);
+/// The first frame of a forged tail, read by the §3.1 rules written out
+/// independently of the decoder.
+enum Step {
+    /// A complete, valid frame of this many bytes.
+    Valid(usize),
+    /// T1 or T2, or nothing left: healed here.
+    Healed,
+    Corrupt,
+}
+
+impl Newest {
+    /// Admit a valid frame forged after `B`: replay delivers it, so `B`
+    /// moves past it.
+    fn admit(&mut self, frame: &[u8]) {
+        self.acknowledged.push(frame[FRAME_HEADER_LEN..].to_vec());
+        self.boundary += frame.len() as u64;
     }
-    let len = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as usize;
-    let well_formed = len <= MAX_FRAME_BYTES && (1..=4).contains(&tail[4]) && tail[5..8] == [0; 3];
+}
+
+fn first_step(rest: &[u8]) -> Step {
+    if rest.len() < FRAME_HEADER_LEN || rest.iter().all(|&b| b == 0) {
+        return Step::Healed;
+    }
+    let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let well_formed = len <= MAX_FRAME_BYTES && (1..=4).contains(&rest[4]) && rest[5..8] == [0; 3];
     if !well_formed {
-        return Some(false);
+        return Step::Corrupt;
     }
-    let Some(payload) = tail.get(FRAME_HEADER_LEN..FRAME_HEADER_LEN + len) else {
-        return Some(true);
+    let Some(payload) = rest.get(FRAME_HEADER_LEN..FRAME_HEADER_LEN + len) else {
+        return Step::Healed;
     };
-    let crc = u32::from_le_bytes([tail[8], tail[9], tail[10], tail[11]]);
     let sealed = Frame {
-        kind: tail[4],
+        kind: rest[4],
         payload: payload.to_vec(),
         ..Frame::default()
     }
     .sealed();
-    (crc != sealed.crc).then_some(false)
+    if sealed.bytes()[8..12] == rest[8..12] {
+        Step::Valid(FRAME_HEADER_LEN + len)
+    } else {
+        Step::Corrupt
+    }
 }
 
-fn tails() -> impl Strategy<Value = Vec<u8>> {
+fn damaged_tails() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
         prop::collection::vec(any::<u8>(), 1..80),
         (12usize..1200).prop_map(|n| vec![0; n]),
@@ -427,21 +452,51 @@ fn tails() -> impl Strategy<Value = Vec<u8>> {
     ]
 }
 
+/// Up to three valid frames, then a damaged tail.
+fn tails() -> impl Strategy<Value = Vec<u8>> {
+    let payloads = prop::collection::vec(prop::collection::vec(any::<u8>(), 0..40), 0..3);
+    (payloads, damaged_tails()).prop_map(|(payloads, damaged)| {
+        let mut tail: Vec<u8> = payloads
+            .into_iter()
+            .flat_map(|payload| {
+                Frame {
+                    kind: 0x01,
+                    payload,
+                    ..Frame::default()
+                }
+                .sealed()
+                .bytes()
+            })
+            .collect();
+        tail.extend(damaged);
+        tail
+    })
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     #[ignore = "RFC0068 red: replay reads a zero header as an unknown kind until §3.1 T2 lands"]
     fn rfc0068_healed_exactly_when_t1_or_t2_holds(tail in tails()) {
-        let Some(healed) = expected_heal(&tail) else {
-            return Ok(());
-        };
-        let newest = Newest::synced(&PAYLOADS);
+        let mut newest = Newest::synced(&PAYLOADS);
         forge(&newest, &tail);
-        if healed {
-            assert_healed(&newest);
-        } else {
-            assert_corrupt_untouched(&newest);
+        let mut rest = tail.as_slice();
+        loop {
+            match first_step(rest) {
+                Step::Valid(len) => {
+                    newest.admit(&rest[..len]);
+                    rest = &rest[len..];
+                }
+                Step::Healed => {
+                    assert_healed(&newest);
+                    break;
+                }
+                Step::Corrupt => {
+                    assert_corrupt_untouched(&newest);
+                    break;
+                }
+            }
         }
     }
 }

@@ -32,6 +32,7 @@ pub mod openfga;
 pub mod propagation;
 pub mod serve;
 pub mod tls;
+pub mod tls_reload;
 pub mod tls_serve;
 
 pub use auth::{AuthBinding, AuthError, AuthResolver, GraphIdentity, authenticate_bearer};

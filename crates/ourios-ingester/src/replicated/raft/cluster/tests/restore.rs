@@ -17,7 +17,7 @@ use super::publication::{
 
 /// Wait for the named flusher, node 3, to checkpoint past `last` into
 /// `store`, every replica to apply it, and node 3 to build its snapshot.
-async fn snapshot_at_the_checkpoint(cluster: &Cluster, store: &Store, last: u64) {
+pub(super) async fn snapshot_at_the_checkpoint(cluster: &Cluster, store: &Store, last: u64) {
     let cut = checkpointed_through(store, last).await;
     applied_everywhere(cluster, cut.seq).await;
     let built = cluster

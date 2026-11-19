@@ -24,6 +24,7 @@ mod idle;
 mod mining;
 mod propose;
 mod publication;
+mod read_faults;
 mod read_index;
 mod restore;
 mod tail;

@@ -372,6 +372,9 @@ fn replay_gated(
         return Err(RecoveryDriverError::TemplateIds(failure));
     }
     replayed.map_err(RecoveryDriverError::Replay)?;
+    if let Some(heal) = wal.healed_tail() {
+        crate::tail_heal::report(heal, &ourios_core::telemetry::meter("ourios.wal"));
+    }
     Ok(Replayed {
         frames_delivered,
         records_fed,

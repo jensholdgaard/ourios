@@ -220,6 +220,9 @@ fn recover(config: WalConfig, gate: &SyncGate) -> io::Result<(Wal, Index, WalOff
     let mut replay = Replay(Index::default());
     wal.replay(&mut replay)
         .map_err(|e| wal_error("replay the group WAL", e))?;
+    if let Some(heal) = wal.healed_tail() {
+        crate::tail_heal::report(heal, &ourios_core::telemetry::meter("ourios.wal"));
+    }
     wal.rebuild_ledger()
         .map_err(|e| wal_error("rebuild the group WAL ledger", e))?;
     let sync = || {

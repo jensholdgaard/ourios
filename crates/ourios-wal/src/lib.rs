@@ -42,6 +42,7 @@ pub mod frame;
 pub(crate) mod housekeeping;
 pub(crate) mod ledger;
 pub(crate) mod pass;
+mod tail;
 // The codec's tombstone and union entry points land ahead of their
 // callers: tenant removal and RFC 0053's `PUBLISHED` dictionary are
 // the slices that reach them.
@@ -73,6 +74,8 @@ use rotation::DirFsync;
 pub use rotation::{RotationFault, RotationFaults, RotationKind, RotationSite, RotationState};
 pub use segment::SEGMENT_HEADER_LEN;
 use segment::{SegmentHeader, write_header};
+use tail::zero_to_eof;
+pub use tail::{TailHeal, TailShape};
 
 // -----------------------------------------------------------
 // Public types (RFC 0008 §6.1 + §6.2.2)
@@ -496,6 +499,8 @@ pub struct Wal {
     syncs_total: u64,
     unflushed_bytes: u64,
     corrupt_frames_total: u64,
+    /// The torn tail the last [`Self::replay`] cut off the newest segment.
+    healed_tail: Option<TailHeal>,
 }
 
 impl Wal {
@@ -595,6 +600,7 @@ impl Wal {
             syncs_total: 0,
             unflushed_bytes: 0,
             corrupt_frames_total: 0,
+            healed_tail: None,
         })
     }
 
@@ -1436,6 +1442,7 @@ impl Wal {
     ///
     /// See [`RecoveryError`].
     pub fn replay<S: FrameSink>(&mut self, sink: &mut S) -> Result<(), RecoveryError> {
+        self.healed_tail = None;
         let segments = list_segments(&self.config.root).map_err(|e| match e {
             OpenError::Io { op, source } => RecoveryError::Io { op, source },
             // `list_segments` only ever surfaces `Io` (it does no
@@ -1450,7 +1457,10 @@ impl Wal {
             let is_newest = Some(idx) == newest_idx;
             match replay_segment(path, is_newest, sink) {
                 Ok(SegmentScan::CleanTail) => {}
-                Ok(SegmentScan::TornTail { valid_to }) => self.heal_newest_segment(valid_to)?,
+                Ok(SegmentScan::TornTail(heal)) => {
+                    self.heal_newest_segment(heal.offset)?;
+                    self.healed_tail = Some(heal);
+                }
                 Err(e) => {
                     if matches!(e, RecoveryError::Corrupt { .. }) {
                         self.corrupt_frames_total += 1;
@@ -1460,6 +1470,14 @@ impl Wal {
             }
         }
         Ok(())
+    }
+
+    /// The torn tail the last [`Self::replay`] healed, if it healed one
+    /// (RFC 0068 §3.3). Only the newest segment can hold one, so there is
+    /// at most one per replay.
+    #[must_use]
+    pub fn healed_tail(&self) -> Option<&TailHeal> {
+        self.healed_tail.as_ref()
     }
 
     /// RFC0008.4 / §6.6 step 4: truncate a torn tail off the
@@ -1895,12 +1913,12 @@ enum SegmentScan {
     /// Frames ended on a clean frame boundary (the scan reached
     /// end-of-file exactly between frames). No healing needed.
     CleanTail,
-    /// The newest segment stopped on a torn tail at byte `valid_to`:
-    /// a partial frame (RFC0008.4) or a run of zeros reaching EOF
-    /// (RFC 0068 §3.1 T2). The caller truncates the segment to
-    /// `valid_to`. Only ever returned for the newest segment; a torn
-    /// tail on a closed segment is corruption.
-    TornTail { valid_to: u64 },
+    /// The newest segment stopped on a torn tail: a partial frame
+    /// (RFC0008.4) or a run of zeros reaching EOF (RFC 0068 §3.1 T2).
+    /// The caller truncates the segment to the heal's offset. Only ever
+    /// returned for the newest segment; a torn tail on a closed segment
+    /// is corruption.
+    TornTail(TailHeal),
 }
 
 /// Scan one segment's frames left-to-right (§6.6 step 3),
@@ -1940,7 +1958,7 @@ fn replay_segment<S: FrameSink>(
             // file_len`, guaranteed by the loop guard) = a torn
             // tail frame.
             Err(frame::FrameError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => {
-                return scan.torn(frame_start);
+                return scan.torn(frame_start, TailShape::PartialFrame);
             }
             Err(frame::FrameError::Io(source)) => {
                 return Err(RecoveryError::Io {
@@ -1959,7 +1977,7 @@ fn replay_segment<S: FrameSink>(
         // zero-tail check sits on this path only. A CRC mismatch stays
         // corruption whatever its bytes.
         if is_newest && zero_to_eof(reader.get_mut(), frame_start)? {
-            return scan.torn(frame_start);
+            return scan.torn(frame_start, TailShape::ZeroTail);
         }
         return Err(scan.corrupt(frame_start, reason));
     }
@@ -1967,17 +1985,18 @@ fn replay_segment<S: FrameSink>(
 }
 
 /// One segment as [`replay_segment`] scans it.
-struct Scan {
+struct Scan<'a> {
+    path: &'a std::path::Path,
     is_newest: bool,
     file_len: u64,
     segment_uuid: uuid::Uuid,
 }
 
-impl Scan {
+impl<'a> Scan<'a> {
     /// Open the segment and validate its header, leaving the reader at
     /// its first frame.
     fn open(
-        path: &std::path::Path,
+        path: &'a std::path::Path,
         is_newest: bool,
     ) -> Result<(BufReader<File>, Self), RecoveryError> {
         let file = File::open(path).map_err(|source| RecoveryError::Io {
@@ -2018,6 +2037,7 @@ impl Scan {
             }
         };
         let scan = Self {
+            path,
             is_newest,
             file_len,
             segment_uuid,
@@ -2035,32 +2055,16 @@ impl Scan {
 
     /// A torn tail starting at `offset`: healed on the newest segment,
     /// corruption on a closed one, whose rotation fsync completed.
-    fn torn(&self, offset: u64) -> Result<SegmentScan, RecoveryError> {
+    fn torn(&self, offset: u64, shape: TailShape) -> Result<SegmentScan, RecoveryError> {
         if !self.is_newest {
             return Err(self.corrupt(offset, CorruptionReason::TornOnClosedSegment));
         }
-        Ok(SegmentScan::TornTail { valid_to: offset })
-    }
-}
-
-/// Whether every byte of `file` from `from` to its end is zero (RFC 0068
-/// §3.1 T2). Reads only the tail the scan stopped in.
-fn zero_to_eof(file: &mut File, from: u64) -> Result<bool, RecoveryError> {
-    use std::io::{Read, Seek, SeekFrom};
-    let io = |source| RecoveryError::Io {
-        op: "read(zero tail of newest segment)",
-        source,
-    };
-    file.seek(SeekFrom::Start(from)).map_err(io)?;
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        match file.read(&mut chunk) {
-            Ok(0) => return Ok(true),
-            Ok(n) if chunk[..n].iter().all(|&b| b == 0) => {}
-            Ok(_) => return Ok(false),
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(io(e)),
-        }
+        Ok(SegmentScan::TornTail(TailHeal {
+            segment: self.path.to_path_buf(),
+            shape,
+            offset,
+            size: self.file_len,
+        }))
     }
 }
 

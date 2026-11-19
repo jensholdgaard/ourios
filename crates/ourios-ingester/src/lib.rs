@@ -62,6 +62,7 @@ pub mod record_sink;
 pub mod recovery;
 pub mod replicated;
 pub mod snapshot_store;
+mod tail_heal;
 pub mod template_ids;
 
 pub use compactor::{Compactor, IngestError, SweepReport, SweepTarget, run_sweep};

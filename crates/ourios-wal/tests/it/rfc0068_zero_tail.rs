@@ -5,7 +5,8 @@
 //! last valid frame, and checks the §3.1 partition: a partial frame (T1)
 //! or an all-zero run from `B` to EOF (T2) is healed back to `B`;
 //! anything else is RFC0008.5 corruption with the segment untouched.
-//! RFC0068.4, the crash test, lives beside RFC0008.2's.
+//! RFC0068.4, the crash test, lives beside RFC0008.2's; RFC0068.5, the
+//! heal's event and counter, in `ourios-ingester`'s `tail_heal` module.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -376,14 +377,6 @@ fn rfc0068_6_a_shared_sector_left_new_never_cuts_below_x() {
     shared_sector_case(SharedSector::New);
 }
 
-#[test]
-#[ignore = "RFC0068 red: Wal::replay reports each healed tail and the server's recovery driver emits the event and counter"]
-fn rfc0068_5_a_heal_is_reported() {
-    todo!(
-        "RFC0068.5: one WARN ourios.wal.recovery.tail.truncated per heal, and the counter grows by E - B"
-    );
-}
-
 /// The first frame of a forged tail, read by the §3.1 rules written out
 /// independently of the decoder.
 enum Step {
@@ -496,4 +489,22 @@ proptest! {
             }
         }
     }
+}
+
+/// RFC0068.5: `healed_tail` names the heal the last replay made, so a
+/// clean replay after a healing one on the same writer reports none.
+#[test]
+fn a_clean_replay_after_a_heal_reports_no_heal() {
+    let newest = Newest::synced(&PAYLOADS);
+    forge(&newest, &[0; SECTOR]);
+    let mut wal = open(newest.root.path());
+
+    wal.replay(&mut CollectingSink::default())
+        .expect("the first replay heals the tail");
+    let heal = wal.healed_tail().expect("the first replay healed").clone();
+    assert_eq!(heal.offset, newest.boundary, "cut back to B");
+
+    wal.replay(&mut CollectingSink::default())
+        .expect("the second replay is clean");
+    assert_eq!(wal.healed_tail(), None, "a clean replay heals nothing");
 }

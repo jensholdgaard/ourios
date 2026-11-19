@@ -2,6 +2,7 @@
 //! the group's snapshot.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ourios_wal::{Control, MinerConfigV1, RaftLogId};
 use uuid::Uuid;
@@ -14,16 +15,24 @@ use super::types::NodeId;
 /// had purged.
 #[derive(Debug, Clone, Default)]
 pub struct HeldControls {
-    controls: BTreeMap<u64, Control>,
+    /// Shared with the log until it next writes a control, so taking a
+    /// view copies nothing under the index lock (#1214).
+    controls: Arc<BTreeMap<u64, Control>>,
     purged_kind: u8,
 }
 
 impl HeldControls {
-    pub(super) fn new(controls: BTreeMap<u64, Control>, purged_kind: u8) -> Self {
+    pub(super) fn new(controls: Arc<BTreeMap<u64, Control>>, purged_kind: u8) -> Self {
         Self {
             controls,
             purged_kind,
         }
+    }
+
+    /// Whether `other` is the same history, not a copy of it.
+    #[cfg(test)]
+    pub(super) fn shares(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.controls, &other.controls)
     }
 
     /// The view of the controls in the log, over `snapshot`'s where it has

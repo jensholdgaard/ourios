@@ -57,7 +57,9 @@ struct Index {
     committed: Option<LogId>,
     /// The control entries `entries` holds, kept beside it so a leader's
     /// pass reads them without scanning the log under its lock.
-    controls: BTreeMap<u64, Control>,
+    /// The control entries by index, shared with the views readers hold
+    /// and copied only when one is written while a view is held.
+    controls: Arc<BTreeMap<u64, Control>>,
     /// The highest control kind purged: a purged entry was committed, so
     /// the log still holds its kind (§6.5).
     purged_kind: u8,
@@ -84,10 +86,10 @@ impl Index {
     fn place(&mut self, entry: Entry) {
         let index = entry.log_id.index;
         self.entries.split_off(&index);
-        self.controls.split_off(&index);
+        self.drop_controls_from(index);
         if self.last_purged.is_none_or(|p| index > p.index) {
             if let EntryPayload::Normal(GroupEntry::Control(control)) = &entry.payload {
-                self.controls.insert(index, *control);
+                Arc::make_mut(&mut self.controls).insert(index, *control);
             }
             self.entries.insert(index, entry);
         }
@@ -116,17 +118,27 @@ impl Index {
     fn truncate_after(&mut self, last: Option<LogId>) {
         let from = last.map_or(0, |l| l.index + 1);
         self.entries.split_off(&from);
-        self.controls.split_off(&from);
+        self.drop_controls_from(from);
+    }
+
+    /// Drop the controls at or above `index`, touching the history only if
+    /// there are any: an append past them, the common case, copies nothing.
+    fn drop_controls_from(&mut self, index: u64) {
+        if self.controls.range(index..).next().is_some() {
+            Arc::make_mut(&mut self.controls).split_off(&index);
+        }
     }
 
     fn purge(&mut self, upto: LogId) {
         self.entries = self.entries.split_off(&(upto.index + 1));
-        let kept = self.controls.split_off(&(upto.index + 1));
-        let purged = std::mem::replace(&mut self.controls, kept);
-        self.purged_kind = purged
-            .values()
-            .map(|c| c.kind())
-            .fold(self.purged_kind, u8::max);
+        if self.controls.range(..=upto.index).next().is_some() {
+            let kept = Arc::make_mut(&mut self.controls).split_off(&(upto.index + 1));
+            let purged = std::mem::replace(&mut self.controls, Arc::new(kept));
+            self.purged_kind = purged
+                .values()
+                .map(|c| c.kind())
+                .fold(self.purged_kind, u8::max);
+        }
         if self.last_purged.is_none_or(|p| upto > p) {
             self.last_purged = Some(upto);
         }
@@ -152,7 +164,7 @@ impl Index {
     }
 
     fn held_controls(&self) -> HeldControls {
-        HeldControls::new(self.controls.clone(), self.purged_kind)
+        HeldControls::new(Arc::clone(&self.controls), self.purged_kind)
     }
 
     fn last_log_id(&self) -> Option<LogId> {

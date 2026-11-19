@@ -68,7 +68,7 @@ impl Log {
     }
 
     fn held(&self) -> HeldControls {
-        HeldControls::new(self.controls.clone(), 0)
+        HeldControls::new(std::sync::Arc::new(self.controls.clone()), 0)
     }
 }
 

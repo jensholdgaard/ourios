@@ -247,7 +247,10 @@ check_golden() {
     return
   fi
   if [[ -n "${UPDATE_GOLDEN:-}" ]]; then
-    cp "$rendered" "$golden"
+    # Staged beside the golden and renamed over it: a rename on one
+    # filesystem replaces it whole, where a copy truncates it first.
+    local staged="$golden.new"
+    cp "$rendered" "$staged" && mv "$staged" "$golden"
   fi
   if diff -u "$golden" "$rendered" >/dev/null; then
     printf 'ok    %s\n' "render matches testdata/${golden##*/}"

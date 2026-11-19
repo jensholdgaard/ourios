@@ -38,6 +38,12 @@ fn voters() -> Vec<String> {
 /// A store holding `GROUP`'s `formed.json` with log id [`LOG`].
 pub(super) fn formed_store() -> Store {
     let store = Store::in_memory();
+    form(&store);
+    store
+}
+
+/// Record `GROUP`'s `formed.json` in `store`, with log id [`LOG`].
+pub(super) fn form(store: &Store) {
     let voters = voters();
     let names: Vec<&str> = voters.iter().map(String::as_str).collect();
     let members = (1..)
@@ -49,7 +55,6 @@ pub(super) fn formed_store() -> Store {
     store
         .put_blocking(&formed_key(GROUP), bytes)
         .expect("record");
-    store
 }
 
 /// Publishing into `store`, flushing anything buffered for 50 ms.
@@ -70,7 +75,7 @@ pub(super) fn publishing(store: Store) -> Publishing {
 }
 
 /// Every row published to `store`'s data files, in position order.
-fn published(store: &Store) -> Vec<MinedRecord> {
+pub(super) fn published(store: &Store) -> Vec<MinedRecord> {
     let keys = store.list_blocking(Some("data")).expect("list");
     let mut rows: Vec<_> = keys
         .iter()

@@ -201,6 +201,87 @@ async fn refused_then_granted(server: &TlsSettings, refused: &Peers, trusted: &P
     node.kill().await;
 }
 
+/// #1175: a refused client certificate is an unreachable peer, which
+/// `openraft` backs off from, not a network error it retries sooner. It
+/// arrives after the handshake, as a TLS alert, and tonic reports it as
+/// `Unknown`.
+#[tokio::test]
+async fn a_refused_certificate_reads_as_an_unreachable_peer() {
+    let (ca, other) = (Ca::new(), Ca::new());
+    let certs = TempDir::new().expect("tempdir");
+    let server = ca.node(certs.path(), "server");
+    let rogue = TlsSettings {
+        client_ca_file: server.client_ca_file.clone(),
+        ..other.node(certs.path(), "rogue")
+    };
+    let (incoming, addr) = bind();
+    let peers = Peers::mutual_tls(&server).expect("peers");
+    let mut node = start_tls(1, incoming, &server, peers).await;
+    let rogue = Peers::mutual_tls(&rogue).expect("peers");
+    let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
+
+    let result = client_to(&rogue, node.id, addr)
+        .await
+        .vote(higher, option())
+        .await;
+    assert!(
+        matches!(result, Err(RPCError::Unreachable(_))),
+        "{result:?}"
+    );
+    node.kill().await;
+}
+
+/// #1175: a node's client certificate follows its files, as its
+/// listener's does: once a refused certificate is replaced by one the peer
+/// CA signed, the node's next connection presents it and is let in, with
+/// no restart and no new pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotated_client_certificate_is_presented_without_a_restart() {
+    let (ca, other) = (Ca::new(), Ca::new());
+    let certs = TempDir::new().expect("tempdir");
+    let server = ca.node(certs.path(), "server");
+    let (incoming, addr) = bind();
+    let mut node = start_tls(
+        1,
+        incoming,
+        &server,
+        Peers::mutual_tls(&server).expect("peers"),
+    )
+    .await;
+    let rotating = TlsSettings {
+        client_ca_file: server.client_ca_file.clone(),
+        reload_interval: Some(Duration::from_millis(50)),
+        ..other.node(certs.path(), "rotating")
+    };
+    let client = Peers::mutual_tls(&rotating).expect("peers");
+    let higher = VoteRequest::new(Vote::new(5, NodeId::from(2)), None);
+    let refused = client_to(&client, node.id, addr)
+        .await
+        .vote(higher.clone(), option())
+        .await;
+    assert!(refused.is_err(), "the other CA's certificate is refused");
+
+    let signed = ca.node(certs.path(), "signed");
+    std::fs::copy(&signed.cert_file, &rotating.cert_file).expect("rotate cert");
+    std::fs::copy(&signed.key_file, &rotating.key_file).expect("rotate key");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let vote = client_to(&client, node.id, addr)
+            .await
+            .vote(higher.clone(), option())
+            .await;
+        if vote.is_ok_and(|granted| granted.vote_granted) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rotated certificate was never presented"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    node.kill().await;
+}
+
 #[tokio::test]
 async fn a_caller_without_a_certificate_is_refused() {
     let ca = Ca::new();

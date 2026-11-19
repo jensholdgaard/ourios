@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use hyper_util::rt::TokioIo;
+use ourios_serving::tls_reload::ReloadingClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -17,9 +18,11 @@ use tonic::codegen::http::Uri;
 use super::client::CONNECT_TIMEOUT;
 
 /// Connects a channel to its peer over TLS, verifying the peer's
-/// certificate for the host the channel's address names.
+/// certificate for the host the channel's address names, with the client
+/// config current when the connection is made: a rotated certificate is
+/// presented from the next connection on (#1175).
 #[derive(Clone)]
-pub(super) struct TlsConnector(pub(super) tokio_rustls::TlsConnector);
+pub(super) struct TlsConnector(pub(super) ReloadingClientConfig);
 
 type Connecting = Pin<Box<dyn Future<Output = io::Result<TokioIo<TlsStream<TcpStream>>>> + Send>>;
 
@@ -33,7 +36,7 @@ impl tower::Service<Uri> for TlsConnector {
     }
 
     fn call(&mut self, uri: Uri) -> Connecting {
-        let connector = self.0.clone();
+        let connector = tokio_rustls::TlsConnector::from(self.0.current());
         connecting(async move {
             let (host, port) = host_and_port(&uri)?;
             let name = ServerName::try_from(host.clone())
@@ -79,6 +82,27 @@ pub(super) fn never_sent(status: &Status) -> bool {
         let inner = e.downcast_ref::<io::Error>().and_then(io::Error::get_ref);
         let marked = inner.is_some_and(<dyn std::error::Error + Send + Sync>::is::<NotConnected>);
         if marked || e.is::<NotConnected>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// Whether `status` failed in the TLS layer, such as on the alert a peer
+/// sends after the handshake when it refuses this node's certificate
+/// (#1175): a peer that will not take the call until the certificates
+/// agree, so unreachable rather than a network error to retry sooner. The
+/// TLS stream reports such a failure as an `InvalidData` I/O error, its
+/// rustls error flattened to text by then, so the kind is what is left to
+/// tell it by.
+pub(super) fn refused_by_tls(status: &Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(e) = source {
+        let invalid = e
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == io::ErrorKind::InvalidData);
+        if invalid || e.is::<rustls::Error>() {
             return true;
         }
         source = e.source();

@@ -490,3 +490,21 @@ proptest! {
         }
     }
 }
+
+/// RFC0068.5: `healed_tail` names the heal the last replay made, so a
+/// clean replay after a healing one on the same writer reports none.
+#[test]
+fn a_clean_replay_after_a_heal_reports_no_heal() {
+    let newest = Newest::synced(&PAYLOADS);
+    forge(&newest, &[0; SECTOR]);
+    let mut wal = open(newest.root.path());
+
+    wal.replay(&mut CollectingSink::default())
+        .expect("the first replay heals the tail");
+    let heal = wal.healed_tail().expect("the first replay healed").clone();
+    assert_eq!(heal.offset, newest.boundary, "cut back to B");
+
+    wal.replay(&mut CollectingSink::default())
+        .expect("the second replay is clean");
+    assert_eq!(wal.healed_tail(), None, "a clean replay heals nothing");
+}

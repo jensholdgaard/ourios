@@ -1442,6 +1442,7 @@ impl Wal {
     ///
     /// See [`RecoveryError`].
     pub fn replay<S: FrameSink>(&mut self, sink: &mut S) -> Result<(), RecoveryError> {
+        self.healed_tail = None;
         let segments = list_segments(&self.config.root).map_err(|e| match e {
             OpenError::Io { op, source } => RecoveryError::Io { op, source },
             // `list_segments` only ever surfaces `Io` (it does no

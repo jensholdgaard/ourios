@@ -65,23 +65,32 @@ impl Server {
 const RESERVED: std::ops::Range<u16> = 20_000..32_000;
 
 /// A loopback address free when asked, its port outside the ephemeral
-/// range. Each call starts from its own point in the range, so parallel
-/// tests rarely try the same port first.
+/// range and never one this process has handed out before: a test takes
+/// every address before it starts any node, so a port only probed, not yet
+/// bound, must not be handed out twice. The process starts at its own point
+/// in the range, so parallel test processes rarely try the same port first.
 pub(super) fn free_addr() -> SocketAddr {
     use std::hash::{BuildHasher as _, RandomState};
 
-    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    static ISSUED: std::sync::Mutex<Option<(u16, std::collections::BTreeSet<u16>)>> =
+        std::sync::Mutex::new(None);
     let span = RESERVED.end - RESERVED.start;
-    let seed = RandomState::new().hash_one(std::process::id());
-    let start = u16::try_from(seed % u64::from(span)).expect("within the span");
-    let step = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    (0..span)
-        .map(|offset| RESERVED.start + (start + step + offset) % span)
+    let mut issued = ISSUED.lock().expect("issued ports");
+    let (start, taken) = issued.get_or_insert_with(|| {
+        let seed = RandomState::new().hash_one(std::process::id());
+        let start = u16::try_from(seed % u64::from(span)).expect("within the span");
+        (start, std::collections::BTreeSet::new())
+    });
+    let addr = (0..span)
+        .map(|offset| RESERVED.start + (*start + offset) % span)
+        .filter(|port| !taken.contains(port))
         .find_map(|port| {
             let listener = std::net::TcpListener::bind(("127.0.0.1", port)).ok()?;
             listener.local_addr().ok()
         })
-        .expect("a free port in the reserved range")
+        .expect("a free port in the reserved range");
+    taken.insert(addr.port());
+    addr
 }
 
 /// One CA, and one leaf it signed for 127.0.0.1 that every peer

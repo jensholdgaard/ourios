@@ -58,10 +58,30 @@ impl Server {
     }
 }
 
-/// A loopback address free when asked.
+/// Ports below every OS's ephemeral range (Linux's starts at 32768,
+/// macOS's at 49152), so a `bind(:0)` elsewhere cannot be handed one of
+/// them between this harness reserving it and the server binding it
+/// (#1373).
+const RESERVED: std::ops::Range<u16> = 20_000..32_000;
+
+/// A loopback address free when asked, its port outside the ephemeral
+/// range. Each call starts from its own point in the range, so parallel
+/// tests rarely try the same port first.
 pub(super) fn free_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr")
+    use std::hash::{BuildHasher as _, RandomState};
+
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let span = RESERVED.end - RESERVED.start;
+    let seed = RandomState::new().hash_one(std::process::id());
+    let start = u16::try_from(seed % u64::from(span)).expect("within the span");
+    let step = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (0..span)
+        .map(|offset| RESERVED.start + (start + step + offset) % span)
+        .find_map(|port| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).ok()?;
+            listener.local_addr().ok()
+        })
+        .expect("a free port in the reserved range")
 }
 
 /// One CA, and one leaf it signed for 127.0.0.1 that every peer

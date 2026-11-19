@@ -403,6 +403,9 @@ enum Work {
     Report,
     /// A tail read's question to the miner.
     Lookup(Lookup),
+    /// The publishing tick, which takes an applied entry's publishing step
+    /// with no output, for a group gone quiet.
+    Drive,
 }
 
 /// A tick every `every`, delayed rather than bunched after a slow step.
@@ -496,6 +499,19 @@ impl Keeping {
         }
     }
 
+    /// Take the step an applied entry would, with no output of its own: a
+    /// named flusher of an idle group builds its publication once the log
+    /// id reads, then publishes or replays what it keeps (#1301).
+    fn drive(&self) {
+        let Some(flushing) = &self.flushing else {
+            return;
+        };
+        // In `keep`'s order: what it keeps, then the publication.
+        let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut flushing = flushing.lock().unwrap_or_else(PoisonError::into_inner);
+        self.publish(&mut flushing, kept, (None, &Mined::default()));
+    }
+
     /// Publish as `flushing` plans from `kept`, holding `kept` only while
     /// planning, and drop from it what a replay rebuilt.
     fn publish<'k>(
@@ -567,6 +583,14 @@ impl Follow {
         let mut reporting = self.reporting.take();
         let mut barrier = checkpointer.as_ref().map(|c| interval(c.every()));
         let mut reports = reporting.as_ref().map(|_| interval(Reporting::every()));
+        // A group that can be published from here takes its publishing step
+        // on this task's tick too, so a quiet group still publishes (#1301).
+        let mut drives = self
+            .keeping
+            .flushing
+            .as_ref()
+            .and(self.sweep.as_ref())
+            .map(|(_, every)| interval(*every));
         let mut lookups = self.lookups.take();
         self.followed_through(&miner);
         loop {
@@ -576,6 +600,7 @@ impl Follow {
                 event = next(&mut applied, &mut stop) => event.map(Work::Event),
                 () = ticked(&mut barrier) => Some(Work::Barrier),
                 () = ticked(&mut reports) => Some(Work::Report),
+                () = ticked(&mut drives) => Some(Work::Drive),
                 lookup = lookup::asked(&mut lookups) => Some(Work::Lookup(lookup)),
             };
             let Some(work) = work else {
@@ -639,6 +664,18 @@ impl Follow {
                 let kept = Arc::clone(&self.keeping.kept);
                 tokio::task::spawn_blocking(move || {
                     lookup.answer(&miner, &kept);
+                    miner
+                })
+                .await
+                .ok()
+            }
+            (Work::Drive, _) => {
+                // On this task, as an applied entry's step is, so it takes
+                // `Kept` and the publication in the same order as `keep`
+                // and never alongside it.
+                let keeping = self.keeping.clone();
+                tokio::task::spawn_blocking(move || {
+                    keeping.drive();
                     miner
                 })
                 .await

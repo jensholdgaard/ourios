@@ -48,7 +48,7 @@ pub(in crate::replicated::raft) fn corpus() -> Vec<&'static str> {
         .collect()
 }
 
-fn log_id(index: u64) -> LogId {
+pub(in crate::replicated::raft) fn log_id(index: u64) -> LogId {
     LogId {
         leader_id: CommittedLeaderId::new(2),
         index,

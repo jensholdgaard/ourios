@@ -1,5 +1,6 @@
 use super::super::kept::tests::{entries, mined_log};
 use super::super::mining::tests::{HeldLog, logged};
+use super::super::types::Entry;
 use super::*;
 
 /// A log held in memory with `entries` from index 1.
@@ -107,4 +108,118 @@ fn a_replay_mines_the_batches_held_for_the_first_configuration_one_at_a_time() {
         Some(30),
         "the configuration mined the six held batches"
     );
+}
+
+/// #1310: a replay given a read budget reads no more than it, however
+/// long the run of entries that mine nothing, and goes on from there.
+#[test]
+fn a_replay_reads_no_more_of_the_log_than_its_budget() {
+    use openraft::EntryPayload;
+
+    let mined = entries(4);
+    let mut log = held(&mined[..2]);
+    for index in 3..=52 {
+        log.0.insert(
+            index,
+            Entry {
+                log_id: super::super::mining::tests::log_id(index),
+                payload: EntryPayload::Blank,
+            },
+        );
+    }
+    for (offset, entry) in logged(&mined[2..]).into_iter().enumerate() {
+        let index = 53 + offset as u64;
+        log.0.insert(
+            index,
+            Entry {
+                log_id: super::super::mining::tests::log_id(index),
+                ..entry
+            },
+        );
+    }
+    let last = *log.0.keys().last().expect("entries");
+    let mut replay = Replayed::new(log, 1, last);
+
+    let mut reads = 10;
+    while replay.next_within(&mut reads).is_some() {}
+    assert_eq!(reads, 0, "the budget is spent");
+    assert_eq!(replay.needs_from(), 11, "ten entries read, no more");
+    assert!(!replay.done());
+
+    let mut rest = usize::MAX;
+    let mut events = 0;
+    while let Some(item) = replay.next_within(&mut rest) {
+        item.expect("mined");
+        events += 1;
+    }
+    assert!(replay.done(), "it goes on from where the budget ran out");
+    assert_eq!(events, mined.len() - 2, "the batches after the blanks");
+}
+
+/// A log that counts the entries read from it.
+#[derive(Clone)]
+struct Counted(HeldLog, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl super::super::mining::GroupLogRead for Counted {
+    fn entry(&self, index: u64) -> Option<Entry> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.entry(index)
+    }
+}
+
+/// [`configured_late`]'s four held batches with twenty blanks after
+/// each, then the rest of it.
+fn late_with_blanks() -> HeldLog {
+    use openraft::EntryPayload;
+
+    let late = logged(&configured_late(4));
+    let payloads = late.into_iter().enumerate().flat_map(|(n, entry)| {
+        let blanks = if (1..=4).contains(&n) { 20 } else { 0 };
+        std::iter::once(entry.payload).chain(std::iter::repeat_n(EntryPayload::Blank, blanks))
+    });
+    HeldLog(
+        (1..)
+            .zip(payloads)
+            .map(|(index, payload)| {
+                let log_id = super::super::mining::tests::log_id(index);
+                (index, Entry { log_id, payload })
+            })
+            .collect(),
+    )
+}
+
+/// Everything `replay` yields, read `budget` entries at a time; fails if
+/// any call reads more of the log than its budget, as `reads` counts.
+fn drained_within(
+    mut replay: Replayed<Counted>,
+    reads: &std::sync::atomic::AtomicUsize,
+    budget: usize,
+) -> Vec<(u64, Mined)> {
+    let mut items = Vec::new();
+    while !replay.done() {
+        let before = reads.load(std::sync::atomic::Ordering::SeqCst);
+        let mut left = budget;
+        items.extend(
+            std::iter::from_fn(|| replay.next_within(&mut left)).map(|item| item.expect("mined")),
+        );
+        let read = reads.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(read <= budget, "{read} reads on a budget of {budget}");
+    }
+    items
+}
+
+/// #1310: the budget holds while the batches held for a late first
+/// configuration are drained too, however many blanks lie between them,
+/// and the replay still yields everything the unbounded one does.
+#[test]
+fn a_replay_keeps_its_budget_while_draining_held_batches() {
+    let log = late_with_blanks();
+    let last = *log.0.keys().last().expect("entries");
+    let unbounded: Vec<_> = Replayed::new(log.clone(), 1, last)
+        .collect::<Result<_, _>>()
+        .expect("replayed");
+
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let replay = Replayed::new(Counted(log, std::sync::Arc::clone(&reads)), 1, last);
+    assert_eq!(drained_within(replay, &reads, 5), unbounded);
 }

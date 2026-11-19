@@ -20,6 +20,7 @@ use super::{
     group_dir, name, propose, wal_config, write,
 };
 
+mod idle;
 mod mining;
 mod propose;
 mod publication;

@@ -35,14 +35,37 @@ impl Rebuild for Arc<rustls::ClientConfig> {
     }
 }
 
-/// When `settings.reload_interval` is set, spawn the task that keeps
-/// `current` following `settings`' files, counting failures under
-/// `listener`. The task stops once every handle to `current` is dropped.
-pub(crate) fn spawn<T: Rebuild>(
+/// `build` of `settings`, kept following `settings`' files from then on
+/// when `settings.reload_interval` is set, its failures counted under
+/// `listener`.
+///
+/// # Errors
+///
+/// Whatever `build` reports.
+pub(crate) fn follow<T: Rebuild>(
     settings: &TlsSettings,
-    alpn: Vec<Vec<u8>>,
+    (alpn, listener): (Vec<Vec<u8>>, &'static str),
+    build: impl FnOnce(&TlsSettings) -> Result<T, String>,
+) -> Result<Arc<RwLock<T>>, String> {
+    // The fingerprint of what is on disk *before* the build: files rotated
+    // during it then differ from it, and the first tick rebuilds, where one
+    // taken after would match the new files and never reload them. A
+    // rotation before this read is simply what gets built.
+    let initial = fingerprint(settings);
+    let current = Arc::new(RwLock::new(build(settings)?));
+    spawn(settings, (alpn, listener), &current, initial);
+    Ok(current)
+}
+
+/// When `settings.reload_interval` is set, spawn the task that keeps
+/// `current` following `settings`' files from the fingerprint `initial`,
+/// counting failures under `listener`. The task stops once every handle to
+/// `current` is dropped.
+fn spawn<T: Rebuild>(
+    settings: &TlsSettings,
+    (alpn, listener): (Vec<Vec<u8>>, &'static str),
     current: &Arc<RwLock<T>>,
-    listener: &'static str,
+    initial: Option<u64>,
 ) {
     let Some(interval) = settings.reload_interval else {
         return;
@@ -58,11 +81,6 @@ pub(crate) fn spawn<T: Rebuild>(
             .build(),
         listener,
     };
-    // Seed with the startup material's fingerprint, taken now rather
-    // than when the task first runs, so the first tick only reloads
-    // if the files changed since the config was built — and a change
-    // made before the task is scheduled is not missed.
-    let initial = fingerprint(settings);
     tokio::spawn(task.run(interval, initial));
 }
 
@@ -101,8 +119,9 @@ pub fn reloading_client_config(
     settings: &TlsSettings,
     listener: &'static str,
 ) -> Result<ReloadingClientConfig, String> {
-    let current = Arc::new(RwLock::new(Arc::new(settings.client_config()?)));
-    spawn(settings, Vec::new(), &current, listener);
+    let current = follow(settings, (Vec::new(), listener), |settings| {
+        settings.client_config().map(Arc::new)
+    })?;
     Ok(ReloadingClientConfig { current })
 }
 
@@ -309,5 +328,61 @@ impl<T: Rebuild> ReloadTask<T> {
                 KeyValue::new(semconv::OURIOS_TLS_RELOAD_ERROR, class),
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{Rebuild as _, follow};
+    use crate::tls::{TlsMinVersion, TlsSettings};
+
+    /// Write a fresh self-signed certificate, its own CA, at `settings`'
+    /// paths.
+    fn mint(settings: &TlsSettings) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mint cert");
+        std::fs::write(&settings.cert_file, minted.cert.pem()).expect("cert");
+        std::fs::write(&settings.key_file, minted.signing_key.serialize_pem()).expect("key");
+    }
+
+    fn settings(dir: &Path) -> TlsSettings {
+        let settings = TlsSettings {
+            cert_file: dir.join("tls.crt"),
+            key_file: dir.join("tls.key"),
+            client_ca_file: Some(dir.join("tls.crt")),
+            min_version: TlsMinVersion::V1_2,
+            reload_interval: Some(Duration::from_millis(20)),
+        };
+        mint(&settings);
+        settings
+    }
+
+    /// #1377: files rotated while the config is being built are reloaded:
+    /// the reload starts from what was on disk before the build, so the
+    /// config built from the old files is never taken for the new ones.
+    #[tokio::test]
+    async fn a_rotation_during_the_first_build_is_reloaded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = settings(dir.path());
+        let current = follow(&settings, (Vec::new(), "test"), |settings| {
+            let built = Arc::<rustls::ClientConfig>::rebuild(settings, &[]);
+            mint(settings);
+            built
+        })
+        .expect("built");
+        let first = Arc::clone(&current.read().expect("lock"));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while Arc::ptr_eq(&first, &current.read().expect("lock")) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the files rotated during the build were never reloaded"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

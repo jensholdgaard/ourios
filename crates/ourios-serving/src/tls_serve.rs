@@ -98,10 +98,10 @@ pub fn reloading_acceptor(
     alpn: &[&[u8]],
     listener: &'static str,
 ) -> Result<ReloadingAcceptor, String> {
-    let acceptor = settings.acceptor(alpn)?;
-    let current = Arc::new(RwLock::new(acceptor));
-    let alpn = alpn.iter().map(|p| p.to_vec()).collect();
-    tls_reload::spawn(settings, alpn, &current, listener);
+    let owned = alpn.iter().map(|p| p.to_vec()).collect();
+    let current = tls_reload::follow(settings, (owned, listener), |settings| {
+        settings.acceptor(alpn)
+    })?;
     Ok(ReloadingAcceptor { current, listener })
 }
 

@@ -50,10 +50,18 @@ async fn a_read_after_the_leader_is_deposed_is_the_new_leaders() {
     cluster.kill(leader).await;
     let elected = cluster.leader(GROUP, Some(leader)).await;
     knows_leader(&cluster, tail, elected).await;
+    // A commit only the new leader can have made: a point that covers it
+    // is the new leader's, never the old one's again.
+    let lines = corpus();
+    let after = vec![batch_at(time(9), "acme", &lines[10..15])];
+    let since = commit_all(&cluster, elected, &after).await;
     let second = read_point(&cluster.node(tail).host, cluster.peers(), GROUP, PATIENCE)
         .await
         .expect("a read point from the new leader");
-    assert!(second >= first, "{second} is behind {first}");
+    assert!(
+        second >= since && since > first,
+        "{second} does not cover {since}"
+    );
 
     cluster.restart(leader).await;
     serve_reads(&cluster, leader);
@@ -102,7 +110,17 @@ async fn a_tail_replica_restored_from_a_snapshot_reads_only_what_it_has_mined() 
         .collect();
     let committed = commit_all(&cluster, leader, &next).await;
 
+    // What it was handed through the last commit, fixed before the read:
+    // a checkpoint applied afterwards moves `handed` on, but the read point
+    // only answers for what was handed by the time it confirmed.
     let host = &cluster.node(3).host;
+    host.raft(GROUP)
+        .expect("hosted")
+        .wait(Some(Duration::from_secs(20)))
+        .applied_index_at_least(Some(committed), "applied the last commit")
+        .await
+        .expect("applied");
+    let handed = host.state_machine(GROUP).expect("hosted").handed_through();
     let point = read_point(host, cluster.peers(), GROUP, Duration::from_secs(20))
         .await
         .expect("a read point once restored");
@@ -111,7 +129,6 @@ async fn a_tail_replica_restored_from_a_snapshot_reads_only_what_it_has_mined() 
         "{point} is behind the restore"
     );
     let mined = *host.mined_through(GROUP).expect("mining").borrow();
-    let handed = host.state_machine(GROUP).expect("hosted").handed_through();
     assert!(
         mined >= handed,
         "served at {point} with {mined:?} mined of {handed:?}"

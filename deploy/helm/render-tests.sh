@@ -232,16 +232,33 @@ default_render() {
   helm template t "$CHART" | grep -v -e 'helm.sh/chart:' -e 'app.kubernetes.io/version:' -e '^$' \
     | sed "s#^\( *image: ghcr.io/jensholdgaard/ourios\):$APP_VERSION\$#\1:<appVersion>#"
 }
-if [[ -n "${UPDATE_GOLDEN:-}" ]]; then
-  default_render > "$GOLDEN"
-fi
-if default_render | diff -u "$GOLDEN" - >/dev/null; then
-  printf 'ok    %s\n' "default render matches testdata/default-render.yaml"
-else
-  printf 'FAIL  default render differs from testdata/default-render.yaml:\n'
-  default_render | diff -u "$GOLDEN" - | sed 's/^/      /' | head -40
-  failures=$((failures + 1))
-fi
+# Compare what the command after `$1`, the golden file, renders with it.
+# The render goes to a temporary file first: with UPDATE_GOLDEN=1 the golden
+# is replaced only by a render that succeeded, and a mismatch is reported
+# without the diagnostic pipeline ending the script under errexit.
+check_golden() {
+  local golden="$1" rendered
+  shift
+  rendered="$(mktemp)"
+  if ! "$@" > "$rendered"; then
+    printf 'FAIL  rendering %s failed\n' "${golden##*/}"
+    failures=$((failures + 1))
+    rm -f "$rendered"
+    return
+  fi
+  if [[ -n "${UPDATE_GOLDEN:-}" ]]; then
+    cp "$rendered" "$golden"
+  fi
+  if diff -u "$golden" "$rendered" >/dev/null; then
+    printf 'ok    %s\n' "render matches testdata/${golden##*/}"
+  else
+    printf 'FAIL  render differs from testdata/%s:\n' "${golden##*/}"
+    { diff -u "$golden" "$rendered" | sed 's/^/      /' | head -40; } || true
+    failures=$((failures + 1))
+  fi
+  rm -f "$rendered"
+}
+check_golden "$GOLDEN" default_render
 
 # --- image tag and pod security ----------------------------------------------
 
@@ -729,6 +746,9 @@ check "RFC0065.17: tail_clients are the querier identities" \
   "spiffe://cluster/querier" "$(replicated_leaf tail_clients | tr -d '"')"
 check "RFC0065.17: scaling the tail pool changes tail_peers only (B24)" \
   "$(replicated_leaf peers)" "$(replicated_leaf peers --set walTail.replicas=2)"
+check "RFC0065.17: and tail_peers names every tail replica once scaled" \
+  "t-ourios-wal-tail-0=t-ourios-wal-tail-0.t-ourios-wal-tail-headless.default.svc.cluster.local:4320,t-ourios-wal-tail-1=t-ourios-wal-tail-1.t-ourios-wal-tail-headless.default.svc.cluster.local:4320" \
+  "$(replicated_leaf tail_peers --set walTail.replicas=2 | tr -d '"')"
 
 pod_name_env() {
   helm template t "$CHART" --show-only "templates/$1" "${replicated_args[@]}" \
@@ -773,6 +793,18 @@ check "RFC0065.17: the peer TLS secret and client CA are mounted on the voters" 
   "peer-tls peer-ca " "$(peer_tls_volumes receiver-statefulset.yaml)"
 check "RFC0065.17: and on the tail replicas" \
   "peer-tls peer-ca " "$(peer_tls_volumes wal-tail-statefulset.yaml)"
+# Where each peer TLS volume is mounted: a volume no container mounts would
+# pass the volume check above but leave the certificate unread.
+peer_tls_mounts() {
+  helm template t "$CHART" --show-only "templates/$1" "${replicated_args[@]}" \
+    | sed -n '/^ *- name: tls-replication/{N;s/^ *- name: \(.*\)\n *mountPath: \(.*\)$/\1=\2/p;}' \
+    | tr '\n' ' '
+}
+peer_tls_mounted="tls-replication=/etc/ourios-tls/replication tls-replication-client-ca=/etc/ourios-tls/replication-client-ca "
+check "RFC0065.17: the voters mount the peer TLS volumes" \
+  "$peer_tls_mounted" "$(peer_tls_mounts receiver-statefulset.yaml)"
+check "RFC0065.17: and the tail replicas mount them" \
+  "$peer_tls_mounted" "$(peer_tls_mounts wal-tail-statefulset.yaml)"
 check "RFC0065.17: the config reads the mounted peer certificate" \
   "/etc/ourios-tls/replication/tls.crt" \
   "$(role_config receiver "${replicated_args[@]}" | sed -n 's/^        cert_file: //p' | tr -d '"')"
@@ -783,16 +815,7 @@ check "the local backend renders no tail StatefulSet" "" \
 # rfc0065_17_the_chart_renders_the_replicated_shape resolves it as each pod
 # would. Regenerated with UPDATE_GOLDEN=1, as the default render is.
 REPLICATED_GOLDEN="$(dirname "${BASH_SOURCE[0]}")/testdata/replicated-config.yaml"
-if [[ -n "${UPDATE_GOLDEN:-}" ]]; then
-  role_config receiver "${replicated_args[@]}" > "$REPLICATED_GOLDEN"
-fi
-if role_config receiver "${replicated_args[@]}" | diff -u "$REPLICATED_GOLDEN" - >/dev/null; then
-  printf 'ok    %s\n' "replicated receiver config matches testdata/replicated-config.yaml"
-else
-  printf 'FAIL  replicated receiver config differs from testdata/replicated-config.yaml:\n'
-  role_config receiver "${replicated_args[@]}" | diff -u "$REPLICATED_GOLDEN" - | sed 's/^/      /' | head -40
-  failures=$((failures + 1))
-fi
+check_golden "$REPLICATED_GOLDEN" role_config receiver "${replicated_args[@]}"
 
 check_fails "RFC0065.17: the replicated backend needs the S3 store" \
   "receiver.wal.backend replicated needs storage.backend s3" \

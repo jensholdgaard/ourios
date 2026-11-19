@@ -213,7 +213,18 @@ async fn a_served_node_answers_read_points_over_mutual_tls() {
 
     let read = asking.read_index(NAMES[leader], 0, patience).await;
     assert!(matches!(read, Outcome::Read(_)), "{read:?}");
-    let named = asking.read_index(NAMES[follower], 0, patience).await;
+    // A follower can know the leader's id before it can give its node: it
+    // then names none, which is a correct answer, so it is asked again
+    // until it names one (#1379).
+    let deadline = tokio::time::Instant::now() + patience;
+    let named = loop {
+        let named = asking.read_index(NAMES[follower], 0, patience).await;
+        let unnamed = matches!(named, Outcome::NotLeader { leader: None });
+        if !unnamed || tokio::time::Instant::now() >= deadline {
+            break named;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(
         named,
         Outcome::NotLeader {

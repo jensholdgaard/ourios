@@ -2,6 +2,7 @@
 //! the group's snapshot.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ourios_wal::{Control, MinerConfigV1, RaftLogId};
 use uuid::Uuid;
@@ -14,16 +15,68 @@ use super::types::NodeId;
 /// had purged.
 #[derive(Debug, Clone, Default)]
 pub struct HeldControls {
-    controls: BTreeMap<u64, Control>,
+    /// Shared with the log until it next writes a control, so taking a
+    /// view copies nothing under the index lock (#1214).
+    controls: Arc<BTreeMap<u64, Control>>,
     purged_kind: u8,
 }
 
+/// The control entries a group log holds, by index, and the highest kind
+/// it has purged. The map is shared with the views readers hold
+/// ([`HeldControls`]): taking one copies nothing, and a write while one is
+/// held copies the map once, the view keeping what it saw (#1214).
+#[derive(Debug, Default)]
+pub(super) struct ControlHistory {
+    controls: Arc<BTreeMap<u64, Control>>,
+    /// The highest control kind purged: a purged entry was committed, so
+    /// the log still holds its kind (§6.5).
+    purged_kind: u8,
+}
+
+impl ControlHistory {
+    pub(super) fn insert(&mut self, index: u64, control: Control) {
+        Arc::make_mut(&mut self.controls).insert(index, control);
+    }
+
+    /// Drop the controls at or above `index`, touching the map only if it
+    /// holds any: an append past them, the common case, copies nothing.
+    pub(super) fn drop_from(&mut self, index: u64) {
+        if self.controls.range(index..).next().is_some() {
+            Arc::make_mut(&mut self.controls).split_off(&index);
+        }
+    }
+
+    /// Drop the controls at or below `upto`, keeping their highest kind.
+    pub(super) fn purge(&mut self, upto: u64) {
+        if self.controls.range(..=upto).next().is_none() {
+            return;
+        }
+        let kept = Arc::make_mut(&mut self.controls).split_off(&(upto + 1));
+        let purged = std::mem::replace(&mut self.controls, Arc::new(kept));
+        self.purged_kind = purged
+            .values()
+            .map(|c| c.kind())
+            .fold(self.purged_kind, u8::max);
+    }
+
+    /// A view of it as it is now.
+    pub(super) fn held(&self) -> HeldControls {
+        HeldControls::new(Arc::clone(&self.controls), self.purged_kind)
+    }
+}
+
 impl HeldControls {
-    pub(super) fn new(controls: BTreeMap<u64, Control>, purged_kind: u8) -> Self {
+    pub(super) fn new(controls: Arc<BTreeMap<u64, Control>>, purged_kind: u8) -> Self {
         Self {
             controls,
             purged_kind,
         }
+    }
+
+    /// Whether `other` is the same history, not a copy of it.
+    #[cfg(test)]
+    pub(super) fn shares(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.controls, &other.controls)
     }
 
     /// The view of the controls in the log, over `snapshot`'s where it has

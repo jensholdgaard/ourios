@@ -891,3 +891,38 @@ async fn controls_read_before_a_purge_over_its_snapshot_keep_the_flusher() {
         assert_eq!(flusher, Some(NodeId::from(7)), "log read {read} the purge");
     }
 }
+
+/// #1214: reading the log's controls copies nothing under the index lock:
+/// views taken with no control written between them share one history,
+/// a batch appended leaves it shared, and a control written gives later
+/// views a new one while an earlier view keeps what it saw.
+#[tokio::test]
+async fn reading_the_controls_shares_one_history_until_a_control_is_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut log, _) = open(dir.path());
+    let reader = log.get_log_reader().await;
+    let mut first = entries(1, 1..=2);
+    first.push(assignment(log_id(1, 3), NodeId::from(7)));
+    append(&mut log, first).await.await.expect("fsynced");
+
+    let held = reader.held_controls();
+    assert!(
+        held.shares(&reader.held_controls()),
+        "two reads, one history"
+    );
+    append(&mut log, entries(1, 4..=5))
+        .await
+        .await
+        .expect("fsynced");
+    assert!(
+        held.shares(&reader.held_controls()),
+        "a batch copies nothing"
+    );
+
+    let newer = vec![assignment(log_id(1, 6), NodeId::from(9))];
+    append(&mut log, newer).await.await.expect("fsynced");
+    let after = reader.held_controls();
+    assert!(!held.shares(&after));
+    assert_eq!(held.over(None).flusher, Some(NodeId::from(7)), "as it saw");
+    assert_eq!(after.over(None).flusher, Some(NodeId::from(9)));
+}

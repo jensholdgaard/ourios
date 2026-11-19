@@ -42,6 +42,7 @@ pub mod frame;
 pub(crate) mod housekeeping;
 pub(crate) mod ledger;
 pub(crate) mod pass;
+mod tail;
 // The codec's tombstone and union entry points land ahead of their
 // callers: tenant removal and RFC 0053's `PUBLISHED` dictionary are
 // the slices that reach them.
@@ -73,6 +74,8 @@ use rotation::DirFsync;
 pub use rotation::{RotationFault, RotationFaults, RotationKind, RotationSite, RotationState};
 pub use segment::SEGMENT_HEADER_LEN;
 use segment::{SegmentHeader, write_header};
+use tail::zero_to_eof;
+pub use tail::{TailHeal, TailShape};
 
 // -----------------------------------------------------------
 // Public types (RFC 0008 §6.1 + §6.2.2)
@@ -1917,27 +1920,6 @@ enum SegmentScan {
     TornTail(TailHeal),
 }
 
-/// Which torn-tail shape recovery healed (RFC 0068 §3.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TailShape {
-    /// T1: a frame cut short at EOF (RFC0008.4).
-    PartialFrame,
-    /// T2: zeros from the last valid frame to EOF.
-    ZeroTail,
-}
-
-/// A torn tail [`Wal::replay`] cut off the newest segment (RFC 0068 §3.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TailHeal {
-    /// The segment that was cut.
-    pub segment: PathBuf,
-    pub shape: TailShape,
-    /// `B`, the end of its last valid frame and its length after the cut.
-    pub offset: u64,
-    /// `E`, its length before the cut.
-    pub size: u64,
-}
-
 /// Scan one segment's frames left-to-right (§6.6 step 3),
 /// delivering each well-formed frame to `sink`. `is_newest`
 /// selects the torn-tail fork: a short read on the newest
@@ -2082,27 +2064,6 @@ impl<'a> Scan<'a> {
             offset,
             size: self.file_len,
         }))
-    }
-}
-
-/// Whether every byte of `file` from `from` to its end is zero (RFC 0068
-/// §3.1 T2). Reads only the tail the scan stopped in.
-fn zero_to_eof(file: &mut File, from: u64) -> Result<bool, RecoveryError> {
-    use std::io::{Read, Seek, SeekFrom};
-    let io = |source| RecoveryError::Io {
-        op: "read(zero tail of newest segment)",
-        source,
-    };
-    file.seek(SeekFrom::Start(from)).map_err(io)?;
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        match file.read(&mut chunk) {
-            Ok(0) => return Ok(true),
-            Ok(n) if chunk[..n].iter().all(|&b| b == 0) => {}
-            Ok(_) => return Ok(false),
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(io(e)),
-        }
     }
 }
 

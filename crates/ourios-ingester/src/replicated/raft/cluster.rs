@@ -167,9 +167,13 @@ pub(crate) struct Replica {
 
 impl Replica {
     pub(crate) fn new(n: u64, groups: &[u32]) -> Self {
+        Self::with_id(NodeId::from(n), groups)
+    }
+
+    /// A fresh replica `id` of `groups`.
+    pub(crate) fn with_id(id: NodeId, groups: &[u32]) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         vote_log::create(dir.path()).expect("vote log");
-        let id = NodeId::from(n);
         Self {
             id,
             node_id: name(id),
@@ -471,7 +475,7 @@ impl Cluster {
         meters: impl Fn(usize) -> Meters,
     ) -> (Self, BTreeMap<NodeId, String>) {
         let bound: Vec<_> = (1..=voters + tail)
-            .map(|n| (NodeId::from(n), bind()))
+            .map(|n| (cluster_node(n), bind()))
             .collect();
         let addresses = bound.iter().map(|(id, (_, a))| (name(*id), a.to_string()));
         let peers = Peers::plaintext().with_addresses(addresses);
@@ -501,7 +505,7 @@ impl Cluster {
                 meters: meters(i),
                 timings,
                 role,
-                ..Replica::new(n, groups)
+                ..Replica::with_id(cluster_node(n), groups)
             };
             let server = ReplicationServer::default();
             let node = Node::open(replica, incoming, &cluster.peers, server).await;
@@ -600,7 +604,7 @@ impl Cluster {
             node_id: old.node_id.clone(),
             role: old.role.clone(),
             timings: old.timings,
-            ..Replica::new(n, &old.groups)
+            ..Replica::with_id(cluster_node(n), &old.groups)
         };
         self.slots[i] = Slot::Down(replica);
     }
@@ -665,4 +669,17 @@ impl Cluster {
             }
         }
     }
+}
+
+/// Node `n` of this test process's in-process clusters. The ids are
+/// numbered under a prefix drawn once per process, so a call another test
+/// process's cluster still sends to a port this one now holds names a node
+/// this process has none of, and is refused (#1353).
+pub(crate) fn cluster_node(n: u64) -> NodeId {
+    static PREFIX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let prefix = *PREFIX.get_or_init(|| {
+        // Never zero, the prefix single-node tests number theirs under.
+        uuid::Uuid::now_v7().as_u64_pair().1 | 1
+    });
+    NodeId::in_cluster(prefix, n)
 }

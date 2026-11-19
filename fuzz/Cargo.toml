@@ -29,7 +29,7 @@ ourios-querier = { path = "../crates/ourios-querier", features = ["fuzzing"] }
 # `audit_events_to_batch`; these write that batch to Parquet bytes and hand
 # them back to `AuditReader::open_bytes`. The versions ourios-parquet uses.
 bytes = { version = "1", default-features = false }
-parquet = { version = "59", default-features = false, features = ["arrow"] }
+parquet = { version = "60", default-features = false, features = ["arrow"] }
 # `artifact_decode` compresses its input into a template-map frame, so the
 # fuzzer can mutate the JSON body behind the zstd layer; the querier's zstd.
 zstd = "0.13"
@@ -111,3 +111,39 @@ bench = false
 # Detach from the parent workspace (belt-and-suspenders with the root
 # `exclude`): this manifest is its own single-package workspace root.
 [workspace]
+
+# DataFusion 56 readiness: build against the 56.0.0-rc2 tag, which carries
+# apache/datafusion#24770 (the #24769 row-group pruning fix). Mirrors the
+# root Cargo.toml patch (this standalone workspace does not inherit it);
+# delete both together once DataFusion 56.0.0 ships.
+[patch.crates-io]
+datafusion = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-catalog = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-catalog-listing = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-common = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-common-runtime = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-datasource = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-datasource-arrow = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-datasource-csv = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-datasource-json = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-datasource-parquet = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-doc = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-execution = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-expr = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-expr-common = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-functions = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-functions-aggregate = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-functions-aggregate-common = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-functions-nested = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-functions-table = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-functions-window = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-functions-window-common = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-macros = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-physical-expr-adapter = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-physical-expr-common = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-physical-optimizer = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-physical-plan = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-pruning = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }
+datafusion-session = { git = "https://github.com/apache/datafusion", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7" }

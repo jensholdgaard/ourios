@@ -10,8 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::object_store::path::Path;
 use datafusion::object_store::{
-    Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    Attributes, CopyOptions, Extensions, GetOptions, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -54,6 +55,7 @@ impl ListedSizes {
             },
             range: 0..0,
             attributes: Attributes::default(),
+            extensions: Extensions::default(),
         })
     }
 }

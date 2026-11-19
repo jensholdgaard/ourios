@@ -92,6 +92,12 @@ impl Proposing {
         self.sm.flusher() == Some(self.replica)
     }
 
+    /// The index of the last flusher assignment the replica applied, while
+    /// it names this replica.
+    pub(super) fn assigned_at(&self) -> Option<u64> {
+        self.sm.assigned_at().filter(|_| self.named())
+    }
+
     /// The cut of the last checkpoint this replica applied.
     pub(super) fn applied_cut(&self) -> Option<super::types::LogId> {
         *self.sm.checkpoints().borrow()

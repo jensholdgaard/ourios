@@ -26,11 +26,12 @@ use std::time::Instant;
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
 use openraft::{EntryPayload, OptionalSend};
 use ourios_wal::{
-    Control, FrameKind, FrameSink, RecoveryError, ReplicatedRecord, Wal, WalConfig, WalOffset,
+    FrameKind, FrameSink, RecoveryError, ReplicatedRecord, Wal, WalConfig, WalOffset,
 };
 use tokio::sync::oneshot;
 
 use super::codec::{self, Replayed};
+use super::controls::ControlHistory;
 pub use super::controls::{HeldControls, LogControls};
 use super::gate::SyncGate;
 use super::mining::GroupLogRead;
@@ -57,12 +58,7 @@ struct Index {
     committed: Option<LogId>,
     /// The control entries `entries` holds, kept beside it so a leader's
     /// pass reads them without scanning the log under its lock.
-    /// The control entries by index, shared with the views readers hold
-    /// and copied only when one is written while a view is held.
-    controls: Arc<BTreeMap<u64, Control>>,
-    /// The highest control kind purged: a purged entry was committed, so
-    /// the log still holds its kind (§6.5).
-    purged_kind: u8,
+    controls: ControlHistory,
 }
 
 impl Index {
@@ -86,10 +82,10 @@ impl Index {
     fn place(&mut self, entry: Entry) {
         let index = entry.log_id.index;
         self.entries.split_off(&index);
-        self.drop_controls_from(index);
+        self.controls.drop_from(index);
         if self.last_purged.is_none_or(|p| index > p.index) {
             if let EntryPayload::Normal(GroupEntry::Control(control)) = &entry.payload {
-                Arc::make_mut(&mut self.controls).insert(index, *control);
+                self.controls.insert(index, *control);
             }
             self.entries.insert(index, entry);
         }
@@ -118,27 +114,12 @@ impl Index {
     fn truncate_after(&mut self, last: Option<LogId>) {
         let from = last.map_or(0, |l| l.index + 1);
         self.entries.split_off(&from);
-        self.drop_controls_from(from);
-    }
-
-    /// Drop the controls at or above `index`, touching the history only if
-    /// there are any: an append past them, the common case, copies nothing.
-    fn drop_controls_from(&mut self, index: u64) {
-        if self.controls.range(index..).next().is_some() {
-            Arc::make_mut(&mut self.controls).split_off(&index);
-        }
+        self.controls.drop_from(from);
     }
 
     fn purge(&mut self, upto: LogId) {
         self.entries = self.entries.split_off(&(upto.index + 1));
-        if self.controls.range(..=upto.index).next().is_some() {
-            let kept = Arc::make_mut(&mut self.controls).split_off(&(upto.index + 1));
-            let purged = std::mem::replace(&mut self.controls, Arc::new(kept));
-            self.purged_kind = purged
-                .values()
-                .map(|c| c.kind())
-                .fold(self.purged_kind, u8::max);
-        }
+        self.controls.purge(upto.index);
         if self.last_purged.is_none_or(|p| upto > p) {
             self.last_purged = Some(upto);
         }
@@ -164,7 +145,7 @@ impl Index {
     }
 
     fn held_controls(&self) -> HeldControls {
-        HeldControls::new(Arc::clone(&self.controls), self.purged_kind)
+        self.controls.held()
     }
 
     fn last_log_id(&self) -> Option<LogId> {

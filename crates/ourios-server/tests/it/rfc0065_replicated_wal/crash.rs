@@ -202,6 +202,59 @@ pub(super) async fn published(store: &Store, acked: &BTreeSet<u64>, patience: Du
     panic!("the acknowledged records did not settle in Parquet: {last}");
 }
 
+/// Wait until the group's checkpoint covers every acknowledged record, as
+/// RFC0065.3 says of "the next checkpoint": `checkpoint.json` names a cut
+/// at or past the highest log index an acknowledged row carries, and that
+/// cut's bundle is written. The stream was acknowledged after the last
+/// kill, so such a cut was written after it too. Fails after `patience`
+/// with the last cut seen.
+pub(super) async fn checkpointed(store: &Store, acked: &BTreeSet<u64>, patience: Duration) {
+    use ourios_ingester::replicated::raft::bundle::{bundle_key, pointer};
+
+    let reading = store.clone();
+    let live = tokio::task::spawn_blocking(move || live_rows(&reading))
+        .await
+        .expect("read")
+        .expect("the live rows");
+    let highest = live
+        .values()
+        .flatten()
+        .filter(|row| row.tenant_id.as_str() == TENANT)
+        .filter(|row| seq_of(row).is_some_and(|seq| acked.contains(&seq)))
+        .filter_map(|row| row.ingest_position)
+        .max_by_key(|position| position.seq)
+        .expect("acknowledged rows");
+    let deadline = tokio::time::Instant::now() + patience;
+    let mut last = None;
+    while tokio::time::Instant::now() < deadline {
+        let store = store.clone();
+        let covered = tokio::task::spawn_blocking(move || {
+            let bytes = store
+                .get_blocking_opt(&pointer::key(highest.group))
+                .ok()??;
+            let cut = pointer::decode(&bytes, highest.group).ok()?;
+            let bundled = store
+                .get_blocking_opt(&bundle_key(highest.group, cut.seq))
+                .ok()?
+                .is_some();
+            Some((cut.seq, bundled))
+        })
+        .await
+        .expect("read");
+        if let Some((seq, true)) = covered
+            && seq >= highest.seq
+        {
+            return;
+        }
+        last = covered;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    panic!(
+        "no checkpoint covers the acknowledged records through {}: last cut {last:?}",
+        highest.seq
+    );
+}
+
 /// Whether the `live` files' rows hold every record [`TENANT`] was
 /// acknowledged for, each position once.
 fn settled(live: &BTreeMap<String, Vec<MinedRecord>>, acked: &BTreeSet<u64>) -> Result<(), String> {

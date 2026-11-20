@@ -287,3 +287,60 @@ fn events_queued_below_a_restored_cut_are_passed_over() {
             mining.stop().await;
         });
 }
+
+/// Batches, an id block, the first configuration at index 4 holding the
+/// batches at 1 and 3, then three batches.
+fn configured_at_4_then_more() -> Vec<GroupEntry> {
+    let mut entries = vec![
+        batch("acme", &["a b c d e"]),
+        block(0, 10_000),
+        batch("acme", &["a b c d x"]),
+        configured(0.7),
+    ];
+    entries.extend((5..8).map(|n| batch("acme", &[&format!("job {n} finished in {n} ms")])));
+    entries
+}
+
+/// #1305: a lagging tail miner whose held batches a checkpoint's purge
+/// took restores from the snapshot that purged them, as after an install,
+/// instead of stopping, and mines on past its cut.
+#[test]
+fn held_batches_purged_before_they_are_mined_restore_at_the_snapshot() {
+    let entries = configured_at_4_then_more();
+    let events = events_of(&entries, 32);
+    let mut through = miner_of(&entries);
+    let (mut cut, mut expected) = (None, Vec::new());
+    for (n, event) in events.iter().cloned().enumerate() {
+        let mined = through.apply(event).expect("mined");
+        match n {
+            4 => cut = Some(through.capture(LOG).expect("a cut").expect("captured")),
+            5 | 6 => expected.extend(mined.rows),
+            _ => {}
+        }
+    }
+    let cut = cut.expect("cut at index 5");
+    let cut_at = events[4].at;
+    // The snapshot at index 5 purged the log through it, held batches too.
+    let log = HeldLog(
+        logged(&entries)
+            .into_iter()
+            .filter(|e| e.log_id.index > cut_at.index)
+            .map(|e| (e.log_id.index, e))
+            .collect(),
+    );
+    let store = store_of(&[&cut]);
+    let cut_state = state(&cut);
+
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async {
+            let (events_to, mut handed, mining, _) = following(store, log, (cut_at, cut_state));
+            for event in &events {
+                events_to.send(event.clone()).await.expect("send");
+            }
+            let mined = rows_of(&mut handed, expected.len()).await;
+            assert_eq!(mined, expected, "the entries past the snapshot's cut");
+            assert!(mining.is_running(), "the miner restored and runs on");
+            mining.stop().await;
+        });
+}

@@ -1140,6 +1140,16 @@ the mass-failover time and vote-log batching as tuning signals.
 >   that matches at least one row, exactly those rows less the ones it
 >   matched
 
+> **Scenario RFC0065.34 — a transient rotation fault does not stop a replica (B4)**
+> - **Given** a group's log whose WAL rotation fails once with
+>   `RotationRetrying`
+> - **When** the replica appends entries across the rotation
+> - **Then** each write's callback reports success only after its
+>   frames are synced, the entries read back in order, and nothing is
+>   counted on `ourios.wal.replication.stops`
+> - **And** a rotation fault that exhausts RFC 0052's budget stops the
+>   replica, counted once, as any other write fault does
+
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
@@ -1457,6 +1467,19 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
 - **Corruption (B4).** A replica whose group WAL fails RFC 0008's CRC
   checks leaves `in_sync` (if leader, it stops leading), discards that
   group's log, and catches up from an in-sync member.
+- **A write fault on a group's log.** A failed append or sync on a
+  group's WAL stops that replica in the group until the node restarts,
+  counted on `ourios.wal.replication.stops`, except a **transient
+  rotation fault**: an append or sync that reports RFC 0052 §3.3's
+  `RotationRetrying`. The group's writer retries that inside itself,
+  after a short backoff, resuming at the frame that failed, before it
+  reports the write to `openraft`, because `openraft` treats a storage
+  error as fatal for the group. Nothing is acknowledged while it
+  retries: the write's callback fires only once its frames are synced.
+  RFC 0052's budget bounds the retries, and a fault that exhausts it
+  (`RotationTerminal`), or any other error, stops the replica as above.
+  So a brief rotation fault, such as a short `ENOSPC`, delays one
+  replica's writes instead of taking it out of the group (#1265).
 
 ### 6.5 Mining, checkpoints and recovery
 
@@ -2772,6 +2795,8 @@ from rows.
 - RFC0065.16: the existing suites, unchanged.
 - RFC0065.33: compaction and erasure tests in `ourios-parquet` beside
   RFC0009.2's, on files written with and without the ingest columns.
+- RFC0065.34: group-log tests beside the storage telemetry tests,
+  arming RFC 0052's rotation fault injection on the group's WAL.
 - RFC0065.31's lock arms (two replicated starts, a crashed
   bootstrapper, a deletion with groups holding blocks): the in-process
   cluster on the in-memory store, with failpoints between the lock,

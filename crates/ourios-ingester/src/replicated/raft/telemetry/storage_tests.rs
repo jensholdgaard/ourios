@@ -325,3 +325,20 @@ fn a_miner_stop_is_the_registered_event_with_its_cause() {
     ];
     assert_eq!(types, registered);
 }
+
+/// RFC0065.34: a rotation that fails once with `RotationRetrying` is
+/// retried inside the writer, so every write across it succeeds once
+/// synced, the entries read back in order, and the group does not stop.
+#[test]
+#[ignore = "RFC0065.34 red: the group writer stops on the first rotation fault until it retries in place (#1265)"]
+fn a_transient_rotation_fault_is_retried_without_stopping_the_group() {
+    todo!("RFC0065.34: retry a transient rotation fault inside the group's writer");
+}
+
+/// RFC0065.34: a rotation fault that outlasts RFC 0052's budget stops the
+/// group, once, as any other write fault does.
+#[test]
+#[ignore = "RFC0065.34 red: lands with the in-place retry it bounds (#1265)"]
+fn a_rotation_fault_past_the_budget_stops_the_group_once() {
+    todo!("RFC0065.34: a rotation fault past the budget stops the group once");
+}

@@ -18,7 +18,8 @@ superseded-by: —
 > attributes on every row with only an absent-body fallback: §3.2 adds
 > the undecodable-value exceptions. RFC 0017 gets a dated pointer here
 > once this RFC is accepted. The fallback keeps RFC 0047 §3.4's masking
-> guarantee (§3.2).
+> guarantee (§3.2). It coordinates with RFC 0062 (`green`), whose §3.3
+> fails a query on an unreadable cell (§3.2).
 
 ## 1. Summary
 
@@ -103,8 +104,16 @@ one bad cell does not affect the row's other cells or other rows.
   content key of the row's tenant gets the reserved attribute with its
   value masked as a whole, never the stored JSON, so no protected value
   leaks through a fallback.
+- **Predicates.** A filter runs before the fallback, over the raw cell
+  (`ourios_attr_cmp`, RFC 0062 §3.3). A predicate over an undecodable
+  cell evaluates as SQL `NULL`, so it does not match, and the cell is
+  logged as undecodable; the query no longer fails. This changes RFC
+  0062 §3.3's "a row the scan cannot read fails the query", which the
+  implementing PR updates (RFC 0062 is `green`, so it is coordinated,
+  not amended).
 - **Batch and query.** `batch_to_mined_records` decodes the other cells
-  and rows as before, and a query returns every row.
+  and rows as before, and a query returns every row its predicates
+  match.
 
 **In compaction, nothing degrades.** The query fallback never reaches
 the compaction path. Compaction reads an undecodable cell as its **raw
@@ -205,6 +214,13 @@ explicit bound is enough.
 > - **Then** the reserved attribute's value is masked as a whole, and the
 >   stored JSON appears nowhere in the result
 
+> **Scenario RFC0069.7 — a filter over an undecodable cell does not fail the query**
+> - **Given** RFC0069.3's file, with valid rows matching an attribute
+>   predicate and the bad row's attributes cell undecodable
+> - **When** a query filters on that attribute
+> - **Then** it returns the valid matching rows, the bad row does not
+>   match, and the query does not fail
+
 ## 6. Testing strategy
 
 - RFC0069.1: an integration test in `ourios-server` that ingests the
@@ -224,6 +240,8 @@ explicit bound is enough.
   RFC 0047 §3.6's erasure tests.
 - RFC0069.6: a visibility test in `ourios-querier` beside RFC 0047's
   masking tests.
+- RFC0069.7: a plan test in `ourios-querier` beside RFC 0062's
+  attribute-predicate tests.
 - `ourios-testgen`'s `MAX_ANY_VALUE_DEPTH` of 16 stays for the property
   suites; the depth matrix is explicit tests.
 

@@ -92,6 +92,22 @@ buy nothing, and could not be bounded: a restart into an unrepaired
 fault replays the whole tail above the floor, and several tenants can be
 held at once.
 
+**Its audit events go too.** The audit sink drops a held tenant's
+retained events and every event emitted for it afterwards, and releases
+the publication ticket they held (`audit_sink.rs`'s ledger), so a held
+tenant's events never block another tenant's records, whether they were
+retained after a transient failure or are still in the sink. A restart
+regenerates them with the records (§3.5). Another tenant's transient
+failure still holds that drain's records, as today.
+
+**Recovery publishes in bounded passes.** Recovery runs the
+coordinator's write whenever the record sink reaches its ceiling while
+it replays, instead of only after the replay ends. A tenant whose fault
+is still unrepaired is then held again within one ceiling of replayed
+output, and its later records are dropped (above), so recovery never
+buffers more than the ceiling. The pass runs on recovery's own thread,
+not on an encode worker.
+
 ### 3.3 Its appends are refused
 
 The receiver refuses a held tenant's new batches **before the WAL
@@ -260,6 +276,9 @@ would stall the node, so the hold is per tenant.
 > - **And** when A was held with its buffers at the ceiling, the sink's
 >   byte total falls by A's buffered bytes, and B's later appends flush
 >   by the size and age triggers as they would without A
+> - **And** when the same drain also retains one of A's events after a
+>   transient failure, A's retained events are dropped with its hold,
+>   and B's records publish on the next drain
 
 > **Scenario RFC0056.2 — a derive failure takes the same path `[§3.1]`**
 > - **Given** an audit event for tenant A whose `derive_audit_partition`
@@ -322,8 +341,8 @@ would stall the node, so the hold is per tenant.
 > - **Then** A is held again, its floor is still `X0` although later
 >   cuts stamped past it, nothing of A's is lost or published, and the
 >   records recovery emits for A are dropped rather than buffered, so a
->   replay tail larger than the ceiling does not raise the sink's byte
->   total
+>   replay tail larger than the ceiling never raises the sink's buffered
+>   bytes above the ceiling at any point during recovery
 
 ## 6. Testing strategy
 

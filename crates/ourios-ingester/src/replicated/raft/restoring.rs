@@ -124,7 +124,12 @@ impl<L: GroupLogRead + Clone + Send + 'static> Restoring<L> {
                         });
                     }
                     event = next(applied, stop) => match event? {
-                        Applied { at: later, event: AppliedEvent::Installed(installed) } => {
+                        // The restore can start at the replica's live
+                        // snapshot, ahead of installs still queued, so only
+                        // a later one moves it.
+                        Applied { at: later, event: AppliedEvent::Installed(installed) }
+                            if later.index > at.index =>
+                        {
                             (at, state) = (later, installed);
                             through = through.max(later.index);
                             break;

@@ -86,7 +86,13 @@ partitions stay with it.
 A held tenant's partitions are **excluded from every drain**, by the age
 sweep, the barrier and the publisher alike, so the node does not spend
 store calls on a failure nothing in-process can repair. They stay in the
-buffers under the sink's byte accounting.
+buffers, but **out of the flush-pressure budget**: the record sink
+moves a held tenant's bytes from the total its size and ceiling triggers
+compare against into a separate held total, and ceiling selection never
+picks a held partition. Otherwise a held tenant at the ceiling would
+keep the sink over budget with nothing it can flush, forcing every
+healthy append into a one-record file. Memory stays bounded because the
+held total cannot grow: its appends are refused (§3.3).
 
 ### 3.3 Its appends are refused
 
@@ -111,8 +117,16 @@ installed and then failed to stamp leaves `S_T` ahead of the checkpoint
 with `T` durable through `S_T` (RFC0052.10 covers `S_T > X`). When `T`
 was held before any checkpoint was stamped or snapshot installed, its
 floor is **the start of the log**, encoded as an absent offset: none of
-`T`'s records count as durable, so all of its frames replay. A held tenant keeps its floor across later
-cuts, and a cut that holds no tenant writes no floors.
+`T`'s records count as durable, so all of its frames replay.
+
+**A floor never rises.** The formula above applies only to a tenant
+with no floor in the sidecar. Recovery seeds each held floor from the
+sidecar before it replays, and a tenant that is held again, as when a
+restart meets the same unrepaired fault, keeps that floor: recomputing
+it from a checkpoint stamped after the first hold would lift it over
+records that were never published, and the next restart would suppress
+them. A held tenant keeps its floor across later cuts, and a cut that
+holds no tenant writes no floors.
 
 Recovery gates a tenant's frames by `F_T` in place of `X`, where `F_T`
 is `H_T` when the sidecar holds a floor for `T` (the start of the log for
@@ -245,6 +259,9 @@ would stall the node, so the hold is per tenant.
 >   drains publish B's records and leave A's buffered
 > - **And** the same holds when the failing audit write comes from a
 >   record sink's inline size or ceiling flush instead of a drain
+> - **And** when A was held with its buffers at the ceiling, B's later
+>   appends flush by the size and age triggers as they would without A,
+>   not one record at a time
 
 > **Scenario RFC0056.2 — a derive failure takes the same path `[§3.1]`**
 > - **Given** an audit event for tenant A whose `derive_audit_partition`
@@ -267,7 +284,8 @@ would stall the node, so the hold is per tenant.
 >   again, and A's records above `S` publish under regenerated events
 
 > **Scenario RFC0056.5 — the checkpoint advances and records the floor `[H3]`**
-> - **Given** a held tenant A, held after the checkpoint `X0`
+> - **Given** a held tenant A, held after the checkpoint `X0`, with no
+>   snapshot of A installed past `X0`
 > - **When** a later cut stamps `X1 > X0`
 > - **Then** the `CHECKPOINT` sidecar holds `X1` and A's floor `X0`, A's
 >   snapshot is not installed past `X0`, no segment holding A's frames
@@ -303,8 +321,8 @@ would stall the node, so the hold is per tenant.
 > **Scenario RFC0056.9 — a restart into an unrepaired fault holds the tenant again `[H3]`**
 > - **Given** RFC0056.5's node, restarted with the fault still present
 > - **When** it recovers
-> - **Then** A is held again, its floor is still `X0`, and nothing of
->   A's is lost or published
+> - **Then** A is held again, its floor is still `X0` although later
+>   cuts stamped past it, and nothing of A's is lost or published
 
 ## 6. Testing strategy
 

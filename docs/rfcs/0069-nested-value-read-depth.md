@@ -107,7 +107,12 @@ one bad cell does not affect the row's other cells or other rows.
 - **Predicates.** A filter runs before the fallback, over the raw cell
   (`ourios_attr_cmp`, RFC 0062 §3.3). A predicate over an undecodable
   cell evaluates as SQL `NULL`, so it does not match, and the cell is
-  logged as undecodable; the query no longer fails. This changes RFC
+  logged as undecodable; the query no longer fails. The guard wraps the
+  **whole** compiled comparison, outside any prefilter: a JSON-attribute
+  comparison compiles to a `LIKE` prefilter `AND` the UDF, and a false
+  prefilter would otherwise make the comparison false, so that `not`
+  matches the undecodable row. Wrapped, the comparison is `NULL` and
+  stays unmatched under `not` too. This changes RFC
   0062 §3.3's "a row the scan cannot read fails the query", which the
   implementing PR updates (RFC 0062 is `green`, so it is coordinated,
   not amended).
@@ -116,11 +121,12 @@ one bad cell does not affect the row's other cells or other rows.
   match.
 
 **In compaction, nothing degrades.** The query fallback never reaches
-the compaction path. Compaction reads an undecodable cell as its **raw
-stored bytes**, carries them through sorting, spills and the final
-write in a dedicated raw form beside the decoded fields, and writes
-them back unchanged, so the row is carried forward byte for byte and
-the partition compacts. That covers a body whose bytes are not valid
+the compaction path. A row with **any** undecodable cell is read
+**whole** as its stored bytes, every cell of it raw, the valid ones
+included, carried through sorting, spills and the final write in a
+dedicated raw form, and written back unchanged, so the whole row is
+carried forward byte for byte, not only its bad cell, and the partition
+compacts. Rows that decode in full are compacted as today. That covers a body whose bytes are not valid
 UTF-8 as well: compaction never routes a raw cell through a string
 conversion.
 
@@ -220,6 +226,9 @@ explicit bound is enough.
 > - **When** a query filters on that attribute
 > - **Then** it returns the valid matching rows, the bad row does not
 >   match, and the query does not fail
+> - **And** the negated filter (`not (attr.k == "x")`), whose `LIKE`
+>   prefilter is false for the bad cell, does not match the bad row
+>   either
 
 ## 6. Testing strategy
 

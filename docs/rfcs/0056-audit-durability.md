@@ -1,7 +1,7 @@
 ---
 rfc: 0056
 title: Audit-sink durability on permanent write failure
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-15
@@ -11,7 +11,8 @@ superseded-by: —
 
 # RFC 0056 — Audit-sink durability on permanent write failure
 
-> **Status note.** `drafted`. Tracks #1294. 2026-11-20: the maintainer
+> **Status note.** `specified` (2026-11-20, maintainer-approved, with
+> the §7 answers). Tracks #1294. 2026-11-20: the maintainer
 > chose this RFC's per-tenant hold over the alternative of publishing and
 > holding the node's checkpoint (§4.1). §3 below is the design; §9 keeps
 > the RFC 0053 draft's wording it grew from, and §3.7 says where it
@@ -320,17 +321,18 @@ would stall the node, so the hold is per tenant.
 
 ## 7. Open questions
 
-- [ ] **Telemetry names (semconv sign-off).** A held tenant needs to be
-  visible: proposed `ourios.receiver.tenant.held` (gauge, `{tenant}`)
-  and the `error.type` value `tenant_held` on the refused-batch path.
-  Both go through the shared `ourios-semconv` registry first.
+- [x] **Telemetry names.** Approved 2026-11-20: the gauge
+  `ourios.receiver.tenant.held` and the `error.type` value
+  `tenant_held` on the refused-batch path. Both go through the shared
+  `ourios-semconv` registry, checked against the OTel conventions,
+  before the code uses them.
 - The replicated backend — **#1392** (§3.6).
-- [ ] **The exact floor (§3.4's known cost).** Records could carry their
-  WAL offset through the sink so `H_T` is the tenant's real publication
-  frontier, removing the republish window. The window is usually one
-  barrier interval but unbounded in the worst case (every record of the
-  held tenant since the last stamped checkpoint), so this is a real
-  trade-off, not a formality.
+- [x] **The exact floor (§3.4's known cost).** Deferred, 2026-11-20.
+  Records could carry their WAL offset through the sink so `H_T` is the
+  tenant's real publication frontier, removing the republish window,
+  which is usually one barrier interval but unbounded in the worst case.
+  It arises only after a permanent audit fault and a restart, so it is
+  revisited only if it is seen to matter.
 - RFC 0026 `IngestDenied` durability — **#809**, owned by RFC 0026. The
   path emits before any frame exists, so replay cannot regenerate it and
   §3 does not reach it. It is a standing contradiction with RFC 0005 §3.7

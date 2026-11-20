@@ -13,10 +13,12 @@ superseded-by: —
 
 > **Status: `drafted`.** Tracks #1136, options A and C, which the
 > maintainer chose on 2026-11-20; option B, ingest conformance at the
-> SDK's depth of 64, is a follow-up (§4.1). This RFC changes the read
-> path's contract for stored `AnyValue` JSON. It contradicts no accepted
-> text: RFC 0001 §6.6's render contract already allows the retained
-> `body` bytes returned verbatim, which §3.3 relies on.
+> SDK's depth of 64, is a follow-up (§4.1). This RFC **amends accepted
+> RFC 0017 §3.3–§3.4**, which require a structured body and decoded
+> attributes on every row with only an absent-body fallback: §3.2 adds
+> the undecodable-value exceptions. RFC 0017 gets a dated pointer here
+> once this RFC is accepted. The fallback keeps RFC 0047 §3.4's masking
+> guarantee (§3.2).
 
 ## 1. Summary
 
@@ -55,7 +57,8 @@ OTLP field ingest stored.
 ### 3.1 Read depth covers ingest depth
 
 The canonical decoders `decode_any_value` and `decode_attributes`
-(`ourios-core/src/otlp.rs`) lift `serde_json`'s fixed limit
+(`ourios-core/src/otlp.rs`), which serve the structured body and the
+log, resource and scope attributes alike, lift `serde_json`'s fixed limit
 (`Deserializer::disable_recursion_limit`, behind `serde_json`'s
 `unbounded_depth` feature, which adds no crate) and bound depth
 themselves:
@@ -80,25 +83,40 @@ scan now does that job, so the guard is still there.
 
 A row whose stored JSON still fails to decode, from file corruption, a
 foreign producer, or a value deeper than `MAX_READ_DEPTH`, no longer
-fails its batch:
+fails its batch. Each of the four stored values, the structured body
+and the log, resource and scope attributes, degrades **independently**:
+one bad cell does not affect the row's other cells or other rows.
+
+**In query output:**
 
 - **Structured body.** `render_log_body` returns the stored body bytes
-  as the line under `Reconstruction::RetainedVerbatim`, which is exactly
-  what RFC 0001 §6.6's render contract means by that signal, instead of
-  an empty line under the same label.
-- **Attributes.** The row's decoded attributes are replaced by a single
+  as the line under `Reconstruction::RetainedVerbatim`, instead of an
+  empty line under the same label. This is the exception to RFC 0017
+  §3.3's structured-body rule.
+- **Attributes.** An undecodable attribute cell is replaced by a single
   attribute whose key is reserved (§7) and whose string value is the
   stored canonical JSON, so the data stays visible and the row says why
-  it is not structured.
-- **Batch and query.** `batch_to_mined_records` decodes the other rows
-  of the batch as before. A query returns every row, the degraded one
-  marked as above.
-- **Compaction.** A degraded row is written back with its stored bytes
-  unchanged, so compaction carries it forward byte for byte and the
-  partition compacts.
+  it is not structured. This is the exception to RFC 0017 §3.4's
+  decoded attributes.
+- **Masking.** The fallback carries the whole cell, so RFC 0047 §3.4's
+  per-key masking cannot see inside it. A reader who is masked from any
+  content key of the row's tenant gets the reserved attribute with its
+  value masked as a whole, never the stored JSON, so no protected value
+  leaks through a fallback.
+- **Batch and query.** `batch_to_mined_records` decodes the other cells
+  and rows as before, and a query returns every row.
 
-Each degraded row logs one `WARN` event naming the file and row, and is
-counted (§7).
+**In compaction, nothing degrades.** The query fallback never reaches
+the compaction path. Compaction reads an undecodable cell as its **raw
+stored bytes**, carries them through sorting, spills and the final
+write in a dedicated raw form beside the decoded fields, and writes
+them back unchanged, so the row is carried forward byte for byte and
+the partition compacts. That covers a body whose bytes are not valid
+UTF-8 as well: compaction never routes a raw cell through a string
+conversion.
+
+Each degraded cell in a query logs one `WARN` event naming the file,
+row and column, and is counted (§7).
 
 ## 4. Alternatives considered
 
@@ -128,8 +146,8 @@ explicit bound is enough.
 
 > **Scenario RFC0069.1 — every depth ingest accepts reads back `[§3.3, H7]`**
 > - **Given** a map and an array chain at every depth ingest accepts,
->   over protobuf and OTLP/JSON, as a body, a log attribute and a
->   resource attribute
+>   over protobuf and OTLP/JSON, as a body, a log attribute, a resource
+>   attribute and a scope attribute
 > - **When** each is ingested, written to Parquet and read back by a
 >   query
 > - **Then** the value read back equals the value sent
@@ -143,15 +161,31 @@ explicit bound is enough.
 >   refused with `CanonicalJsonError::TooDeep`, without overflowing the
 >   stack
 
-> **Scenario RFC0069.3 — an undecodable row degrades alone `[§3.3, H4]`**
-> - **Given** a Parquet file holding one row whose structured body and
->   attributes are invalid canonical JSON, among valid rows
-> - **When** a query reads the file, and when compaction rewrites it
-> - **Then** the query returns every row, the bad row's body as its
->   stored bytes under `RetainedVerbatim` and its attributes as the
->   reserved attribute holding the stored JSON; compaction succeeds and
->   the bad row's stored bytes are unchanged in the output; one `WARN`
->   event names the file and row
+> **Scenario RFC0069.3 — an undecodable cell degrades alone `[§3.3, H4]`**
+> - **Given** a Parquet file holding, among valid rows, one row whose
+>   structured body, log attributes, resource attributes and scope
+>   attributes are each invalid canonical JSON, and another row whose
+>   scope attributes alone are, with a body that is not valid UTF-8
+> - **When** a query reads the file
+> - **Then** it returns every row: the bad body as its stored bytes
+>   under `RetainedVerbatim`, each bad attribute cell as the reserved
+>   attribute holding its stored JSON, and every valid cell of those
+>   rows decoded as usual; one `WARN` event names each bad cell
+
+> **Scenario RFC0069.4 — compaction carries an undecodable cell byte for byte `[H4]`**
+> - **Given** RFC0069.3's file
+> - **When** compaction rewrites its partition, including a run large
+>   enough to spill
+> - **Then** compaction succeeds, every bad cell's stored bytes are
+>   unchanged in the output, the non-UTF-8 body included, and no output
+>   row carries the reserved attribute
+
+> **Scenario RFC0069.5 — the fallback is masked for a masked reader `[§3.7]`**
+> - **Given** RFC0069.3's file, under a tenant with a content key masked
+>   from a metadata-only reader (RFC 0047 §3.4)
+> - **When** that reader queries it
+> - **Then** the reserved attribute's value is masked as a whole, and the
+>   stored JSON appears nowhere in the result
 
 ## 6. Testing strategy
 
@@ -161,11 +195,15 @@ explicit bound is enough.
 - RFC0069.2: unit tests in `ourios-core` beside the canonical JSON
   round-trip tests, building the deepest admitted value from the ingest
   limits rather than a hard-coded number.
-- RFC0069.3: reader and compaction tests in `ourios-parquet`, and a
-  render test in `ourios-querier` replacing
+- RFC0069.3: reader tests in `ourios-parquet`, and a render test in
+  `ourios-querier` replacing
   `structured_undecodable_body_is_retained_not_faithful`'s expectation
   of an empty line, as a superseded test kept `#[ignore]`d beside its
   successor.
+- RFC0069.4: compaction tests in `ourios-parquet` beside RFC0009.2's,
+  with a spill forced by a small memory budget.
+- RFC0069.5: a visibility test in `ourios-querier` beside RFC 0047's
+  masking tests.
 - `ourios-testgen`'s `MAX_ANY_VALUE_DEPTH` of 16 stays for the property
   suites; the depth matrix is explicit tests.
 
@@ -185,8 +223,9 @@ explicit bound is enough.
 ## 8. References
 
 - #1136, the measurements and options; #1134, where it was found.
-- RFC 0001 §6.6 (render contract, `RetainedVerbatim`), RFC 0005 (the
-  stored canonical JSON), RFC 0017 (read path), RFC 0018 §3.4
-  (non-finite doubles in the same decoders).
+- RFC 0017 (`accepted`) §3.3–§3.4, **amended here**; RFC 0047
+  (`accepted`) §3.4, whose masking §3.2 keeps; RFC 0001 §6.6
+  (`RetainedVerbatim`); RFC 0005 (the stored canonical JSON); RFC 0018
+  §3.4 (non-finite doubles in the same decoders).
 - OpenTelemetry common spec, `AnyValue` and attribute limits.
 - `AGENTS.md` §3.3; `docs/hazards.md` H4 and H7.

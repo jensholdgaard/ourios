@@ -9,8 +9,9 @@ use ourios_wal::{AppendError, FrameKind, SyncError, Wal, WalOffset};
 use super::WalFailure;
 
 /// The waits between attempts at a write RFC 0052 §3.3 reports as a
-/// transient rotation fault. The WAL's own budget ends the retries first;
-/// the cap only bounds a WAL that never says so.
+/// transient rotation fault, the last repeated: the WAL's own budget
+/// (`rotation_retry_attempts`) decides when the retries end, by reporting
+/// `RotationTerminal`.
 const ROTATION_BACKOFF: [Duration; 4] = [
     Duration::from_millis(50),
     Duration::from_millis(200),
@@ -18,22 +19,23 @@ const ROTATION_BACKOFF: [Duration; 4] = [
     Duration::from_secs(2),
 ];
 
-/// `write`, retried after each of [`ROTATION_BACKOFF`]'s waits while it
-/// fails `transient`ly, and reported as I/O otherwise (RFC 0065 §6.4).
+/// `write`, retried after [`ROTATION_BACKOFF`]'s waits while it fails
+/// `transient`ly, and reported as I/O otherwise (RFC 0065 §6.4).
 /// Nothing is acknowledged meanwhile: the write's callback fires only
 /// after this returns and the frames are synced.
 fn retrying<T, E: WalFailure>(
     mut write: impl FnMut() -> Result<T, E>,
     transient: impl Fn(&E) -> bool,
 ) -> io::Result<T> {
-    let mut waits = ROTATION_BACKOFF.iter();
+    let last = ROTATION_BACKOFF[ROTATION_BACKOFF.len() - 1];
+    let mut waits = ROTATION_BACKOFF.into_iter().chain(std::iter::repeat(last));
     loop {
         match write() {
             Ok(done) => return Ok(done),
-            Err(e) => match waits.next() {
-                Some(wait) if transient(&e) => std::thread::sleep(*wait),
-                _ => return Err(e.to_io()),
-            },
+            Err(e) if transient(&e) => {
+                std::thread::sleep(waits.next().unwrap_or(last));
+            }
+            Err(e) => return Err(e.to_io()),
         }
     }
 }

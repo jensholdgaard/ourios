@@ -357,54 +357,66 @@ async fn across_a_rotation(log: &mut GroupLog) -> Vec<io::Result<()>> {
     outcomes
 }
 
-/// Group `group`'s log, whose WAL rotation faults as `faults` says,
-/// metered on `reader`. `group` must be one no other test uses.
-fn faulted_log(
-    dir: &Path,
-    (group, reader): (u32, &Reader),
+/// A rotation-fault case: the group it runs on, which no other test uses,
+/// the faults armed on its WAL, and RFC 0052's retry budget.
+struct Faulted {
+    group: u32,
     faults: ourios_wal::RotationFaults,
-) -> GroupLog {
-    vote_log::create(dir).expect("create");
-    let votes = VoteLog::open(dir).expect("vote log");
-    let config = wal_config(&group_dir(dir, group));
-    let disk = Disk {
-        gate: Arc::new(SyncGate::default()),
-        storage: Meters::on(&reader.meter()).storage(),
-    };
-    retry::injected::on_group(group, faults);
-    GroupLog::open_metered(config, group, votes, disk).expect("group log")
+    attempts: u32,
 }
 
-/// RFC0065.34: a rotation that fails once with `RotationRetrying` is
-/// retried inside the writer, so every write across it succeeds once
-/// synced, the entries read back in order, and the group does not stop.
-#[tokio::test]
-async fn a_transient_rotation_fault_is_retried_without_stopping_the_group() {
+impl Faulted {
+    fn config(&self, dir: &Path) -> ourios_wal::WalConfig {
+        ourios_wal::WalConfig {
+            rotation_retry_attempts: self.attempts,
+            ..wal_config(&group_dir(dir, self.group))
+        }
+    }
+
+    /// The group's log with the faults armed, metered on `reader`.
+    fn open(self, dir: &Path, reader: &Reader) -> GroupLog {
+        vote_log::create(dir).expect("create");
+        let votes = VoteLog::open(dir).expect("vote log");
+        let config = self.config(dir);
+        let disk = Disk {
+            gate: Arc::new(SyncGate::default()),
+            storage: Meters::on(&reader.meter()).storage(),
+        };
+        retry::injected::on_group(self.group, self.faults);
+        GroupLog::open_metered(config, self.group, votes, disk).expect("group log")
+    }
+}
+
+/// RFC0065.34's healing arm: every write across the rotation succeeds,
+/// the group does not stop, and once the log is shut down and reopened
+/// from its WAL every entry is there, in order.
+async fn retried_without_stopping(case: Faulted) {
     let dir = tempfile::tempdir().expect("tempdir");
     let reader = Reader::new();
-    let faults = ourios_wal::RotationFaults::failing(ourios_wal::RotationSite::Create, 1);
-    let mut log = faulted_log(dir.path(), (12_651, &reader), faults);
+    let (group, config) = (case.group, case.config(dir.path()));
+    let mut log = case.open(dir.path(), &reader);
 
     let outcomes = across_a_rotation(&mut log).await;
 
     let failed: Vec<_> = outcomes.iter().filter(|o| o.is_err()).collect();
     assert!(failed.is_empty(), "every write succeeds: {failed:?}");
-    let mut read = log.get_log_reader().await;
+    assert!(reader.points(STOPS).is_empty(), "the group did not stop");
+    log.shutdown();
+    let votes = VoteLog::open(dir.path()).expect("vote log");
+    let mut reopened = GroupLog::open(config, group, votes).expect("reopen");
     let count = u64::try_from(outcomes.len()).expect("count");
+    let mut read = reopened.get_log_reader().await;
     let entries = read.try_get_log_entries(0..count).await.expect("read");
     let indexes: Vec<u64> = entries.iter().map(|e| e.log_id.index).collect();
-    assert_eq!(indexes, (0..count).collect::<Vec<_>>(), "in order");
-    assert!(reader.points(STOPS).is_empty(), "the group did not stop");
+    assert_eq!(indexes, (0..count).collect::<Vec<_>>(), "durable, in order");
 }
 
-/// RFC0065.34: a rotation fault that outlasts RFC 0052's budget stops the
-/// group, once, as any other write fault does.
-#[tokio::test]
-async fn a_rotation_fault_past_the_budget_stops_the_group_once() {
+/// RFC0065.34's budget arm: the fault outlasts the budget, so a write
+/// after the rotation fails and the group stops, counted once.
+async fn stopped_once(case: Faulted) {
     let dir = tempfile::tempdir().expect("tempdir");
     let reader = Reader::new();
-    let faults = ourios_wal::RotationFaults::always(ourios_wal::RotationSite::Create);
-    let mut log = faulted_log(dir.path(), (12_652, &reader), faults);
+    let mut log = case.open(dir.path(), &reader);
 
     let outcomes = across_a_rotation(&mut log).await;
 
@@ -415,4 +427,68 @@ async fn a_rotation_fault_past_the_budget_stops_the_group_once() {
     assert!(outcomes.last().is_some_and(Result::is_err), "after it");
     let stops: u64 = reader.points(STOPS).iter().map(|(_, n)| n).sum();
     assert_eq!(stops, 1, "stopped once");
+}
+
+const DEFAULT_ATTEMPTS: u32 = ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS;
+
+/// RFC0065.34: an append whose rotation fails once is retried in place.
+#[tokio::test]
+async fn a_transient_rotation_fault_is_retried_without_stopping_the_group() {
+    let faults = ourios_wal::RotationFaults::failing(ourios_wal::RotationSite::Create, 1);
+    retried_without_stopping(Faulted {
+        group: 12_651,
+        faults,
+        attempts: DEFAULT_ATTEMPTS,
+    })
+    .await;
+}
+
+/// RFC0065.34: the WAL's budget, not the writer's backoff, ends the
+/// retries, so a larger budget heals more failures.
+#[tokio::test]
+async fn the_wal_budget_decides_how_often_a_rotation_is_retried() {
+    let faults = ourios_wal::RotationFaults::failing(ourios_wal::RotationSite::Create, 5);
+    retried_without_stopping(Faulted {
+        group: 12_653,
+        faults,
+        attempts: 6,
+    })
+    .await;
+}
+
+/// RFC0065.34: a sync whose rotation-owed directory fsync fails is retried
+/// in place too.
+#[tokio::test]
+async fn a_transient_parent_fsync_fault_is_retried_without_stopping_the_group() {
+    let faults = ourios_wal::RotationFaults::failing(ourios_wal::RotationSite::ParentFsync, 2);
+    retried_without_stopping(Faulted {
+        group: 12_654,
+        faults,
+        attempts: DEFAULT_ATTEMPTS,
+    })
+    .await;
+}
+
+/// RFC0065.34: a rotation fault that outlasts RFC 0052's budget stops the
+/// group, once, as any other write fault does.
+#[tokio::test]
+async fn a_rotation_fault_past_the_budget_stops_the_group_once() {
+    stopped_once(Faulted {
+        group: 12_652,
+        faults: ourios_wal::RotationFaults::always(ourios_wal::RotationSite::Create),
+        attempts: DEFAULT_ATTEMPTS,
+    })
+    .await;
+}
+
+/// RFC0065.34: a directory fsync that keeps failing exhausts the same
+/// budget through `sync` and stops the group once.
+#[tokio::test]
+async fn a_parent_fsync_fault_past_the_budget_stops_the_group_once() {
+    stopped_once(Faulted {
+        group: 12_655,
+        faults: ourios_wal::RotationFaults::always(ourios_wal::RotationSite::ParentFsync),
+        attempts: DEFAULT_ATTEMPTS,
+    })
+    .await;
 }

@@ -107,7 +107,11 @@ instead of only after the replay ends. The audit side matters on its
 own: replay at or below a tenant's floor suppresses records but can
 still emit the events of templates it re-mints, which would otherwise
 grow with no record pass to flush them. The pass runs on recovery's own
-thread, not on an encode worker.
+thread, not on an encode worker. If a pass leaves a sink at its bound,
+because a transient failure retained its drain, recovery **stops
+reading frames** and retries the pass with backoff until one frees
+capacity, as the receiver already waits out a store outage; it never
+reads past a full sink.
 
 The passes bound **buffering**, not how soon a fault is found. Replay
 can publish several passes of a tenant's records whose template events
@@ -155,8 +159,11 @@ is `H_T` when the sidecar holds a floor for `T` (the start of the log for
 an absent one) and `X` otherwise. Both of recovery's gates take it:
 
 - **records** route by `max(S_T, F_T)` instead of `max(S_T, X)`, `S_T`
-  being the tenant's restored snapshot horizon, which a hold never lets
-  pass `H_T`, so this is `F_T` for a held tenant;
+  being the tenant's restored snapshot horizon. A hold installs no
+  snapshot of `T`, but after a repaired restart a cut can install one
+  past `H_T` and fail to stamp; a snapshot is installed only once its
+  records and events are durable, so `max(S_T, F_T)` then routes `T` by
+  `S_T`, correctly, and the stale floor is dropped at the next stamp;
 - **audit events** are suppressed through `F_T` instead of `X`, keeping
   the existing exception for a template a frame at or below the gate
   mints afresh (RFC 0059 §3.4).
@@ -343,7 +350,16 @@ would stall the node, so the hold is per tenant.
 > - **And** a version-3 sidecar beside a missing `RECLAIM` fails closed
 >   exactly as a version-2 one does
 
-> **Scenario RFC0056.9 — a restart into an unrepaired fault holds the tenant again `[H3]`**
+> **Scenario RFC0056.9 — a snapshot past the floor after a repaired restart `[H3]`**
+> - **Given** RFC0056.6's node after its repaired restart, where a cut
+>   installs A's snapshot at `S > X0` and fails to stamp, leaving the
+>   sidecar's floor `X0`
+> - **When** the node restarts again
+> - **Then** recovery routes A by `S`, nothing of A's at or below `S`
+>   publishes again, A's records above `S` publish, and the next stamp
+>   writes no floor for A
+
+> **Scenario RFC0056.10 — a restart into an unrepaired fault holds the tenant again `[H3]`**
 > - **Given** RFC0056.5's node, restarted with the fault still present
 > - **When** it recovers
 > - **Then** A is held again from the pass whose audit write fails, its
@@ -353,7 +369,9 @@ would stall the node, so the hold is per tenant.
 >   publish
 > - **And** neither sink buffers more than its bound at any point
 >   during recovery, including a replay at or below A's floor that
->   emits only re-minted template events
+>   emits only re-minted template events, and including tenant B's
+>   audit writes failing transiently meanwhile, when recovery stops
+>   reading frames until a pass frees capacity
 
 ## 6. Testing strategy
 
@@ -361,7 +379,7 @@ would stall the node, so the hold is per tenant.
   for one tenant, and an event stamped before the epoch for the derive
   path.
 - RFC0056.3: receiver tests over both transports.
-- RFC0056.4–.7 and .9: integration tests in `ourios-server` on the local
+- RFC0056.4–.7, .9 and .10: integration tests in `ourios-server` on the local
   backend, killing and restarting the node, beside the RFC 0052 barrier
   tests; .4 injects a stamp failure after the install.
 - RFC0056.8 and the sidecar's version 3: codec round-trip and version

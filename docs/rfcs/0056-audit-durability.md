@@ -18,8 +18,9 @@ superseded-by: —
 > departs. This RFC **amends accepted RFC 0005 §3.7** (no audit event is
 > lost) by naming what a permanent audit-write failure does. It
 > coordinates with RFC 0052 (`green`), whose `CHECKPOINT` sidecar and
-> recovery routing it extends, and RFC 0065 (`red`), whose publication
-> reuses the same coordinator. **Blocked from `validated` by [#809](https://github.com/jensholdgaard/ourios/issues/809)**,
+> recovery routing it extends. It covers the **local** WAL backend; the
+> replicated backend (RFC 0065, `red`) needs its own protocol and is
+> tracked by #1392 (§3.6). **Blocked from `validated` by [#809](https://github.com/jensholdgaard/ourios/issues/809)**,
 > RFC 0026's denial-audit durability, which §7 explains this RFC cannot
 > close.
 
@@ -97,11 +98,16 @@ WAL and lose nothing.
 A cut (RFC 0052 §3.1) still stamps the node's checkpoint `X` when every
 **other** tenant is durable through it. The `CHECKPOINT` sidecar gains a
 version 3 that carries, beside `X`, a **held floor** `H_T` for each held
-tenant `T`: the last checkpoint stamped before `T` was held, through
-which every one of `T`'s records is in the store. When `T` was held
-before any checkpoint was stamped, its floor is **the start of the log**,
-encoded as an absent offset: none of `T`'s records count as durable, so
-all of its frames replay. A held tenant keeps its floor across later
+tenant `T`: the offset through which every one of `T`'s records and
+their template events are in the store when `T` is held. That is the
+later of the last checkpoint stamped and `T`'s installed snapshot
+horizon `S_T`. A cut installs snapshots before it stamps (RFC 0052
+§3.1), and only after its records and events are written, so a cut that
+installed and then failed to stamp leaves `S_T` ahead of the checkpoint
+with `T` durable through `S_T` (RFC0052.10 covers `S_T > X`). When `T`
+was held before any checkpoint was stamped or snapshot installed, its
+floor is **the start of the log**, encoded as an absent offset: none of
+`T`'s records count as durable, so all of its frames replay. A held tenant keeps its floor across later
 cuts, and a cut that holds no tenant writes no floors.
 
 Recovery gates a tenant's frames by `F_T` in place of `X`, where `F_T`
@@ -109,7 +115,8 @@ is `H_T` when the sidecar holds a floor for `T` (the start of the log for
 an absent one) and `X` otherwise. Both of recovery's gates take it:
 
 - **records** route by `max(S_T, F_T)` instead of `max(S_T, X)`, `S_T`
-  being the tenant's restored snapshot horizon;
+  being the tenant's restored snapshot horizon, which a hold never lets
+  pass `H_T`, so this is `F_T` for a held tenant;
 - **audit events** are suppressed through `F_T` instead of `X`, keeping
   the existing exception for a template a frame at or below the gate
   mints afresh (RFC 0059 §3.4).
@@ -159,21 +166,23 @@ replay is deterministic and a replica's clock cannot change them; there
 range (RFC 0065 §6.5), so a derive failure is not expected, and one that
 does occur is a bug that needs a code fix before the restart.
 
-### 3.6 The replicated backend
+### 3.6 The replicated backend: out of scope, #1392
 
-RFC 0065's flusher publishes through the same coordinator and the same
-shared audit sink (`replicated/raft/publication.rs`), including its
-inline size and ceiling flushes, so §3.1 and §3.2 apply unchanged: a
-held tenant's rows do not publish and stay in the flusher's kept
-output. Its appends are refused at the leader as in §3.3. A group's
-checkpoint is a log entry whose cut also purges the log, so a held
-floor cannot sit below the cut there without losing the entries a
-restart needs. The group's checkpoint therefore **does not advance past
-a held tenant's floor**: the flusher proposes no checkpoint for a group
-holding a tenant. Other tenants in the group keep publishing; rows of
-theirs written again after a restart carry their ingest position and
-are deduplicated by it (RFC 0065 §6.7). §7 asks whether that group-wide
-cost is acceptable.
+This RFC covers the local backend. RFC 0065's flusher publishes through
+the same coordinator and audit sink, so §3.1 and §3.2 would hold its
+rows, but the rest does not carry over:
+
+- appends are admitted by the leader, which does not mine, so the hold
+  has to reach it, presumably as a log entry every replica applies, with
+  rules for leader and flusher changes and for clearing it;
+- the flusher's gap replay makes each slice durable before the next, so
+  a held tenant's rows would stop the healthy tenants' too;
+- a group checkpoint also purges the log, so a per-tenant floor below
+  the cut loses the entries a restart needs.
+
+Until #1392 designs that, the replicated backend keeps today's
+behaviour: a permanently unwritable event is dropped, logged and
+counted, and its rows publish.
 
 ### 3.7 Where this departs from the 0053 draft (§9)
 
@@ -218,8 +227,7 @@ would stall the node, so the hold is per tenant.
 > - **Then** B's records publish and A's do not, A is held, and later
 >   drains publish B's records and leave A's buffered
 > - **And** the same holds when the failing audit write comes from a
->   record sink's inline size or ceiling flush instead of a drain, on
->   the local and the replicated backend
+>   record sink's inline size or ceiling flush instead of a drain
 
 > **Scenario RFC0056.2 — a derive failure takes the same path `[§3.1]`**
 > - **Given** an audit event for tenant A whose `derive_audit_partition`
@@ -233,22 +241,30 @@ would stall the node, so the hold is per tenant.
 > - **Then** it is refused before the WAL append with `UNAVAILABLE` and
 >   `503`, naming A, and B's batches are accepted
 
-> **Scenario RFC0056.4 — the checkpoint advances and records the floor `[H3]`**
+> **Scenario RFC0056.4 — a snapshot installed by a cut that did not stamp `[H3]`**
+> - **Given** a cut that installed tenant A's snapshot at `S` and failed
+>   to stamp, leaving the checkpoint at `X0 < S`, and A then held
+> - **When** a later cut stamps `X1`, and the node restarts with the
+>   fault repaired
+> - **Then** A's floor is `S`, nothing of A's at or below `S` publishes
+>   again, and A's records above `S` publish under regenerated events
+
+> **Scenario RFC0056.5 — the checkpoint advances and records the floor `[H3]`**
 > - **Given** a held tenant A, held after the checkpoint `X0`
 > - **When** a later cut stamps `X1 > X0`
 > - **Then** the `CHECKPOINT` sidecar holds `X1` and A's floor `X0`, A's
 >   snapshot is not installed past `X0`, and no segment holding A's
 >   frames above `X0` is reclaimed
 
-> **Scenario RFC0056.5 — a restart after repair publishes the held records under their events `[§3.1, H3]`**
-> - **Given** RFC0056.4's node, killed, with the audit fault repaired
+> **Scenario RFC0056.6 — a restart after repair publishes the held records under their events `[§3.1, H3]`**
+> - **Given** RFC0056.5's node, killed, with the audit fault repaired
 > - **When** it restarts and recovers
 > - **Then** A's records above `X0` publish, after template events that
 >   describe them, including events for frames in `(X0, X1]`, B's
 >   records and events through `X1` publish nothing again, and the next
 >   cut stamps with no floor for A
 
-> **Scenario RFC0056.8 — a tenant held before the first checkpoint `[H3]`**
+> **Scenario RFC0056.7 — a tenant held before the first checkpoint `[H3]`**
 > - **Given** tenant A held before any checkpoint was stamped, and B
 >   healthy
 > - **When** a cut stamps `X1`, then the node restarts with the fault
@@ -258,17 +274,11 @@ would stall the node, so the hold is per tenant.
 >   of A's records and their template events and none of B's through
 >   `X1`
 
-> **Scenario RFC0056.6 — a restart into an unrepaired fault holds the tenant again `[H3]`**
-> - **Given** RFC0056.4's node, restarted with the fault still present
+> **Scenario RFC0056.8 — a restart into an unrepaired fault holds the tenant again `[H3]`**
+> - **Given** RFC0056.5's node, restarted with the fault still present
 > - **When** it recovers
 > - **Then** A is held again, its floor is still `X0`, and nothing of
 >   A's is lost or published
-
-> **Scenario RFC0056.7 — the replicated flusher holds the group's checkpoint**
-> - **Given** a replicated group whose flusher holds tenant A
-> - **When** a checkpoint is due
-> - **Then** the flusher publishes the group's other tenants and
->   proposes no checkpoint for the group until a restart clears the hold
 
 ## 6. Testing strategy
 
@@ -276,11 +286,9 @@ would stall the node, so the hold is per tenant.
   for one tenant, and an event stamped before the epoch for the derive
   path.
 - RFC0056.3: receiver tests over both transports.
-- RFC0056.4–.6 and .8: integration tests in `ourios-server` on the
-  local backend, killing and restarting the node, beside the RFC 0052
-  barrier tests.
-- RFC0056.7: a replicated cluster test beside RFC 0065's flusher
-  tests.
+- RFC0056.4–.8: integration tests in `ourios-server` on the local
+  backend, killing and restarting the node, beside the RFC 0052 barrier
+  tests; .4 injects a stamp failure after the install.
 - The sidecar's version 3 gets codec round-trip and version tests beside
   RFC 0052's.
 
@@ -290,11 +298,7 @@ would stall the node, so the hold is per tenant.
   visible: proposed `ourios.receiver.tenant.held` (gauge, `{tenant}`)
   and the `error.type` value `tenant_held` on the refused-batch path.
   Both go through the shared `ourios-semconv` registry first.
-- [ ] **The replicated group-wide hold (§3.6).** A held tenant stops its
-  whole group's checkpoints, so the group's log grows until a restart.
-  The alternative is a per-tenant floor in the group's checkpoint entry
-  plus a purge that keeps the held tenant's entries, which RFC 0065's
-  purge does not support today.
+- The replicated backend — **#1392** (§3.6).
 - [ ] **The exact floor (§3.4's known cost).** Records could carry their
   WAL offset through the sink so `H_T` is the tenant's real publication
   frontier, removing the republish window. The window is usually one
@@ -312,8 +316,7 @@ would stall the node, so the hold is per tenant.
 - RFC 0005 §3.7, amended here; `AGENTS.md` §3.1 and §3.4.
 - RFC 0052 (`green`) §3.1 (cuts), §3.2 (the `CHECKPOINT` sidecar and the
   reclamation floor), and its regeneration-only replay.
-- RFC 0065 (`red`) §6.5 (group checkpoints) and §6.7 (dedup by ingest
-  position).
+- RFC 0065 (`red`) §6.5 and §6.7, whose hold is #1392.
 - RFC 0018 §3 (retryable refusals), RFC 0025 §3.3 (quarantine), RFC 0026.
 - #1294, which this RFC answers; #802, the RFC 0053 draft it was split
   from.

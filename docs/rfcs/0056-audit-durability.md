@@ -145,6 +145,11 @@ version-1 sidecar marks a legitimate pre-RFC 0052 root.
 The RFC 0052 §3.2 reclamation floor takes the minimum of the held
 floors as well, so no segment holding a held tenant's frames above
 `H_T` is reclaimed; a floor at the start of the log reclaims nothing.
+**Known cost:** reclamation is prefix-only, so while a tenant is held
+the WAL keeps every segment after its floor, healthy tenants' traffic
+included, and grows until the restart. The held tenant itself appends
+nothing after the hold (§3.3), so only the segments up to its last frame
+need keeping; §7 records that per-segment alternative.
 
 **Known cost.** Records of `T` that published between `H_T` and the
 failure publish a second time after the restart: the sink does not track
@@ -319,6 +324,11 @@ would stall the node, so the hold is per tenant.
   and the `error.type` value `tenant_held` on the refused-batch path.
   Both go through the shared `ourios-semconv` registry first.
 - The replicated backend — **#1392** (§3.6).
+- [ ] **Per-segment retention (§3.4's WAL-growth cost).** Keep only the
+  segments holding a held tenant's frames above its floor and reclaim
+  the rest, instead of the prefix floor. That needs RFC 0052's ledger to
+  know which tenants a segment holds, and a non-prefix reclaim. Worth it
+  if holds last long enough for WAL growth to matter.
 - [ ] **The exact floor (§3.4's known cost).** Records could carry their
   WAL offset through the sink so `H_T` is the tenant's real publication
   frontier, removing the republish window. The window is usually one

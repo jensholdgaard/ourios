@@ -115,6 +115,16 @@ the partition compacts. That covers a body whose bytes are not valid
 UTF-8 as well: compaction never routes a raw cell through a string
 conversion.
 
+**Erasure stays pending past an undecodable identity.** Erasure (RFC
+0047 §3.6) runs through the same rewrite and finds the rows to erase by
+the conversation id in their decoded attributes. A row whose attributes
+cell does not decode has no trustworthy id, so the rewrite carries it
+forward and the erasure for that partition **does not advance its
+marker**: it stays pending, the row is logged and counted, and the
+erasure is not reported complete. Rows are never kept while the marker
+claims they are gone, which keeps RFC 0047 §3.6's rows-before-tuples
+guarantee.
+
 Each degraded cell in a query logs one `WARN` event naming the file,
 row and column, and is counted (§7).
 
@@ -180,7 +190,15 @@ explicit bound is enough.
 >   unchanged in the output, the non-UTF-8 body included, and no output
 >   row carries the reserved attribute
 
-> **Scenario RFC0069.5 — the fallback is masked for a masked reader `[§3.7]`**
+> **Scenario RFC0069.5 — erasure stays pending past an undecodable identity `[§3.7]`**
+> - **Given** a partition under an erasure request for a conversation,
+>   holding a row whose attributes cell does not decode
+> - **When** the erasure rewrite runs
+> - **Then** the row is carried forward byte for byte, the erasure's
+>   marker for that partition does not advance, the erasure is not
+>   reported complete, and the row is logged
+
+> **Scenario RFC0069.6 — the fallback is masked for a masked reader `[§3.7]`**
 > - **Given** RFC0069.3's file, under a tenant with a content key masked
 >   from a metadata-only reader (RFC 0047 §3.4)
 > - **When** that reader queries it
@@ -202,7 +220,9 @@ explicit bound is enough.
   successor.
 - RFC0069.4: compaction tests in `ourios-parquet` beside RFC0009.2's,
   with a spill forced by a small memory budget.
-- RFC0069.5: a visibility test in `ourios-querier` beside RFC 0047's
+- RFC0069.5: an erasure test in `ourios-ingester`'s compactor beside
+  RFC 0047 §3.6's erasure tests.
+- RFC0069.6: a visibility test in `ourios-querier` beside RFC 0047's
   masking tests.
 - `ourios-testgen`'s `MAX_ANY_VALUE_DEPTH` of 16 stays for the property
   suites; the depth matrix is explicit tests.

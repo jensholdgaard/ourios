@@ -394,6 +394,17 @@ pub(super) async fn next(
 }
 
 /// What the miner's task does next.
+/// How following an event left the miner.
+enum Followed {
+    On(GroupMiner),
+    /// The log no longer held the entry at `index`, which the miner still
+    /// had to mine under the first configuration at `at`.
+    Purged {
+        at: LogId,
+        index: u64,
+    },
+}
+
 enum Work {
     Event(Applied),
     /// The checkpoint barrier's tick.
@@ -621,10 +632,10 @@ impl Follow {
                 None => {}
             }
             let forced = matches!(work, Work::Report);
-            let Some(back) = self
+            let followed = self
                 .work(work, miner, (checkpointer.as_mut(), &mut stop))
-                .await
-            else {
+                .await;
+            let Some(back) = self.resumed(followed, &mut applied, &mut stop).await else {
                 return;
             };
             miner = back;
@@ -654,9 +665,9 @@ impl Follow {
         work: Work,
         miner: GroupMiner,
         (checkpointer, stop): (Option<&mut Checkpointer>, &mut watch::Receiver<bool>),
-    ) -> Option<GroupMiner> {
-        match (work, checkpointer) {
-            (Work::Event(event), _) => self.follow(miner, event, stop).await,
+    ) -> Option<Followed> {
+        let back = match (work, checkpointer) {
+            (Work::Event(event), _) => return self.follow(miner, event, stop).await,
             (Work::Barrier, Some(checkpointer)) => self.checkpoint(checkpointer, miner).await,
             // Off the runtime's workers, as a step is: an answer formats
             // templates.
@@ -682,7 +693,8 @@ impl Follow {
                 .ok()
             }
             (Work::Barrier | Work::Report, _) => Some(miner),
-        }
+        };
+        back.map(Followed::On)
     }
 
     /// Follow `event`, then mine the batches a first configuration holds,
@@ -693,7 +705,7 @@ impl Follow {
         mut miner: GroupMiner,
         event: Applied,
         stop: &mut watch::Receiver<bool>,
-    ) -> Option<GroupMiner> {
+    ) -> Option<Followed> {
         let index = event.at.index;
         let mut work = Some(event);
         while work.is_some() || miner.holds() {
@@ -702,6 +714,11 @@ impl Follow {
             let handed_on = match followed {
                 None => break,
                 Some(Ok(out)) => self.hand_on(out, stop).await,
+                // A replica that restores takes the miner back from the
+                // snapshot whose purge took the entry (#1305).
+                Some(Err(GroupMinerError::Purged { at, index })) if self.restoring.is_some() => {
+                    return Some(Followed::Purged { at, index });
+                }
                 Some(Err(error)) => {
                     self.storage.miner_stopped(self.group, &error);
                     false
@@ -711,7 +728,7 @@ impl Follow {
                 return None;
             }
         }
-        Some(miner)
+        Some(Followed::On(miner))
     }
 
     /// One step of `miner` off the runtime's workers: follow `event`, or

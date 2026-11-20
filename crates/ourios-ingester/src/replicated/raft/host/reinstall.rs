@@ -14,7 +14,7 @@ use super::super::restoring::{Restored, Restoring};
 use super::super::snapshot_record::GroupState;
 use super::super::state_machine::{Applied, AppliedEvent, Replay};
 use super::super::types::LogId;
-use super::{Applying, Follow, Tail, Work};
+use super::{Applying, Follow, Followed, Tail, Work};
 
 /// Where `group`'s miner restores from: `source`'s store, over `tail`'s
 /// log, reading `sm`'s snapshot.
@@ -116,22 +116,70 @@ impl Follow {
         let mut replay = Replay::from_snapshot(at, state);
         for index in at.index + 1..=through {
             let Some(entry) = restoring.log.entry(index) else {
-                return match (restoring.installed)() {
-                    Some((later, state)) if later.index >= index => {
-                        Some(Caught::Purged((later, state, through)))
-                    }
-                    _ => self
-                        .unrestorable(at, format!("the log no longer holds entry {index}"))
-                        .map(Caught::Up),
-                };
+                return self.purged_from(at, index, through);
             };
             match replay.apply(entry) {
-                Ok(Some(event)) => miner = self.follow(miner, event, stop).await?,
+                Ok(Some(event)) => match self.follow(miner, event, stop).await? {
+                    Followed::On(back) => miner = back,
+                    Followed::Purged { index, .. } => return self.purged_from(at, index, through),
+                },
                 Ok(None) => {}
                 Err(e) => return self.unrestorable(at, e.to_string()).map(Caught::Up),
             }
         }
         Some(Caught::Up(miner))
+    }
+
+    /// The later snapshot to restore again at, once a catch-up from the
+    /// snapshot through `at` finds the log no longer holds `index`.
+    fn purged_from(&self, at: LogId, index: u64, through: u64) -> Option<Caught> {
+        match self.covering(index) {
+            Some((later, state)) => Some(Caught::Purged((later, state, through))),
+            None => self
+                .unrestorable(at, format!("the log no longer holds entry {index}"))
+                .map(Caught::Up),
+        }
+    }
+
+    /// The miner to follow on with after `followed`: the one it handed
+    /// back, or after a purge took an entry it still had to mine, the one
+    /// restored at the snapshot that purged it (#1305). `None` once the
+    /// miner has stopped or the host says to.
+    pub(super) async fn resumed(
+        &self,
+        followed: Option<Followed>,
+        applied: &mut mpsc::Receiver<Applied>,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Option<GroupMiner> {
+        match followed? {
+            Followed::On(miner) => Some(miner),
+            Followed::Purged { at, index } => self.restore_purged((at, index), applied, stop).await,
+        }
+    }
+
+    /// The miner restored at the snapshot whose purge took the entry at
+    /// `index`, which it still had to mine under the first configuration
+    /// at `at`; stopped when no snapshot covers it.
+    async fn restore_purged(
+        &self,
+        (at, index): (LogId, u64),
+        applied: &mut mpsc::Receiver<Applied>,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Option<GroupMiner> {
+        let Some(installed) = self.covering(index) else {
+            let error = GroupMinerError::Purged { at, index };
+            self.storage.miner_stopped(self.group, &error);
+            return None;
+        };
+        self.reinstall(installed, applied, stop).await
+    }
+
+    /// The replica's snapshot, when it covers the entry at `index`: a log
+    /// is purged only through a snapshot, so a lost entry lies at or
+    /// below one.
+    fn covering(&self, index: u64) -> Option<(LogId, GroupState)> {
+        let restoring = self.restoring.as_ref()?;
+        (restoring.installed)().filter(|(later, _)| later.index >= index)
     }
 
     /// Report the miner stopped at the snapshot through `at`, for `detail`.

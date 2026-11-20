@@ -11,98 +11,263 @@ superseded-by: —
 
 # RFC 0056 — Audit-sink durability on permanent write failure
 
-> **Status note.** `drafted`. Split out of RFC 0053's status note so an
-> amendment to an *accepted* RFC is not hidden. Source wording: [#802](https://github.com/jensholdgaard/ourios/pull/802) @
-> `30a21f80`, status note + the three-way `write_owned` result in §3.2.
-> **Blocked from `validated` by [#809](https://github.com/jensholdgaard/ourios/issues/809)** — RFC 0026's denial-audit
-> durability, which §7 explains this RFC cannot close.
+> **Status note.** `drafted`. Tracks #1294. 2026-11-20: the maintainer
+> chose this RFC's per-tenant hold over the alternative of publishing and
+> holding the node's checkpoint (§4.1). §3 below is the design; §9 keeps
+> the RFC 0053 draft's wording it grew from, and §3.7 says where it
+> departs. This RFC **amends accepted RFC 0005 §3.7** (no audit event is
+> lost) by naming what a permanent audit-write failure does. It
+> coordinates with RFC 0052 (`green`), whose `CHECKPOINT` sidecar and
+> recovery routing it extends, and RFC 0065 (`red`), whose publication
+> reuses the same coordinator. **Blocked from `validated` by [#809](https://github.com/jensholdgaard/ourios/issues/809)**,
+> RFC 0026's denial-audit durability, which §7 explains this RFC cannot
+> close.
 
 ## 1. Summary
 
-RFC 0005 §3.7 says the writer guarantees no audit event is lost across
-crashes. The current audit sink reports a *permanent* write failure as
-success and `write_ordered` then publishes the dependent records.
-
-This RFC amends that clause: a permanent audit-write failure is a
-third outcome. Dependent records for that tenant stay unpublished and
-requeued. The tenant becomes server-terminal until repaired.
+When the audit sink cannot write a tenant's template events for good,
+that tenant's records stop publishing instead of publishing without
+their events. The tenant is **held**: its buffered records stay
+unpublished, its new appends are refused with a retryable error, and
+every other tenant carries on. The node's checkpoint keeps advancing and
+records, per held tenant, the offset its records are durable through, so
+a restart re-mines that tenant's frames and publishes its records under
+events that exist. A restart after the fault is repaired is the only
+thing that clears a hold.
 
 ## 2. Motivation
 
-A record in Parquet without the template event that describes it
-breaks one of two contracts, and which one depends on where the event
-went missing. `CLAUDE.md` §3.1 governs *emission*: it forbids a silent
-template merge and requires an audit event on every template change. RFC
-0005 §3.7 governs *durability*: an event the miner did emit survives a
-crash, because the writer routes audit events through the same WAL path
-as data records. A missing event does not by itself say which was broken
-— it may never have been emitted — so the sink's behaviour here is judged
-against §3.7 only once the event is known to have been emitted, which is
-the case this RFC is about: the sink held the event and dropped it on a
-permanent write failure. The 0053 draft changed that behaviour in a status
-note. An accepted RFC needs its own amendment and criterion.
+`AGENTS.md` §3.1 requires an audit event on every template change, and
+RFC 0005 §3.7 says no audit event is lost. Today
+`SharedParquetAuditSink::write_retaining` returns only **transient**
+failures. A permanent write error (`route_partition_result`) or a failed
+partition derive (`derive_audit_partition`: a pre-epoch or overflowing
+timestamp) drops the event, logs `ourios.receiver.audit_sink.dropped`,
+and reports success, so `PublishCoordinator::write` publishes the
+records that depend on it (#1294). The result is a published row whose
+template history the audit stream does not hold.
+
+Every permanent error the sink can return today is deterministic:
+encoding (`Parquet`, `Batch`), a partition mismatch, a poisoned lock, or
+the derive failure. Retrying the same event fails the same way, so the
+choice is between publishing without the event and holding the records.
 
 ## 3. Proposed design
 
-- `write_owned` returns a three-way result: durable / transient /
-  permanent.
-- `write_ordered` refuses the dependent record publish for that tenant
-  on permanent.
-- That tenant is marked terminal; other tenants continue.
-- Derive failure on the audit side takes the same path.
-- Authorization-denial events (`IngestDenied`, RFC 0026) are emitted
-  before any frame exists; replay cannot regenerate them. That gap
-  stays RFC 0026's, named here so 0056 does not pretend to cover it.
+### 3.1 A third audit outcome, per tenant
+
+`write_retaining` reports, besides the events it retains for retry, the
+**set of tenants** whose events it dropped for good, from either path:
+a permanent write error on one of the tenant's audit partitions, or a
+derive failure on one of its events. Audit partitions are keyed by
+tenant, so the set is exact.
+
+### 3.2 A held tenant's records do not publish
+
+`PublishCoordinator::write` publishes the record partitions of every
+tenant not in the set, as today. The partitions of a tenant in the set
+are not published: they go back to the record sink and the tenant
+becomes **held**. Its other buffered partitions stay with it.
+
+A held tenant's partitions are **excluded from every drain**, by the age
+sweep, the barrier and the publisher alike, so the node does not spend
+store calls on a failure nothing in-process can repair. They stay in the
+buffers under the sink's byte accounting.
+
+### 3.3 Its appends are refused
+
+The receiver refuses a held tenant's new batches **before the WAL
+append**, with the retryable class RFC 0018 §3 already maps to gRPC
+`UNAVAILABLE` and HTTP `503`, naming the tenant. This bounds what the
+held tenant buffers, and a client that retries lands after the restart
+that clears the hold. Batches acknowledged before the hold are in the
+WAL and lose nothing.
+
+### 3.4 The checkpoint records where each held tenant stands
+
+A cut (RFC 0052 §3.1) still stamps the node's checkpoint `X` when every
+**other** tenant is durable through it. The `CHECKPOINT` sidecar gains a
+version 3 that carries, beside `X`, a **held floor** `H_T` for each held
+tenant `T`: the last checkpoint stamped before `T` was held, through
+which every one of `T`'s records is in the store. A held tenant keeps its
+floor across later cuts, and a cut that holds no tenant writes no
+floors.
+
+Recovery routes a record for tenant `T` by `max(S_T, F_T)` instead of
+`max(S_T, X)`, where `F_T` is `H_T` when the sidecar holds a floor for
+`T` and `X` otherwise, and `S_T` is the tenant's restored snapshot
+horizon. So `T`'s records above `H_T` publish again on restart, and
+every other tenant's are suppressed through `X` exactly as today.
+
+The held tenant's miner snapshot is not installed past `H_T` either: a
+cut installs no snapshot for a held tenant, so its horizon stays at or
+below `H_T`, and replay re-mints the template events those frames
+carried, as RFC 0052's regeneration-only replay already does above a
+horizon.
+
+The RFC 0052 §3.2 reclamation floor takes the minimum of the held
+floors as well, so no segment holding a held tenant's frames above
+`H_T` is reclaimed.
+
+**Known cost.** Records of `T` that published between `H_T` and the
+failure publish a second time after the restart: the sink does not track
+a per-tenant publication offset finer than a cut. The window is at most
+one barrier interval of one tenant's data, and only after a permanent
+audit fault and a restart. §7 records the exact alternative.
+
+### 3.5 Restart clears a hold, once the fault is repaired
+
+Nothing in-process clears a hold: the dropped events are no longer in
+the sink, so releasing the tenant's records would publish them under
+events that were never written. A restart re-mines the frames above
+`H_T`, the miner emits the events again, and the first cut that writes
+both stamps without a floor for `T`. A restart into an unrepaired fault
+holds the tenant again, visibly, and loses nothing: its frames stay in
+the WAL under `H_T`. A derive failure is repaired by the clock, because
+the miner stamps events from its own clock rather than the frame
+(§9.3).
+
+### 3.6 The replicated backend
+
+RFC 0065's flusher publishes through the same coordinator
+(`replicated/raft/publication.rs`), so §3.1 and §3.2 apply unchanged:
+a held tenant's rows do not publish and stay in the flusher's kept
+output. Its appends are refused at the leader as in §3.3. A group's
+checkpoint is a log entry whose cut also purges the log, so a held
+floor cannot sit below the cut there without losing the entries a
+restart needs. The group's checkpoint therefore **does not advance past
+a held tenant's floor**: the flusher proposes no checkpoint for a group
+holding a tenant. Other tenants in the group keep publishing; rows of
+theirs written again after a restart carry their ingest position and
+are deduplicated by it (RFC 0065 §6.7). §7 asks whether that group-wide
+cost is acceptable.
+
+### 3.7 Where this departs from the 0053 draft (§9)
+
+- The node checkpoint keeps advancing (§3.4). The draft left the record
+  gate node-wide, which would either republish every tenant's records
+  or lose the held tenant's; the held floor resolves that.
+- The draft named a `ourios.wal.tenant_unrecoverable` signal. No such
+  name exists, so §7 lists the telemetry this needs instead.
 
 ## 4. Alternatives considered
 
-- Keep the silent drop. Rejected against RFC 0005 §3.7 and §3.1.
-- Fold into RFC 0053. Rejected: wrong document.
+### 4.1 Publish, and hold the node's checkpoint
+
+Keep publishing every tenant's records, but stop the checkpoint
+advancing while an event is lost, so a restart re-mines and re-emits it.
+Simpler, with no format change. Rejected: rows are live without their
+events until the restart, which is the §3.1 breach this RFC exists to
+close, and every tenant pays: the node's WAL grows, and a restart
+republishes every tenant's records since the checkpoint as duplicate
+objects.
+
+### 4.2 Keep the silent drop
+
+Rejected against RFC 0005 §3.7 and `AGENTS.md` §3.1.
+
+### 4.3 Quarantine the records
+
+RFC 0025 §3.3's quarantine writes a `record_quarantined` event into the
+same audit sink that is failing, so it cannot serve here.
+
+### 4.4 Hold every tenant
+
+Stop all publication on any permanent audit failure. One bad partition
+would stall the node, so the hold is per tenant.
 
 ## 5. Acceptance criteria
 
-> **RFC0056.1**
-> - **Given** a permanent audit-write failure for one tenant
-> - **When** `write_ordered` returns
-> - **Then** that tenant's records are unpublished and requeued, the
->   tenant is terminal, other tenants publish, and the RFC 0005 §3.7
->   clause is the amended one
+> **Scenario RFC0056.1 — a permanent audit write failure holds the tenant `[§3.1]`**
+> - **Given** a permanent audit-write failure for tenant A beside a
+>   healthy tenant B
+> - **When** the coordinator writes a drain holding both
+> - **Then** B's records publish and A's do not, A is held, and later
+>   drains publish B's records and leave A's buffered
 
-> **RFC0056.2**
-> - **Given** an audit event whose `derive_audit_partition` fails
->   permanently — a pre-epoch or nanosecond-overflow timestamp, so no
->   partition key exists to write under
-> - **When** `write_ordered` returns
-> - **Then** that tenant takes the same path as a permanent write
->   failure: its records are unpublished and requeued, the tenant is
->   terminal, and other tenants publish
+> **Scenario RFC0056.2 — a derive failure takes the same path `[§3.1]`**
+> - **Given** an audit event for tenant A whose `derive_audit_partition`
+>   fails (a pre-epoch or overflowing timestamp)
+> - **When** the coordinator writes the drain
+> - **Then** A is held exactly as in RFC0056.1, and B publishes
+
+> **Scenario RFC0056.3 — a held tenant's appends are refused, retryably**
+> - **Given** a held tenant A
+> - **When** a client sends A a batch over gRPC and over HTTP
+> - **Then** it is refused before the WAL append with `UNAVAILABLE` and
+>   `503`, naming A, and B's batches are accepted
+
+> **Scenario RFC0056.4 — the checkpoint advances and records the floor `[H3]`**
+> - **Given** a held tenant A, held after the checkpoint `X0`
+> - **When** a later cut stamps `X1 > X0`
+> - **Then** the `CHECKPOINT` sidecar holds `X1` and A's floor `X0`, A's
+>   snapshot is not installed past `X0`, and no segment holding A's
+>   frames above `X0` is reclaimed
+
+> **Scenario RFC0056.5 — a restart after repair publishes the held records under their events `[§3.1, H3]`**
+> - **Given** RFC0056.4's node, killed, with the audit fault repaired
+> - **When** it restarts and recovers
+> - **Then** A's records above `X0` publish, after template events that
+>   describe them, B's records through `X1` publish nothing again, and
+>   the next cut stamps with no floor for A
+
+> **Scenario RFC0056.6 — a restart into an unrepaired fault holds the tenant again `[H3]`**
+> - **Given** RFC0056.4's node, restarted with the fault still present
+> - **When** it recovers
+> - **Then** A is held again, its floor is still `X0`, and nothing of
+>   A's is lost or published
+
+> **Scenario RFC0056.7 — the replicated flusher holds the group's checkpoint**
+> - **Given** a replicated group whose flusher holds tenant A
+> - **When** a checkpoint is due
+> - **Then** the flusher publishes the group's other tenants and
+>   proposes no checkpoint for the group until a restart clears the hold
 
 ## 6. Testing strategy
 
-One fault-injected permanent audit failure beside a healthy second
-tenant, and a second injection on the derive path — a record timestamped
-outside the representable range — asserting RFC0056.2 rather than the
-write path. Implementing PR.
+- RFC0056.1 and .2: coordinator tests with a fault-injected audit store
+  for one tenant, and an event stamped before the epoch for the derive
+  path.
+- RFC0056.3: receiver tests over both transports.
+- RFC0056.4–.6: integration tests in `ourios-server` on the local
+  backend, killing and restarting the node, beside the RFC 0052
+  barrier tests.
+- RFC0056.7: a replicated cluster test beside RFC 0065's flusher
+  tests.
+- The sidecar's version 3 gets codec round-trip and version tests beside
+  RFC 0052's.
 
 ## 7. Open questions
 
-- RFC 0026 `IngestDenied` durability — **#809**, and owned by RFC 0026.
-  The path emits before any frame exists, so replay cannot regenerate it
-  and §3's mechanism does not reach it; closing it takes an amendment to
-  RFC 0026's denial-audit durability, not a widening of this RFC. It is
-  not a deferral but a standing contradiction with RFC 0005 §3.7 and RFC
-  0026's own accepted criterion, so **this RFC cannot reach `validated`
-  until #809 lands**.
-
-Not open, recorded so it is not reopened: the operator repair path for a
-terminal tenant is a **restart**, which §3 already decides — the dropped
-events are gone and only recovery regenerates them, so an in-process
-clear would release requeued records under events that were never
-written. A future operator repair still ends in a restart.
+- [ ] **Telemetry names (semconv sign-off).** A held tenant needs to be
+  visible: proposed `ourios.receiver.tenant.held` (gauge, `{tenant}`)
+  and the `error.type` value `tenant_held` on the refused-batch path.
+  Both go through the shared `ourios-semconv` registry first.
+- [ ] **The replicated group-wide hold (§3.6).** A held tenant stops its
+  whole group's checkpoints, so the group's log grows until a restart.
+  The alternative is a per-tenant floor in the group's checkpoint entry
+  plus a purge that keeps the held tenant's entries, which RFC 0065's
+  purge does not support today.
+- [ ] **The exact floor (§3.4's known cost).** Records could carry their
+  WAL offset through the sink so `H_T` is the tenant's real publication
+  frontier, removing the republish window. Worth it only if the window
+  is shown to matter.
+- RFC 0026 `IngestDenied` durability — **#809**, owned by RFC 0026. The
+  path emits before any frame exists, so replay cannot regenerate it and
+  §3 does not reach it. It is a standing contradiction with RFC 0005 §3.7
+  and RFC 0026's own accepted criterion, so **this RFC cannot reach
+  `validated` until #809 lands**.
 
 ## 8. References
 
-- RFC 0005 §3.7, RFC 0026, RFC 0053 draft status note on #802
+- RFC 0005 §3.7, amended here; `AGENTS.md` §3.1 and §3.4.
+- RFC 0052 (`green`) §3.1 (cuts), §3.2 (the `CHECKPOINT` sidecar and the
+  reclamation floor), and its regeneration-only replay.
+- RFC 0065 (`red`) §6.5 (group checkpoints) and §6.7 (dedup by ingest
+  position).
+- RFC 0018 §3 (retryable refusals), RFC 0025 §3.3 (quarantine), RFC 0026.
+- #1294, which this RFC answers; #802, the RFC 0053 draft it was split
+  from.
 
 ## 9. Extracted wording (RFC 0053 draft, `30a21f80`)
 

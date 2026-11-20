@@ -29,8 +29,8 @@ superseded-by: —
 
 When the audit sink cannot write a tenant's template events for good,
 that tenant's records stop publishing instead of publishing without
-their events. The tenant is **held**: its buffered records stay
-unpublished, its new appends are refused with a retryable error, and
+their events. The tenant is **held**: its records stay unpublished,
+kept only in the WAL, its new appends are refused with a retryable error, and
 every other tenant carries on. The node's checkpoint keeps advancing and
 records, per held tenant, the offset its records are durable through, so
 a restart re-mines that tenant's frames and publishes its records under
@@ -77,30 +77,28 @@ events for good, whoever triggered that write: the coordinator's drain,
 or a record sink's inline size or ceiling flush, which writes the audit
 sink first through its barrier (`audit_sink.rs`).
 
-Every record publication skips a held tenant's partitions:
-`PublishCoordinator::write` publishes the partitions of every tenant
-that is not held and returns the held tenant's to the record sink, and
-an inline size or ceiling flush leaves them buffered. Its other buffered
-partitions stay with it.
+Every record publication skips a held tenant: `PublishCoordinator::write`
+publishes the partitions of every tenant that is not held, and an inline
+size or ceiling flush publishes nothing of a held tenant's.
 
-A held tenant's partitions are **excluded from every drain**, by the age
-sweep, the barrier and the publisher alike, so the node does not spend
-store calls on a failure nothing in-process can repair. They stay in the
-buffers, but **out of the flush-pressure budget**: the record sink
-moves a held tenant's bytes from the total its size and ceiling triggers
-compare against into a separate held total, and ceiling selection never
-picks a held partition. Otherwise a held tenant at the ceiling would
-keep the sink over budget with nothing it can flush, forcing every
-healthy append into a one-record file. Memory stays bounded because the
-held total cannot grow: its appends are refused (§3.3).
+**A held tenant's records are not kept in memory.** The record sink
+drops its buffered partitions when it is held, and drops every record
+for it emitted afterwards, during ingest and during recovery alike, so
+they never count against the size or ceiling budget and never reach a
+drain. Nothing is lost: only a restart clears a hold (§3.5), and that
+restart replays every one of the tenant's frames above its floor from
+the WAL, which keeps them (§3.4). Keeping them in memory as well would
+buy nothing, and could not be bounded: a restart into an unrepaired
+fault replays the whole tail above the floor, and several tenants can be
+held at once.
 
 ### 3.3 Its appends are refused
 
 The receiver refuses a held tenant's new batches **before the WAL
 append**, with the retryable class RFC 0018 §3 already maps to gRPC
-`UNAVAILABLE` and HTTP `503`, naming the tenant. This bounds what the
-held tenant buffers, and a client that retries lands after the restart
-that clears the hold. Batches acknowledged before the hold are in the
+`UNAVAILABLE` and HTTP `503`, naming the tenant. This keeps the held
+tenant's WAL tail, which a restart must replay, from growing, and a
+client that retries lands after the restart that clears the hold. Batches acknowledged before the hold are in the
 WAL and lose nothing.
 
 ### 3.4 The checkpoint records where each held tenant stands
@@ -255,13 +253,13 @@ would stall the node, so the hold is per tenant.
 > - **Given** a permanent audit-write failure for tenant A beside a
 >   healthy tenant B
 > - **When** the coordinator writes a drain holding both
-> - **Then** B's records publish and A's do not, A is held, and later
->   drains publish B's records and leave A's buffered
+> - **Then** B's records publish and A's do not, A is held, A's buffered
+>   records are dropped from memory, and later drains publish B's records
 > - **And** the same holds when the failing audit write comes from a
 >   record sink's inline size or ceiling flush instead of a drain
-> - **And** when A was held with its buffers at the ceiling, B's later
->   appends flush by the size and age triggers as they would without A,
->   not one record at a time
+> - **And** when A was held with its buffers at the ceiling, the sink's
+>   byte total falls by A's buffered bytes, and B's later appends flush
+>   by the size and age triggers as they would without A
 
 > **Scenario RFC0056.2 — a derive failure takes the same path `[§3.1]`**
 > - **Given** an audit event for tenant A whose `derive_audit_partition`
@@ -322,7 +320,10 @@ would stall the node, so the hold is per tenant.
 > - **Given** RFC0056.5's node, restarted with the fault still present
 > - **When** it recovers
 > - **Then** A is held again, its floor is still `X0` although later
->   cuts stamped past it, and nothing of A's is lost or published
+>   cuts stamped past it, nothing of A's is lost or published, and the
+>   records recovery emits for A are dropped rather than buffered, so a
+>   replay tail larger than the ceiling does not raise the sink's byte
+>   total
 
 ## 6. Testing strategy
 

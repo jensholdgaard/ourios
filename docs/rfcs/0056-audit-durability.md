@@ -142,14 +142,14 @@ version-3 sidecar counts as version 2 does: one beside a missing
 `RECLAIM` is a root that lost its record and fails closed, and only a
 version-1 sidecar marks a legitimate pre-RFC 0052 root.
 
-The RFC 0052 §3.2 reclamation floor takes the minimum of the held
-floors as well, so no segment holding a held tenant's frames above
-`H_T` is reclaimed; a floor at the start of the log reclaims nothing.
-**Known cost:** reclamation is prefix-only, so while a tenant is held
-the WAL keeps every segment after its floor, healthy tenants' traffic
-included, and grows until the restart. The held tenant itself appends
-nothing after the hold (§3.3), so only the segments up to its last frame
-need keeping; §7 records that per-segment alternative.
+Reclamation needs no new rule. RFC 0052 §3.2's eligibility is already
+per segment and tenant-aware (`retain.rs`): a closed segment is
+reclaimed only when, for every tenant with a frame in it, that frame is
+at or below the tenant's snapshot horizon. A hold never installs the
+tenant's snapshot past `H_T`, so exactly the segments holding its frames
+above `H_T` are kept, and segments holding only other tenants' covered
+frames are reclaimed as before. A tenant held before any snapshot has no
+horizon, which already pins exactly its own segments.
 
 **Known cost.** Records of `T` that published between `H_T` and the
 failure publish a second time after the restart: the sink does not track
@@ -269,8 +269,9 @@ would stall the node, so the hold is per tenant.
 > - **Given** a held tenant A, held after the checkpoint `X0`
 > - **When** a later cut stamps `X1 > X0`
 > - **Then** the `CHECKPOINT` sidecar holds `X1` and A's floor `X0`, A's
->   snapshot is not installed past `X0`, and no segment holding A's
->   frames above `X0` is reclaimed
+>   snapshot is not installed past `X0`, no segment holding A's frames
+>   above `X0` is reclaimed, and a closed segment holding only B's
+>   frames at or below `X1` is
 
 > **Scenario RFC0056.6 — a restart after repair publishes the held records under their events `[§3.1, H3]`**
 > - **Given** RFC0056.5's node, killed, with the audit fault repaired
@@ -324,11 +325,6 @@ would stall the node, so the hold is per tenant.
   and the `error.type` value `tenant_held` on the refused-batch path.
   Both go through the shared `ourios-semconv` registry first.
 - The replicated backend — **#1392** (§3.6).
-- [ ] **Per-segment retention (§3.4's WAL-growth cost).** Keep only the
-  segments holding a held tenant's frames above its floor and reclaim
-  the rest, instead of the prefix floor. That needs RFC 0052's ledger to
-  know which tenants a segment holds, and a non-prefix reclaim. Worth it
-  if holds last long enough for WAL growth to matter.
 - [ ] **The exact floor (§3.4's known cost).** Records could carry their
   WAL offset through the sink so `H_T` is the tenant's real publication
   frontier, removing the republish window. The window is usually one
@@ -345,7 +341,7 @@ would stall the node, so the hold is per tenant.
 
 - RFC 0005 §3.7, amended here; `AGENTS.md` §3.1 and §3.4.
 - RFC 0052 (`green`) §3.1 (cuts), §3.2 (the `CHECKPOINT` sidecar and the
-  reclamation floor), and its regeneration-only replay.
+  per-segment, tenant-aware reclamation), and its regeneration-only replay.
 - RFC 0065 (`red`) §6.5 and §6.7, whose hold is #1392.
 - RFC 0018 §3 (retryable refusals), RFC 0025 §3.3 (quarantine), RFC 0026.
 - #1294, which this RFC answers; #802, the RFC 0053 draft it was split

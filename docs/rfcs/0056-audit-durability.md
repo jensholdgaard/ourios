@@ -101,12 +101,20 @@ regenerates them with the records (§3.5). Another tenant's transient
 failure still holds that drain's records, as today.
 
 **Recovery publishes in bounded passes.** Recovery runs the
-coordinator's write whenever the record sink reaches its ceiling while
-it replays, instead of only after the replay ends. A tenant whose fault
-is still unrepaired is then held again within one ceiling of replayed
-output, and its later records are dropped (above), so recovery never
-buffers more than the ceiling. The pass runs on recovery's own thread,
-not on an encode worker.
+coordinator's write whenever **either** sink reaches its bound while it
+replays, the record sink its ceiling or the audit sink its buffer bound,
+instead of only after the replay ends. The audit side matters on its
+own: replay at or below a tenant's floor suppresses records but can
+still emit the events of templates it re-mints, which would otherwise
+grow with no record pass to flush them. The pass runs on recovery's own
+thread, not on an encode worker.
+
+The passes bound **buffering**, not how soon a fault is found. Replay
+can publish several passes of a tenant's records whose template events
+write successfully before it reaches the event whose write fails; those
+records publish under events that exist, which is all §3.1 asks, and
+the tenant is held from that pass on. Its floor stays where it was, so
+the next restart publishes those records again (§3.4's known cost).
 
 ### 3.3 Its appends are refused
 
@@ -338,11 +346,14 @@ would stall the node, so the hold is per tenant.
 > **Scenario RFC0056.9 — a restart into an unrepaired fault holds the tenant again `[H3]`**
 > - **Given** RFC0056.5's node, restarted with the fault still present
 > - **When** it recovers
-> - **Then** A is held again, its floor is still `X0` although later
->   cuts stamped past it, nothing of A's is lost or published, and the
->   records recovery emits for A are dropped rather than buffered, so a
->   replay tail larger than the ceiling never raises the sink's buffered
->   bytes above the ceiling at any point during recovery
+> - **Then** A is held again from the pass whose audit write fails, its
+>   floor is still `X0` although later cuts stamped past it, nothing of
+>   A's is lost, and nothing of A's publishes without its template
+>   events; records of A whose events wrote before that pass may
+>   publish
+> - **And** neither sink buffers more than its bound at any point
+>   during recovery, including a replay at or below A's floor that
+>   emits only re-minted template events
 
 ## 6. Testing strategy
 

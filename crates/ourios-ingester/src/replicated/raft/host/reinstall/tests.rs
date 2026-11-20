@@ -344,3 +344,66 @@ fn held_batches_purged_before_they_are_mined_restore_at_the_snapshot() {
             mining.stop().await;
         });
 }
+
+/// A restore that started at the replica's live snapshot, as after a
+/// purge, is not moved back by an older install still queued: the store
+/// holds no bundle at the older cut, and the miner restores at the newer.
+#[test]
+fn a_queued_older_install_does_not_move_a_restore_back() {
+    let entries = configured_at_4_then_more();
+    let events = events_of(&entries, 32);
+    let mut through = miner_of(&entries);
+    let (mut cuts, mut expected) = (Vec::new(), Vec::new());
+    for (n, event) in events.iter().cloned().enumerate() {
+        let mined = through.apply(event).expect("mined");
+        match n {
+            4 | 5 => cuts.push(through.capture(LOG).expect("a cut").expect("captured")),
+            6 => expected.extend(mined.rows),
+            _ => {}
+        }
+    }
+    let [older, newer] = <[_; 2]>::try_from(cuts).unwrap_or_else(|_| panic!("two cuts"));
+    let (older_at, newer_at) = (events[4].at, events[5].at);
+    // The newer snapshot purged the log through it; only its bundle is
+    // in the store, and its read waits until the test has queued the
+    // older install.
+    let (store, paused) = pausing(store_of(&[&newer]), Point::AfterFormedRead);
+    let log = HeldLog(
+        logged(&entries)
+            .into_iter()
+            .filter(|e| e.log_id.index > newer_at.index)
+            .map(|e| (e.log_id.index, e))
+            .collect(),
+    );
+    let (older_state, newer_state) = (state(&older), state(&newer));
+
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async {
+            let (events_to, mut handed, mining, _) = following(store, log, (newer_at, newer_state));
+            for event in &events[..4] {
+                events_to.send(event.clone()).await.expect("send");
+            }
+            paused.reached.await.expect("the restore reads the store");
+            let older_install = Applied {
+                at: older_at,
+                event: AppliedEvent::Installed(older_state),
+            };
+            events_to.send(older_install).await.expect("send");
+            let drained = async {
+                while events_to.capacity() < events_to.max_capacity() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), drained)
+                .await
+                .expect("the older install taken while the miner restores");
+            paused.release.send(()).expect("release");
+            events_to.send(events[6].clone()).await.expect("send");
+
+            let mined = rows_of(&mut handed, expected.len()).await;
+            assert_eq!(mined, expected, "the entry past the newer cut");
+            assert!(mining.is_running(), "the miner restored at the newer cut");
+            mining.stop().await;
+        });
+}

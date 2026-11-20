@@ -64,10 +64,19 @@ tenant, so the set is exact.
 
 ### 3.2 A held tenant's records do not publish
 
-`PublishCoordinator::write` publishes the record partitions of every
-tenant not in the set, as today. The partitions of a tenant in the set
-are not published: they go back to the record sink and the tenant
-becomes **held**. Its other buffered partitions stay with it.
+The hold lives in the **shared audit sink**, so every path that writes
+audit events marks it, and every path that publishes records reads it.
+A tenant becomes **held** the moment any audit write drops one of its
+events for good, whoever triggered that write: the coordinator's drain,
+or a record sink's inline size or ceiling flush, which writes the audit
+sink first through its barrier (`audit_sink.rs`, and on the replicated
+backend `publication.rs`'s inline callback).
+
+Every record publication skips a held tenant's partitions:
+`PublishCoordinator::write` publishes the partitions of every tenant
+that is not held and returns the held tenant's to the record sink, and
+an inline size or ceiling flush leaves them buffered. Its other buffered
+partitions stay with it.
 
 A held tenant's partitions are **excluded from every drain**, by the age
 sweep, the barrier and the publisher alike, so the node does not spend
@@ -89,15 +98,25 @@ A cut (RFC 0052 §3.1) still stamps the node's checkpoint `X` when every
 **other** tenant is durable through it. The `CHECKPOINT` sidecar gains a
 version 3 that carries, beside `X`, a **held floor** `H_T` for each held
 tenant `T`: the last checkpoint stamped before `T` was held, through
-which every one of `T`'s records is in the store. A held tenant keeps its
-floor across later cuts, and a cut that holds no tenant writes no
-floors.
+which every one of `T`'s records is in the store. When `T` was held
+before any checkpoint was stamped, its floor is **the start of the log**,
+encoded as an absent offset: none of `T`'s records count as durable, so
+all of its frames replay. A held tenant keeps its floor across later
+cuts, and a cut that holds no tenant writes no floors.
 
-Recovery routes a record for tenant `T` by `max(S_T, F_T)` instead of
-`max(S_T, X)`, where `F_T` is `H_T` when the sidecar holds a floor for
-`T` and `X` otherwise, and `S_T` is the tenant's restored snapshot
-horizon. So `T`'s records above `H_T` publish again on restart, and
-every other tenant's are suppressed through `X` exactly as today.
+Recovery gates a tenant's frames by `F_T` in place of `X`, where `F_T`
+is `H_T` when the sidecar holds a floor for `T` (the start of the log for
+an absent one) and `X` otherwise. Both of recovery's gates take it:
+
+- **records** route by `max(S_T, F_T)` instead of `max(S_T, X)`, `S_T`
+  being the tenant's restored snapshot horizon;
+- **audit events** are suppressed through `F_T` instead of `X`, keeping
+  the existing exception for a template a frame at or below the gate
+  mints afresh (RFC 0059 §3.4).
+
+So `T`'s records above `H_T` publish again on restart **and** the
+template events replay regenerates for them are written, while every
+other tenant's are suppressed through `X` exactly as today.
 
 The held tenant's miner snapshot is not installed past `H_T` either: a
 cut installs no snapshot for a held tenant, so its horizon stays at or
@@ -107,13 +126,18 @@ horizon.
 
 The RFC 0052 §3.2 reclamation floor takes the minimum of the held
 floors as well, so no segment holding a held tenant's frames above
-`H_T` is reclaimed.
+`H_T` is reclaimed; a floor at the start of the log reclaims nothing.
 
 **Known cost.** Records of `T` that published between `H_T` and the
 failure publish a second time after the restart: the sink does not track
-a per-tenant publication offset finer than a cut. The window is at most
-one barrier interval of one tenant's data, and only after a permanent
-audit fault and a restart. §7 records the exact alternative.
+a per-tenant publication offset finer than a cut. The window is usually
+one barrier interval of one tenant's data, but it is **not bounded by
+one**: `H_T` is the last checkpoint that *stamped*, and cuts can fail to
+stamp for many intervals in a row (another tenant's transient write
+failures, a failed snapshot install) while `T`'s age flushes keep
+publishing. The worst case is every record of `T` published since the
+last stamped checkpoint. It arises only after a permanent audit fault
+and a restart. §7 records the exact alternative.
 
 ### 3.5 Restart clears a hold, once the fault is repaired
 
@@ -123,15 +147,24 @@ events that were never written. A restart re-mines the frames above
 `H_T`, the miner emits the events again, and the first cut that writes
 both stamps without a floor for `T`. A restart into an unrepaired fault
 holds the tenant again, visibly, and loses nothing: its frames stay in
-the WAL under `H_T`. A derive failure is repaired by the clock, because
-the miner stamps events from its own clock rather than the frame
-(§9.3).
+the WAL under `H_T`.
+
+What repairs a derive failure differs by backend. On the **local**
+backend the miner stamps events from its own clock rather than the
+frame (§9.3), so a restart on a node whose clock has recovered derives
+normally. On the **replicated** backend template events take the
+timestamp persisted in the batch (RFC 0065 §6.7, `BatchClock`), so
+replay is deterministic and a replica's clock cannot change them; there
+`BatchTime` clamps batch timestamps to the audit stream's representable
+range (RFC 0065 §6.5), so a derive failure is not expected, and one that
+does occur is a bug that needs a code fix before the restart.
 
 ### 3.6 The replicated backend
 
-RFC 0065's flusher publishes through the same coordinator
-(`replicated/raft/publication.rs`), so §3.1 and §3.2 apply unchanged:
-a held tenant's rows do not publish and stay in the flusher's kept
+RFC 0065's flusher publishes through the same coordinator and the same
+shared audit sink (`replicated/raft/publication.rs`), including its
+inline size and ceiling flushes, so §3.1 and §3.2 apply unchanged: a
+held tenant's rows do not publish and stay in the flusher's kept
 output. Its appends are refused at the leader as in §3.3. A group's
 checkpoint is a log entry whose cut also purges the log, so a held
 floor cannot sit below the cut there without losing the entries a
@@ -184,6 +217,9 @@ would stall the node, so the hold is per tenant.
 > - **When** the coordinator writes a drain holding both
 > - **Then** B's records publish and A's do not, A is held, and later
 >   drains publish B's records and leave A's buffered
+> - **And** the same holds when the failing audit write comes from a
+>   record sink's inline size or ceiling flush instead of a drain, on
+>   the local and the replicated backend
 
 > **Scenario RFC0056.2 — a derive failure takes the same path `[§3.1]`**
 > - **Given** an audit event for tenant A whose `derive_audit_partition`
@@ -208,8 +244,19 @@ would stall the node, so the hold is per tenant.
 > - **Given** RFC0056.4's node, killed, with the audit fault repaired
 > - **When** it restarts and recovers
 > - **Then** A's records above `X0` publish, after template events that
->   describe them, B's records through `X1` publish nothing again, and
->   the next cut stamps with no floor for A
+>   describe them, including events for frames in `(X0, X1]`, B's
+>   records and events through `X1` publish nothing again, and the next
+>   cut stamps with no floor for A
+
+> **Scenario RFC0056.8 — a tenant held before the first checkpoint `[H3]`**
+> - **Given** tenant A held before any checkpoint was stamped, and B
+>   healthy
+> - **When** a cut stamps `X1`, then the node restarts with the fault
+>   repaired
+> - **Then** the sidecar holds `X1` and an absent floor for A, no
+>   segment holding A's frames is reclaimed, and recovery publishes all
+>   of A's records and their template events and none of B's through
+>   `X1`
 
 > **Scenario RFC0056.6 — a restart into an unrepaired fault holds the tenant again `[H3]`**
 > - **Given** RFC0056.4's node, restarted with the fault still present
@@ -229,8 +276,8 @@ would stall the node, so the hold is per tenant.
   for one tenant, and an event stamped before the epoch for the derive
   path.
 - RFC0056.3: receiver tests over both transports.
-- RFC0056.4–.6: integration tests in `ourios-server` on the local
-  backend, killing and restarting the node, beside the RFC 0052
+- RFC0056.4–.6 and .8: integration tests in `ourios-server` on the
+  local backend, killing and restarting the node, beside the RFC 0052
   barrier tests.
 - RFC0056.7: a replicated cluster test beside RFC 0065's flusher
   tests.
@@ -250,8 +297,10 @@ would stall the node, so the hold is per tenant.
   purge does not support today.
 - [ ] **The exact floor (§3.4's known cost).** Records could carry their
   WAL offset through the sink so `H_T` is the tenant's real publication
-  frontier, removing the republish window. Worth it only if the window
-  is shown to matter.
+  frontier, removing the republish window. The window is usually one
+  barrier interval but unbounded in the worst case (every record of the
+  held tenant since the last stamped checkpoint), so this is a real
+  trade-off, not a formality.
 - RFC 0026 `IngestDenied` durability — **#809**, owned by RFC 0026. The
   path emits before any frame exists, so replay cannot regenerate it and
   §3 does not reach it. It is a standing contradiction with RFC 0005 §3.7

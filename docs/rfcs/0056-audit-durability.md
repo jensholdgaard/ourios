@@ -41,10 +41,11 @@ thing that clears a hold.
 `AGENTS.md` §3.1 requires an audit event on every template change, and
 RFC 0005 §3.7 says no audit event is lost. Today
 `SharedParquetAuditSink::write_retaining` returns only **transient**
-failures. A permanent write error (`route_partition_result`) or a failed
-partition derive (`derive_audit_partition`: a pre-epoch or overflowing
-timestamp) drops the event, logs `ourios.receiver.audit_sink.dropped`,
-and reports success, so `PublishCoordinator::write` publishes the
+failures. A permanent write error (`route_partition_result`) drops the
+event, logs `ourios.receiver.audit_sink.dropped` and reports success; a
+failed partition derive (`derive_audit_partition`: a pre-epoch or
+overflowing timestamp) drops it with nothing but the sink's
+derive-error count and reports success too, so `PublishCoordinator::write` publishes the
 records that depend on it (#1294). The result is a published row whose
 template history the audit stream does not hold.
 
@@ -65,13 +66,15 @@ tenant, so the set is exact.
 
 ### 3.2 A held tenant's records do not publish
 
+§3.1–§3.5 apply to the **local** backend; §3.6 states the replicated
+backend's behaviour.
+
 The hold lives in the **shared audit sink**, so every path that writes
 audit events marks it, and every path that publishes records reads it.
 A tenant becomes **held** the moment any audit write drops one of its
 events for good, whoever triggered that write: the coordinator's drain,
 or a record sink's inline size or ceiling flush, which writes the audit
-sink first through its barrier (`audit_sink.rs`, and on the replicated
-backend `publication.rs`'s inline callback).
+sink first through its barrier (`audit_sink.rs`).
 
 Every record publication skips a held tenant's partitions:
 `PublishCoordinator::write` publishes the partitions of every tenant
@@ -130,6 +133,14 @@ cut installs no snapshot for a held tenant, so its horizon stays at or
 below `H_T`, and replay re-mints the template events those frames
 carried, as RFC 0052's regeneration-only replay already does above a
 horizon.
+
+**Upgrade and the version witness.** A version-3 reader accepts
+versions 1 and 2 as well, as carrying no held floors, and every sidecar
+it writes is version 3; there is no dual-write and no tooling,
+pre-production (RFC 0052 §3.8). For RFC 0052 §3.2's recovery witness a
+version-3 sidecar counts as version 2 does: one beside a missing
+`RECLAIM` is a root that lost its record and fails closed, and only a
+version-1 sidecar marks a legitimate pre-RFC 0052 root.
 
 The RFC 0052 §3.2 reclamation floor takes the minimum of the held
 floors as well, so no segment holding a held tenant's frames above
@@ -265,8 +276,8 @@ would stall the node, so the hold is per tenant.
 >   cut stamps with no floor for A
 
 > **Scenario RFC0056.7 — a tenant held before the first checkpoint `[H3]`**
-> - **Given** tenant A held before any checkpoint was stamped, and B
->   healthy
+> - **Given** tenant A held before any checkpoint was stamped and before
+>   any snapshot of A was installed, and B healthy
 > - **When** a cut stamps `X1`, then the node restarts with the fault
 >   repaired
 > - **Then** the sidecar holds `X1` and an absent floor for A, no
@@ -274,7 +285,15 @@ would stall the node, so the hold is per tenant.
 >   of A's records and their template events and none of B's through
 >   `X1`
 
-> **Scenario RFC0056.8 — a restart into an unrepaired fault holds the tenant again `[H3]`**
+> **Scenario RFC0056.8 — a version-2 root upgrades `[H3]`**
+> - **Given** a root whose `CHECKPOINT` is version 2, with `RECLAIM`
+> - **When** a version-3 node opens and recovers it, and a cut stamps
+> - **Then** recovery routes by the version-2 mark with no floors, and
+>   the new sidecar is version 3
+> - **And** a version-3 sidecar beside a missing `RECLAIM` fails closed
+>   exactly as a version-2 one does
+
+> **Scenario RFC0056.9 — a restart into an unrepaired fault holds the tenant again `[H3]`**
 > - **Given** RFC0056.5's node, restarted with the fault still present
 > - **When** it recovers
 > - **Then** A is held again, its floor is still `X0`, and nothing of
@@ -286,11 +305,12 @@ would stall the node, so the hold is per tenant.
   for one tenant, and an event stamped before the epoch for the derive
   path.
 - RFC0056.3: receiver tests over both transports.
-- RFC0056.4–.8: integration tests in `ourios-server` on the local
+- RFC0056.4–.7 and .9: integration tests in `ourios-server` on the local
   backend, killing and restarting the node, beside the RFC 0052 barrier
   tests; .4 injects a stamp failure after the install.
-- The sidecar's version 3 gets codec round-trip and version tests beside
-  RFC 0052's.
+- RFC0056.8 and the sidecar's version 3: codec round-trip and version
+  tests in `ourios-wal` beside RFC 0052's, and the witness test beside
+  RFC0052's missing-record tests.
 
 ## 7. Open questions
 

@@ -911,4 +911,52 @@ mod tests {
 
         assert_eq!(stores.audit.buffered_events(), 0, "nothing restored");
     }
+
+    /// An RFC 0026 denial event for `tenant`.
+    fn denial_event(tenant: &str) -> AuditEvent {
+        AuditEvent {
+            payload: AuditPayload::IngestDenied {
+                token_name: "ingest-a".to_owned(),
+            },
+            ..created_event(tenant)
+        }
+    }
+
+    /// #1396: a hold drops only template events. A denied batch never
+    /// reaches the WAL, so replay cannot regenerate its denial: the hold
+    /// keeps a denial buffered before it, emitted after it, or requeued.
+    #[test]
+    fn rfc0056_1_a_hold_keeps_the_tenants_denial_events() {
+        let stores = Stores::new(usize::MAX);
+        stores.audit.clone().emit(unwritable_event("acme"));
+        let holding = stores.coord.drain_aged();
+        stores.audit.clone().emit(denial_event("acme"));
+
+        let _ = stores.coord.write_ordered(holding, "age");
+        assert!(stores.audit.held().is_held(&TenantId::new("acme")));
+        assert_eq!(stores.audit.buffered_events(), 1, "kept through the purge");
+
+        stores.audit.clone().emit(denial_event("acme"));
+        stores.audit.requeue(vec![denial_event("acme")]);
+        assert_eq!(
+            stores.audit.buffered_events(),
+            3,
+            "emitted and requeued, kept"
+        );
+    }
+
+    /// #1396: a denial that is lost for good holds no tenant, since a hold
+    /// exists to stop records publishing ahead of their template events.
+    #[test]
+    fn rfc0056_1_a_lost_denial_alone_holds_no_tenant() {
+        let stores = Stores::new(usize::MAX);
+        stores.audit.clone().emit(AuditEvent {
+            timestamp: UNIX_EPOCH - Duration::from_secs(1),
+            ..denial_event("acme")
+        });
+
+        let _ = stores.coord.write_ordered(stores.coord.drain_aged(), "age");
+
+        assert!(!stores.audit.held().is_held(&TenantId::new("acme")));
+    }
 }

@@ -56,6 +56,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ourios_core::audit::{AuditEvent, AuditSink};
+use ourios_core::tenant::TenantId;
 use ourios_parquet::{AuditWriter, AuditWriterError, PartitionKey, Store, derive_audit_partition};
 use tokio::sync::Notify;
 
@@ -72,6 +73,9 @@ struct FlushSummary {
     transient_errors: u64,
     permanent_errors: u64,
     derive_errors: u64,
+    /// Tenants whose template events were dropped for good, by a permanent
+    /// write error or a failed derive (RFC 0056 §3.1).
+    lost_templates: std::collections::BTreeSet<TenantId>,
 }
 
 /// Classify a failed audit partition flush (issue #302 fix #2): a store-I/O
@@ -115,6 +119,11 @@ fn route_partition_result(
         }
         Err(err) => {
             summary.permanent_errors = summary.permanent_errors.saturating_add(1);
+            if batch.iter().any(crate::held::is_template_event) {
+                summary
+                    .lost_templates
+                    .insert(TenantId::new(partition.tenant_id.clone()));
+            }
             tracing::error!(
                 name: ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED,
                 {
@@ -142,6 +151,9 @@ fn write_events(store: &Store, events: Vec<AuditEvent>) -> (Vec<AuditEvent>, Flu
     for event in events {
         let Ok(partition) = derive_audit_partition(&event) else {
             summary.derive_errors = summary.derive_errors.saturating_add(1);
+            if crate::held::is_template_event(&event) {
+                summary.lost_templates.insert(event.tenant_id.clone());
+            }
             continue;
         };
         groups.entry(partition).or_default().push(event);
@@ -291,6 +303,12 @@ impl BufferingAuditSink {
     /// `emit` buffered during the unlocked I/O, then refresh the gauge. Never
     /// drops — the buffer is retained for retry (the WAL is the durability of
     /// record).
+    /// Drop the buffered events a hold drops (RFC 0056 §3.2).
+    fn purge_held(&mut self, held: &crate::held::HeldTenants) {
+        self.buffer.retain(|event| !held.drops(event));
+        self.metrics.set_buffered(self.buffer.len());
+    }
+
     fn requeue_ahead(&mut self, mut retained: Vec<AuditEvent>) {
         if !retained.is_empty() {
             retained.append(&mut self.buffer);
@@ -322,6 +340,8 @@ pub struct SharedParquetAuditSink {
     inner: Arc<Mutex<BufferingAuditSink>>,
     /// Every take out of the buffer not yet settled.
     takes: Arc<Takes>,
+    /// RFC 0056 §3.2's held tenants.
+    held: crate::held::HeldTenants,
 }
 
 impl SharedParquetAuditSink {
@@ -331,7 +351,24 @@ impl SharedParquetAuditSink {
         Self {
             inner: Arc::new(Mutex::new(sink)),
             takes: Arc::new(Takes::default()),
+            held: crate::held::HeldTenants::default(),
         }
+    }
+
+    /// This sink, holding a tenant whose template events it cannot write
+    /// for good (RFC 0056 §3.2). Without it, such events are dropped and
+    /// their records publish, as the replicated backend still does (§3.6).
+    #[must_use]
+    pub fn holding(mut self) -> Self {
+        self.held = crate::held::HeldTenants::enabled();
+        self
+    }
+
+    /// The tenants this sink holds (RFC 0056 §3.2), shared with whatever
+    /// publishes their records.
+    #[must_use]
+    pub fn held(&self) -> crate::held::HeldTenants {
+        self.held.clone()
     }
 
     /// Lock the sink, recovering a poisoned mutex. A poison means a past panic
@@ -391,9 +428,21 @@ impl SharedParquetAuditSink {
         if events.is_empty() {
             return events;
         }
+        let mut events = events;
+        events.retain(|event| !self.held.drops(event));
         let store = self.lock().store.clone();
-        let (retained, summary) = write_events(&store, events);
-        self.lock().settle(&summary);
+        let (mut retained, summary) = write_events(&store, events);
+        let mut sink = self.lock();
+        sink.settle(&summary);
+        let newly_held = summary
+            .lost_templates
+            .iter()
+            .filter(|tenant| self.held.hold(tenant))
+            .count();
+        if newly_held > 0 {
+            sink.purge_held(&self.held);
+        }
+        retained.retain(|event| !self.held.drops(event));
         retained
     }
 
@@ -404,7 +453,12 @@ impl SharedParquetAuditSink {
         if events.is_empty() {
             return;
         }
-        self.lock().requeue_ahead(events);
+        let mut events = events;
+        // RFC 0056 §3.2: a held tenant's events are not restored, so they
+        // cannot block another tenant's barrier.
+        let mut sink = self.lock();
+        events.retain(|event| !self.held.drops(event));
+        sink.requeue_ahead(events);
     }
 
     /// Drain the internal buffer to durability — the standalone
@@ -617,7 +671,12 @@ impl Takes {
 
 impl AuditSink for SharedParquetAuditSink {
     fn emit(&mut self, event: AuditEvent) {
-        self.lock().buffer_event(event);
+        // Checked under the sink lock, which a hold and its purge also take,
+        // so an event cannot land just after the purge.
+        let mut sink = self.lock();
+        if !self.held.drops(&event) {
+            sink.buffer_event(event);
+        }
     }
 }
 

@@ -206,6 +206,10 @@ pub struct ParquetRecordSink {
     /// `None` (tests / minimal wiring) quarantines silently to the
     /// counter only.
     audit: Option<Box<dyn ourios_core::audit::AuditSink + Send>>,
+    /// RFC 0056 §3.2's held tenants, whose records are dropped rather than
+    /// buffered or published; the WAL keeps them for the restart that
+    /// clears the hold. The default holds nothing.
+    held: crate::held::HeldTenants,
     /// RFC 0014 §6.3 instruments (flush throughput/latency by trigger,
     /// errors, buffer occupancy). No-op when no meter provider is installed.
     metrics: SinkMetrics,
@@ -304,8 +308,36 @@ impl ParquetRecordSink {
             derive_errors: 0,
             audit_barrier: None,
             audit: None,
+            held: crate::held::HeldTenants::default(),
             metrics: SinkMetrics::new(),
             promoted: PromotedAttributes::default(),
+        }
+    }
+
+    /// Whether `tenant` is held (RFC 0056 §3.2).
+    fn holds(&self, tenant: &str) -> bool {
+        self.held
+            .is_held(&ourios_core::tenant::TenantId::new(tenant))
+    }
+
+    /// Drop every buffered partition of a held tenant, out of the byte
+    /// accounting with it (RFC 0056 §3.2).
+    fn purge_held(&mut self) {
+        if !self.held.any() {
+            return;
+        }
+        let held: Vec<PartitionKey> = self
+            .buffers
+            .keys()
+            .filter(|key| self.holds(&key.tenant_id))
+            .cloned()
+            .collect();
+        for key in held {
+            if let Some(buf) = self.buffers.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(buf.est_bytes);
+                self.metrics
+                    .add_buffered(-i64::try_from(buf.est_bytes).unwrap_or(i64::MAX));
+            }
         }
     }
 
@@ -342,10 +374,14 @@ impl ParquetRecordSink {
     /// Whether an inline publish may proceed: with a barrier installed, flush
     /// the audit sink first and require it to fully drain; without one, always.
     fn inline_publish_allowed(&mut self) -> bool {
-        match &mut self.audit_barrier {
+        let allowed = match &mut self.audit_barrier {
             Some(barrier) => barrier(),
             None => true,
-        }
+        };
+        // The barrier's audit write is where a hold begins, so a held
+        // tenant's partitions leave before the trigger picks one.
+        self.purge_held();
+        allowed
     }
 
     /// Total estimated bytes currently buffered across all partitions.
@@ -1327,6 +1363,12 @@ impl SharedParquetSink {
     /// durable write, a requeue, or a park.
     #[must_use]
     pub fn detach_concurrent(&self, record: MinedRecord) -> [(&'static str, TakenPartitions); 2] {
+        if self.lock().holds(record.tenant_id.as_str()) {
+            return [
+                ("ceiling", TakenPartitions::default()),
+                ("size", TakenPartitions::default()),
+            ];
+        }
         let Ok(key) = PartitionKey::derive(&record) else {
             let mut sink = self.lock();
             sink.derive_errors += 1;
@@ -1342,9 +1384,26 @@ impl SharedParquetSink {
     }
 }
 
+impl SharedParquetSink {
+    /// Share RFC 0056 §3.2's held tenants with this sink, so it drops
+    /// their records.
+    pub fn hold_from(&self, held: crate::held::HeldTenants) {
+        self.lock().held = held;
+    }
+
+    /// Drop every buffered partition of a held tenant.
+    pub fn purge_held(&self) {
+        self.lock().purge_held();
+    }
+}
+
 impl RecordSink for SharedParquetSink {
     fn emit(&mut self, record: MinedRecord) {
-        self.lock().emit(record);
+        let mut sink = self.lock();
+        // RFC 0056 §3.2: a held tenant's record is dropped; the WAL keeps it.
+        if !sink.holds(record.tenant_id.as_str()) {
+            sink.emit(record);
+        }
     }
 }
 

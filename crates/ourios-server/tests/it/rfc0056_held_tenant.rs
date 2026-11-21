@@ -3,27 +3,10 @@
 //!
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC
 //! is red; each names the slice that discharges it. RFC0056.1 and .2
-//! land beside the coordinator in `ourios-ingester`, and the rest here.
+//! are in `ourios-ingester` (`src/publish.rs`), beside the coordinator,
+//! and the rest land here.
 //! RFC0056.8 is in `ourios-wal`: the codec's tests in `src/checkpoint.rs`
 //! and the version-3 successors in `tests/it/rfc0052_17_reclaim_record/`.
-
-/// Scenario RFC0056.1 — a permanent audit write failure holds the tenant.
-#[test]
-#[ignore = "RFC0056.1 stub — implemented with the held-tenant slice (coordinator and sinks)"]
-fn rfc0056_1_a_permanent_audit_write_failure_holds_the_tenant() {
-    todo!(
-        "RFC0056.1 — B publishes, A is held and its buffered records and events are \
-         dropped; an inline size or ceiling flush holds it too; a hold at the ceiling \
-         frees A's bytes; A's retained events drop with the hold"
-    );
-}
-
-/// Scenario RFC0056.2 — a derive failure takes the same path.
-#[test]
-#[ignore = "RFC0056.2 stub — implemented with the held-tenant slice (coordinator and sinks)"]
-fn rfc0056_2_a_derive_failure_takes_the_same_path() {
-    todo!("RFC0056.2 — an event that does not derive a partition holds its tenant");
-}
 
 /// Scenario RFC0056.3 — a held tenant's appends are refused, retryably.
 #[test]

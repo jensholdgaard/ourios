@@ -633,10 +633,13 @@ fn build_write_sinks(
     promoted: PromotedAttributes,
     max_buffer_age: Duration,
 ) -> (SharedParquetSink, SharedParquetAuditSink) {
+    // RFC 0056 §3.2: the local backend holds a tenant whose template events
+    // cannot be written for good, rather than publishing its records.
     let audit_sink = SharedParquetAuditSink::new(BufferingAuditSink::new(
         store.clone().with_caller(Caller::AuditSink),
         AUDIT_SINK_CEILING_EVENTS,
-    ));
+    ))
+    .holding();
     let barrier_audit = audit_sink.clone();
     let quarantine_audit = audit_sink.clone();
     let sink = SharedParquetSink::new(

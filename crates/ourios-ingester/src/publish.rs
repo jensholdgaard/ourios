@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ourios_core::audit::AuditEvent;
 use ourios_core::record::MinedRecord;
+use ourios_core::tenant::TenantId;
 use ourios_parquet::PartitionKey;
 
 use crate::audit_sink::{SharedParquetAuditSink, Ticket};
@@ -140,6 +141,7 @@ impl PublishCoordinator {
     /// Build a coordinator over the two shared sinks.
     #[must_use]
     pub fn new(record: SharedParquetSink, audit: SharedParquetAuditSink) -> Self {
+        record.hold_from(audit.held());
         let handoff = Arc::new(Mutex::new(()));
         let feed = Feed::new(Returns::new(record.clone(), Arc::clone(&handoff)));
         Self {
@@ -339,7 +341,14 @@ impl PublishCoordinator {
         // The guard settles when this returns, whichever arm took it.
         let _guard = guard;
         let retained = self.audit.write_retaining(audit);
-        let records = records.into_partitions();
+        let held = self.audit.held();
+        let mut records = records.into_partitions();
+        if held.any() {
+            // RFC 0056 §3.2: a held tenant's records are neither published
+            // nor requeued; the WAL keeps them for the restart.
+            records.retain(|(key, _)| !held.is_held(&TenantId::new(key.tenant_id.clone())));
+            self.record.purge_held();
+        }
         if !retained.is_empty() {
             // The audit stream didn't fully reach durability (a transient store
             // error). Do NOT publish the records — their template events aren't
@@ -368,7 +377,9 @@ impl PublishCoordinator {
             self.record.requeue(records, registered);
             return false;
         }
-        self.feed.publish(records, trigger, registered)
+        // Until RFC 0056 §3.4's held floors land, a hold keeps a cut from
+        // stamping past the held tenant's frames, so a restart replays them.
+        self.feed.publish(records, trigger, registered) && !held.any()
     }
 
     /// The record sink handle (for the receiver's existing flush/snapshot paths).
@@ -581,7 +592,8 @@ mod tests {
             let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
                 Store::local(&audit_root).expect("audit store"),
                 1024,
-            ));
+            ))
+            .holding();
             let barrier_audit = audit.clone();
             let records = SharedParquetSink::new(
                 ParquetRecordSink::new(
@@ -700,5 +712,87 @@ mod tests {
 
         assert!(stores.coord.write_ordered(held, "age"));
         stores.assert_next_drain_publishes_everything();
+    }
+
+    /// An event RFC 0005 §3.7's writer refuses for good: a type expansion
+    /// whose template changed (`TemplateMustNotChange`).
+    fn unwritable_event(tenant: &str) -> AuditEvent {
+        AuditEvent {
+            payload: AuditPayload::Template {
+                template_id: 1,
+                triggering_line_hash: hash_triggering_line(b"user 1 logged in"),
+                triggering_line_sample: None,
+                change: TemplateChange::TypeExpanded {
+                    old_version: 1,
+                    new_version: 1,
+                    old_template: "user <*> logged in".to_owned(),
+                    new_template: "user <*> logged out".to_owned(),
+                    slots_expanded: Vec::new(),
+                },
+            },
+            ..created_event(tenant)
+        }
+    }
+
+    /// An event whose timestamp derives no audit partition.
+    fn pre_epoch_event(tenant: &str) -> AuditEvent {
+        AuditEvent {
+            timestamp: UNIX_EPOCH - Duration::from_secs(1),
+            ..created_event(tenant)
+        }
+    }
+
+    /// The data files published for `tenant`.
+    fn tenant_files(root: &Path, tenant: &str) -> usize {
+        let dir = format!("tenant_id={tenant}");
+        data_files(root)
+            .iter()
+            .filter(|p| p.components().any(|c| c.as_os_str() == dir.as_str()))
+            .count()
+    }
+
+    /// RFC0056.1 and .2: `acme`'s template event is permanently unwritable,
+    /// `globex`'s writes; `globex` publishes, `acme` is held and its records
+    /// are dropped, now and on later drains.
+    fn holds_the_tenant(unwritable: AuditEvent) {
+        let stores = Stores::new(usize::MAX);
+        let (acme, globex) = (TenantId::new("acme"), TenantId::new("globex"));
+        stores.records.clone().emit(mined("acme"));
+        stores.records.clone().emit(mined("globex"));
+        stores.audit.clone().emit(unwritable);
+        stores.audit.clone().emit(created_event("globex"));
+
+        let published = stores.coord.write_ordered(stores.coord.drain_aged(), "age");
+
+        // Until held floors land (RFC 0056 §3.4), a hold keeps the
+        // checkpoint from passing the held tenant's frames.
+        assert!(!published, "a hold is not a full publish");
+        assert!(stores.audit.held().is_held(&acme), "acme is held");
+        assert!(!stores.audit.held().is_held(&globex), "globex is not");
+        assert_eq!(tenant_files(&stores.data_root, "globex"), 1);
+        assert_eq!(tenant_files(&stores.data_root, "acme"), 0);
+        assert_eq!(
+            stores.records.buffered_records(),
+            0,
+            "acme's records dropped"
+        );
+        assert_eq!(stores.audit.buffered_events(), 0);
+
+        stores.records.clone().emit(mined("acme"));
+        stores.records.clone().emit(mined("globex"));
+        let _ = stores.coord.write_ordered(stores.coord.drain_aged(), "age");
+        assert_eq!(tenant_files(&stores.data_root, "globex"), 2);
+        assert_eq!(tenant_files(&stores.data_root, "acme"), 0);
+        assert_eq!(stores.records.buffered_records(), 0);
+    }
+
+    #[test]
+    fn rfc0056_1_a_permanent_audit_write_failure_holds_the_tenant() {
+        holds_the_tenant(unwritable_event("acme"));
+    }
+
+    #[test]
+    fn rfc0056_2_a_derive_failure_takes_the_same_path() {
+        holds_the_tenant(pre_epoch_event("acme"));
     }
 }

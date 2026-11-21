@@ -896,4 +896,19 @@ mod tests {
         );
         assert_eq!(tenant_files(&stores.data_root, "acme"), 0);
     }
+
+    /// RFC0056.1: a held tenant's template event returned to the audit
+    /// sink, as a refused drain's events are, is not restored, so it cannot
+    /// block another tenant's barrier.
+    #[test]
+    fn rfc0056_1_a_requeued_event_of_a_held_tenant_is_not_restored() {
+        let (stores, acme) = held_acme(usize::MAX);
+        stores.records.clone().emit(mined("acme"));
+        let _ = stores.coord.write_ordered(stores.coord.drain_aged(), "age");
+        assert!(stores.audit.held().is_held(&acme));
+
+        stores.audit.requeue(vec![created_event("acme")]);
+
+        assert_eq!(stores.audit.buffered_events(), 0, "nothing restored");
+    }
 }

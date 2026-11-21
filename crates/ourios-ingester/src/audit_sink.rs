@@ -453,7 +453,12 @@ impl SharedParquetAuditSink {
         if events.is_empty() {
             return;
         }
-        self.lock().requeue_ahead(events);
+        let mut events = events;
+        // RFC 0056 §3.2: a held tenant's events are not restored, so they
+        // cannot block another tenant's barrier.
+        let mut sink = self.lock();
+        events.retain(|event| !self.held.drops(event));
+        sink.requeue_ahead(events);
     }
 
     /// Drain the internal buffer to durability — the standalone
@@ -666,10 +671,12 @@ impl Takes {
 
 impl AuditSink for SharedParquetAuditSink {
     fn emit(&mut self, event: AuditEvent) {
-        if self.held.drops(&event) {
-            return;
+        // Checked under the sink lock, which a hold and its purge also take,
+        // so an event cannot land just after the purge.
+        let mut sink = self.lock();
+        if !self.held.drops(&event) {
+            sink.buffer_event(event);
         }
-        self.lock().buffer_event(event);
     }
 }
 

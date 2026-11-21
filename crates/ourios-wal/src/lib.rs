@@ -558,7 +558,7 @@ impl Wal {
                 detail: other.to_string(),
             },
         })?;
-        let witness = reconcile::root(&config, sidecar, &existing_segments)?;
+        let witness = reconcile::root(&config, sidecar.as_ref(), &existing_segments)?;
         let (current_segment, current_segment_path, current_segment_uuid) =
             append_target(&config.root, existing_segments)?;
         let max_unlinks_per_pass = config.max_unlinks_per_pass;
@@ -574,8 +574,8 @@ impl Wal {
             dir_fsync: DirFsync::PendingOpen,
             rotation: RotationState::Healthy,
             faults: RotationFaults::default(),
-            checkpoint: sidecar.map(|s| s.offset),
-            checkpoint_version: sidecar.map(|s| s.version),
+            checkpoint: sidecar.as_ref().map(|s| s.offset),
+            checkpoint_version: sidecar.as_ref().map(|s| s.version),
             // The instance number is minted here and never reused in
             // the process, so a [`PassId`] cannot be mistaken for one
             // another instance on the same root — a reopen — handed
@@ -1214,7 +1214,9 @@ impl Wal {
             // housekeeping would stay gated forever. Only an equal
             // mark on an already-version-2 sidecar takes the no-write
             // fast path.
-            if durable_to == current && self.checkpoint_is_settled() {
+            let settled = self.checkpoint_is_settled();
+            if durable_to == current && checkpoint::skips_rewrite(self.checkpoint_version, settled)
+            {
                 return Ok(());
             }
         }
@@ -1228,7 +1230,11 @@ impl Wal {
         // and rewrite the sidecar *backwards*, which recovery reads as
         // a lower Parquet suppression horizon and republishes every
         // row above it.
-        checkpoint::write(&self.config.root, durable_to)?;
+        checkpoint::write(
+            &self.config.root,
+            durable_to,
+            &checkpoint::HeldFloors::new(),
+        )?;
         self.checkpoint = Some(durable_to);
         self.checkpoint_version = Some(checkpoint::SidecarVersion::Current);
         // Advancing the mark is not the same as being allowed to
@@ -1266,7 +1272,7 @@ impl Wal {
         if self.reclaim_gate != ReclaimGate::Open {
             return false;
         }
-        if self.checkpoint_version != Some(checkpoint::SidecarVersion::Current) {
+        if !checkpoint::reclaims_under(self.checkpoint_version) {
             return false;
         }
         self.reclaim.checkpoint_witnessed()
@@ -2327,6 +2333,9 @@ pub enum CheckpointError {
         current: WalOffset,
         attempted: WalOffset,
     },
+    /// The held floors do not fit the sidecar (RFC 0056 §3.4); nothing
+    /// was written and the mark did not advance.
+    Unencodable { detail: String },
 }
 
 impl std::fmt::Display for CheckpointError {
@@ -2338,6 +2347,7 @@ impl std::fmt::Display for CheckpointError {
                 "WAL checkpoint is monotonic: segment {} byte {} is below the current segment {} byte {}",
                 attempted.segment, attempted.byte, current.segment, current.byte,
             ),
+            Self::Unencodable { detail } => write!(f, "WAL checkpoint does not encode: {detail}"),
         }
     }
 }
@@ -2346,7 +2356,7 @@ impl std::error::Error for CheckpointError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::NonMonotonic { .. } => None,
+            Self::NonMonotonic { .. } | Self::Unencodable { .. } => None,
         }
     }
 }

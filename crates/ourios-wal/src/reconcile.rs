@@ -85,7 +85,7 @@ impl RootWitness {
 /// two are never collapsed: only the first is safe to proceed from.
 pub(crate) fn root(
     config: &WalConfig,
-    sidecar: Option<checkpoint::Sidecar>,
+    sidecar: Option<&checkpoint::Sidecar>,
     segments: &[PathBuf],
 ) -> Result<RootWitness, OpenError> {
     let version = sidecar.map(|s| s.version);
@@ -97,7 +97,9 @@ pub(crate) fn root(
         // root the record is created at open, before the first
         // checkpoint can exist — so a version-2 sidecar beside no
         // record is a loss, not a pre-RFC layout.
-        Some(checkpoint::SidecarVersion::Current) => Err(lost_record(&config.root)),
+        Some(checkpoint::SidecarVersion::Reclaim | checkpoint::SidecarVersion::Current) => {
+            Err(lost_record(&config.root))
+        }
         Some(checkpoint::SidecarVersion::Legacy) => Ok(RootWitness::legacy()),
         None => open_without_sidecars(config, segments),
     }
@@ -118,7 +120,7 @@ fn recorded_root(
     let mut store =
         reclaim_store::ReclaimStore::open(&config.root, geometry, config.macos_full_fsync)?;
     match (version, proves_a_checkpoint(store.record())) {
-        (Some(checkpoint::SidecarVersion::Current), _) => {
+        (Some(checkpoint::SidecarVersion::Reclaim | checkpoint::SidecarVersion::Current), _) => {
             promote_checkpoint_witness(&mut store)?;
             planned(&mut store, &config.root)?;
             Ok(RootWitness::witnessed(store))

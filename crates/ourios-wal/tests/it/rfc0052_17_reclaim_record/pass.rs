@@ -349,6 +349,7 @@ fn rfc0052_17_crash_after_record_write_before_first_unlink_restarts_cleanly() {
 /// Scenario RFC0052.17 — a pass inside the migration window is a skipped pass that still sweeps.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
+#[ignore = "superseded: RFC 0056 §3.4 writes every CHECKPOINT at version 3, so the version-2 assertion is no longer the contract; rfc0052_17_pass_in_the_migration_window_is_skipped_but_sweeps_partials_at_version_3 covers this"]
 fn rfc0052_17_pass_in_the_migration_window_is_skipped_but_sweeps_partials() {
     // Given: a still-version-1 root — a legitimate pre-RFC layout —
     // with rotation debris beside it.
@@ -395,6 +396,62 @@ fn rfc0052_17_pass_in_the_migration_window_is_skipped_but_sweeps_partials() {
     // And: the pass after the first checkpoint reclaims normally.
     wal.checkpoint(mark).expect("the upgrade");
     assert_eq!(checkpoint_version(root), 2);
+    let after = wal
+        .housekeeping_pass(&known(&[]), CAP)
+        .expect("housekeeping");
+    assert_eq!(after.outcome, PassOutcome::Planned);
+    assert_eq!(after.removed_segments, 2);
+}
+
+/// Scenario RFC0052.17 — a pass inside the migration window is a skipped pass that still sweeps.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[test]
+fn rfc0052_17_pass_in_the_migration_window_is_skipped_but_sweeps_partials_at_version_3() {
+    // Given: a still-version-1 root — a legitimate pre-RFC layout —
+    // with rotation debris beside it.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    build_closed_segment(root, &[b"a1"]);
+    let second = build_closed_segment(root, &[b"b1"]);
+    build_closed_segment(root, &[b"c1"]);
+    std::fs::remove_file(root.join(RECLAIM)).expect("a pre-RFC root has no record");
+    downgrade_segments(root);
+    let mark = *second.last().expect("segment two's offsets");
+    write_legacy_checkpoint(root, mark);
+    let debris = write_partial(root);
+
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+
+    // When: a housekeeping pass fires in that window.
+    let plan = wal.housekeeping_prepare(&known(&[]), CAP).expect("prepare");
+
+    // Then: it plans no segment, writes no record, and is counted as a
+    // skipped pass with its reason.
+    assert_eq!(
+        plan.progress().outcome,
+        PassOutcome::Skipped(SkipReason::MigrationWindow),
+    );
+    assert_eq!(SkipReason::MigrationWindow.as_str(), "migration_window");
+    assert!(plan.segments().is_empty() && !plan.records());
+    assert!(
+        !root.join(RECLAIM).exists(),
+        "no record is created under a version-1 checkpoint",
+    );
+
+    // And: it still sweeps stale `.wal.partial` files, so debris from
+    // before the first checkpoint does not survive the window.
+    let permit = wal.write_plan_record(&plan).expect("no record is owed");
+    let progress = wal
+        .housekeeping_commit(plan.pass(), unlink_planned(&plan, permit))
+        .expect("commit");
+    assert_eq!(progress.removed_partials, 1);
+    assert!(!debris.exists());
+    assert_eq!(segment_files(root).len(), 3, "and no segment was touched");
+
+    // And: the pass after the first checkpoint reclaims normally.
+    wal.checkpoint(mark).expect("the upgrade");
+    assert_eq!(checkpoint_version(root), 3);
     let after = wal
         .housekeeping_pass(&known(&[]), CAP)
         .expect("housekeeping");

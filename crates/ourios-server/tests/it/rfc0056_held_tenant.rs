@@ -3,8 +3,9 @@
 //!
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC
 //! is red; each names the slice that discharges it. RFC0056.1 and .2
-//! land beside the coordinator in `ourios-ingester`, RFC0056.8 beside
-//! the `CHECKPOINT` codec in `ourios-wal`, and the rest here.
+//! land beside the coordinator in `ourios-ingester`, and the rest here.
+//! RFC0056.8 is in `ourios-wal`: the codec's tests in `src/checkpoint.rs`
+//! and the version-3 successors in `tests/it/rfc0052_17_reclaim_record/`.
 
 /// Scenario RFC0056.1 — a permanent audit write failure holds the tenant.
 #[test]
@@ -60,13 +61,6 @@ fn rfc0056_6_a_restart_after_repair_publishes_the_held_records() {
 #[ignore = "RFC0056.7 stub — implemented with the held-floor slice (CHECKPOINT v3 and recovery)"]
 fn rfc0056_7_a_tenant_held_before_the_first_checkpoint() {
     todo!("RFC0056.7 — an absent floor replays all of A's frames and reclaims none of them");
-}
-
-/// Scenario RFC0056.8 — a version-2 root upgrades.
-#[test]
-#[ignore = "RFC0056.8 stub — implemented with the CHECKPOINT v3 codec in ourios-wal"]
-fn rfc0056_8_a_version_2_root_upgrades() {
-    todo!("RFC0056.8 — v2 reads as floorless, the next stamp writes v3, the witness holds");
 }
 
 /// Scenario RFC0056.9 — a snapshot past the floor after a repaired restart.

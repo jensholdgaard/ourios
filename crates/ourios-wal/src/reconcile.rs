@@ -85,7 +85,7 @@ impl RootWitness {
 /// two are never collapsed: only the first is safe to proceed from.
 pub(crate) fn root(
     config: &WalConfig,
-    sidecar: Option<checkpoint::Sidecar>,
+    sidecar: Option<&checkpoint::Sidecar>,
     segments: &[PathBuf],
 ) -> Result<RootWitness, OpenError> {
     let version = sidecar.map(|s| s.version);

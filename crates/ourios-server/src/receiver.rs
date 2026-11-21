@@ -359,6 +359,18 @@ fn flush_then_snapshot(
         return Snapshotted::Skipped;
     }
     sink.flush_all();
+    // Until RFC 0056 §3.4's held floors land, a held tenant's records are
+    // only in the WAL, so a snapshot past them would let recovery suppress
+    // them. Healthy tenants' records still flushed above.
+    if audit_sink.held().any() {
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_RECEIVER_SINK_RETAINED,
+            "{cadence}: a tenant is held after a permanent audit write failure, so the \
+             snapshot is skipped — the next start replays its frames from the WAL (no \
+             acknowledged data is lost)"
+        );
+        return Snapshotted::Skipped;
+    }
     let records = sink.buffered_records();
     if records != 0 {
         tracing::warn!(
@@ -654,6 +666,9 @@ fn build_write_sinks(
         // partition buffer (#362).
         .with_audit_sink(Box::new(quarantine_audit)),
     );
+    // Before recovery: replay re-emits into both sinks, so a hold it meets
+    // must already stop the record sink (RFC 0056 §3.2).
+    sink.hold_from(audit_sink.held());
     (sink, audit_sink)
 }
 
@@ -1608,6 +1623,49 @@ mod tests {
                 },
             },
         }
+    }
+
+    /// RFC 0056 §3.2: a flush whose audit write holds a tenant installs
+    /// no snapshot, since until held floors land the held tenant's records
+    /// are only in the WAL and a snapshot past them would let recovery
+    /// suppress them.
+    #[test]
+    fn flush_then_snapshot_skips_the_snapshot_while_a_tenant_is_held() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store_root = tmp.path().join("store");
+        let sink = buffered_sink(&store_root);
+        let audit = audit_sink(&tmp.path().join("audit")).holding();
+        sink.hold_from(audit.held());
+        let mut emitter = audit.clone();
+        emitter.emit(ourios_core::audit::AuditEvent {
+            timestamp: std::time::UNIX_EPOCH - Duration::from_secs(1),
+            ..audit_event("checkout")
+        });
+        let miner = MinerCluster::new(MinerConfig::default());
+
+        let outcome = flush_then_snapshot(
+            &sink,
+            &audit,
+            &tmp.path().join("snapshots"),
+            &miner,
+            &Stamp::PreFlight,
+            "test",
+        );
+
+        assert!(audit.held().is_held(&TenantId::new("checkout")));
+        assert!(
+            matches!(outcome, Snapshotted::Skipped),
+            "no snapshot while held"
+        );
+        assert_eq!(
+            sink.buffered_records(),
+            0,
+            "the held tenant's records are dropped"
+        );
+        assert!(
+            !store_root.join("data").exists(),
+            "nothing of the held tenant was published",
+        );
     }
 
     #[test]

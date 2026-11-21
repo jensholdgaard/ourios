@@ -767,23 +767,38 @@ mod tests {
         // Until held floors land (RFC 0056 §3.4), a hold keeps the
         // checkpoint from passing the held tenant's frames.
         assert!(!published, "a hold is not a full publish");
-        assert!(stores.audit.held().is_held(&acme), "acme is held");
-        assert!(!stores.audit.held().is_held(&globex), "globex is not");
-        assert_eq!(tenant_files(&stores.data_root, "globex"), 1);
-        assert_eq!(tenant_files(&stores.data_root, "acme"), 0);
-        assert_eq!(
-            stores.records.buffered_records(),
-            0,
-            "acme's records dropped"
+        let held = stores.audit.held();
+        assert!(
+            held.is_held(&acme) && !held.is_held(&globex),
+            "acme alone is held"
         );
+        assert_published(&stores, (0, 1));
         assert_eq!(stores.audit.buffered_events(), 0);
 
         stores.records.clone().emit(mined("acme"));
         stores.records.clone().emit(mined("globex"));
         let _ = stores.coord.write_ordered(stores.coord.drain_aged(), "age");
-        assert_eq!(tenant_files(&stores.data_root, "globex"), 2);
-        assert_eq!(tenant_files(&stores.data_root, "acme"), 0);
-        assert_eq!(stores.records.buffered_records(), 0);
+        assert_published(&stores, (0, 2));
+    }
+
+    /// `acme` and `globex` have published `files` data files each, and no
+    /// record is left buffered.
+    fn assert_published(stores: &Stores, (acme, globex): (usize, usize)) {
+        assert_eq!(
+            tenant_files(&stores.data_root, "acme"),
+            acme,
+            "acme's files"
+        );
+        assert_eq!(
+            tenant_files(&stores.data_root, "globex"),
+            globex,
+            "globex's files"
+        );
+        assert_eq!(
+            stores.records.buffered_records(),
+            0,
+            "nothing left buffered"
+        );
     }
 
     #[test]
@@ -794,5 +809,91 @@ mod tests {
     #[test]
     fn rfc0056_2_a_derive_failure_takes_the_same_path() {
         holds_the_tenant(pre_epoch_event("acme"));
+    }
+
+    /// `acme`'s template event that no write accepts, and `globex`'s that
+    /// writes; the stores and the two tenants.
+    fn held_acme(target_bytes: usize) -> (Stores, TenantId) {
+        let stores = Stores::new(target_bytes);
+        stores.audit.clone().emit(unwritable_event("acme"));
+        stores.audit.clone().emit(created_event("globex"));
+        (stores, TenantId::new("acme"))
+    }
+
+    /// RFC0056.1's inline arm: the size trigger's audit barrier is where
+    /// the hold begins, so the record that fired it is dropped with its
+    /// tenant, and `globex` flushes on its own size trigger as before.
+    #[test]
+    fn rfc0056_1_an_inline_size_flush_holds_the_tenant_and_spares_the_rest() {
+        let (stores, acme) = held_acme(1);
+        stores.records.clone().emit(mined("acme"));
+        assert!(stores.audit.held().is_held(&acme), "the barrier held acme");
+        stores.records.clone().emit(mined("globex"));
+
+        assert_published(&stores, (0, 1));
+        assert_eq!(
+            stores.records.buffered_bytes(),
+            0,
+            "acme's bytes are released"
+        );
+    }
+
+    /// RFC0056.1: an event of `acme` retained after a transient failure is
+    /// dropped once a later write holds `acme`, so it never blocks others.
+    #[test]
+    fn rfc0056_1_a_held_tenants_retained_events_drop_with_the_hold() {
+        let stores = Stores::new(usize::MAX);
+        stores.records.clone().emit(mined("acme"));
+        stores.audit.clone().emit(created_event("acme"));
+        stores.fail_audit_write(stores.coord.drain_aged());
+        assert_eq!(stores.audit.buffered_events(), 1, "retained for retry");
+
+        stores.audit.clone().emit(unwritable_event("acme"));
+        let _ = stores.coord.write_ordered(stores.coord.drain_aged(), "age");
+
+        assert!(stores.audit.held().is_held(&TenantId::new("acme")));
+        assert_eq!(
+            stores.audit.buffered_events(),
+            0,
+            "the retained event is dropped"
+        );
+        assert_published(&stores, (0, 0));
+    }
+
+    /// RFC0056.1: once `acme` is held, no boundary takes its records: not
+    /// the encode pool's detach, not a requeue, not an owned publish of a
+    /// partition taken before the hold.
+    #[test]
+    fn rfc0056_1_no_boundary_takes_a_held_tenants_records() {
+        let (stores, acme) = held_acme(usize::MAX);
+        stores.records.clone().emit(mined("acme"));
+        stores.records.clone().emit(mined("globex"));
+        let _ = stores.coord.write_ordered(stores.coord.drain_aged(), "age");
+        assert!(stores.audit.held().is_held(&acme));
+        let key = ourios_parquet::PartitionKey::derive(&mined("acme")).expect("key");
+
+        let [ceiling, size] = stores.records.detach_concurrent(mined("acme"));
+        assert!(
+            ceiling.1.is_empty() && size.1.is_empty(),
+            "detach takes nothing"
+        );
+        stores.records.requeue(
+            vec![(key.clone(), vec![mined("acme")])],
+            crate::cadence::Epoch::LAST,
+        );
+        assert_eq!(
+            stores.records.buffered_records(),
+            0,
+            "a requeue restores nothing"
+        );
+        assert!(
+            stores.records.publish_owned(
+                vec![(key, vec![mined("acme")])],
+                "size",
+                crate::cadence::Epoch::LAST
+            ),
+            "nothing is left to publish",
+        );
+        assert_eq!(tenant_files(&stores.data_root, "acme"), 0);
     }
 }

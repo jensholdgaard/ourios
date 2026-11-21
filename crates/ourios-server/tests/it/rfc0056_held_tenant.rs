@@ -7,13 +7,8 @@
 //! and the rest land here.
 //! RFC0056.8 is in `ourios-wal`: the codec's tests in `src/checkpoint.rs`
 //! and the version-3 successors in `tests/it/rfc0052_17_reclaim_record/`.
-
-/// Scenario RFC0056.3 — a held tenant's appends are refused, retryably.
-#[test]
-#[ignore = "RFC0056.3 stub — implemented with the receiver's admission slice"]
-fn rfc0056_3_a_held_tenants_appends_are_refused_retryably() {
-    todo!("RFC0056.3 — UNAVAILABLE and 503 naming A, before the WAL append; B accepted");
-}
+//! RFC0056.3 is in `ourios-ingester`'s `tests/it/rfc0056_3_held_admission.rs`,
+//! over both transports.
 
 /// Scenario RFC0056.4 — a snapshot installed by a cut that did not stamp.
 #[test]

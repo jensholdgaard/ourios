@@ -74,8 +74,9 @@ struct FlushSummary {
     permanent_errors: u64,
     derive_errors: u64,
     /// Tenants whose template events were dropped for good, by a permanent
-    /// write error or a failed derive (RFC 0056 §3.1).
-    lost_templates: std::collections::BTreeSet<TenantId>,
+    /// write error or a failed derive (RFC 0056 §3.1), with the first loss's
+    /// `error.type`.
+    lost_templates: std::collections::BTreeMap<TenantId, &'static str>,
 }
 
 /// Classify a failed audit partition flush (issue #302 fix #2): a store-I/O
@@ -122,7 +123,8 @@ fn route_partition_result(
             if batch.iter().any(crate::held::is_template_event) {
                 summary
                     .lost_templates
-                    .insert(TenantId::new(partition.tenant_id.clone()));
+                    .entry(TenantId::new(partition.tenant_id.clone()))
+                    .or_insert(permanent_error_type(&err));
             }
             tracing::error!(
                 name: ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED,
@@ -149,12 +151,18 @@ fn write_events(store: &Store, events: Vec<AuditEvent>) -> (Vec<AuditEvent>, Flu
     let mut summary = FlushSummary::default();
     let mut groups: HashMap<PartitionKey, Vec<AuditEvent>> = HashMap::new();
     for event in events {
-        let Ok(partition) = derive_audit_partition(&event) else {
-            summary.derive_errors = summary.derive_errors.saturating_add(1);
-            if crate::held::is_template_event(&event) {
-                summary.lost_templates.insert(event.tenant_id.clone());
+        let partition = match derive_audit_partition(&event) {
+            Ok(partition) => partition,
+            Err(err) => {
+                summary.derive_errors = summary.derive_errors.saturating_add(1);
+                if crate::held::is_template_event(&event) {
+                    summary
+                        .lost_templates
+                        .entry(event.tenant_id.clone())
+                        .or_insert(permanent_error_type(&err));
+                }
+                continue;
             }
-            continue;
         };
         groups.entry(partition).or_default().push(event);
     }
@@ -434,12 +442,25 @@ impl SharedParquetAuditSink {
         let (mut retained, summary) = write_events(&store, events);
         let mut sink = self.lock();
         sink.settle(&summary);
-        let newly_held = summary
-            .lost_templates
-            .iter()
-            .filter(|tenant| self.held.hold(tenant))
-            .count();
-        if newly_held > 0 {
+        let mut newly_held = false;
+        for (tenant, error_type) in &summary.lost_templates {
+            if self.held.hold(tenant) {
+                newly_held = true;
+                sink.metrics.record_tenant_held(tenant);
+                tracing::warn!(
+                    name: ourios_semconv::EVENT_OURIOS_RECEIVER_TENANT_HOLD_STARTED,
+                    {
+                        { ourios_semconv::OURIOS_TENANT } = tenant.as_str(),
+                        { ERROR_TYPE } = *error_type,
+                    },
+                    "audit sink: holding tenant {:?}: a template event could not be \
+                     written, so its records stop publishing and its batches are \
+                     refused until a restart after the fault is repaired",
+                    tenant.as_str(),
+                );
+            }
+        }
+        if newly_held {
             sink.purge_held(&self.held);
         }
         retained.retain(|event| !self.held.drops(event));
@@ -872,10 +893,18 @@ mod tests {
 
     /// The `(tenant, error.type)` of each dropped-partition event `run` logs.
     fn dropped_events(run: impl FnOnce()) -> Vec<(String, String)> {
+        events_named(
+            ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED,
+            run,
+        )
+    }
+
+    /// The `(tenant, error.type)` of each event named `name` that `run` logs.
+    fn events_named(name: &'static str, run: impl FnOnce()) -> Vec<(String, String)> {
         use std::sync::{Arc, Mutex, PoisonError};
         use tracing_subscriber::prelude::*;
 
-        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+        struct Capture(&'static str, Arc<Mutex<Vec<(String, String)>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
             fn on_event(
                 &self,
@@ -895,14 +924,12 @@ mod tests {
                     fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
                     }
                 }
-                if event.metadata().name()
-                    != ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED
-                {
+                if event.metadata().name() != self.0 {
                     return;
                 }
                 let mut fields = Fields::default();
                 event.record(&mut fields);
-                self.0
+                self.1
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push(fields.0);
@@ -911,12 +938,38 @@ mod tests {
 
         crate::global_subscriber();
         let events: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
-        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+        let subscriber = tracing_subscriber::registry().with(Capture(name, Arc::clone(&events)));
         tracing::subscriber::with_default(subscriber, run);
         events
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// RFC 0056 §3.2: holding a tenant logs `hold.started` once, with the
+    /// lost write's `error.type`; a second loss for the held tenant logs
+    /// nothing more.
+    #[test]
+    fn a_hold_logs_hold_started_once() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let handle =
+            SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING)).holding();
+        let pre_epoch = || AuditEvent {
+            timestamp: std::time::UNIX_EPOCH - std::time::Duration::from_secs(1),
+            ..created_event("acme", 1, "GET <*>")
+        };
+
+        let events = events_named(
+            ourios_semconv::EVENT_OURIOS_RECEIVER_TENANT_HOLD_STARTED,
+            || {
+                let _ = handle.write_retaining(vec![pre_epoch()]);
+                let _ = handle.write_retaining(vec![pre_epoch()]);
+            },
+        );
+
+        assert!(handle.held().is_held(&TenantId::new("acme")));
+        assert_eq!(events, vec![("acme".to_owned(), "batch".to_owned())]);
     }
 
     /// The dropped-partition events one partition write's `result` logs.

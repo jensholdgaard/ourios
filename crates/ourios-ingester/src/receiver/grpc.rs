@@ -365,7 +365,9 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
         // would tell the client to drop a batch that was never acked
         // (RFC 0018 §3.2, as RFC 0052 §3.3 amends it). The message, not
         // the code, carries the distinction.
-        IngestFailure::Unavailable | IngestFailure::ServerTerminal => Status::unavailable(msg),
+        IngestFailure::Unavailable | IngestFailure::ServerTerminal | IngestFailure::Held => {
+            Status::unavailable(msg)
+        }
         IngestFailure::Internal => Status::internal(msg),
     };
     // A leader's rejection goes back as it gave it, details included

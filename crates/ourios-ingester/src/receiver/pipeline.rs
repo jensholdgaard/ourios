@@ -231,6 +231,14 @@ impl IngestPipeline {
         self
     }
 
+    /// Refuse the batches of every tenant `held` holds (RFC 0056 §3.3),
+    /// shared with the sinks that hold them.
+    #[must_use]
+    pub fn with_held_tenants(mut self, held: crate::held::HeldTenants) -> Self {
+        self.admission.hold_from(held);
+        self
+    }
+
     /// Install the §6.9 rotation-cadence hook: called once per
     /// detected WAL segment rotation with the miner as it stands
     /// and the **rotation-point high-water mark** — the last
@@ -387,6 +395,7 @@ impl IngestPipeline {
         // RFC 0026 §3.2: authz precedes every other ingest step — a denied
         // batch does no encode, materialisation, or WAL work.
         self.admission.enforce_binding(&tenant, binding)?;
+        self.admission.enforce_hold(&tenant)?;
         // Steps 1–3: every record under the selected tenant (RFC 0046 §3.2),
         // and the frame.
         let framed = Framed::of(request, &tenant)?;

@@ -1309,6 +1309,8 @@ pub async fn serve_until(
             // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
             // through the same durable audit sink as every other event.
             .with_denial_audit_sink(Box::new(audit_sink.clone()))
+            // RFC 0056 §3.3: a held tenant's batches are refused.
+            .with_held_tenants(audit_sink.held())
             .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier)))
             // RFC 0035 §3.1: Parquet encoding runs on the pool, off the
             // global commit gate; the pool emits into the same shared

@@ -20,7 +20,10 @@ superseded-by: —
 > the undecodable-value exceptions. RFC 0017 gets a dated pointer here
 > once this RFC is accepted. The fallback keeps RFC 0047 §3.4's masking
 > guarantee (§3.2). It coordinates with RFC 0062 (`green`), whose §3.3
-> fails a query on an unreadable cell (§3.2).
+> fails a query on an unreadable cell (§3.2), and leaves RFC 0022 §3.3's
+> and RFC 0042 §3.4's promoted-column comparisons unchanged. Under RFC
+> 0002 §6.6 it changes one successful result set, with no deprecation
+> window before 1.0.0 (§3.2; maintainer decision, 2026-11-21).
 
 ## 1. Summary
 
@@ -113,7 +116,20 @@ one bad cell does not affect the row's other cells or other rows.
   comparison compiles to a `LIKE` prefilter `AND` the UDF, and a false
   prefilter would otherwise make the comparison false, so that `not`
   matches the undecodable row. Wrapped, the comparison is `NULL` and
-  stays unmatched under `not` too. This changes RFC
+  stays unmatched under `not` too. The guard covers **only comparisons
+  that read the raw JSON cell**, RFC 0062's scanner path. A comparison
+  on a promoted key reads its typed column (RFC 0022 §3.3, RFC 0042
+  §3.4) and is unchanged, whatever the row's raw attributes cell holds.
+- **Result-set compatibility.** Excluding an undecodable cell under
+  `not` changes a result that succeeds today: `not (attr.k == "x") |
+  count` counts a row whose attributes cell is malformed. RFC 0002 §6.6
+  asks for that change to be handled explicitly: there is **no
+  deprecation window**, because Ourios has not reached 1.0.0. The
+  implementing PR is a breaking change with a `BREAKING CHANGE` footer,
+  and the query cookbook states that a negated comparison no longer
+  matches a row whose attributes cannot be read. It affects only such
+  rows, which after §3.1 come from corruption or a foreign producer
+  (H6). This changes RFC
   0062 §3.3's "a row the scan cannot read fails the query", which the
   implementing PR updates (RFC 0062 is `green`, so it is coordinated,
   not amended).
@@ -230,6 +246,8 @@ explicit bound is enough.
 > - **And** the negated filter (`not (attr.k == "x")`), whose `LIKE`
 >   prefilter is false for the bad cell, does not match the bad row
 >   either
+> - **And** a comparison on a promoted key matches the bad row when its
+>   promoted column matches, whatever its raw attributes cell holds
 
 ## 6. Testing strategy
 
@@ -262,6 +280,10 @@ explicit bound is enough.
   JSON of a row's attributes that did not decode. It goes through the
   shared `ourios-semconv` registry, checked against the OTel
   conventions.
+- [x] **RFC 0002 §6.6's deprecation window.** None (maintainer,
+  2026-11-21): Ourios has not reached 1.0.0. The implementing PR is a
+  breaking change and the cookbook documents the negated-comparison
+  rule.
 - [x] **The degraded-row signal.** Approved 2026-11-21: the event
   `ourios.reader.row.undecodable` (`WARN`, with `file.path` and the row
   index), and a count of degraded rows, on an existing reader counter
@@ -271,7 +293,8 @@ explicit bound is enough.
 ## 8. References
 
 - #1136, the measurements and options; #1134, where it was found.
-- RFC 0017 (`accepted`) §3.3–§3.4, **amended here**; RFC 0047
+- RFC 0017 (`accepted`) §3.3–§3.4, **amended here**; RFC 0002
+  (`accepted`) §6.6, RFC 0022 §3.3, RFC 0042 §3.4 and RFC 0062 §3.3; RFC 0047
   (`accepted`) §3.4, whose masking §3.2 keeps; RFC 0001 §6.6
   (`RetainedVerbatim`); RFC 0005 (the stored canonical JSON); RFC 0018
   §3.4 (non-finite doubles in the same decoders).

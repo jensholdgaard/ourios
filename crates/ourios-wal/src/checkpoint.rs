@@ -499,6 +499,46 @@ mod tests {
         assert!(decode(&bytes).is_err(), "a repeated tenant id");
     }
 
+    /// A version-3 sidecar whose floor table is `table`, with a valid CRC,
+    /// so the table parser itself is what rejects it.
+    fn sealed_table(table: &[u8]) -> Vec<u8> {
+        let mut bytes = header(offset(), VERSION).to_vec();
+        bytes.extend_from_slice(table);
+        let crc = crc32c::crc32c(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    /// One entry for `acme` followed by `tag`.
+    fn one_entry_tagged(tag: u8) -> Vec<u8> {
+        let mut table = 1u32.to_le_bytes().to_vec();
+        table.extend_from_slice(&4u16.to_le_bytes());
+        table.extend_from_slice(b"acme");
+        table.push(tag);
+        table
+    }
+
+    #[test]
+    fn a_floor_with_an_unknown_tag_is_corrupt() {
+        let error = decode(&sealed_table(&one_entry_tagged(2))).expect_err("unknown tag");
+        assert!(error.contains("unknown floor tag"), "{error}");
+    }
+
+    #[test]
+    fn a_floor_table_that_ends_inside_an_entry_is_corrupt() {
+        // Tag 1 promises a 24-byte offset that is not there.
+        let error = decode(&sealed_table(&one_entry_tagged(FLOOR_AT))).expect_err("cut short");
+        assert!(error.contains("ends early"), "{error}");
+    }
+
+    #[test]
+    fn bytes_after_the_floor_table_are_corrupt() {
+        let mut table = one_entry_tagged(FLOOR_START_OF_LOG);
+        table.push(0);
+        let error = decode(&sealed_table(&table)).expect_err("trailing byte");
+        assert!(error.contains("after the floor table"), "{error}");
+    }
+
     /// The writer refuses a sidecar larger than the reader accepts, so a
     /// successful checkpoint never leaves a file its own reader refuses.
     #[test]

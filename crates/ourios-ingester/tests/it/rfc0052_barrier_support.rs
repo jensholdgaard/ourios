@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ourios_config::MinerConfig;
+use ourios_core::tenant::TenantId;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::barrier::Barrier;
 use ourios_ingester::cadence::BarrierEpochs;
@@ -97,7 +98,16 @@ pub struct RigSpec {
     pub held_audit_puts: Option<Gate>,
     /// Panics armed on the journal the coordinator owns.
     pub journal_faults: Option<Arc<JournalFaults>>,
+    /// Hold tenants as the receiver does (RFC 0056 §3.2): the audit sink
+    /// holds, and the record sink shares its held set.
+    pub holding: bool,
+    /// Runs over the WAL and the miner before the pipeline exists, as
+    /// `serve`'s recovery does; the horizons it returns seed the barrier.
+    pub startup: Option<Box<Startup>>,
 }
+
+/// [`RigSpec::startup`]'s shape.
+pub type Startup = dyn FnOnce(&mut Wal, &mut MinerCluster) -> Vec<(TenantId, WalOffset)>;
 
 impl RigSpec {
     pub fn new(wal: WalConfig) -> Self {
@@ -111,6 +121,8 @@ impl RigSpec {
             held_puts: None,
             held_audit_puts: None,
             journal_faults: None,
+            holding: false,
+            startup: None,
         }
     }
 }
@@ -258,6 +270,8 @@ impl BarrierRig {
             held_puts: put_gate,
             held_audit_puts: audit_gate,
             journal_faults,
+            holding,
+            startup,
         } = spec;
         let wal_root = wal.root.clone();
         let data_root = tmp.join("data");
@@ -267,18 +281,17 @@ impl BarrierRig {
             std::fs::create_dir_all(dir).expect("rig directory");
         }
 
-        let journal = Wal::open(wal).expect("open WAL");
-        let (audit, poison) = rig_audit(&audit_root, audit_gate.as_ref(), poison);
+        let mut wal = Wal::open(wal).expect("open WAL");
+        let (audit, poison) = rig_audit(&audit_root, audit_gate.as_ref(), poison, holding);
         let sink = rig_sink(&data_root, flush, &audit, poison, put_gate.as_ref());
-        let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
-            .with_record_sink(Box::new(sink.clone()));
+        let mut miner =
+            MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
+                .with_record_sink(Box::new(sink.clone()));
+        let horizons = startup.map_or_else(Vec::new, |run| run(&mut wal, &mut miner));
 
         let journal: Box<dyn Journal> = match journal_faults {
-            Some(faults) => Box::new(FaultyJournal {
-                wal: journal,
-                faults,
-            }),
-            None => Box::new(journal),
+            Some(faults) => Box::new(FaultyJournal { wal, faults }),
+            None => Box::new(wal),
         };
         let commits = CommitCoordinator::new(
             journal,
@@ -289,12 +302,13 @@ impl BarrierRig {
         // does it: the capture-only rotation hook the pipeline installs
         // holds the barrier.
         let publish = PublishCoordinator::new(sink.clone(), audit.clone());
-        let barrier = Arc::new(Barrier::new(
+        let barrier = Barrier::new(
             publish.clone(),
             Arc::clone(&commits),
             snapshots_root.clone(),
             ceiling_bytes,
-        ));
+        );
+        let barrier = Arc::new(barrier.with_durable_horizons(horizons));
         let mut building = IngestPipeline::new(Arc::clone(&commits), miner)
             .with_encode_pool(EncodePool::with_publisher(publish.publisher(), workers));
         if rotation_capture {
@@ -303,20 +317,18 @@ impl BarrierRig {
                 hook_barrier.capture_rotation(miner, mark);
             }));
         }
-        let pipeline: SharedPipeline = Arc::new(building);
-        let epochs = sink.epochs();
         Self {
             wal_root,
             data_root,
             audit_root,
             snapshots_root,
-            pipeline,
+            pipeline: Arc::new(building),
+            epochs: sink.epochs(),
             sink,
             audit,
             publish,
             barrier,
             commits,
-            epochs,
         }
     }
 
@@ -379,6 +391,7 @@ fn rig_audit(
     audit_root: &Path,
     gate: Option<&Gate>,
     poison: Option<Box<dyn FnMut() -> bool + Send>>,
+    holding: bool,
 ) -> (
     SharedParquetAuditSink,
     Option<Box<dyn FnMut() -> bool + Send>>,
@@ -387,7 +400,10 @@ fn rig_audit(
     if let Some(gate) = gate {
         store = held_puts(store, gate);
     }
-    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 100_000));
+    let mut audit = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 100_000));
+    if holding {
+        audit = audit.holding();
+    }
     let barrier = match gate {
         Some(_) => {
             let settled = audit.clone();
@@ -399,7 +415,8 @@ fn rig_audit(
 }
 
 /// The rig's record sink: its inline audit barrier is `poison` when given,
-/// else a flush of `audit`, and its PUTs are held at `put_gate` when given.
+/// else a flush of `audit`, its PUTs are held at `put_gate` when given, and
+/// it drops what `audit` holds.
 fn rig_sink(
     data_root: &Path,
     flush: FlushConfig,
@@ -415,9 +432,11 @@ fn rig_sink(
     if let Some(gate) = put_gate {
         data_store = held_puts(data_store, gate);
     }
-    SharedParquetSink::new(
+    let sink = SharedParquetSink::new(
         ParquetRecordSink::new(data_store, flush).with_audit_barrier(audit_barrier),
-    )
+    );
+    sink.hold_from(audit.held());
+    sink
 }
 
 /// The handle on [`BarrierRig::with_held_encode`]'s held worker.
@@ -680,8 +699,20 @@ impl Journal for FaultyJournal {
         Journal::checkpoint(&mut self.wal, durable_to)
     }
 
+    fn checkpoint_with_floors(
+        &mut self,
+        durable_to: WalOffset,
+        floors: &ourios_wal::HeldFloors,
+    ) -> Result<(), ReclaimError> {
+        Journal::checkpoint_with_floors(&mut self.wal, durable_to, floors)
+    }
+
     fn last_checkpoint(&self) -> Option<WalOffset> {
         Journal::last_checkpoint(&self.wal)
+    }
+
+    fn held_floors(&self) -> ourios_wal::HeldFloors {
+        Journal::held_floors(&self.wal)
     }
 
     fn housekeeping_prepare(

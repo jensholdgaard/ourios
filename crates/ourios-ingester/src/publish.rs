@@ -377,9 +377,9 @@ impl PublishCoordinator {
             self.record.requeue(records, registered);
             return false;
         }
-        // Until RFC 0056 §3.4's held floors land, a hold keeps a cut from
-        // stamping past the held tenant's frames, so a restart replays them.
-        self.feed.publish(records, trigger, registered) && !held.any()
+        // RFC 0056 §3.4: the cut may stamp past a held tenant's frames;
+        // its floor in the checkpoint is what replays them.
+        self.feed.publish(records, trigger, registered)
     }
 
     /// The record sink handle (for the receiver's existing flush/snapshot paths).
@@ -754,7 +754,9 @@ mod tests {
     /// RFC0056.1 and .2: `acme`'s template event is permanently unwritable,
     /// `globex`'s writes; `globex` publishes, `acme` is held and its records
     /// are dropped, now and on later drains.
-    fn holds_the_tenant(unwritable: AuditEvent) {
+    /// `published` is what the hold's publish reports: whether a cut may
+    /// stamp over it.
+    fn holds_the_tenant(unwritable: AuditEvent, published: bool) {
         let stores = Stores::new(usize::MAX);
         let (acme, globex) = (TenantId::new("acme"), TenantId::new("globex"));
         stores.records.clone().emit(mined("acme"));
@@ -762,11 +764,11 @@ mod tests {
         stores.audit.clone().emit(unwritable);
         stores.audit.clone().emit(created_event("globex"));
 
-        let published = stores.coord.write_ordered(stores.coord.drain_aged(), "age");
-
-        // Until held floors land (RFC 0056 §3.4), a hold keeps the
-        // checkpoint from passing the held tenant's frames.
-        assert!(!published, "a hold is not a full publish");
+        assert_eq!(
+            stores.coord.write_ordered(stores.coord.drain_aged(), "age"),
+            published,
+            "what the hold's publish reports"
+        );
         let held = stores.audit.held();
         assert!(
             held.is_held(&acme) && !held.is_held(&globex),
@@ -802,13 +804,29 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded: with held floors (RFC 0056 §3.4) a hold no longer keeps the cut \
+                from stamping; see rfc0056_1_a_permanent_audit_write_failure_holds_only_the_tenant"]
     fn rfc0056_1_a_permanent_audit_write_failure_holds_the_tenant() {
-        holds_the_tenant(unwritable_event("acme"));
+        holds_the_tenant(unwritable_event("acme"), false);
     }
 
     #[test]
+    #[ignore = "superseded: with held floors (RFC 0056 §3.4) a hold no longer keeps the cut \
+                from stamping; see rfc0056_2_a_derive_failure_holds_only_the_tenant"]
     fn rfc0056_2_a_derive_failure_takes_the_same_path() {
-        holds_the_tenant(pre_epoch_event("acme"));
+        holds_the_tenant(pre_epoch_event("acme"), false);
+    }
+
+    /// The publish succeeds for the rest: the held tenant's floor, not a
+    /// refused stamp, is what replays its frames (RFC 0056 §3.4).
+    #[test]
+    fn rfc0056_1_a_permanent_audit_write_failure_holds_only_the_tenant() {
+        holds_the_tenant(unwritable_event("acme"), true);
+    }
+
+    #[test]
+    fn rfc0056_2_a_derive_failure_holds_only_the_tenant() {
+        holds_the_tenant(pre_epoch_event("acme"), true);
     }
 
     /// `acme`'s template event that no write accepts, and `globex`'s that

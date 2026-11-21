@@ -359,9 +359,10 @@ fn flush_then_snapshot(
         return Snapshotted::Skipped;
     }
     sink.flush_all();
-    // Until RFC 0056 §3.4's held floors land, a held tenant's records are
-    // only in the WAL, so a snapshot past them would let recovery suppress
-    // them. Healthy tenants' records still flushed above.
+    // A held tenant's records are only in the WAL, and this writes every
+    // tenant's snapshot: one past the held tenant's floor would let
+    // recovery fold its frames (RFC 0056 §3.4). Healthy tenants' records
+    // still flushed above; their snapshots wait for the barrier's cut.
     if audit_sink.held().any() {
         tracing::warn!(
             name: ourios_semconv::EVENT_OURIOS_RECEIVER_SINK_RETAINED,
@@ -1646,9 +1647,8 @@ mod tests {
     }
 
     /// RFC 0056 §3.2: a flush whose audit write holds a tenant installs
-    /// no snapshot, since until held floors land the held tenant's records
-    /// are only in the WAL and a snapshot past them would let recovery
-    /// suppress them.
+    /// no snapshot: the held tenant's records are only in the WAL, and a
+    /// snapshot past its floor would let recovery suppress them.
     #[test]
     fn flush_then_snapshot_skips_the_snapshot_while_a_tenant_is_held() {
         let tmp = tempfile::TempDir::new().expect("temp");

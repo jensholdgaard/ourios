@@ -318,10 +318,30 @@ impl CommitCoordinator {
         self.lock_journal().checkpoint(mark)
     }
 
+    /// [`Self::checkpoint`], carrying the held tenants' floors (RFC 0056
+    /// §3.4).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::checkpoint`].
+    pub fn checkpoint_with_floors(
+        &self,
+        mark: WalOffset,
+        floors: &ourios_wal::HeldFloors,
+    ) -> Result<(), ReclaimError> {
+        self.lock_journal().checkpoint_with_floors(mark, floors)
+    }
+
     /// The journal's persisted checkpoint mark.
     #[must_use]
     pub fn last_checkpoint(&self) -> Option<WalOffset> {
         self.lock_journal().last_checkpoint()
+    }
+
+    /// The held floors persisted beside [`Self::last_checkpoint`].
+    #[must_use]
+    pub fn held_floors(&self) -> ourios_wal::HeldFloors {
+        self.lock_journal().held_floors()
     }
 
     /// RFC 0052 §3.5's export surface, read through the one journal

@@ -1377,8 +1377,20 @@ impl Journal for SharedWal {
         Journal::checkpoint(&mut *lock_wal(&self.0), durable_to)
     }
 
+    fn checkpoint_with_floors(
+        &mut self,
+        durable_to: WalOffset,
+        floors: &ourios_wal::HeldFloors,
+    ) -> Result<(), ourios_wal::ReclaimError> {
+        Journal::checkpoint_with_floors(&mut *lock_wal(&self.0), durable_to, floors)
+    }
+
     fn last_checkpoint(&self) -> Option<WalOffset> {
         Journal::last_checkpoint(&*lock_wal(&self.0))
+    }
+
+    fn held_floors(&self) -> ourios_wal::HeldFloors {
+        Journal::held_floors(&*lock_wal(&self.0))
     }
 
     fn housekeeping_prepare(

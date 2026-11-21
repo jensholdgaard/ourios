@@ -2,7 +2,7 @@
 //! through, and its RFC 0008 WAL implementation.
 
 use ourios_wal::{
-    FrameKind, HousekeepingProgress, PassId, ReclaimError, ReclaimOutcome, ReclaimPlan,
+    FrameKind, HeldFloors, HousekeepingProgress, PassId, ReclaimError, ReclaimOutcome, ReclaimPlan,
     ReclaimState, RotationKind, RotationState, SnapshotHorizons, Wal, WalOffset,
 };
 
@@ -67,9 +67,36 @@ pub trait Journal: Send {
         Err(ReclaimError::NoReclamationSurface)
     }
 
+    /// [`Self::checkpoint`], carrying the held tenants' floors (RFC 0056
+    /// §3.4). The default writes a floorless mark through
+    /// [`Self::checkpoint`] and refuses any floor: a journal that cannot
+    /// persist one must not let a held tenant's records read as
+    /// durable through the mark.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::checkpoint`]; [`ReclaimError::NoReclamationSurface`]
+    /// for a floor this journal cannot persist.
+    fn checkpoint_with_floors(
+        &mut self,
+        durable_to: WalOffset,
+        floors: &HeldFloors,
+    ) -> Result<(), ReclaimError> {
+        if floors.is_empty() {
+            self.checkpoint(durable_to)
+        } else {
+            Err(ReclaimError::NoReclamationSurface)
+        }
+    }
+
     /// The journal's persisted checkpoint mark, if any.
     fn last_checkpoint(&self) -> Option<WalOffset> {
         None
+    }
+
+    /// The held floors persisted beside [`Self::last_checkpoint`].
+    fn held_floors(&self) -> HeldFloors {
+        HeldFloors::new()
     }
 
     /// The ledger half of one capped housekeeping pass (§3.2), under the
@@ -169,8 +196,20 @@ impl Journal for Wal {
         Wal::checkpoint(self, durable_to).map_err(ReclaimError::Checkpoint)
     }
 
+    fn checkpoint_with_floors(
+        &mut self,
+        durable_to: WalOffset,
+        floors: &HeldFloors,
+    ) -> Result<(), ReclaimError> {
+        Wal::checkpoint_with_floors(self, durable_to, floors).map_err(ReclaimError::Checkpoint)
+    }
+
     fn last_checkpoint(&self) -> Option<WalOffset> {
         Wal::last_checkpoint(self)
+    }
+
+    fn held_floors(&self) -> HeldFloors {
+        Wal::held_floors(self).clone()
     }
 
     fn housekeeping_prepare(

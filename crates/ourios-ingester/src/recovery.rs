@@ -27,8 +27,8 @@ use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, RestoreError};
 use ourios_miner::snapshot::{LegacyMark, RecoveryOutcome, SnapshotError, WalHighWater};
 use ourios_wal::{
-    FrameKind, FrameSink, HousekeepingError, LedgerError, RecoveryError, TenantBatch,
-    TenantHorizon, Wal, WalOffset,
+    FrameKind, FrameSink, HeldFloor, HeldFloors, HousekeepingError, LedgerError, RecoveryError,
+    TenantBatch, TenantHorizon, Wal, WalOffset,
 };
 use prost::Message;
 
@@ -271,6 +271,7 @@ pub fn recover(
     ids: &TemplateIds,
 ) -> Result<RecoveryReport, RecoveryDriverError> {
     let parquet_horizon = wal.last_checkpoint();
+    let floors = wal.held_floors().clone();
     let artefacts =
         snapshot_store::load_all_durable(snapshots_root).map_err(RecoveryDriverError::Store)?;
 
@@ -285,6 +286,7 @@ pub fn recover(
     let gates = Gates {
         horizons: &horizons,
         checkpoint: parquet_horizon,
+        floors: &floors,
         ids,
     };
     let replay = replay_gated(wal, miner, gates)?;
@@ -780,7 +782,22 @@ fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
 struct Gates<'a> {
     horizons: &'a HashMap<TenantId, WalOffset>,
     checkpoint: Option<WalOffset>,
+    /// The held tenants' floors (RFC 0056 §3.4), each of which gates its
+    /// tenant in place of the checkpoint.
+    floors: &'a HeldFloors,
     ids: &'a TemplateIds,
+}
+
+impl Gates<'_> {
+    /// `F_T`: what `tenant`'s records are durable through — its held
+    /// floor if the checkpoint carries one, the checkpoint otherwise.
+    fn durable_through(&self, tenant: &TenantId) -> Option<WalOffset> {
+        match self.floors.get(tenant) {
+            Some(HeldFloor::StartOfLog) => None,
+            Some(HeldFloor::At(floor)) => Some(*floor),
+            None => self.checkpoint,
+        }
+    }
 }
 
 struct DriverSink<'a> {
@@ -860,7 +877,7 @@ impl DriverSink<'_> {
         match route(
             offset,
             self.gates.horizons.get(&tenant),
-            self.gates.checkpoint,
+            self.gates.durable_through(&tenant),
         ) {
             Route::Folded => self.records_suppressed += count,
             mined => {
@@ -1060,6 +1077,8 @@ mod tests {
         assert_eq!(withheld.events, 2, "the events of seated ids stay withheld");
     }
 
+    static NO_FLOORS: HeldFloors = HeldFloors::new();
+
     fn sink<'a>(
         miner: &'a mut MinerCluster,
         horizons: &'a HashMap<TenantId, WalOffset>,
@@ -1071,6 +1090,7 @@ mod tests {
             gates: Gates {
                 horizons,
                 checkpoint: None,
+                floors: &NO_FLOORS,
                 ids,
             },
             failure: None,

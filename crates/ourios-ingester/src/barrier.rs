@@ -46,16 +46,17 @@
 //!   barrier began can panic *while the barrier waits on it*, and the
 //!   latch it sets lands after the first check.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::SnapshotState;
-use ourios_wal::{AppendError, ReclaimError, SnapshotHorizons, WalOffset};
+use ourios_wal::{AppendError, HeldFloors, ReclaimError, SnapshotHorizons, WalOffset};
 
 use crate::cadence::{BarrierEpochs, Epoch};
+use crate::held;
 use crate::metrics::{BarrierMetrics, ERROR_TYPE};
 use crate::publish::{Drained, PublishCoordinator};
 use crate::receiver::CommitCoordinator;
@@ -273,6 +274,10 @@ pub struct Barrier {
     /// startup: a write whose rename landed but whose fsync failed is
     /// visible there and may not survive a crash.
     horizons: Mutex<HashMap<TenantId, WalOffset>>,
+    /// The held tenants' floors (RFC 0056 §3.4), seeded from the
+    /// `CHECKPOINT` and assigned once per tenant: kept, not recomputed,
+    /// even past a stamp that failed after its rename landed.
+    floors: Mutex<HeldFloors>,
     ceiling_bytes: usize,
     metrics: BarrierMetrics,
     /// Runs inside `capture_rotation` between the drain and the cut's
@@ -297,6 +302,7 @@ impl Barrier {
     ) -> Self {
         let epochs = publish.record().epochs();
         let metrics = BarrierMetrics::new(&epochs);
+        let floors = Mutex::new(coordinator.held_floors());
         Self {
             publish,
             coordinator,
@@ -305,6 +311,7 @@ impl Barrier {
             pending: Mutex::new(None),
             install: Mutex::new(None),
             horizons: Mutex::new(HashMap::new()),
+            floors,
             ceiling_bytes,
             metrics,
             #[cfg(test)]
@@ -647,9 +654,14 @@ impl Barrier {
         // snapshot still at `S` republishes nothing in `(S, X]`. Retaining
         // instead costs this cut's rows, already in the store, one
         // republish if the node restarts before a later cut stamps.
-        match self.install(&snapshots, mark) {
+        //
+        // RFC 0056 §3.4: the tenants held once this cut's publishes have
+        // settled, read once so the installs it skips and the floors it
+        // stamps are for the same tenants.
+        let held = self.publish.audit().held().tenants();
+        match self.install(&snapshots, mark, &held) {
             Install::Failed => CutOutcome::Retained.into(),
-            Install::Written | Install::Superseded => self.stamp(mark),
+            Install::Written | Install::Superseded => self.stamp(mark, &held),
         }
     }
 
@@ -663,7 +675,16 @@ impl Barrier {
     /// mark, and the ledger records exactly that — so an idle tenant
     /// keeps the older horizon its state reflects, and the floor stays
     /// the minimum over what each tenant truly folded.
-    fn install(&self, snapshots: &[(TenantId, TenantCut)], mark: Option<WalOffset>) -> Install {
+    ///
+    /// A held tenant is not installed (RFC 0056 §3.4): its horizon stays
+    /// at or below its floor, so replay re-mints its events and its
+    /// segments stay unreclaimed.
+    fn install(
+        &self,
+        snapshots: &[(TenantId, TenantCut)],
+        mark: Option<WalOffset>,
+        held: &BTreeSet<TenantId>,
+    ) -> Install {
         let Some(mark) = mark else {
             return Install::Superseded;
         };
@@ -671,7 +692,7 @@ impl Barrier {
         if installed.is_some_and(|previous| mark < previous) {
             return Install::Superseded;
         }
-        for (tenant, share) in snapshots {
+        for (tenant, share) in snapshots.iter().filter(|(t, _)| !held.contains(t)) {
             if let Err(e) = snapshot_store::write(&self.snapshots_root, tenant, &share.artefact()) {
                 self.metrics
                     .record_snapshot_write(tenant.as_str(), Some(e.error_type()));
@@ -696,11 +717,12 @@ impl Barrier {
     /// in-memory mark where it was, so nothing past the *previous* mark
     /// becomes reclaimable — segments already eligible under it still
     /// are.
-    fn stamp(&self, mark: Option<WalOffset>) -> Ran {
+    fn stamp(&self, mark: Option<WalOffset>, held: &BTreeSet<TenantId>) -> Ran {
         let Some(mark) = mark else {
             return CutOutcome::Stamped.into();
         };
-        let written = self.coordinator.checkpoint(mark);
+        let floors = self.assign_floors(held);
+        let written = self.coordinator.checkpoint_with_floors(mark, &floors);
         self.metrics
             .record_checkpoint_write(written.as_ref().err().map(ReclaimError::error_type));
         match written {
@@ -726,6 +748,20 @@ impl Barrier {
                 }
             }
         }
+    }
+}
+
+impl Barrier {
+    /// The floors `held` stamps with, kept for the next cut before the
+    /// write is tried (RFC 0056 §3.4).
+    fn assign_floors(&self, held: &BTreeSet<TenantId>) -> HeldFloors {
+        // Read before either lock: it takes the journal's.
+        let checkpoint = self.coordinator.last_checkpoint();
+        let mut kept = self.floors.lock().unwrap_or_else(PoisonError::into_inner);
+        let horizons = self.lock_horizons();
+        let floors = held::floors_for(held, &kept, checkpoint, |t| horizons.get(t).copied());
+        kept.clone_from(&floors);
+        floors
     }
 }
 

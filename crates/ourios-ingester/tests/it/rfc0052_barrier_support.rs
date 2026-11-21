@@ -101,13 +101,15 @@ pub struct RigSpec {
     /// Hold tenants as the receiver does (RFC 0056 §3.2): the audit sink
     /// holds, and the record sink shares its held set.
     pub holding: bool,
-    /// Runs over the WAL and the miner before the pipeline exists, as
-    /// `serve`'s recovery does; the horizons it returns seed the barrier.
+    /// Runs over the WAL, the miner and the coordinator before the
+    /// pipeline exists, as `serve`'s recovery does; the horizons it
+    /// returns seed the barrier.
     pub startup: Option<Box<Startup>>,
 }
 
 /// [`RigSpec::startup`]'s shape.
-pub type Startup = dyn FnOnce(&mut Wal, &mut MinerCluster) -> Vec<(TenantId, WalOffset)>;
+pub type Startup =
+    dyn FnOnce(&mut Wal, &mut MinerCluster, &PublishCoordinator) -> Vec<(TenantId, WalOffset)>;
 
 impl RigSpec {
     pub fn new(wal: WalConfig) -> Self {
@@ -287,7 +289,8 @@ impl BarrierRig {
         let mut miner =
             MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
                 .with_record_sink(Box::new(sink.clone()));
-        let horizons = startup.map_or_else(Vec::new, |run| run(&mut wal, &mut miner));
+        let publish = PublishCoordinator::new(sink.clone(), audit.clone());
+        let horizons = startup.map_or_else(Vec::new, |run| run(&mut wal, &mut miner, &publish));
 
         let journal: Box<dyn Journal> = match journal_faults {
             Some(faults) => Box::new(FaultyJournal { wal, faults }),
@@ -301,7 +304,6 @@ impl BarrierRig {
         // The barrier is built before the pipeline, exactly as `serve`
         // does it: the capture-only rotation hook the pipeline installs
         // holds the barrier.
-        let publish = PublishCoordinator::new(sink.clone(), audit.clone());
         let barrier = Barrier::new(
             publish.clone(),
             Arc::clone(&commits),

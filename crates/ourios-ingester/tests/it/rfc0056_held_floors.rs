@@ -11,14 +11,18 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, UNIX_EPOCH};
 
-use ourios_core::audit::AuditPayload;
+use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
+use ourios_core::record::RecordSink;
 use ourios_core::tenant::TenantId;
+use ourios_ingester::audit_sink::SharedParquetAuditSink;
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
-use ourios_ingester::recovery;
+use ourios_ingester::record_sink::{ParquetRecordSink, SharedParquetSink};
+use ourios_ingester::recovery::{self, RecoveryDriverError, RecoveryReport};
 use ourios_ingester::snapshot_store;
 use ourios_ingester::template_ids::TemplateIds;
 use ourios_parquet::Store;
@@ -26,7 +30,7 @@ use ourios_wal::{HeldFloor, HeldFloors, WalConfig, WalOffset};
 
 use crate::ingest_support::{request, resource_logs};
 use crate::rfc0052_barrier_support::{
-    BarrierRig, RigSpec, Startup, audit_events, rows, wal_config,
+    BarrierRig, RigSpec, Startup, audit_events, never_flush, rows, wal_config,
 };
 
 const A: &str = "acme";
@@ -47,7 +51,7 @@ fn spec(tmp: &Path, recover: bool) -> RigSpec {
 /// pipeline exists.
 fn recovery(tmp: &Path) -> Box<Startup> {
     let (snapshots, audit) = (tmp.join("wal").join("snapshots"), tmp.join("audit"));
-    Box::new(move |wal, miner| {
+    Box::new(move |wal, miner, _| {
         let ids = TemplateIds::new(Store::local(&audit).expect("audit store"))
             .with_bootstrap_allowed(true);
         recovery::recover(wal, &snapshots, miner, &ids)
@@ -84,8 +88,14 @@ fn hold(rig: &BarrierRig, tenant: &str) {
 
 /// Ingest one record of `tenant` stamped `n` and return its frame.
 async fn ingest_at(rig: &BarrierRig, tenant: &str, n: u64, body: &str) -> WalOffset {
-    let mut logs = resource_logs(tenant, &[body]);
-    for record in &mut logs.scope_logs[0].log_records {
+    ingest_each(rig, tenant, n, &[body]).await
+}
+
+/// Ingest one frame of `tenant`'s records, stamped `first` onward, and
+/// return it.
+async fn ingest_each(rig: &BarrierRig, tenant: &str, first: u64, bodies: &[&str]) -> WalOffset {
+    let mut logs = resource_logs(tenant, bodies);
+    for (n, record) in (first..).zip(&mut logs.scope_logs[0].log_records) {
         record.time_unix_nano = n;
     }
     rig.pipeline
@@ -130,6 +140,25 @@ fn described(rig: &BarrierRig, tenant: &str) -> bool {
         .iter()
         .filter(|r| r.tenant_id.as_str() == tenant)
         .all(|r| events.contains(&r.template_id))
+}
+
+/// The most bytes the record sink buffers for any one of `tenant`'s
+/// published rows.
+fn largest_record(rig: &BarrierRig, tenant: &str) -> usize {
+    let scratch = tempfile::TempDir::new().expect("temp");
+    rows(&rig.data_root)
+        .into_iter()
+        .filter(|r| r.tenant_id.as_str() == tenant)
+        .map(|row| {
+            let sink = SharedParquetSink::new(ParquetRecordSink::new(
+                Store::local(scratch.path()).expect("scratch store"),
+                never_flush(),
+            ));
+            sink.clone().emit(row);
+            sink.buffered_bytes()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn events_of(rig: &BarrierRig, tenant: &str) -> usize {
@@ -361,4 +390,248 @@ async fn rfc0056_9_a_snapshot_past_the_floor_after_a_repaired_restart() {
         rig.commits.held_floors().is_empty(),
         "the next stamp writes no floor for A"
     );
+}
+
+/// A's template events stamped before the epoch, on their way to the
+/// audit sink: the fault a restart does not repair, since no write of
+/// them ever succeeds.
+struct PreEpochFor(Box<dyn AuditSink>);
+
+impl AuditSink for PreEpochFor {
+    fn emit(&mut self, mut event: AuditEvent) {
+        if event.tenant_id.as_str() == A && matches!(event.payload, AuditPayload::Template { .. }) {
+            event.timestamp = UNIX_EPOCH - Duration::from_secs(1);
+        }
+        self.0.emit(event);
+    }
+}
+
+/// How [`unrepaired_recovery`] runs: whether shutdown is asked for on the
+/// first of B's failed writes, and where its outcome lands.
+struct Paced {
+    blocked: Blocked,
+    stop_on_failure: bool,
+    outcome: Arc<Mutex<Option<Result<RecoveryReport, RecoveryDriverError>>>>,
+}
+
+/// Recovery in passes bounded at one buffered byte and one buffered
+/// event, with A's fault still present and B's audit writes blocked until
+/// one has failed.
+fn unrepaired_recovery(tmp: &Path, paced: Paced) -> Box<Startup> {
+    let (snapshots, audit) = (tmp.join("wal").join("snapshots"), tmp.join("audit"));
+    Box::new(move |wal, miner, publish| {
+        let Paced {
+            blocked,
+            stop_on_failure,
+            outcome,
+        } = paced;
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopping);
+        let unblocked = blocked.lift_after_a_failure(publish.audit().clone(), move || {
+            stop.store(stop_on_failure, Ordering::Release);
+        });
+        let real = miner.replace_audit_sink(Box::new(ourios_core::audit::NoOpAuditSink));
+        let _ = miner.replace_audit_sink(Box::new(PreEpochFor(real)));
+        let ids = TemplateIds::new(Store::local(&audit).expect("audit store"))
+            .with_bootstrap_allowed(true);
+        let passes = recovery::Passes {
+            publish,
+            record_bytes: 1,
+            audit_events: 1,
+            stopping: &stopping,
+        };
+        let recovered = passes.recover((wal, miner), &snapshots, &ids);
+        unblocked.join().expect("B's writes recovered");
+        let horizons = recovered
+            .as_ref()
+            .map(RecoveryReport::accepted_horizons)
+            .unwrap_or_default();
+        *outcome.lock().expect("outcome") = Some(recovered);
+        horizons
+    })
+}
+
+/// B's audit partition, refusing every write: a file sits where its
+/// directory belongs, so each write fails transiently.
+struct Blocked {
+    partition: std::path::PathBuf,
+    aside: std::path::PathBuf,
+}
+
+impl Blocked {
+    fn b_audit_writes(tmp: &Path) -> Self {
+        let partition = tmp
+            .join("audit")
+            .join("audit")
+            .join(format!("tenant_id={B}"));
+        let aside = partition.with_extension("aside");
+        std::fs::rename(&partition, &aside).expect("move B's partition aside");
+        std::fs::write(&partition, b"not a directory").expect("block it");
+        Self { partition, aside }
+    }
+
+    /// Lift the block once `audit` has seen a write fail transiently, so
+    /// recovery has met the failure before it clears; `first` runs before
+    /// the lift.
+    fn lift_after_a_failure(
+        self,
+        audit: SharedParquetAuditSink,
+        first: impl FnOnce() + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while audit.flush_errors_transient() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no write of B's failed"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            first();
+            std::fs::remove_file(&self.partition).expect("unblock");
+            std::fs::rename(&self.aside, &self.partition).expect("put B's partition back");
+        })
+    }
+}
+
+/// RFC0056.5's node with an unpublished tail of B's in one frame, killed.
+async fn held_with_a_tail_of_b(tmp: &Path) -> Held {
+    let (rig, held) = held_after_x0(tmp).await;
+    ingest_each(
+        &rig,
+        B,
+        14,
+        &["job 14 queued", "cache warmed in 15 ms", "disk 16 is full"],
+    )
+    .await;
+    drop(rig);
+    held
+}
+
+/// Restart over `tmp` with A's fault unrepaired and B's audit writes
+/// blocked until one fails, shutdown asked for then when `stop`.
+fn restart_unrepaired(
+    tmp: &Path,
+    stop: bool,
+) -> (BarrierRig, Result<RecoveryReport, RecoveryDriverError>) {
+    let outcome = Arc::new(Mutex::new(None));
+    let paced = Paced {
+        blocked: Blocked::b_audit_writes(tmp),
+        stop_on_failure: stop,
+        outcome: Arc::clone(&outcome),
+    };
+    let rig = BarrierRig::build(
+        tmp,
+        RigSpec {
+            startup: Some(unrepaired_recovery(tmp, paced)),
+            ..spec(tmp, false)
+        },
+    );
+    let recovered = outcome
+        .lock()
+        .expect("outcome")
+        .take()
+        .expect("recovery ran");
+    (rig, recovered)
+}
+
+/// RFC 0056 §3.2: shutdown asked for while a pass waits stops recovery,
+/// even when the store has recovered by the next retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_while_a_pass_waits_stops_recovery() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    held_with_a_tail_of_b(tmp.path()).await;
+    let (_, recovered) = restart_unrepaired(tmp.path(), true);
+    assert!(
+        matches!(recovered, Err(RecoveryDriverError::Stopped)),
+        "{recovered:?}"
+    );
+}
+
+/// Scenario RFC0056.10 — a restart into an unrepaired fault holds the
+/// tenant again. See `docs/rfcs/0056-audit-durability.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0056_10_a_restart_into_an_unrepaired_fault_holds_the_tenant_again() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let held = held_with_a_tail_of_b(tmp.path()).await;
+    let (rig, recovered) = restart_unrepaired(tmp.path(), false);
+    let _ = rig
+        .publish
+        .write_ordered(rig.publish.drain_all(), "shutdown");
+    let passes = recovered.expect("recovered").passes;
+
+    assert!(
+        rig.audit.held().is_held(&TenantId::new(A)),
+        "A is held again"
+    );
+    assert!(
+        passes.peak_audit_events <= 1 && passes.peak_record_bytes <= largest_record(&rig, B),
+        "neither sink holds more than the one item just handed to it: {passes:?}"
+    );
+    assert!(
+        passes.waits > 0,
+        "B's failing writes stop the reading: {passes:?}"
+    );
+    assert_eq!(
+        stamps(&rig, A),
+        [1],
+        "nothing of A's publishes without its events"
+    );
+    assert!(described(&rig, A));
+    assert_eq!(
+        stamps(&rig, B),
+        [11, 12, 13, 14, 15, 16],
+        "B's tail publishes once its writes recover"
+    );
+    assert!(described(&rig, B));
+
+    ingest_at(&rig, B, 17, "user 17 logged in").await;
+    cut(&rig);
+    assert!(
+        rig.commits.last_checkpoint() > Some(held.x1),
+        "later cuts stamp"
+    );
+    assert_eq!(
+        rig.commits.held_floors(),
+        floors(&[(A, HeldFloor::At(held.x0))]),
+        "A's floor is still X0, so nothing of A's is lost"
+    );
+}
+
+/// RFC0056.10's re-minted case: a replay at or below the checkpoint that
+/// only re-mints template events is bounded too, and waits out B's
+/// failing writes without republishing a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replay_that_only_re_mints_events_is_bounded_too() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = node(tmp.path());
+    ingest_each(
+        &rig,
+        B,
+        11,
+        &["user 11 logged in", "job 12 queued", "disk 13 is full"],
+    )
+    .await;
+    cut(&rig);
+    let snapshot = rig.snapshots_root.join(format!("{B}.snap"));
+    drop(rig);
+    std::fs::remove_file(snapshot).expect("B's snapshot goes, so its frame re-mints");
+
+    let (rig, recovered) = restart_unrepaired(tmp.path(), false);
+    let _ = rig
+        .publish
+        .write_ordered(rig.publish.drain_all(), "shutdown");
+    let report = recovered.expect("recovered");
+    assert_eq!(report.records_suppressed_for_parquet, 3, "{report:?}");
+    assert!(
+        report.passes.peak_audit_events <= 1 && report.passes.waits > 0,
+        "the re-minted events are paced and wait out B's writes: {:?}",
+        report.passes
+    );
+    assert_eq!(
+        stamps(&rig, B),
+        [11, 12, 13],
+        "no row of B's is republished"
+    );
+    assert!(described(&rig, B));
 }

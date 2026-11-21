@@ -408,6 +408,13 @@ impl SharedParquetAuditSink {
         self.lock().flushes()
     }
 
+    /// Partition writes that failed transiently so far — observability +
+    /// tests.
+    #[must_use]
+    pub fn flush_errors_transient(&self) -> u64 {
+        self.lock().flush_errors_transient()
+    }
+
     /// Atomically take the whole buffer (a cheap memory move, no I/O) with
     /// its place in the take order. The
     /// [`crate::publish::PublishCoordinator`] calls this under the pipeline's

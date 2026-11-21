@@ -390,11 +390,15 @@ would stall the node, so the hold is per tenant.
 
 ## 7. Open questions
 
-- [x] **Telemetry names.** Approved 2026-11-20: the gauge
-  `ourios.receiver.tenant.held` and the `error.type` value
-  `tenant_held` on the refused-batch path. Both go through the shared
-  `ourios-semconv` registry, checked against the OTel conventions,
-  before the code uses them.
+- [x] **Telemetry names.** Approved 2026-11-20 and registered in
+  `ourios-semconv` v0.3.39 (2026-11-21), checked against the OTel
+  conventions: `ourios.receiver.tenant.held`, an UpDownCounter in
+  `{tenant}` of the tenants held, one per `ourios.tenant` (OTel's
+  state-count instrument, so it sums across nodes, where the first draft
+  said gauge); the WARN event `ourios.receiver.tenant.hold.started`, once
+  when a tenant is held, with `ourios.tenant` and the lost write's
+  `error.type`; and the `error.type` value `tenant_held` on
+  `ourios.ingest.batches` for a refused batch.
 - The replicated backend — **#1392** (§3.6).
 - [x] **The exact floor (§3.4's known cost).** Deferred, 2026-11-20.
   Records could carry their WAL offset through the sink so `H_T` is the

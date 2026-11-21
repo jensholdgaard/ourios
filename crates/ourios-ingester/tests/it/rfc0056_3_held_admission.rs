@@ -2,8 +2,8 @@
 //! See `docs/rfcs/0056-audit-durability.md` §5.
 //!
 //! Driven through a real WAL and both transports: the refusal must come
-//! before the append, so the durable high-water mark does not move until
-//! the other tenant's batch is accepted.
+//! before the append, so replaying the WAL afterwards finds only the
+//! other tenant's batches.
 
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::{Ingest, IngestPipeline};
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::Wal;
+use ourios_wal::{FrameKind, FrameSink, RecoveryError, TenantBatch, Wal, WalOffset};
 use prost::Message;
 use tonic::Code;
 
@@ -108,4 +108,39 @@ async fn rfc0056_3_a_held_tenants_appends_are_refused_retryably() {
     .await;
     assert_eq!(status, StatusCode::OK, "and over HTTP");
     assert!(pipeline.acknowledged_durable().is_some());
+
+    drop(grpc);
+    drop(pipeline);
+    assert_eq!(
+        frame_tenants(tmp.path()),
+        vec![OTHER, OTHER],
+        "only the accepted batches reached the WAL",
+    );
+}
+
+/// The tenant of every `TenantOtlpBatch` frame in the WAL at `root`, in log
+/// order, read back by replay.
+fn frame_tenants(root: &std::path::Path) -> Vec<String> {
+    #[derive(Default)]
+    struct Tenants(Vec<String>);
+    impl FrameSink for Tenants {
+        fn consume(
+            &mut self,
+            _: WalOffset,
+            kind: FrameKind,
+            payload: &[u8],
+        ) -> Result<(), RecoveryError> {
+            if kind == FrameKind::TenantOtlpBatch {
+                let batch = TenantBatch::decode(payload).expect("valid tenant prefix");
+                self.0.push(batch.tenant.to_owned());
+            }
+            Ok(())
+        }
+    }
+    let mut tenants = Tenants::default();
+    Wal::open(wal_config(root))
+        .expect("reopen WAL")
+        .replay(&mut tenants)
+        .expect("replay");
+    tenants.0
 }

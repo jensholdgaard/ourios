@@ -391,9 +391,10 @@ would stall the node, so the hold is per tenant.
 - RFC0056.3: receiver tests over both transports.
 - RFC0056.11: the audit sink's hold-event test and its exported-metrics
   test in `ourios-ingester`, and the refusal's count beside RFC0056.3.
-- RFC0056.4–.7, .9 and .10: integration tests in `ourios-server` on the local
-  backend, killing and restarting the node, beside the RFC 0052 barrier
-  tests; .4 injects a stamp failure after the install.
+- RFC0056.4–.7, .9 and .10: integration tests in `ourios-ingester` on the
+  local backend's barrier rig, beside the RFC 0052 barrier tests, killing
+  the node and restarting it over its roots with recovery run first, as
+  `serve` runs it; .4 injects a stamp failure after the install.
 - RFC0056.8 and the sidecar's version 3: codec round-trip and version
   tests in `ourios-wal` beside RFC 0052's, and the witness test beside
   RFC0052's missing-record tests.

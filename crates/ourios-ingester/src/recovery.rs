@@ -18,7 +18,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
@@ -33,6 +35,7 @@ use ourios_wal::{
 use prost::Message;
 
 use crate::metrics::ERROR_TYPE;
+use crate::publish::PublishCoordinator;
 use crate::receiver::tenant::assign;
 use crate::snapshot_store::{self, SnapshotStoreError};
 use crate::template_ids::{Seated, SnapshotTrust, TemplateIds, TemplateIdsError};
@@ -66,6 +69,113 @@ pub struct RecoveryReport {
     /// The template-id high-water this start seated the miner above
     /// (RFC 0059 §3.4).
     pub template_ids: Seated,
+    /// What recovery's bounded passes did (RFC 0056 §3.2); all zero for
+    /// a recovery without them.
+    pub passes: PassReport,
+}
+
+/// RFC 0056 §3.2: recovery publishes in bounded passes. Before it reads a
+/// frame, a sink at its bound is published through the coordinator; one
+/// still at its bound after the pass, because a transient failure
+/// retained the drain, stops the reading until a retry frees capacity.
+/// Recovery never reads past a full sink.
+pub struct Passes<'a> {
+    /// The coordinator over the sinks the miner replays into.
+    pub publish: &'a PublishCoordinator,
+    /// The record sink's bound: its buffered bytes.
+    pub record_bytes: usize,
+    /// The audit sink's bound: its buffered events.
+    pub audit_events: usize,
+    /// Set at shutdown: a recovery waiting out a store stops.
+    pub stopping: &'a AtomicBool,
+}
+
+/// What recovery's passes did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PassReport {
+    /// Passes run.
+    pub passes: u64,
+    /// Waits for a pass to free capacity.
+    pub waits: u64,
+    /// The most bytes the record sink held when a frame was read.
+    pub peak_record_bytes: usize,
+    /// The most events the audit sink held when a frame was read.
+    pub peak_audit_events: usize,
+}
+
+/// The first wait for a retried pass, and the most any one waits.
+const PASS_BACKOFF_START: Duration = Duration::from_millis(100);
+const PASS_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+impl Passes<'_> {
+    /// [`recover`], publishing in passes.
+    ///
+    /// # Errors
+    ///
+    /// As [`recover`], and [`RecoveryDriverError::Stopped`] when shutdown
+    /// came while a pass was waiting.
+    pub fn recover(
+        &self,
+        (wal, miner): (&mut Wal, &mut MinerCluster),
+        snapshots_root: &Path,
+        ids: &TemplateIds,
+    ) -> Result<RecoveryReport, RecoveryDriverError> {
+        recover_paced(
+            wal,
+            snapshots_root,
+            miner,
+            Pacing {
+                ids,
+                passes: Some(self),
+            },
+        )
+    }
+
+    fn buffered(&self) -> (usize, usize) {
+        (
+            self.publish.record().buffered_bytes(),
+            self.publish.audit().buffered_events(),
+        )
+    }
+
+    fn full(&self) -> bool {
+        let (bytes, events) = self.buffered();
+        bytes >= self.record_bytes || events >= self.audit_events
+    }
+
+    /// Publish until neither sink is at its bound, waiting out a store
+    /// that retains the drain. `false` if shutdown came first.
+    fn make_room(&self, report: &mut PassReport) -> bool {
+        let mut backoff = PASS_BACKOFF_START;
+        while self.full() {
+            report.passes += 1;
+            // The registry's `ceiling` trigger: a publish to keep the
+            // buffers under their bound.
+            let _ = self
+                .publish
+                .write_ordered(self.publish.drain_all(), "ceiling");
+            if !self.full() {
+                break;
+            }
+            if self.stopping.load(Ordering::Acquire) {
+                return false;
+            }
+            report.waits += 1;
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(PASS_BACKOFF_MAX);
+        }
+        let (bytes, events) = self.buffered();
+        report.peak_record_bytes = report.peak_record_bytes.max(bytes);
+        report.peak_audit_events = report.peak_audit_events.max(events);
+        true
+    }
+}
+
+/// What a recovery reserves template ids from, and the passes it
+/// publishes in, if any.
+struct Pacing<'a> {
+    ids: &'a TemplateIds,
+    passes: Option<&'a Passes<'a>>,
 }
 
 impl RecoveryReport {
@@ -208,6 +318,9 @@ pub enum RecoveryDriverError {
     /// reserved from (RFC 0059 §3.4): a guessed floor could re-issue an id
     /// published rows carry.
     TemplateIds(TemplateIdsError),
+    /// Shutdown came while a recovery pass waited for a sink to free
+    /// capacity (RFC 0056 §3.2).
+    Stopped,
 }
 
 impl std::fmt::Display for RecoveryDriverError {
@@ -224,6 +337,7 @@ impl std::fmt::Display for RecoveryDriverError {
                 tenant.as_str()
             ),
             Self::TemplateIds(e) => write!(f, "recovery template-id high-water: {e}"),
+            Self::Stopped => write!(f, "recovery stopped: shutdown while a pass waited"),
         }
     }
 }
@@ -234,7 +348,10 @@ impl std::error::Error for RecoveryDriverError {
             Self::Store(e) => Some(e),
             Self::Ledger(e) => Some(e),
             Self::TemplateIds(e) => Some(e),
-            Self::LegacyStaleGap(_) | Self::LegacyMarkUnreadable(_) | Self::Replay(_) => None,
+            Self::LegacyStaleGap(_)
+            | Self::LegacyMarkUnreadable(_)
+            | Self::Replay(_)
+            | Self::Stopped => None,
         }
     }
 }
@@ -270,6 +387,15 @@ pub fn recover(
     miner: &mut MinerCluster,
     ids: &TemplateIds,
 ) -> Result<RecoveryReport, RecoveryDriverError> {
+    recover_paced(wal, snapshots_root, miner, Pacing { ids, passes: None })
+}
+
+fn recover_paced(
+    wal: &mut Wal,
+    snapshots_root: &Path,
+    miner: &mut MinerCluster,
+    Pacing { ids, passes }: Pacing<'_>,
+) -> Result<RecoveryReport, RecoveryDriverError> {
     let parquet_horizon = wal.last_checkpoint();
     let floors = wal.held_floors().clone();
     let artefacts =
@@ -288,6 +414,7 @@ pub fn recover(
         checkpoint: parquet_horizon,
         floors: &floors,
         ids,
+        passes,
     };
     let replay = replay_gated(wal, miner, gates)?;
     ids.finish_replay()
@@ -323,6 +450,7 @@ pub fn recover(
         max_delivered: replay.max_delivered,
         tenants,
         template_ids,
+        passes: replay.passes,
     })
 }
 
@@ -334,6 +462,7 @@ struct Replayed {
     segments_seen: HashSet<uuid::Uuid>,
     max_delivered: Option<WalOffset>,
     withheld: Withheld,
+    passes: PassReport,
 }
 
 /// Replay the WAL into `miner` with its configured sinks held aside, so
@@ -350,6 +479,8 @@ fn replay_gated(
         miner,
         gates,
         failure: None,
+        stopped: false,
+        passes: PassReport::default(),
         capture,
         frames_delivered: 0,
         records_fed: 0,
@@ -367,11 +498,16 @@ fn replay_gated(
         segments_seen,
         max_delivered,
         failure,
+        stopped,
+        passes,
         ..
     } = sink;
     let withheld = capture.restore(miner);
     if let Some(failure) = failure {
         return Err(RecoveryDriverError::TemplateIds(failure));
+    }
+    if stopped {
+        return Err(RecoveryDriverError::Stopped);
     }
     replayed.map_err(RecoveryDriverError::Replay)?;
     if let Some(heal) = wal.healed_tail() {
@@ -384,6 +520,7 @@ fn replay_gated(
         segments_seen,
         max_delivered,
         withheld,
+        passes,
     })
 }
 
@@ -786,6 +923,8 @@ struct Gates<'a> {
     /// tenant in place of the checkpoint.
     floors: &'a HeldFloors,
     ids: &'a TemplateIds,
+    /// RFC 0056 §3.2's passes, which bound what a frame may be read into.
+    passes: Option<&'a Passes<'a>>,
 }
 
 impl Gates<'_> {
@@ -805,6 +944,9 @@ struct DriverSink<'a> {
     gates: Gates<'a>,
     /// A reservation replay could not make: recovery fails with it.
     failure: Option<TemplateIdsError>,
+    /// Shutdown came while a pass waited: recovery stops.
+    stopped: bool,
+    passes: PassReport,
     capture: ReplayCapture,
     frames_delivered: u64,
     records_fed: u64,
@@ -868,6 +1010,16 @@ impl DriverSink<'_> {
     /// and publish what it regenerated only above the checkpoint.
     fn consume_batch(&mut self, offset: WalOffset, payload: &[u8]) -> Result<(), RecoveryError> {
         let kind = FrameKind::TenantOtlpBatch;
+        if let Some(passes) = self.gates.passes
+            && !passes.make_room(&mut self.passes)
+        {
+            self.stopped = true;
+            return Err(reject(
+                kind,
+                offset,
+                &"shutdown while a recovery pass waited",
+            ));
+        }
         let batch = TenantBatch::decode(payload).map_err(|e| reject(kind, offset, &e))?;
         let tenant = TenantId::new(batch.tenant);
         let request = ExportLogsServiceRequest::decode(batch.protobuf)
@@ -1092,8 +1244,11 @@ mod tests {
                 checkpoint: None,
                 floors: &NO_FLOORS,
                 ids,
+                passes: None,
             },
             failure: None,
+            stopped: false,
+            passes: PassReport::default(),
             capture,
             frames_delivered: 0,
             records_fed: 0,

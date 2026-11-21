@@ -712,18 +712,23 @@ fn warn_stale_gaps(report: &RecoveryReport) {
 /// its clone. Attached after, it would reach only the sweep's clone, and
 /// every batch a cut or the rotation hook published would be missing from
 /// the authorization graph until a compaction re-derived its tuples.
+fn build_publisher(
+    (sink, audit_sink): (&SharedParquetSink, &SharedParquetAuditSink),
+    graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
+) -> PublishCoordinator {
+    let publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    match graph_emitter {
+        Some(emitter) => publisher.with_graph_emitter(emitter),
+        None => publisher,
+    }
+}
+
 fn build_barrier(
-    sinks: (&SharedParquetSink, &SharedParquetAuditSink),
+    publisher: &PublishCoordinator,
     commits: &Arc<CommitCoordinator>,
     snapshots_root: PathBuf,
-    graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
     horizons: Vec<(TenantId, WalOffset)>,
-) -> (PublishCoordinator, Arc<Barrier>) {
-    let (sink, audit_sink) = sinks;
-    let mut publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
-    if let Some(emitter) = graph_emitter {
-        publisher = publisher.with_graph_emitter(emitter);
-    }
+) -> Arc<Barrier> {
     let barrier = Barrier::new(
         publisher.clone(),
         Arc::clone(commits),
@@ -731,7 +736,7 @@ fn build_barrier(
         SINK_CEILING_BYTES,
     )
     .with_durable_horizons(horizons);
-    (publisher, Arc::new(barrier))
+    Arc::new(barrier)
 }
 
 /// The ingest pipeline over `commits` and `miner`: denials and holds go
@@ -1162,13 +1167,23 @@ struct Recovered {
 /// that long would starve every task on it, the shutdown-signal listener
 /// among them.
 async fn recover_off_runtime(
-    mut wal: Wal,
+    (mut wal, mut miner): (Wal, MinerCluster),
     snapshots_root: PathBuf,
-    mut miner: MinerCluster,
     ids: TemplateIds,
+    (publisher, stopping): (PublishCoordinator, Arc<AtomicBool>),
 ) -> Result<Recovered, StartError> {
     tokio::task::spawn_blocking(move || {
-        recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids)
+        // RFC 0056 §3.2: replay publishes in passes at the sinks' own
+        // bounds, so recovery never buffers past them.
+        let passes = recovery::Passes {
+            publish: &publisher,
+            record_bytes: SINK_CEILING_BYTES,
+            audit_events: AUDIT_SINK_CEILING_EVENTS,
+            stopping: &stopping,
+        };
+        let recovered = passes.recover((&mut wal, &mut miner), &snapshots_root, &ids);
+        recovered
+            .inspect(warn_stale_gaps)
             .map(|report| Recovered {
                 wal,
                 miner,
@@ -1304,17 +1319,18 @@ pub async fn serve_until(
 
     let ids = TemplateIds::new(config.store.clone().with_caller(Caller::TemplateIds))
         .with_bootstrap_allowed(config.template_ids_allow_bootstrap)
-        .with_shutdown(stopping);
+        .with_shutdown(Arc::clone(&stopping));
     let (sink, audit_sink) =
         build_write_sinks(config.store, config.promoted, config.max_buffer_age);
     let miner = build_miner(config.miner, (&sink, &audit_sink), &ids);
+    let publisher = build_publisher((&sink, &audit_sink), config.graph_emitter.clone());
+    let pace = (publisher.clone(), stopping);
     let Recovered {
         wal,
         miner,
         ids,
         report,
-    } = recover_off_runtime(wal, snapshots_root.clone(), miner, ids).await?;
-    warn_stale_gaps(&report);
+    } = recover_off_runtime((wal, miner), snapshots_root.clone(), ids, pace).await?;
     let ledger = snapshot_post_recovery((&sink, &audit_sink), &snapshots_root, &miner, &report);
 
     // The group-commit coordinator owns the single-writer WAL and folds
@@ -1326,11 +1342,10 @@ pub async fn serve_until(
     let commits = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     // RFC 0052 §3.1: the barrier is built before the pipeline, because
     // the pipeline's rotation hook is now a capture into it.
-    let (publisher, barrier) = build_barrier(
-        (&sink, &audit_sink),
+    let barrier = build_barrier(
+        &publisher,
         &commits,
         snapshots_root.clone(),
-        config.graph_emitter.clone(),
         // RFC 0052 §3.2's snapshot ledger starts from the snapshots on
         // disk: an artefact recovery rejected would be rejected again on
         // the next start, so its horizon must never let housekeeping

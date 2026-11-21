@@ -11,14 +11,15 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, UNIX_EPOCH};
 
-use ourios_core::audit::AuditPayload;
+use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
 use ourios_core::tenant::TenantId;
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
-use ourios_ingester::recovery;
+use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_ingester::snapshot_store;
 use ourios_ingester::template_ids::TemplateIds;
 use ourios_parquet::Store;
@@ -47,7 +48,7 @@ fn spec(tmp: &Path, recover: bool) -> RigSpec {
 /// pipeline exists.
 fn recovery(tmp: &Path) -> Box<Startup> {
     let (snapshots, audit) = (tmp.join("wal").join("snapshots"), tmp.join("audit"));
-    Box::new(move |wal, miner| {
+    Box::new(move |wal, miner, _| {
         let ids = TemplateIds::new(Store::local(&audit).expect("audit store"))
             .with_bootstrap_allowed(true);
         recovery::recover(wal, &snapshots, miner, &ids)
@@ -360,5 +361,135 @@ async fn rfc0056_9_a_snapshot_past_the_floor_after_a_repaired_restart() {
     assert!(
         rig.commits.held_floors().is_empty(),
         "the next stamp writes no floor for A"
+    );
+}
+
+/// A's template events stamped before the epoch, on their way to the
+/// audit sink: the fault a restart does not repair, since no write of
+/// them ever succeeds.
+struct PreEpochFor(Box<dyn AuditSink>);
+
+impl AuditSink for PreEpochFor {
+    fn emit(&mut self, mut event: AuditEvent) {
+        if event.tenant_id.as_str() == A && matches!(event.payload, AuditPayload::Template { .. }) {
+            event.timestamp = UNIX_EPOCH - Duration::from_secs(1);
+        }
+        self.0.emit(event);
+    }
+}
+
+/// Recovery in passes bounded at one buffered byte and one buffered
+/// event, with A's fault still present; its report lands in `report`.
+fn unrepaired_recovery(tmp: &Path, report: Arc<Mutex<Option<RecoveryReport>>>) -> Box<Startup> {
+    let (snapshots, audit) = (tmp.join("wal").join("snapshots"), tmp.join("audit"));
+    Box::new(move |wal, miner, publish| {
+        let real = miner.replace_audit_sink(Box::new(ourios_core::audit::NoOpAuditSink));
+        let _ = miner.replace_audit_sink(Box::new(PreEpochFor(real)));
+        let ids = TemplateIds::new(Store::local(&audit).expect("audit store"))
+            .with_bootstrap_allowed(true);
+        let stopping = AtomicBool::new(false);
+        let passes = recovery::Passes {
+            publish,
+            record_bytes: 1,
+            audit_events: 1,
+            stopping: &stopping,
+        };
+        let recovered = passes
+            .recover((wal, miner), &snapshots, &ids)
+            .expect("recover");
+        let horizons = recovered.accepted_horizons();
+        *report.lock().expect("report") = Some(recovered);
+        horizons
+    })
+}
+
+/// B's audit partition refuses every write until `for_ms` has passed: a
+/// file sits where its directory belongs.
+fn block_b_audit_writes(tmp: &Path, for_ms: u64) -> std::thread::JoinHandle<()> {
+    let partition = tmp
+        .join("audit")
+        .join("audit")
+        .join(format!("tenant_id={B}"));
+    let aside = partition.with_extension("aside");
+    std::fs::rename(&partition, &aside).expect("move B's partition aside");
+    std::fs::write(&partition, b"not a directory").expect("block it");
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(for_ms));
+        std::fs::remove_file(&partition).expect("unblock");
+        std::fs::rename(&aside, &partition).expect("put B's partition back");
+    })
+}
+
+/// Scenario RFC0056.10 — a restart into an unrepaired fault holds the
+/// tenant again. See `docs/rfcs/0056-audit-durability.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0056_10_a_restart_into_an_unrepaired_fault_holds_the_tenant_again() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (rig, held) = held_after_x0(tmp.path()).await;
+    for (n, body) in [
+        (14, "job 14 queued"),
+        (15, "cache warmed in 15 ms"),
+        (16, "disk 16 is full"),
+    ] {
+        ingest_at(&rig, B, n, body).await;
+    }
+    drop(rig);
+
+    let unblock = block_b_audit_writes(tmp.path(), 400);
+    let report = Arc::new(Mutex::new(None));
+    let rig = BarrierRig::build(
+        tmp.path(),
+        RigSpec {
+            startup: Some(unrepaired_recovery(tmp.path(), Arc::clone(&report))),
+            ..spec(tmp.path(), false)
+        },
+    );
+    unblock.join().expect("unblocked");
+    let _ = rig
+        .publish
+        .write_ordered(rig.publish.drain_all(), "shutdown");
+    let passes = report
+        .lock()
+        .expect("report")
+        .take()
+        .expect("recovered")
+        .passes;
+
+    assert!(
+        rig.audit.held().is_held(&TenantId::new(A)),
+        "A is held again"
+    );
+    assert_eq!(
+        (passes.peak_record_bytes, passes.peak_audit_events),
+        (0, 0),
+        "no frame is read while a sink is at its bound: {passes:?}"
+    );
+    assert!(
+        passes.waits > 0,
+        "B's failing writes stop the reading: {passes:?}"
+    );
+    assert_eq!(
+        stamps(&rig, A),
+        [1],
+        "nothing of A's publishes without its events"
+    );
+    assert!(described(&rig, A));
+    assert_eq!(
+        stamps(&rig, B),
+        [11, 12, 13, 14, 15, 16],
+        "B's tail publishes once its writes recover"
+    );
+    assert!(described(&rig, B));
+
+    ingest_at(&rig, B, 17, "user 17 logged in").await;
+    cut(&rig);
+    assert!(
+        rig.commits.last_checkpoint() > Some(held.x1),
+        "later cuts stamp"
+    );
+    assert_eq!(
+        rig.commits.held_floors(),
+        floors(&[(A, HeldFloor::At(held.x0))]),
+        "A's floor is still X0, so nothing of A's is lost"
     );
 }

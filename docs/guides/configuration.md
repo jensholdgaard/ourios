@@ -264,7 +264,7 @@ keys, under `receiver.wal.replicated`, are read only when it is selected:
 | `listen_addr` | the peer listener (default `0.0.0.0:4320`) |
 | `peers` | required; the voting replicas, `id=host:port,…`, ids unique |
 | `tail_peers` | required; the tail pool, `id=host:port,…`, no id also in `peers` |
-| `groups` | integer ≥ 1 (default 16) |
+| `groups` | integer from 1 to 256 (default 16) |
 | `replication_factor` | voters per group, `3` (default) or `5`, at most the number of `peers` |
 | `tail_replicas` | tail replicas per group, `1` (default) up to the number of `tail_peers` |
 | `tail_clients` | required; comma-separated querier certificate identities allowed to read the tail |

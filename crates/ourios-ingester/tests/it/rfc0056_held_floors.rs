@@ -23,6 +23,7 @@ use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
 use ourios_ingester::publish::PublishCoordinator;
+use ourios_ingester::receiver::tenant::assign;
 use ourios_ingester::record_sink::{ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryDriverError, RecoveryReport};
 use ourios_ingester::snapshot_store;
@@ -672,64 +673,141 @@ fn append(wal: &mut Wal, tenant: &str, stamps: (u64, Option<u64>), bodies: &[&st
         .expect("append");
 }
 
+/// A WAL and the sinks a starting receiver recovers into, built as it
+/// builds them: the record sink quarantines into the audit sink.
+struct BareNode {
+    tmp: tempfile::TempDir,
+    wal: Wal,
+    publish: PublishCoordinator,
+    miner: MinerCluster,
+}
+
+impl BareNode {
+    fn new() -> Self {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        for dir in ["data", "audit"] {
+            std::fs::create_dir_all(tmp.path().join(dir)).expect("root");
+        }
+        let wal = Wal::open(wal_config(&tmp.path().join("wal"))).expect("open");
+        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+            Store::local(tmp.path().join("audit")).expect("audit store"),
+            100_000,
+        ));
+        let record = SharedParquetSink::new(
+            ParquetRecordSink::new(
+                Store::local(tmp.path().join("data")).expect("data store"),
+                never_flush(),
+            )
+            .with_audit_sink(Box::new(audit.clone())),
+        );
+        let publish = PublishCoordinator::new(record.clone(), audit.clone());
+        let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit))
+            .with_record_sink(Box::new(record));
+        Self {
+            tmp,
+            wal,
+            publish,
+            miner,
+        }
+    }
+
+    /// Recover in passes bounded at `audit_events`, with no record bound,
+    /// then publish what is left as the post-recovery flush does, and the
+    /// quarantine events that publish made.
+    fn recover(&mut self, audit_events: usize) -> recovery::PassReport {
+        let ids = TemplateIds::new(Store::local(self.tmp.path().join("audit")).expect("store"))
+            .with_bootstrap_allowed(true);
+        let stopping = AtomicBool::new(false);
+        let passes = recovery::Passes {
+            publish: &self.publish,
+            record_bytes: usize::MAX,
+            audit_events,
+            stopping: &stopping,
+        };
+        let snapshots = self.tmp.path().join("snapshots");
+        let report = passes
+            .recover((&mut self.wal, &mut self.miner), &snapshots, &ids)
+            .expect("recover")
+            .passes;
+        let _ = self
+            .publish
+            .write_ordered(self.publish.drain_all(), "shutdown");
+        // That publish's own quarantine events, as the next sweep would.
+        assert!(self.publish.audit().flush());
+        report
+    }
+
+    fn quarantined(&self) -> usize {
+        audit_events(&self.tmp.path().join("audit"))
+            .iter()
+            .filter(|e| matches!(e.payload, AuditPayload::RecordQuarantined { .. }))
+            .count()
+    }
+
+    fn published(&self) -> Vec<u64> {
+        rows(&self.tmp.path().join("data"))
+            .iter()
+            .map(|r| r.time_unix_nano)
+            .collect()
+    }
+}
+
 /// #1407: a pass that quarantines rows the store rejects for good emits
 /// one event per row into the audit sink while it runs (RFC 0025 §3.3).
 /// A pass never drains more records than the audit sink has room for, so
 /// that never takes it past its bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pass_that_quarantines_rows_stays_within_the_audit_bound() {
-    let tmp = tempfile::TempDir::new().expect("temp");
-    let (data, audit_root) = (tmp.path().join("data"), tmp.path().join("audit"));
-    for dir in [&data, &audit_root] {
-        std::fs::create_dir_all(dir).expect("root");
-    }
-    let mut wal = Wal::open(wal_config(&tmp.path().join("wal"))).expect("open");
+    let mut node = BareNode::new();
     let poisoned = [
         "user 11 logged in",
         "user 12 logged in",
         "user 13 logged in",
     ];
-    append(&mut wal, B, (11, Some(u64::MAX)), &poisoned);
-    append(&mut wal, B, (14, None), &["job 14 queued"]);
-    wal.sync().expect("sync");
+    append(&mut node.wal, B, (11, Some(u64::MAX)), &poisoned);
+    append(&mut node.wal, B, (14, None), &["job 14 queued"]);
+    node.wal.sync().expect("sync");
 
-    // Both sinks as the receiver builds them: the record sink quarantines
-    // into the audit sink.
-    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
-        Store::local(&audit_root).expect("audit store"),
-        100_000,
-    ));
-    let record = SharedParquetSink::new(
-        ParquetRecordSink::new(Store::local(&data).expect("data store"), never_flush())
-            .with_audit_sink(Box::new(audit.clone())),
-    );
-    let publish = PublishCoordinator::new(record.clone(), audit.clone());
-    let mut miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit))
-        .with_record_sink(Box::new(record));
-    let ids = TemplateIds::new(Store::local(&audit_root).expect("audit store"))
-        .with_bootstrap_allowed(true);
-    let stopping = AtomicBool::new(false);
-    let passes = recovery::Passes {
-        publish: &publish,
-        record_bytes: usize::MAX,
-        audit_events: 2,
-        stopping: &stopping,
-    };
-    let report = passes
-        .recover((&mut wal, &mut miner), &tmp.path().join("snapshots"), &ids)
-        .expect("recover")
-        .passes;
-    let _ = publish.write_ordered(publish.drain_all(), "shutdown");
+    let report = node.recover(2);
 
     assert!(
         report.peak_audit_events <= 2,
         "quarantine never takes the audit sink past its bound: {report:?}"
     );
-    let quarantined = audit_events(&audit_root)
-        .iter()
-        .filter(|e| matches!(e.payload, AuditPayload::RecordQuarantined { .. }))
-        .count();
-    assert_eq!(quarantined, 3, "every rejected row is quarantined");
-    let published: Vec<u64> = rows(&data).iter().map(|r| r.time_unix_nano).collect();
-    assert_eq!(published, [14], "and only the encodable row publishes");
+    assert_eq!(node.quarantined(), 3, "every rejected row is quarantined");
+    assert_eq!(
+        node.published(),
+        [14],
+        "and only the encodable row publishes"
+    );
+}
+
+/// Records already in the record sink when recovery starts count against
+/// the audit sink's room as well: they drain with the first pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn records_buffered_before_recovery_count_against_the_audit_room() {
+    let mut node = BareNode::new();
+    let rejected = stamped(
+        B,
+        (11, Some(u64::MAX)),
+        &["user 11 logged in", "user 12 logged in"],
+    );
+    for record in assign(request(vec![rejected]), &TenantId::new(B)) {
+        node.miner.ingest(&record);
+    }
+    append(
+        &mut node.wal,
+        B,
+        (13, Some(u64::MAX)),
+        &["user 13 logged in"],
+    );
+    node.wal.sync().expect("sync");
+
+    let report = node.recover(2);
+
+    assert!(
+        report.peak_audit_events <= 2,
+        "the buffered rows drain within the audit bound: {report:?}"
+    );
+    assert_eq!(node.quarantined(), 3, "every rejected row is quarantined");
 }

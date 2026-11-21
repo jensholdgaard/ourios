@@ -82,6 +82,11 @@ pub struct RecoveryReport {
 /// sink: a sink holds at most its bound, less one, plus the one event or
 /// record just handed to it, which may alone exceed a byte bound and is
 /// published by the next pass.
+///
+/// Records already buffered when recovery starts count against the audit
+/// sink's room too, since a pass that quarantines them adds an event
+/// apiece. Fewer of them than the audit bound drain within it; a starting
+/// receiver's sinks are empty.
 pub struct Passes<'a> {
     /// The coordinator over the sinks the miner replays into.
     pub publish: &'a PublishCoordinator,
@@ -504,12 +509,20 @@ fn replay_gated(
     gates: Gates<'_>,
 ) -> Result<Replayed, RecoveryDriverError> {
     let capture = ReplayCapture::install(miner);
+    // Records already buffered drain with the first pass, so they count
+    // against the audit sink's room from the start.
+    let paced = Paced {
+        records: gates
+            .passes
+            .map_or(0, |passes| passes.publish.record().buffered_records()),
+        ..Paced::default()
+    };
     let mut sink = DriverSink {
         miner,
         gates,
         failure: None,
         stopped: false,
-        paced: Paced::default(),
+        paced,
         capture,
         frames_delivered: 0,
         records_fed: 0,

@@ -62,3 +62,13 @@ fn rfc0056_10_a_restart_into_an_unrepaired_fault_holds_the_tenant_again() {
          events; neither sink passes its bound during recovery"
     );
 }
+
+/// Scenario RFC0056.11 — a hold is reported once, and so is each refusal.
+#[test]
+#[ignore = "RFC0056.11 stub — implemented with the receiver's admission slice"]
+fn rfc0056_11_a_hold_is_reported_once_and_so_is_each_refusal() {
+    todo!(
+        "RFC0056.11 — tenant.held counts A once, hold.started is logged once, and the \
+         refused batch counts as tenant_held"
+    );
+}

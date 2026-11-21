@@ -375,12 +375,22 @@ would stall the node, so the hold is per tenant.
 >   audit writes failing transiently meanwhile, when recovery stops
 >   reading frames until a pass frees capacity
 
+> **Scenario RFC0056.11 — a hold is reported once, and so is each refusal**
+> - **Given** tenant A's template events lost for good twice
+> - **When** A is held and then sends a batch
+> - **Then** `ourios.receiver.tenant.held` counts A once on the node,
+>   `ourios.receiver.tenant.hold.started` is logged once with the first
+>   loss's `error.type`, and the refused batch counts on
+>   `ourios.ingest.batches` with `error.type` `tenant_held`
+
 ## 6. Testing strategy
 
 - RFC0056.1 and .2: coordinator tests with a fault-injected audit store
   for one tenant, and an event stamped before the epoch for the derive
   path.
 - RFC0056.3: receiver tests over both transports.
+- RFC0056.11: the audit sink's hold-event test and its exported-metrics
+  test in `ourios-ingester`, and the refusal's count beside RFC0056.3.
 - RFC0056.4–.7, .9 and .10: integration tests in `ourios-server` on the local
   backend, killing and restarting the node, beside the RFC 0052 barrier
   tests; .4 injects a stamp failure after the install.
@@ -390,11 +400,18 @@ would stall the node, so the hold is per tenant.
 
 ## 7. Open questions
 
-- [x] **Telemetry names.** Approved 2026-11-20: the gauge
-  `ourios.receiver.tenant.held` and the `error.type` value
-  `tenant_held` on the refused-batch path. Both go through the shared
-  `ourios-semconv` registry, checked against the OTel conventions,
-  before the code uses them.
+- [x] **Telemetry names.** Approved 2026-11-20 and registered in
+  `ourios-semconv` v0.3.39 (2026-11-21), checked against the OTel
+  conventions: `ourios.receiver.tenant.held`, an UpDownCounter in
+  `{tenant}`, 1 per tenant a node holds under its `ourios.tenant` (OTel's
+  state-count instrument, where the first draft said gauge). A hold is
+  per node, so with several replicas one tenant can be held on two of
+  them, and the sum across nodes counts tenant–node holds; the number of
+  distinct tenants held is the count of series grouped by
+  `ourios.tenant`; the WARN event `ourios.receiver.tenant.hold.started`, once
+  when a tenant is held, with `ourios.tenant` and the lost write's
+  `error.type`; and the `error.type` value `tenant_held` on
+  `ourios.ingest.batches` for a refused batch.
 - The replicated backend — **#1392** (§3.6).
 - [x] **The exact floor (§3.4's known cost).** Deferred, 2026-11-20.
   Records could carry their WAL offset through the sink so `H_T` is the

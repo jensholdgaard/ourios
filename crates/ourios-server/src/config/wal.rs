@@ -16,6 +16,10 @@ use crate::config::resolve::{parse_addr, tls_settings};
 
 /// Default peer listener address (RFC 0065 §3.8).
 pub const DEFAULT_PEER_LISTEN_ADDR: &str = "0.0.0.0:4320";
+/// The most groups a replicated WAL may run (RFC 0065 §3.8, #1351): every
+/// start walks all of them, so an unbounded count stalls a start instead of
+/// failing it.
+pub const MAX_GROUPS: u32 = 256;
 /// Default group count (RFC 0065 §3.8).
 pub const DEFAULT_GROUPS: NonZeroU32 = match NonZeroU32::new(16) {
     Some(groups) => groups,
@@ -434,12 +438,13 @@ fn parse_groups(raw: Option<&str>) -> Result<NonZeroU32, String> {
     let Some(raw) = raw else {
         return Ok(DEFAULT_GROUPS);
     };
-    raw.parse::<NonZeroU32>().map_err(|_| {
-        format!(
+    match raw.parse::<NonZeroU32>() {
+        Ok(groups) if groups.get() <= MAX_GROUPS => Ok(groups),
+        _ => Err(format!(
             "receiver.wal.replicated.groups (OURIOS_RECEIVER_WAL_GROUPS) must be an integer \
-             ≥ 1, got {raw:?}"
-        )
-    })
+             from 1 to {MAX_GROUPS}, got {raw:?}"
+        )),
+    }
 }
 
 fn parse_replication_factor(raw: Option<&str>, peers: usize) -> Result<ReplicationFactor, String> {
@@ -682,7 +687,7 @@ mod tests {
     }
 
     /// Each invalid input, with the field its error must name.
-    const INVALID: [(&str, &[Edit], &str); 28] = [
+    const INVALID: [(&str, &[Edit], &str); 29] = [
         // The criterion's inputs.
         ("no peers", &[("peers", None)], "peers"),
         (
@@ -809,11 +814,32 @@ mod tests {
         ("groups 0", &[("groups", Some("0"))], "groups"),
         ("groups not a number", &[("groups", Some("many"))], "groups"),
         (
+            "groups above the ceiling",
+            &[("groups", Some("257"))],
+            "groups",
+        ),
+        (
             "a malformed listen_addr",
             &[("listen_addr", Some("0.0.0.0"))],
             "listen_addr",
         ),
     ];
+
+    /// RFC 0065 §3.8's ceiling on `groups` is inclusive (#1351).
+    #[test]
+    fn the_group_ceiling_parses() {
+        let edits = [("groups", Some("256"))];
+        for parsed in [
+            from_file(Some("replicated"), &edits, Some(MTLS)),
+            from_env(Some("replicated"), &edits),
+        ] {
+            let error = parsed.err().unwrap_or_default();
+            assert!(
+                !error.starts_with("receiver.wal.replicated.groups "),
+                "{error}"
+            );
+        }
+    }
 
     /// Scenario RFC0065.1, the invalid arm: each of the criterion's
     /// inputs, then the rest of §3.8's rules, fails naming the field,

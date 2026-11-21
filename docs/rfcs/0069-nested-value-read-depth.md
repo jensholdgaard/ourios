@@ -1,7 +1,7 @@
 ---
 rfc: 0069
 title: Reading back every nested value ingest accepts
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-20
@@ -11,7 +11,8 @@ superseded-by: —
 
 # RFC 0069 — Reading back every nested value ingest accepts
 
-> **Status: `drafted`.** Tracks #1136, options A and C, which the
+> **Status: `specified`** (2026-11-21, maintainer-approved, with the
+> §7 names). Tracks #1136, options A and C, which the
 > maintainer chose on 2026-11-20; option B, ingest conformance at the
 > SDK's depth of 64, is a follow-up (§4.1). This RFC **amends accepted
 > RFC 0017 §3.3–§3.4**, which require a structured body and decoded
@@ -256,16 +257,16 @@ explicit bound is enough.
 
 ## 7. Open questions
 
-- [ ] **The reserved attribute key (semconv sign-off).** Proposed
+- [x] **The reserved attribute key.** Approved 2026-11-21:
   `ourios.attribute.undecodable` (string), holding the stored canonical
   JSON of a row's attributes that did not decode. It goes through the
   shared `ourios-semconv` registry, checked against the OTel
   conventions.
-- [ ] **The degraded-row signal.** Proposed: the event
+- [x] **The degraded-row signal.** Approved 2026-11-21: the event
   `ourios.reader.row.undecodable` (`WARN`, with `file.path` and the row
   index), and a count of degraded rows, on an existing reader counter
   with `error.type` `undecodable` if one fits, otherwise a new one.
-  Both are registry names needing sign-off.
+  Both go through the shared `ourios-semconv` registry.
 
 ## 8. References
 

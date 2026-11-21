@@ -106,6 +106,22 @@ pub struct PassReport {
     pub peak_audit_events: usize,
 }
 
+/// What recovery's passes track between checks: their report, and the
+/// records handed to the record sink since it was last empty.
+#[derive(Default)]
+struct Paced {
+    report: PassReport,
+    records: usize,
+}
+
+/// What replay just handed a sink, if anything.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handed {
+    Nothing,
+    Event,
+    Record,
+}
+
 /// The first wait for a retried pass, and the most any one waits.
 const PASS_BACKOFF_START: Duration = Duration::from_millis(100);
 const PASS_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -134,33 +150,49 @@ impl Passes<'_> {
         )
     }
 
-    fn full(&self) -> bool {
+    /// A sink is at its bound. The records handed over since the record
+    /// sink was last empty count against the audit sink's room: a pass
+    /// that quarantines them (RFC 0025 §3.3) adds one event apiece, and
+    /// must not take it past its bound.
+    fn full(&self, paced: &Paced) -> bool {
         self.publish.record().buffered_bytes() >= self.record_bytes
-            || self.publish.audit().buffered_events() >= self.audit_events
+            || self.publish.audit().buffered_events() + paced.records >= self.audit_events
+    }
+
+    fn sample(&self, report: &mut PassReport) {
+        let (record, audit) = (self.publish.record(), self.publish.audit());
+        report.peak_record_bytes = report.peak_record_bytes.max(record.buffered_bytes());
+        report.peak_audit_events = report.peak_audit_events.max(audit.buffered_events());
     }
 
     /// Publish until neither sink is at its bound, waiting out a store
     /// that retains the drain. `false` once shutdown is asked for while a
     /// sink is full: no pass after it, so replay feeds nothing more.
-    fn make_room(&self, report: &mut PassReport) -> bool {
-        let (record, audit) = (self.publish.record(), self.publish.audit());
-        report.peak_record_bytes = report.peak_record_bytes.max(record.buffered_bytes());
-        report.peak_audit_events = report.peak_audit_events.max(audit.buffered_events());
+    fn make_room(&self, paced: &mut Paced, handed: Handed) -> bool {
+        if handed == Handed::Record {
+            paced.records += 1;
+        }
+        self.sample(&mut paced.report);
         let mut backoff = PASS_BACKOFF_START;
-        while self.full() {
+        while self.full(paced) {
             if self.stopping.load(Ordering::Acquire) {
                 return false;
             }
-            report.passes += 1;
+            paced.report.passes += 1;
             // The registry's `ceiling` trigger: a publish to keep the
             // buffers under their bound.
             let _ = self
                 .publish
                 .write_ordered(self.publish.drain_all(), "ceiling");
-            if !self.full() {
+            if self.publish.record().buffered_bytes() == 0 {
+                paced.records = 0;
+            }
+            // A pass's own record write quarantines into the audit sink.
+            self.sample(&mut paced.report);
+            if !self.full(paced) {
                 break;
             }
-            report.waits += 1;
+            paced.report.waits += 1;
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(PASS_BACKOFF_MAX);
         }
@@ -477,7 +509,7 @@ fn replay_gated(
         gates,
         failure: None,
         stopped: false,
-        passes: PassReport::default(),
+        paced: Paced::default(),
         capture,
         frames_delivered: 0,
         records_fed: 0,
@@ -496,7 +528,7 @@ fn replay_gated(
         max_delivered,
         failure,
         stopped,
-        passes,
+        paced,
         ..
     } = sink;
     let withheld = capture.restore(miner);
@@ -517,7 +549,7 @@ fn replay_gated(
         segments_seen,
         max_delivered,
         withheld,
-        passes,
+        passes: paced.report,
     })
 }
 
@@ -620,7 +652,7 @@ impl ReplayCapture {
     /// Hand this frame's output to the sinks by `route`, calling `pace`
     /// after each item it hands over; `false`, and nothing more handed
     /// over, once `pace` refuses.
-    fn settle(&mut self, route: Route, pace: &mut dyn FnMut() -> bool) -> bool {
+    fn settle(&mut self, route: Route, pace: &mut dyn FnMut(Handed) -> bool) -> bool {
         let (records, events) = (self.records.take(), self.events.take());
         match route {
             // Events first: a record emit can publish inline, and the sink's
@@ -629,17 +661,17 @@ impl ReplayCapture {
             Route::Published => {
                 events.into_iter().all(|event| {
                     self.audit_sink.emit(event);
-                    pace()
+                    pace(Handed::Event)
                 }) && records.into_iter().all(|record| {
                     self.record_sink.emit(record);
-                    pace()
+                    pace(Handed::Record)
                 })
             }
             Route::MinerOnly => {
                 self.withheld.records += records.len() as u64;
                 events
                     .into_iter()
-                    .all(|event| !self.publish_if_reminted(event) || pace())
+                    .all(|event| !self.publish_if_reminted(event) || pace(Handed::Event))
             }
             Route::Folded => {
                 self.withheld.records += records.len() as u64;
@@ -949,7 +981,7 @@ struct DriverSink<'a> {
     failure: Option<TemplateIdsError>,
     /// Shutdown came while a pass waited: recovery stops.
     stopped: bool,
-    passes: PassReport,
+    paced: Paced,
     capture: ReplayCapture,
     frames_delivered: u64,
     records_fed: u64,
@@ -1014,7 +1046,7 @@ impl DriverSink<'_> {
     fn consume_batch(&mut self, offset: WalOffset, payload: &[u8]) -> Result<(), RecoveryError> {
         let kind = FrameKind::TenantOtlpBatch;
         if let Some(passes) = self.gates.passes
-            && !passes.make_room(&mut self.passes)
+            && !passes.make_room(&mut self.paced, Handed::Nothing)
         {
             self.stopped = true;
             return Err(reject(
@@ -1050,8 +1082,8 @@ impl DriverSink<'_> {
                 self.records_fed += count;
                 self.miner
                     .fold_through(&tenant, snapshot_store::high_water(offset));
-                let (passes, report) = (self.gates.passes, &mut self.passes);
-                let mut pace = || passes.is_none_or(|passes| passes.make_room(report));
+                let (passes, paced) = (self.gates.passes, &mut self.paced);
+                let mut pace = |handed| passes.is_none_or(|passes| passes.make_room(paced, handed));
                 if !self.capture.settle(mined, &mut pace) {
                     self.stopped = true;
                     return Err(reject(
@@ -1233,7 +1265,7 @@ mod tests {
         for id in [9, 10, 11, 12] {
             capture.events.push(created(id));
         }
-        assert!(capture.settle(Route::MinerOnly, &mut || true));
+        assert!(capture.settle(Route::MinerOnly, &mut |_| true));
         let withheld = capture.restore(&mut miner);
 
         let forwarded: Vec<AuditEvent> = published.drain();
@@ -1260,7 +1292,7 @@ mod tests {
             },
             failure: None,
             stopped: false,
-            passes: PassReport::default(),
+            paced: Paced::default(),
             capture,
             frames_delivered: 0,
             records_fed: 0,

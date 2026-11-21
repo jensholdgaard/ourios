@@ -15,18 +15,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
+use ourios_config::MinerConfig;
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
 use ourios_core::record::RecordSink;
 use ourios_core::tenant::TenantId;
-use ourios_ingester::audit_sink::SharedParquetAuditSink;
+use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
+use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::record_sink::{ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryDriverError, RecoveryReport};
 use ourios_ingester::snapshot_store;
 use ourios_ingester::template_ids::TemplateIds;
+use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::Store;
-use ourios_wal::{HeldFloor, HeldFloors, WalConfig, WalOffset};
+use ourios_wal::{FrameKind, HeldFloor, HeldFloors, TenantBatch, Wal, WalConfig, WalOffset};
+use prost::Message;
 
 use crate::ingest_support::{request, resource_logs};
 use crate::rfc0052_barrier_support::{
@@ -94,10 +98,34 @@ async fn ingest_at(rig: &BarrierRig, tenant: &str, n: u64, body: &str) -> WalOff
 /// Ingest one frame of `tenant`'s records, stamped `first` onward, and
 /// return it.
 async fn ingest_each(rig: &BarrierRig, tenant: &str, first: u64, bodies: &[&str]) -> WalOffset {
+    ingest_observed(rig, tenant, (first, None), bodies).await
+}
+
+/// `tenant`'s records of `bodies`, stamped `first` onward and observed at
+/// `observed` when given.
+fn stamped(
+    tenant: &str,
+    (first, observed): (u64, Option<u64>),
+    bodies: &[&str],
+) -> opentelemetry_proto::tonic::logs::v1::ResourceLogs {
     let mut logs = resource_logs(tenant, bodies);
     for (n, record) in (first..).zip(&mut logs.scope_logs[0].log_records) {
         record.time_unix_nano = n;
+        if let Some(observed) = observed {
+            record.observed_time_unix_nano = observed;
+        }
     }
+    logs
+}
+
+/// [`ingest_each`], each record also observed at `observed` when given.
+async fn ingest_observed(
+    rig: &BarrierRig,
+    tenant: &str,
+    (first, observed): (u64, Option<u64>),
+    bodies: &[&str],
+) -> WalOffset {
+    let logs = stamped(tenant, (first, observed), bodies);
     rig.pipeline
         .ingest(request(vec![logs]), TenantId::new(tenant))
         .await
@@ -634,4 +662,74 @@ async fn a_replay_that_only_re_mints_events_is_bounded_too() {
         "no row of B's is republished"
     );
     assert!(described(&rig, B));
+}
+
+/// Append one frame of `tenant`'s records to `wal`.
+fn append(wal: &mut Wal, tenant: &str, stamps: (u64, Option<u64>), bodies: &[&str]) {
+    let request = request(vec![stamped(tenant, stamps, bodies)]);
+    let frame = TenantBatch::encode(tenant, &request.encode_to_vec()).expect("frame");
+    wal.append(FrameKind::TenantOtlpBatch, &frame)
+        .expect("append");
+}
+
+/// #1407: a pass that quarantines rows the store rejects for good emits
+/// one event per row into the audit sink while it runs (RFC 0025 §3.3).
+/// A pass never drains more records than the audit sink has room for, so
+/// that never takes it past its bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_that_quarantines_rows_stays_within_the_audit_bound() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (data, audit_root) = (tmp.path().join("data"), tmp.path().join("audit"));
+    for dir in [&data, &audit_root] {
+        std::fs::create_dir_all(dir).expect("root");
+    }
+    let mut wal = Wal::open(wal_config(&tmp.path().join("wal"))).expect("open");
+    let poisoned = [
+        "user 11 logged in",
+        "user 12 logged in",
+        "user 13 logged in",
+    ];
+    append(&mut wal, B, (11, Some(u64::MAX)), &poisoned);
+    append(&mut wal, B, (14, None), &["job 14 queued"]);
+    wal.sync().expect("sync");
+
+    // Both sinks as the receiver builds them: the record sink quarantines
+    // into the audit sink.
+    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+        Store::local(&audit_root).expect("audit store"),
+        100_000,
+    ));
+    let record = SharedParquetSink::new(
+        ParquetRecordSink::new(Store::local(&data).expect("data store"), never_flush())
+            .with_audit_sink(Box::new(audit.clone())),
+    );
+    let publish = PublishCoordinator::new(record.clone(), audit.clone());
+    let mut miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit))
+        .with_record_sink(Box::new(record));
+    let ids = TemplateIds::new(Store::local(&audit_root).expect("audit store"))
+        .with_bootstrap_allowed(true);
+    let stopping = AtomicBool::new(false);
+    let passes = recovery::Passes {
+        publish: &publish,
+        record_bytes: usize::MAX,
+        audit_events: 2,
+        stopping: &stopping,
+    };
+    let report = passes
+        .recover((&mut wal, &mut miner), &tmp.path().join("snapshots"), &ids)
+        .expect("recover")
+        .passes;
+    let _ = publish.write_ordered(publish.drain_all(), "shutdown");
+
+    assert!(
+        report.peak_audit_events <= 2,
+        "quarantine never takes the audit sink past its bound: {report:?}"
+    );
+    let quarantined = audit_events(&audit_root)
+        .iter()
+        .filter(|e| matches!(e.payload, AuditPayload::RecordQuarantined { .. }))
+        .count();
+    assert_eq!(quarantined, 3, "every rejected row is quarantined");
+    let published: Vec<u64> = rows(&data).iter().map(|r| r.time_unix_nano).collect();
+    assert_eq!(published, [14], "and only the encodable row publishes");
 }

@@ -2331,6 +2331,9 @@ pub enum CheckpointError {
         current: WalOffset,
         attempted: WalOffset,
     },
+    /// The held floors do not fit the sidecar (RFC 0056 §3.4); nothing
+    /// was written and the mark did not advance.
+    Unencodable { detail: String },
 }
 
 impl std::fmt::Display for CheckpointError {
@@ -2342,6 +2345,7 @@ impl std::fmt::Display for CheckpointError {
                 "WAL checkpoint is monotonic: segment {} byte {} is below the current segment {} byte {}",
                 attempted.segment, attempted.byte, current.segment, current.byte,
             ),
+            Self::Unencodable { detail } => write!(f, "WAL checkpoint does not encode: {detail}"),
         }
     }
 }
@@ -2350,7 +2354,7 @@ impl std::error::Error for CheckpointError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::NonMonotonic { .. } => None,
+            Self::NonMonotonic { .. } | Self::Unencodable { .. } => None,
         }
     }
 }

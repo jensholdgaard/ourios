@@ -656,3 +656,32 @@ fn rfc0055_5_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve()
          promoted to confirmed durably at open, never read as a fault"
     );
 }
+
+/// RFC0056.8: an idle node offers an unchanged mark on every barrier, so
+/// the version upgrade must not ride on a new mark. A root whose sidecar
+/// is still version 2 is rewritten at version 3 by the next checkpoint of
+/// the same mark.
+#[test]
+fn rfc0056_8_an_unchanged_mark_upgrades_a_version_2_sidecar() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let mut wal = open(root);
+    let mark = wal.append(FrameKind::OtlpBatch, b"x").expect("append");
+    wal.sync().expect("sync");
+    wal.checkpoint(mark).expect("checkpoint");
+    drop(wal);
+    // Rewrite the sidecar as RFC 0052 wrote it: the 32 B header, version 2.
+    let mut header = std::fs::read(root.join(CHECKPOINT)).expect("read")[..32].to_vec();
+    header[4..6].copy_from_slice(&2u16.to_le_bytes());
+    std::fs::write(root.join(CHECKPOINT), &header).expect("downgrade to version 2");
+    assert_eq!(checkpoint_version(root), 2);
+
+    let mut wal = open(root);
+    wal.checkpoint(mark).expect("the same mark again");
+
+    assert_eq!(
+        checkpoint_version(root),
+        3,
+        "the unchanged mark upgrades the sidecar"
+    );
+}

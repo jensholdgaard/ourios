@@ -3,6 +3,9 @@
 //! **global** meter provider, so this must not share a process with another
 //! provider-installing test (the colocated `metrics.rs` compaction test).
 
+#[path = "it/ingest_support/mod.rs"]
+mod ingest_support;
+
 use std::time::{Duration, UNIX_EPOCH};
 
 use opentelemetry_sdk::metrics::data::{
@@ -14,6 +17,7 @@ use ourios_core::audit::{
 use ourios_core::tenant::TenantId;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::metrics::FLUSH_OUTCOME_TRANSIENT;
+use ourios_ingester::receiver::ReceiveError;
 use ourios_parquet::Store;
 use ourios_semconv as semconv;
 
@@ -105,6 +109,7 @@ async fn audit_sink_exports_its_instruments() {
         "the transient error retained the event"
     );
     lose_a_template_event_for_good(&sink);
+    refuse_a_held_tenants_batch(&sink, &dir.path().join("wal")).await;
 
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
@@ -167,7 +172,8 @@ fn lose_a_template_event_for_good(sink: &SharedParquetAuditSink) {
     }
 }
 
-/// The held tenant counts once, under its `ourios.tenant`.
+/// RFC0056.11: the held tenant counts once, under its `ourios.tenant`, and
+/// its refused batch counts as `tenant_held`.
 fn assert_one_tenant_held(rms: &[ResourceMetrics], tenant: &str) {
     let AggregatedMetrics::I64(MetricData::Sum(held)) =
         metric(rms, semconv::OURIOS_RECEIVER_TENANT_HELD)
@@ -185,4 +191,42 @@ fn assert_one_tenant_held(rms: &[ResourceMetrics], tenant: &str) {
         })
         .collect();
     assert_eq!(points, vec![(Some(tenant.to_owned()), 1)]);
+    assert_eq!(
+        tenant_held_refusals(rms),
+        1,
+        "RFC0056.11: the refusal counts"
+    );
+}
+
+/// RFC0056.11: the held tenant's next batch is refused (RFC 0056 §3.3).
+async fn refuse_a_held_tenants_batch(sink: &SharedParquetAuditSink, wal_root: &std::path::Path) {
+    let pipeline = ingest_support::open_pipeline(wal_root).with_held_tenants(sink.held());
+    let refused = pipeline
+        .ingest(
+            ingest_support::request(vec![ingest_support::resource_logs("svc", &["a line"])]),
+            TenantId::new("charlie"),
+        )
+        .await
+        .expect_err("a held tenant's batch is refused");
+    assert!(
+        matches!(refused, ReceiveError::TenantHeld { .. }),
+        "{refused}"
+    );
+}
+
+/// The `ourios.ingest.batches` count with `error.type` `tenant_held`.
+fn tenant_held_refusals(rms: &[ResourceMetrics]) -> u64 {
+    let AggregatedMetrics::U64(MetricData::Sum(batches)) =
+        metric(rms, semconv::OURIOS_INGEST_BATCHES)
+    else {
+        panic!("ingest.batches should be a u64 sum");
+    };
+    batches
+        .data_points()
+        .filter(|dp| {
+            dp.attributes()
+                .any(|kv| kv.key.as_str() == "error.type" && kv.value.as_str() == "tenant_held")
+        })
+        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+        .sum()
 }

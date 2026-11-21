@@ -18,7 +18,10 @@ use prost::Message as _;
 use super::error::{ReceiveError, check_binding};
 use super::materialize::severity_is_out_of_range;
 use super::tenant::assign;
-use crate::metrics::{AcceptedBatch, ERROR_TYPE_PERMISSION_DENIED, IngestMetrics};
+use crate::held::HeldTenants;
+use crate::metrics::{
+    AcceptedBatch, ERROR_TYPE_PERMISSION_DENIED, ERROR_TYPE_TENANT_HELD, IngestMetrics,
+};
 
 /// One decoded export, as a transport hands it to an ingest path.
 pub struct Export<'a> {
@@ -49,6 +52,8 @@ pub(crate) struct Admission {
     /// the rejection path — a write-amplification lever for any
     /// authenticated-but-misconfigured (or hostile) sender.
     denial_audit: Mutex<Option<Box<dyn AuditSink + Send>>>,
+    /// RFC 0056 §3.3: the tenants whose batches are refused.
+    held: HeldTenants,
 }
 
 impl Admission {
@@ -56,11 +61,16 @@ impl Admission {
         Self {
             metrics: IngestMetrics::new(),
             denial_audit: Mutex::new(None),
+            held: HeldTenants::default(),
         }
     }
 
     pub(crate) fn metrics(&self) -> &IngestMetrics {
         &self.metrics
+    }
+
+    pub(crate) fn hold_from(&mut self, held: HeldTenants) {
+        self.held = held;
     }
 
     pub(crate) fn set_denial_audit_sink(&self, sink: Box<dyn AuditSink + Send>) {
@@ -81,6 +91,18 @@ impl Admission {
             return Ok(());
         };
         check_binding(tenant, binding).inspect_err(|e| self.deny(e))
+    }
+
+    /// RFC 0056 §3.3: refuse a held tenant's batch before its append,
+    /// counted on `ourios.ingest.batches` as `tenant_held`.
+    pub(crate) fn enforce_hold(&self, tenant: &TenantId) -> Result<(), ReceiveError> {
+        if !self.held.is_held(tenant) {
+            return Ok(());
+        }
+        self.metrics.record_rejected_batch(ERROR_TYPE_TENANT_HELD);
+        Err(ReceiveError::TenantHeld {
+            tenant: tenant.clone(),
+        })
     }
 
     fn deny(&self, error: &ReceiveError) {

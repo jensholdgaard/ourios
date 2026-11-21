@@ -7,13 +7,10 @@
 //! and the rest land here.
 //! RFC0056.8 is in `ourios-wal`: the codec's tests in `src/checkpoint.rs`
 //! and the version-3 successors in `tests/it/rfc0052_17_reclaim_record/`.
-
-/// Scenario RFC0056.3 — a held tenant's appends are refused, retryably.
-#[test]
-#[ignore = "RFC0056.3 stub — implemented with the receiver's admission slice"]
-fn rfc0056_3_a_held_tenants_appends_are_refused_retryably() {
-    todo!("RFC0056.3 — UNAVAILABLE and 503 naming A, before the WAL append; B accepted");
-}
+//! RFC0056.3 is in `ourios-ingester`'s `tests/it/rfc0056_3_held_admission.rs`,
+//! over both transports.
+//! RFC0056.11 is in `ourios-ingester` too: `src/audit_sink.rs`'s
+//! `a_hold_logs_hold_started_once` and `tests/audit_sink_metrics.rs`.
 
 /// Scenario RFC0056.4 — a snapshot installed by a cut that did not stamp.
 #[test]
@@ -60,15 +57,5 @@ fn rfc0056_10_a_restart_into_an_unrepaired_fault_holds_the_tenant_again() {
     todo!(
         "RFC0056.10 — A held again with floor X0; nothing of A's publishes without its \
          events; neither sink passes its bound during recovery"
-    );
-}
-
-/// Scenario RFC0056.11 — a hold is reported once, and so is each refusal.
-#[test]
-#[ignore = "RFC0056.11 stub — implemented with the receiver's admission slice"]
-fn rfc0056_11_a_hold_is_reported_once_and_so_is_each_refusal() {
-    todo!(
-        "RFC0056.11 — tenant.held counts A once, hold.started is logged once, and the \
-         refused batch counts as tenant_held"
     );
 }

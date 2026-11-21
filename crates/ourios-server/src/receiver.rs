@@ -733,6 +733,38 @@ fn build_barrier(
     (publisher, Arc::new(barrier))
 }
 
+/// The ingest pipeline over `commits` and `miner`: denials and holds go
+/// through `audit_sink`, rotations are captured into the barrier, and the
+/// encode pool publishes through the coordinator.
+fn build_pipeline(
+    (commits, miner): (&Arc<CommitCoordinator>, MinerCluster),
+    audit_sink: &SharedParquetAuditSink,
+    (publisher, barrier): (&PublishCoordinator, &Arc<Barrier>),
+    encode_workers: usize,
+) -> SharedPipeline {
+    Arc::new(
+        IngestPipeline::new(Arc::clone(commits), miner)
+            // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
+            // through the same durable audit sink as every other event.
+            .with_denial_audit_sink(Box::new(audit_sink.clone()))
+            // RFC 0056 §3.3: a held tenant's batches are refused.
+            .with_held_tenants(audit_sink.held())
+            .with_rotation_hook(rotation_capture_hook(Arc::clone(barrier)))
+            // RFC 0035 §3.1: Parquet encoding runs on the pool, off the
+            // global commit gate; the pool emits into the same shared
+            // sink the miner holds, so a cut's drain covers it. The
+            // pipeline drains the pool inside every capture, and the
+            // receiver's shutdown drains it. What the size and ceiling
+            // triggers detach goes to the coordinator's publisher (RFC 0052
+            // §3.1), so it feeds the RFC 0047 §3.3 graph like every other
+            // publish.
+            .with_encode_pool(ourios_ingester::encode_pool::EncodePool::with_publisher(
+                publisher.publisher(),
+                encode_workers,
+            )),
+    )
+}
+
 /// The WAL-segment-rotation hook (RFC 0001 §6.9 primary cadence point):
 /// capture a cut at the rotation `mark`, which the barrier then publishes
 /// and snapshots only if both sinks drained (the no-loss invariant). The
@@ -1304,23 +1336,11 @@ pub async fn serve_until(
         // unlink the frames that start would replay.
         ledger,
     );
-    let pipeline: SharedPipeline = Arc::new(
-        IngestPipeline::new(Arc::clone(&commits), miner)
-            // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
-            // through the same durable audit sink as every other event.
-            .with_denial_audit_sink(Box::new(audit_sink.clone()))
-            .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier)))
-            // RFC 0035 §3.1: Parquet encoding runs on the pool, off the
-            // global commit gate; the pool emits into the same shared
-            // sink the miner holds, so a cut's drain covers it. The
-            // pipeline drains the pool inside every capture; shutdown
-            // drains it below. What the size and ceiling triggers detach
-            // goes to the coordinator's publisher (RFC 0052 §3.1), so it
-            // feeds the RFC 0047 §3.3 graph like every other publish.
-            .with_encode_pool(ourios_ingester::encode_pool::EncodePool::with_publisher(
-                publisher.publisher(),
-                config.encode_workers,
-            )),
+    let pipeline = build_pipeline(
+        (&commits, miner),
+        &audit_sink,
+        (&publisher, &barrier),
+        config.encode_workers,
     );
 
     let (grpc_incoming, grpc_addr, http_listener, http_addr) =

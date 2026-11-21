@@ -20,6 +20,12 @@ pub enum ReceiveError {
         /// The offending selected tenant.
         tenant: ourios_core::tenant::TenantId,
     },
+    /// The tenant is held because its template events could not be
+    /// written (RFC 0056 §3.3): refused before the WAL append, retryably,
+    /// until a restart after the fault is repaired.
+    TenantHeld {
+        tenant: ourios_core::tenant::TenantId,
+    },
     /// The tenant could not be framed into the WAL payload (RFC 0046
     /// §3.3) — unreachable for a transport-validated selector; surfaced
     /// rather than unwrapped.
@@ -93,6 +99,11 @@ pub(super) enum IngestFailure {
     /// schedules no retry of its own, so a conforming client backs off
     /// exponentially.
     ServerTerminal,
+    /// The tenant is held (RFC 0056 §3.3). HTTP 503 / gRPC `UNAVAILABLE`
+    /// like the durability classes, for the same reason: the batch was
+    /// never acked and is valid, so a client must retry rather than drop
+    /// it, and a retry after the restart that clears the hold lands.
+    Held,
     /// Unreachable for a transport-validated selector; our bug.
     /// HTTP 500 / gRPC `INTERNAL`.
     Internal,
@@ -104,6 +115,7 @@ impl IngestFailure {
     pub(super) fn classify(error: &ReceiveError) -> Self {
         match error {
             ReceiveError::TenantDenied { .. } => Self::Denied,
+            ReceiveError::TenantHeld { .. } => Self::Held,
             ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. })
             | ReceiveError::Replication(crate::replicated::write::WriteError::TooLarge {
                 ..
@@ -146,6 +158,7 @@ impl IngestFailure {
             Self::TooLarge => "too_large",
             Self::Unavailable => "unavailable",
             Self::ServerTerminal => "server_terminal",
+            Self::Held => "tenant_held",
             Self::Internal => "internal",
         }
     }
@@ -160,7 +173,9 @@ impl IngestFailure {
     pub(super) fn span_error_type(self) -> Option<&'static str> {
         match self {
             Self::Denied | Self::Unauthenticated | Self::TooLarge => None,
-            Self::Unavailable | Self::ServerTerminal | Self::Internal => Some(self.error_type()),
+            Self::Unavailable | Self::ServerTerminal | Self::Held | Self::Internal => {
+                Some(self.error_type())
+            }
         }
     }
 }
@@ -178,6 +193,13 @@ impl std::fmt::Display for ReceiveError {
                  tenant set (RFC 0026 §3.2)",
                 tenant.as_str(),
             ),
+            Self::TenantHeld { tenant } => write!(
+                f,
+                "tenant `{}` is held: its template events could not be written, \
+                 so its batches are refused until the node restarts after the \
+                 fault is repaired (RFC 0056 §3.3)",
+                tenant.as_str(),
+            ),
             Self::TenantFrame(e) => write!(f, "{e}"),
             Self::WalAppend(e) => write!(f, "{e}"),
             Self::WalSync(e) => write!(f, "{e}"),
@@ -191,7 +213,10 @@ impl std::fmt::Display for ReceiveError {
 impl std::error::Error for ReceiveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::TenantDenied { .. } | Self::Forwarded(_) | Self::ShuttingDown => None,
+            Self::TenantDenied { .. }
+            | Self::TenantHeld { .. }
+            | Self::Forwarded(_)
+            | Self::ShuttingDown => None,
             Self::TenantFrame(e) => Some(e),
             Self::WalAppend(e) => Some(e),
             Self::WalSync(e) => Some(e),

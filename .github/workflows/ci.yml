@@ -714,10 +714,11 @@ jobs:
             echo "::error::ourios-server exited with status $server_status"
           fi
           [ "$unexpected" -eq 0 ] && [ "$server_status" -eq 0 ] && [ -z "$missing_client" ]
-      # The WAL's rotation, floor and latch events (RFC0052.7) and the
-      # listener events (#873) fire only when a disk fails, a tenant pins
-      # the floor, an accept fails or a certificate goes bad, which the
-      # served binary above never reaches. These test binaries drive each
+      # The WAL's rotation, floor and latch events (RFC0052.7), the
+      # listener events (#873) and the held-tenant event (RFC0056.11) fire
+      # only when a disk fails, a tenant pins the floor, an accept fails, a
+      # certificate goes bad or a template event cannot be written, which
+      # the served binary above never reaches. These test binaries drive each
       # one and hand what they emitted to weaver, so an event is never
       # registered without also being live-checked.
       - name: Live-check the fault-path events

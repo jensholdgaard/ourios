@@ -740,6 +740,7 @@ fn rotation_error_type(error: &ReceiveError) -> &'static str {
         ReceiveError::WalAppend(AppendError::Io { .. }) => "io",
         ReceiveError::WalAppend(AppendError::TooLarge { .. })
         | ReceiveError::TenantDenied { .. }
+        | ReceiveError::TenantHeld { .. }
         | ReceiveError::TenantFrame(_)
         | ReceiveError::WalSync(_)
         | ReceiveError::Replication(_)

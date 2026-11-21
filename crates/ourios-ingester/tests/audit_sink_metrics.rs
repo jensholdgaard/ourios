@@ -3,6 +3,9 @@
 //! **global** meter provider, so this must not share a process with another
 //! provider-installing test (the colocated `metrics.rs` compaction test).
 
+#[path = "it/ingest_support/mod.rs"]
+mod ingest_support;
+
 use std::time::{Duration, UNIX_EPOCH};
 
 use opentelemetry_sdk::metrics::data::{
@@ -14,6 +17,7 @@ use ourios_core::audit::{
 use ourios_core::tenant::TenantId;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::metrics::FLUSH_OUTCOME_TRANSIENT;
+use ourios_ingester::receiver::ReceiveError;
 use ourios_parquet::Store;
 use ourios_semconv as semconv;
 
@@ -38,6 +42,22 @@ fn names(rms: &[ResourceMetrics]) -> Vec<String> {
         .flat_map(ScopeMetrics::metrics)
         .map(|m| m.name().to_string())
         .collect()
+}
+
+fn assert_exported(rms: &[ResourceMetrics]) {
+    let collected = names(rms);
+    for expected in [
+        semconv::OURIOS_AUDIT_SINK_BUFFER_USAGE,
+        semconv::OURIOS_AUDIT_SINK_FLUSHES,
+        semconv::OURIOS_AUDIT_SINK_FLUSH_EVENTS,
+        semconv::OURIOS_AUDIT_SINK_FLUSH_ERRORS,
+        semconv::OURIOS_AUDIT_SINK_DERIVE_ERRORS,
+    ] {
+        assert!(
+            collected.iter().any(|n| n == expected),
+            "exported stream missing {expected}, got {collected:?}",
+        );
+    }
 }
 
 fn metric<'a>(rms: &'a [ResourceMetrics], name: &str) -> &'a AggregatedMetrics {
@@ -65,7 +85,8 @@ async fn audit_sink_exports_its_instruments() {
     let store_root = dir.path().join("store");
     std::fs::create_dir_all(&store_root).expect("create store root");
     let store = Store::local(&store_root).expect("store");
-    let mut sink = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 1024));
+    // Holding is inert until phase 3; a second sink would skew the gauge.
+    let mut sink = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 1024)).holding();
 
     // Phase 1 — three events across two tenants flush to two files.
     sink.emit(created_event("alpha", 1));
@@ -87,23 +108,13 @@ async fn audit_sink_exports_its_instruments() {
         1,
         "the transient error retained the event"
     );
+    lose_a_template_event_for_good(&sink);
+    refuse_a_held_tenants_batch(&sink, &dir.path().join("wal")).await;
 
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
 
-    let collected = names(&rms);
-    for expected in [
-        semconv::OURIOS_AUDIT_SINK_BUFFER_USAGE,
-        semconv::OURIOS_AUDIT_SINK_FLUSHES,
-        semconv::OURIOS_AUDIT_SINK_FLUSH_EVENTS,
-        semconv::OURIOS_AUDIT_SINK_FLUSH_ERRORS,
-        semconv::OURIOS_AUDIT_SINK_DERIVE_ERRORS,
-    ] {
-        assert!(
-            collected.iter().any(|n| n == expected),
-            "exported stream missing {expected}, got {collected:?}",
-        );
-    }
+    assert_exported(&rms);
 
     assert_eq!(
         u64_sum(&rms, semconv::OURIOS_AUDIT_SINK_FLUSHES),
@@ -144,4 +155,78 @@ async fn audit_sink_exports_its_instruments() {
         1,
         "the buffer gauge reports the retained event",
     );
+
+    assert_one_tenant_held(&rms, "charlie");
+}
+
+/// Phase 3 — RFC 0056 §3.2: a template event lost for good (a pre-epoch
+/// timestamp derives no partition, so no store I/O) holds its tenant,
+/// which counts once however many of its events are lost.
+fn lose_a_template_event_for_good(sink: &SharedParquetAuditSink) {
+    for _ in 0..2 {
+        let lost = AuditEvent {
+            timestamp: UNIX_EPOCH - Duration::from_secs(1),
+            ..created_event("charlie", 1)
+        };
+        let _ = sink.write_retaining(vec![lost]);
+    }
+}
+
+/// RFC0056.11: the held tenant counts once, under its `ourios.tenant`, and
+/// its refused batch counts as `tenant_held`.
+fn assert_one_tenant_held(rms: &[ResourceMetrics], tenant: &str) {
+    let AggregatedMetrics::I64(MetricData::Sum(held)) =
+        metric(rms, semconv::OURIOS_RECEIVER_TENANT_HELD)
+    else {
+        panic!("tenant.held should be an i64 sum (UpDownCounter)");
+    };
+    let points: Vec<_> = held
+        .data_points()
+        .map(|dp| {
+            let tenant = dp
+                .attributes()
+                .find(|kv| kv.key.as_str() == semconv::OURIOS_TENANT)
+                .map(|kv| kv.value.as_str().into_owned());
+            (tenant, dp.value())
+        })
+        .collect();
+    assert_eq!(points, vec![(Some(tenant.to_owned()), 1)]);
+    assert_eq!(
+        tenant_held_refusals(rms),
+        1,
+        "RFC0056.11: the refusal counts"
+    );
+}
+
+/// RFC0056.11: the held tenant's next batch is refused (RFC 0056 §3.3).
+async fn refuse_a_held_tenants_batch(sink: &SharedParquetAuditSink, wal_root: &std::path::Path) {
+    let pipeline = ingest_support::open_pipeline(wal_root).with_held_tenants(sink.held());
+    let refused = pipeline
+        .ingest(
+            ingest_support::request(vec![ingest_support::resource_logs("svc", &["a line"])]),
+            TenantId::new("charlie"),
+        )
+        .await
+        .expect_err("a held tenant's batch is refused");
+    assert!(
+        matches!(refused, ReceiveError::TenantHeld { .. }),
+        "{refused}"
+    );
+}
+
+/// The `ourios.ingest.batches` count with `error.type` `tenant_held`.
+fn tenant_held_refusals(rms: &[ResourceMetrics]) -> u64 {
+    let AggregatedMetrics::U64(MetricData::Sum(batches)) =
+        metric(rms, semconv::OURIOS_INGEST_BATCHES)
+    else {
+        panic!("ingest.batches should be a u64 sum");
+    };
+    batches
+        .data_points()
+        .filter(|dp| {
+            dp.attributes()
+                .any(|kv| kv.key.as_str() == "error.type" && kv.value.as_str() == "tenant_held")
+        })
+        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+        .sum()
 }

@@ -542,6 +542,15 @@ pub const OURIOS_RECEIVER_TENANT_DIVERGENCES_DESCRIPTION: &str = "ResourceLogs g
 /// `ourios.receiver.tenant.divergences` unit (UCUM).
 pub const OURIOS_RECEIVER_TENANT_DIVERGENCES_UNIT: &str = "{divergence}";
 
+/// `ourios.receiver.tenant.held` (updowncounter, unit `{tenant}`).
+pub const OURIOS_RECEIVER_TENANT_HELD: &str = "ourios.receiver.tenant.held";
+
+/// `ourios.receiver.tenant.held` description (the registry `brief`).
+pub const OURIOS_RECEIVER_TENANT_HELD_DESCRIPTION: &str = "Tenants currently held because their template events could not be written for good (RFC 0056 §3.2).";
+
+/// `ourios.receiver.tenant.held` unit (UCUM).
+pub const OURIOS_RECEIVER_TENANT_HELD_UNIT: &str = "{tenant}";
+
 /// `ourios.receiver.tls.handshake_failures` (counter, unit `{failure}`).
 pub const OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES: &str = "ourios.receiver.tls.handshake_failures";
 
@@ -1320,6 +1329,9 @@ pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_STOPPED: &str =
 
 /// `ourios.receiver.tenant.divergence` log event name.
 pub const EVENT_OURIOS_RECEIVER_TENANT_DIVERGENCE: &str = "ourios.receiver.tenant.divergence";
+
+/// `ourios.receiver.tenant.hold.started` log event name.
+pub const EVENT_OURIOS_RECEIVER_TENANT_HOLD_STARTED: &str = "ourios.receiver.tenant.hold.started";
 
 /// `ourios.receiver.tenant.watch_saturated` log event name.
 pub const EVENT_OURIOS_RECEIVER_TENANT_WATCH_SATURATED: &str =

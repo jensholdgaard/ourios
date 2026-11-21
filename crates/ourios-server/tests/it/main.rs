@@ -44,6 +44,7 @@ mod rfc0048_5_backfill;
 mod rfc0048_grammar;
 mod rfc0050_3_served_mixed_stream;
 mod rfc0051_layering;
+mod rfc0056_held_tenant;
 mod rfc0059_6_bootstrap_sigterm;
 mod rfc0060_refresh_config;
 mod rfc0062_8_engine_names;

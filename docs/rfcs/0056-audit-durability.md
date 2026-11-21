@@ -1,7 +1,7 @@
 ---
 rfc: 0056
 title: Audit-sink durability on permanent write failure
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-15
@@ -11,8 +11,10 @@ superseded-by: —
 
 # RFC 0056 — Audit-sink durability on permanent write failure
 
-> **Status note.** `specified` (2026-11-20, maintainer-approved, with
-> the §7 answers). Tracks #1294. 2026-11-20: the maintainer
+> **Status note.** `red`. Every §5 scenario has an `#[ignore]`d `todo!`
+> stub in `ourios-server` (`tests/it/rfc0056_held_tenant.rs`) naming the
+> slice that discharges it. Specified 2026-11-20 (maintainer-approved,
+> with the §7 answers). Tracks #1294. 2026-11-20: the maintainer
 > chose this RFC's per-tenant hold over the alternative of publishing and
 > holding the node's checkpoint (§4.1). §3 below is the design; §9 keeps
 > the RFC 0053 draft's wording it grew from, and §3.7 says where it

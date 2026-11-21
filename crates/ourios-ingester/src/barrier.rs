@@ -1268,4 +1268,91 @@ mod tests {
             "the cut's records still reached the store",
         );
     }
+
+    /// A journal whose checkpoint write lands, mark and floors, and is then
+    /// reported failed: the parent-directory fsync after the sidecar's
+    /// rename failing.
+    #[derive(Default)]
+    struct LandsThenFails {
+        mark: Option<WalOffset>,
+        floors: ourios_wal::HeldFloors,
+    }
+
+    impl Journal for LandsThenFails {
+        fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+            unreachable!("the barrier never appends")
+        }
+
+        fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+            unreachable!("the barrier never syncs")
+        }
+
+        fn unflushed_bytes(&self) -> u64 {
+            0
+        }
+
+        fn checkpoint_with_floors(
+            &mut self,
+            durable_to: WalOffset,
+            floors: &ourios_wal::HeldFloors,
+        ) -> Result<(), ourios_wal::ReclaimError> {
+            self.mark = Some(durable_to);
+            self.floors.clone_from(floors);
+            Err(ourios_wal::ReclaimError::Checkpoint(
+                ourios_wal::CheckpointError::Io {
+                    op: "fsync CHECKPOINT's directory",
+                    source: std::io::Error::other("injected after the rename"),
+                },
+            ))
+        }
+
+        fn last_checkpoint(&self) -> Option<WalOffset> {
+            self.mark
+        }
+
+        fn held_floors(&self) -> ourios_wal::HeldFloors {
+            self.floors.clone()
+        }
+    }
+
+    /// RFC 0056 §3.4: a floor is assigned once. A stamp that failed after
+    /// its rename has advanced the mark, so a floor recomputed at the next
+    /// cut would rise over the held tenant's records that never published.
+    #[test]
+    fn a_floor_is_kept_across_a_stamp_that_failed_after_its_rename() {
+        let rig = Rig::new();
+        let commits = CommitCoordinator::new(
+            Box::new(LandsThenFails::default()),
+            Duration::ZERO,
+            u64::MAX,
+        );
+        let barrier = Barrier::new(
+            rig.publish.clone(),
+            Arc::clone(&commits),
+            rig.audit_root.with_file_name("snapshots"),
+            usize::MAX,
+        );
+        let held = std::collections::BTreeSet::from([TenantId::new("acme")]);
+        let floor = |at| ourios_wal::HeldFloors::from([(TenantId::new("acme"), at)]);
+
+        let _ = barrier.stamp(Some(offset(50)), &std::collections::BTreeSet::new());
+        let _ = barrier.stamp(Some(offset(100)), &held);
+        assert_eq!(
+            commits.held_floors(),
+            floor(ourios_wal::HeldFloor::At(offset(50))),
+            "held after the stamp at 50 landed"
+        );
+        assert_eq!(
+            commits.last_checkpoint(),
+            Some(offset(100)),
+            "the mark advanced"
+        );
+
+        let _ = barrier.stamp(Some(offset(150)), &held);
+        assert_eq!(
+            commits.held_floors(),
+            floor(ourios_wal::HeldFloor::At(offset(50))),
+            "the floor assigned before the failure stands"
+        );
+    }
 }

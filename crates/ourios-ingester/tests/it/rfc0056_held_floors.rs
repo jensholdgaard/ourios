@@ -11,15 +11,16 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
 use ourios_core::tenant::TenantId;
+use ourios_ingester::audit_sink::SharedParquetAuditSink;
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
-use ourios_ingester::recovery::{self, RecoveryReport};
+use ourios_ingester::recovery::{self, RecoveryDriverError, RecoveryReport};
 use ourios_ingester::snapshot_store;
 use ourios_ingester::template_ids::TemplateIds;
 use ourios_parquet::Store;
@@ -85,8 +86,14 @@ fn hold(rig: &BarrierRig, tenant: &str) {
 
 /// Ingest one record of `tenant` stamped `n` and return its frame.
 async fn ingest_at(rig: &BarrierRig, tenant: &str, n: u64, body: &str) -> WalOffset {
-    let mut logs = resource_logs(tenant, &[body]);
-    for record in &mut logs.scope_logs[0].log_records {
+    ingest_each(rig, tenant, n, &[body]).await
+}
+
+/// Ingest one frame of `tenant`'s records, stamped `first` onward, and
+/// return it.
+async fn ingest_each(rig: &BarrierRig, tenant: &str, first: u64, bodies: &[&str]) -> WalOffset {
+    let mut logs = resource_logs(tenant, bodies);
+    for (n, record) in (first..).zip(&mut logs.scope_logs[0].log_records) {
         record.time_unix_nano = n;
     }
     rig.pipeline
@@ -378,46 +385,146 @@ impl AuditSink for PreEpochFor {
     }
 }
 
+/// How [`unrepaired_recovery`] runs: whether shutdown is asked for on the
+/// first of B's failed writes, and where its outcome lands.
+struct Paced {
+    blocked: Blocked,
+    stop_on_failure: bool,
+    outcome: Arc<Mutex<Option<Result<RecoveryReport, RecoveryDriverError>>>>,
+}
+
 /// Recovery in passes bounded at one buffered byte and one buffered
-/// event, with A's fault still present; its report lands in `report`.
-fn unrepaired_recovery(tmp: &Path, report: Arc<Mutex<Option<RecoveryReport>>>) -> Box<Startup> {
+/// event, with A's fault still present and B's audit writes blocked until
+/// one has failed.
+fn unrepaired_recovery(tmp: &Path, paced: Paced) -> Box<Startup> {
     let (snapshots, audit) = (tmp.join("wal").join("snapshots"), tmp.join("audit"));
     Box::new(move |wal, miner, publish| {
+        let Paced {
+            blocked,
+            stop_on_failure,
+            outcome,
+        } = paced;
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopping);
+        let unblocked = blocked.lift_after_a_failure(publish.audit().clone(), move || {
+            stop.store(stop_on_failure, Ordering::Release);
+        });
         let real = miner.replace_audit_sink(Box::new(ourios_core::audit::NoOpAuditSink));
         let _ = miner.replace_audit_sink(Box::new(PreEpochFor(real)));
         let ids = TemplateIds::new(Store::local(&audit).expect("audit store"))
             .with_bootstrap_allowed(true);
-        let stopping = AtomicBool::new(false);
         let passes = recovery::Passes {
             publish,
             record_bytes: 1,
             audit_events: 1,
             stopping: &stopping,
         };
-        let recovered = passes
-            .recover((wal, miner), &snapshots, &ids)
-            .expect("recover");
-        let horizons = recovered.accepted_horizons();
-        *report.lock().expect("report") = Some(recovered);
+        let recovered = passes.recover((wal, miner), &snapshots, &ids);
+        unblocked.join().expect("B's writes recovered");
+        let horizons = recovered
+            .as_ref()
+            .map(RecoveryReport::accepted_horizons)
+            .unwrap_or_default();
+        *outcome.lock().expect("outcome") = Some(recovered);
         horizons
     })
 }
 
-/// B's audit partition refuses every write until `for_ms` has passed: a
-/// file sits where its directory belongs.
-fn block_b_audit_writes(tmp: &Path, for_ms: u64) -> std::thread::JoinHandle<()> {
-    let partition = tmp
-        .join("audit")
-        .join("audit")
-        .join(format!("tenant_id={B}"));
-    let aside = partition.with_extension("aside");
-    std::fs::rename(&partition, &aside).expect("move B's partition aside");
-    std::fs::write(&partition, b"not a directory").expect("block it");
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(for_ms));
-        std::fs::remove_file(&partition).expect("unblock");
-        std::fs::rename(&aside, &partition).expect("put B's partition back");
-    })
+/// B's audit partition, refusing every write: a file sits where its
+/// directory belongs, so each write fails transiently.
+struct Blocked {
+    partition: std::path::PathBuf,
+    aside: std::path::PathBuf,
+}
+
+impl Blocked {
+    fn b_audit_writes(tmp: &Path) -> Self {
+        let partition = tmp
+            .join("audit")
+            .join("audit")
+            .join(format!("tenant_id={B}"));
+        let aside = partition.with_extension("aside");
+        std::fs::rename(&partition, &aside).expect("move B's partition aside");
+        std::fs::write(&partition, b"not a directory").expect("block it");
+        Self { partition, aside }
+    }
+
+    /// Lift the block once `audit` has seen a write fail transiently, so
+    /// recovery has met the failure before it clears; `first` runs before
+    /// the lift.
+    fn lift_after_a_failure(
+        self,
+        audit: SharedParquetAuditSink,
+        first: impl FnOnce() + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while audit.flush_errors_transient() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no write of B's failed"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            first();
+            std::fs::remove_file(&self.partition).expect("unblock");
+            std::fs::rename(&self.aside, &self.partition).expect("put B's partition back");
+        })
+    }
+}
+
+/// RFC0056.5's node with an unpublished tail of B's in one frame, killed.
+async fn held_with_a_tail_of_b(tmp: &Path) -> Held {
+    let (rig, held) = held_after_x0(tmp).await;
+    ingest_each(
+        &rig,
+        B,
+        14,
+        &["job 14 queued", "cache warmed in 15 ms", "disk 16 is full"],
+    )
+    .await;
+    drop(rig);
+    held
+}
+
+/// Restart over `tmp` with A's fault unrepaired and B's audit writes
+/// blocked until one fails, shutdown asked for then when `stop`.
+fn restart_unrepaired(
+    tmp: &Path,
+    stop: bool,
+) -> (BarrierRig, Result<RecoveryReport, RecoveryDriverError>) {
+    let outcome = Arc::new(Mutex::new(None));
+    let paced = Paced {
+        blocked: Blocked::b_audit_writes(tmp),
+        stop_on_failure: stop,
+        outcome: Arc::clone(&outcome),
+    };
+    let rig = BarrierRig::build(
+        tmp,
+        RigSpec {
+            startup: Some(unrepaired_recovery(tmp, paced)),
+            ..spec(tmp, false)
+        },
+    );
+    let recovered = outcome
+        .lock()
+        .expect("outcome")
+        .take()
+        .expect("recovery ran");
+    (rig, recovered)
+}
+
+/// RFC 0056 §3.2: shutdown asked for while a pass waits stops recovery,
+/// even when the store has recovered by the next retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_while_a_pass_waits_stops_recovery() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    held_with_a_tail_of_b(tmp.path()).await;
+    let (_, recovered) = restart_unrepaired(tmp.path(), true);
+    assert!(
+        matches!(recovered, Err(RecoveryDriverError::Stopped)),
+        "{recovered:?}"
+    );
 }
 
 /// Scenario RFC0056.10 — a restart into an unrepaired fault holds the
@@ -425,44 +532,20 @@ fn block_b_audit_writes(tmp: &Path, for_ms: u64) -> std::thread::JoinHandle<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rfc0056_10_a_restart_into_an_unrepaired_fault_holds_the_tenant_again() {
     let tmp = tempfile::TempDir::new().expect("temp");
-    let (rig, held) = held_after_x0(tmp.path()).await;
-    for (n, body) in [
-        (14, "job 14 queued"),
-        (15, "cache warmed in 15 ms"),
-        (16, "disk 16 is full"),
-    ] {
-        ingest_at(&rig, B, n, body).await;
-    }
-    drop(rig);
-
-    let unblock = block_b_audit_writes(tmp.path(), 400);
-    let report = Arc::new(Mutex::new(None));
-    let rig = BarrierRig::build(
-        tmp.path(),
-        RigSpec {
-            startup: Some(unrepaired_recovery(tmp.path(), Arc::clone(&report))),
-            ..spec(tmp.path(), false)
-        },
-    );
-    unblock.join().expect("unblocked");
+    let held = held_with_a_tail_of_b(tmp.path()).await;
+    let (rig, recovered) = restart_unrepaired(tmp.path(), false);
     let _ = rig
         .publish
         .write_ordered(rig.publish.drain_all(), "shutdown");
-    let passes = report
-        .lock()
-        .expect("report")
-        .take()
-        .expect("recovered")
-        .passes;
+    let passes = recovered.expect("recovered").passes;
 
     assert!(
         rig.audit.held().is_held(&TenantId::new(A)),
         "A is held again"
     );
-    assert_eq!(
-        (passes.peak_record_bytes, passes.peak_audit_events),
-        (0, 0),
-        "no frame is read while a sink is at its bound: {passes:?}"
+    assert!(
+        passes.peak_records <= 1 && passes.peak_audit_events <= 1,
+        "neither sink is fed past its bound of one: {passes:?}"
     );
     assert!(
         passes.waits > 0,

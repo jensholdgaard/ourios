@@ -74,11 +74,14 @@ pub struct RecoveryReport {
     pub passes: PassReport,
 }
 
-/// RFC 0056 §3.2: recovery publishes in bounded passes. Before it reads a
-/// frame, a sink at its bound is published through the coordinator; one
-/// still at its bound after the pass, because a transient failure
-/// retained the drain, stops the reading until a retry frees capacity.
-/// Recovery never reads past a full sink.
+/// RFC 0056 §3.2: recovery publishes in bounded passes. After every event
+/// and record replay hands a sink, and before it reads a frame, a sink at
+/// its bound is published through the coordinator; one still at its bound
+/// after the pass, because a transient failure retained the drain, stops
+/// the replay until a retry frees capacity. Recovery never feeds a full
+/// sink: a sink holds at most its bound, less one, plus the one event or
+/// record just handed to it, which may alone exceed a byte bound and is
+/// published by the next pass.
 pub struct Passes<'a> {
     /// The coordinator over the sinks the miner replays into.
     pub publish: &'a PublishCoordinator,
@@ -97,9 +100,11 @@ pub struct PassReport {
     pub passes: u64,
     /// Waits for a pass to free capacity.
     pub waits: u64,
-    /// The most bytes the record sink held when a frame was read.
+    /// The most bytes the record sink held at any check.
     pub peak_record_bytes: usize,
-    /// The most events the audit sink held when a frame was read.
+    /// The most records the record sink held at any check.
+    pub peak_records: usize,
+    /// The most events the audit sink held at any check.
     pub peak_audit_events: usize,
 }
 
@@ -131,23 +136,24 @@ impl Passes<'_> {
         )
     }
 
-    fn buffered(&self) -> (usize, usize) {
-        (
-            self.publish.record().buffered_bytes(),
-            self.publish.audit().buffered_events(),
-        )
-    }
-
     fn full(&self) -> bool {
-        let (bytes, events) = self.buffered();
-        bytes >= self.record_bytes || events >= self.audit_events
+        self.publish.record().buffered_bytes() >= self.record_bytes
+            || self.publish.audit().buffered_events() >= self.audit_events
     }
 
     /// Publish until neither sink is at its bound, waiting out a store
-    /// that retains the drain. `false` if shutdown came first.
+    /// that retains the drain. `false` once shutdown is asked for while a
+    /// sink is full: no pass after it, so replay feeds nothing more.
     fn make_room(&self, report: &mut PassReport) -> bool {
+        let (record, audit) = (self.publish.record(), self.publish.audit());
+        report.peak_record_bytes = report.peak_record_bytes.max(record.buffered_bytes());
+        report.peak_records = report.peak_records.max(record.buffered_records());
+        report.peak_audit_events = report.peak_audit_events.max(audit.buffered_events());
         let mut backoff = PASS_BACKOFF_START;
         while self.full() {
+            if self.stopping.load(Ordering::Acquire) {
+                return false;
+            }
             report.passes += 1;
             // The registry's `ceiling` trigger: a publish to keep the
             // buffers under their bound.
@@ -157,16 +163,10 @@ impl Passes<'_> {
             if !self.full() {
                 break;
             }
-            if self.stopping.load(Ordering::Acquire) {
-                return false;
-            }
             report.waits += 1;
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(PASS_BACKOFF_MAX);
         }
-        let (bytes, events) = self.buffered();
-        report.peak_record_bytes = report.peak_record_bytes.max(bytes);
-        report.peak_audit_events = report.peak_audit_events.max(events);
         true
     }
 }
@@ -620,43 +620,49 @@ impl ReplayCapture {
 
     /// Forward what the frame just mined emitted, in emission order, or
     /// count it as withheld.
-    fn settle(&mut self, route: Route) {
+    /// Hand this frame's output to the sinks by `route`, calling `pace`
+    /// after each item it hands over; `false`, and nothing more handed
+    /// over, once `pace` refuses.
+    fn settle(&mut self, route: Route, pace: &mut dyn FnMut() -> bool) -> bool {
         let (records, events) = (self.records.take(), self.events.take());
         match route {
             // Events first: a record emit can publish inline, and the sink's
             // audit barrier must already see the template event it flushes
             // ahead of that record.
             Route::Published => {
-                for event in events {
+                events.into_iter().all(|event| {
                     self.audit_sink.emit(event);
-                }
-                for record in records {
+                    pace()
+                }) && records.into_iter().all(|record| {
                     self.record_sink.emit(record);
-                }
+                    pace()
+                })
             }
             Route::MinerOnly => {
                 self.withheld.records += records.len() as u64;
-                for event in events {
-                    self.publish_if_reminted(event);
-                }
+                events
+                    .into_iter()
+                    .all(|event| !self.publish_if_reminted(event) || pace())
             }
             Route::Folded => {
                 self.withheld.records += records.len() as u64;
                 self.withheld.events += events.len() as u64;
+                true
             }
         }
     }
 
-    /// Publish an event of a template this replay minted, whose id no
-    /// published event binds yet, so rows ingested after startup resolve;
-    /// withhold every other, whose original was published before the
-    /// crash.
-    fn publish_if_reminted(&mut self, event: AuditEvent) {
+    /// Whether it published `event`.
+    fn publish_if_reminted(&mut self, event: AuditEvent) -> bool {
         match &event.payload {
             AuditPayload::Template { template_id, .. } if *template_id > self.seated => {
                 self.audit_sink.emit(event);
+                true
             }
-            _ => self.withheld.events += 1,
+            _ => {
+                self.withheld.events += 1;
+                false
+            }
         }
     }
 
@@ -1047,7 +1053,16 @@ impl DriverSink<'_> {
                 self.records_fed += count;
                 self.miner
                     .fold_through(&tenant, snapshot_store::high_water(offset));
-                self.capture.settle(mined);
+                let (passes, report) = (self.gates.passes, &mut self.passes);
+                let mut pace = || passes.is_none_or(|passes| passes.make_room(report));
+                if !self.capture.settle(mined, &mut pace) {
+                    self.stopped = true;
+                    return Err(reject(
+                        kind,
+                        offset,
+                        &"shutdown while a recovery pass waited",
+                    ));
+                }
             }
         }
         Ok(())
@@ -1221,7 +1236,7 @@ mod tests {
         for id in [9, 10, 11, 12] {
             capture.events.push(created(id));
         }
-        capture.settle(Route::MinerOnly);
+        assert!(capture.settle(Route::MinerOnly, &mut || true));
         let withheld = capture.restore(&mut miner);
 
         let forwarded: Vec<AuditEvent> = published.drain();

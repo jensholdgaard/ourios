@@ -1147,9 +1147,8 @@ impl std::fmt::Display for StartError {
 fn recovery_failed(error: &recovery::RecoveryDriverError) -> StartError {
     let message = format!("startup recovery: {error}");
     match error {
-        recovery::RecoveryDriverError::TemplateIds(TemplateIdsError::Interrupted { .. }) => {
-            StartError::Interrupted(message)
-        }
+        recovery::RecoveryDriverError::TemplateIds(TemplateIdsError::Interrupted { .. })
+        | recovery::RecoveryDriverError::Stopped => StartError::Interrupted(message),
         _ => StartError::Failed(message),
     }
 }
@@ -3538,6 +3537,16 @@ mod tests {
         assert!(matches!(
             recovery_failed(&failed),
             StartError::Failed(message) if message.contains("data/x.parquet")
+        ));
+    }
+
+    /// RFC 0056 §3.2: a shutdown while a recovery pass waits out the store
+    /// is a requested stop, not a failed start.
+    #[test]
+    fn a_shutdown_during_a_recovery_pass_is_a_requested_stop() {
+        assert!(matches!(
+            recovery_failed(&ourios_ingester::recovery::RecoveryDriverError::Stopped),
+            StartError::Interrupted(message) if message.contains("shutdown")
         ));
     }
 

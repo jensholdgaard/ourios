@@ -1214,7 +1214,9 @@ impl Wal {
             // housekeeping would stay gated forever. Only an equal
             // mark on an already-version-2 sidecar takes the no-write
             // fast path.
-            if durable_to == current && self.checkpoint_is_settled() {
+            let settled = self.checkpoint_is_settled();
+            if durable_to == current && checkpoint::skips_rewrite(self.checkpoint_version, settled)
+            {
                 return Ok(());
             }
         }
@@ -1270,7 +1272,7 @@ impl Wal {
         if self.reclaim_gate != ReclaimGate::Open {
             return false;
         }
-        if self.checkpoint_version != Some(checkpoint::SidecarVersion::Current) {
+        if !checkpoint::reclaims_under(self.checkpoint_version) {
             return false;
         }
         self.reclaim.checkpoint_witnessed()

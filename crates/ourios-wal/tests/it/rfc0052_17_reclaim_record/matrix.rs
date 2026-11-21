@@ -685,3 +685,28 @@ fn rfc0056_8_an_unchanged_mark_upgrades_a_version_2_sidecar() {
         "the unchanged mark upgrades the sidecar"
     );
 }
+
+/// RFC0056.8: a witnessed version-2 checkpoint is a complete RFC 0052
+/// checkpoint, so housekeeping may reclaim under it before the version-3
+/// upgrade. Gating reclamation on that write would let a full disk, which
+/// fails the write, block the only thing that frees space.
+#[test]
+fn rfc0056_8_a_witnessed_version_2_checkpoint_is_reclaimable_before_the_upgrade() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let mut wal = open(root);
+    let mark = wal.append(FrameKind::OtlpBatch, b"x").expect("append");
+    wal.sync().expect("sync");
+    wal.checkpoint(mark).expect("checkpoint");
+    drop(wal);
+    let mut header = std::fs::read(root.join(CHECKPOINT)).expect("read")[..32].to_vec();
+    header[4..6].copy_from_slice(&2u16.to_le_bytes());
+    std::fs::write(root.join(CHECKPOINT), &header).expect("downgrade to version 2");
+
+    let wal = open(root);
+
+    assert!(
+        wal.reclaim_state().reclaimable,
+        "reclaimable under the version-2 checkpoint, no write needed",
+    );
+}

@@ -55,6 +55,25 @@ pub(crate) enum SidecarVersion {
     Current,
 }
 
+/// Whether a sidecar at `version` lets housekeeping reclaim under it. A
+/// witnessed version-2 checkpoint is a complete RFC 0052 one, so
+/// reclamation does not wait for RFC 0056's version 3: a full disk, which
+/// fails that write, would otherwise block the reclamation that frees
+/// space.
+pub(crate) fn reclaims_under(version: Option<SidecarVersion>) -> bool {
+    matches!(
+        version,
+        Some(SidecarVersion::Reclaim | SidecarVersion::Current)
+    )
+}
+
+/// Whether re-asserting an unchanged mark may skip the write: only a
+/// `settled` sidecar already at version 3. RFC 0052's upgrade one step on,
+/// so an idle node's version-2 sidecar still reaches version 3.
+pub(crate) fn skips_rewrite(version: Option<SidecarVersion>, settled: bool) -> bool {
+    settled && version == Some(SidecarVersion::Current)
+}
+
 /// Where a held tenant's records are durable through (RFC 0056 §3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeldFloor {

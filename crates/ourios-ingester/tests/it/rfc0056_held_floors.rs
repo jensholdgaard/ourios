@@ -16,10 +16,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
+use ourios_core::record::RecordSink;
 use ourios_core::tenant::TenantId;
 use ourios_ingester::audit_sink::SharedParquetAuditSink;
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
+use ourios_ingester::record_sink::{ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryDriverError, RecoveryReport};
 use ourios_ingester::snapshot_store;
 use ourios_ingester::template_ids::TemplateIds;
@@ -28,7 +30,7 @@ use ourios_wal::{HeldFloor, HeldFloors, WalConfig, WalOffset};
 
 use crate::ingest_support::{request, resource_logs};
 use crate::rfc0052_barrier_support::{
-    BarrierRig, RigSpec, Startup, audit_events, rows, wal_config,
+    BarrierRig, RigSpec, Startup, audit_events, never_flush, rows, wal_config,
 };
 
 const A: &str = "acme";
@@ -138,6 +140,25 @@ fn described(rig: &BarrierRig, tenant: &str) -> bool {
         .iter()
         .filter(|r| r.tenant_id.as_str() == tenant)
         .all(|r| events.contains(&r.template_id))
+}
+
+/// The most bytes the record sink buffers for any one of `tenant`'s
+/// published rows.
+fn largest_record(rig: &BarrierRig, tenant: &str) -> usize {
+    let scratch = tempfile::TempDir::new().expect("temp");
+    rows(&rig.data_root)
+        .into_iter()
+        .filter(|r| r.tenant_id.as_str() == tenant)
+        .map(|row| {
+            let sink = SharedParquetSink::new(ParquetRecordSink::new(
+                Store::local(scratch.path()).expect("scratch store"),
+                never_flush(),
+            ));
+            sink.clone().emit(row);
+            sink.buffered_bytes()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn events_of(rig: &BarrierRig, tenant: &str) -> usize {
@@ -544,8 +565,8 @@ async fn rfc0056_10_a_restart_into_an_unrepaired_fault_holds_the_tenant_again() 
         "A is held again"
     );
     assert!(
-        passes.peak_records <= 1 && passes.peak_audit_events <= 1,
-        "neither sink is fed past its bound of one: {passes:?}"
+        passes.peak_audit_events <= 1 && passes.peak_record_bytes <= largest_record(&rig, B),
+        "neither sink holds more than the one item just handed to it: {passes:?}"
     );
     assert!(
         passes.waits > 0,
@@ -575,4 +596,42 @@ async fn rfc0056_10_a_restart_into_an_unrepaired_fault_holds_the_tenant_again() 
         floors(&[(A, HeldFloor::At(held.x0))]),
         "A's floor is still X0, so nothing of A's is lost"
     );
+}
+
+/// RFC0056.10's re-minted case: a replay at or below the checkpoint that
+/// only re-mints template events is bounded too, and waits out B's
+/// failing writes without republishing a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replay_that_only_re_mints_events_is_bounded_too() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = node(tmp.path());
+    ingest_each(
+        &rig,
+        B,
+        11,
+        &["user 11 logged in", "job 12 queued", "disk 13 is full"],
+    )
+    .await;
+    cut(&rig);
+    let snapshot = rig.snapshots_root.join(format!("{B}.snap"));
+    drop(rig);
+    std::fs::remove_file(snapshot).expect("B's snapshot goes, so its frame re-mints");
+
+    let (rig, recovered) = restart_unrepaired(tmp.path(), false);
+    let _ = rig
+        .publish
+        .write_ordered(rig.publish.drain_all(), "shutdown");
+    let report = recovered.expect("recovered");
+    assert_eq!(report.records_suppressed_for_parquet, 3, "{report:?}");
+    assert!(
+        report.passes.peak_audit_events <= 1 && report.passes.waits > 0,
+        "the re-minted events are paced and wait out B's writes: {:?}",
+        report.passes
+    );
+    assert_eq!(
+        stamps(&rig, B),
+        [11, 12, 13],
+        "no row of B's is republished"
+    );
+    assert!(described(&rig, B));
 }

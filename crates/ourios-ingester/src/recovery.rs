@@ -102,8 +102,6 @@ pub struct PassReport {
     pub waits: u64,
     /// The most bytes the record sink held at any check.
     pub peak_record_bytes: usize,
-    /// The most records the record sink held at any check.
-    pub peak_records: usize,
     /// The most events the audit sink held at any check.
     pub peak_audit_events: usize,
 }
@@ -147,7 +145,6 @@ impl Passes<'_> {
     fn make_room(&self, report: &mut PassReport) -> bool {
         let (record, audit) = (self.publish.record(), self.publish.audit());
         report.peak_record_bytes = report.peak_record_bytes.max(record.buffered_bytes());
-        report.peak_records = report.peak_records.max(record.buffered_records());
         report.peak_audit_events = report.peak_audit_events.max(audit.buffered_events());
         let mut backoff = PASS_BACKOFF_START;
         while self.full() {

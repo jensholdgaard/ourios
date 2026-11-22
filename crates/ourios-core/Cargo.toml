@@ -36,7 +36,9 @@ subtle = { version = "2.6", default-features = false }
 # drifts `decode(encode(x))` by 1–2 ULP for ~12% of arbitrary finite
 # f64 (#130) — RFC 0001 §6.1's `stored_bytes ↔ AnyValue` faithfulness
 # guarantee requires the correctly-rounded parser.
-serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
+# `unbounded_depth` lets the canonical decoders lift the fixed recursion
+# limit; they bound depth themselves (RFC 0069 §3.1). It adds no crate.
+serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip", "unbounded_depth"] }
 # The OTel metrics and trace **API** only (RFC 0001 §6.8 "Export architecture":
 # library crates depend on the lightweight API and resolve instruments
 # through `telemetry::meter`; the heavy SDK + OTLP exporter live in
@@ -70,6 +72,9 @@ ourios-semconv = { path = "../ourios-semconv" }
 serde = { version = "1", default-features = false }
 
 [dev-dependencies]
+# RFC0069.2 probes the receiver's protobuf decode for the deepest body it
+# admits. Already in the tree via the ingester and server.
+prost = { version = "=0.14.4", default-features = false, features = ["std"] }
 # `init_in_memory` collects the alias counters' exported metric stream
 # through an in-memory reader (no OTLP endpoint) in the §6.8 telemetry
 # unit test — same pattern as the compaction-metrics test.

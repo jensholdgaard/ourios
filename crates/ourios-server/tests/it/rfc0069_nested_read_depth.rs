@@ -3,21 +3,8 @@
 //!
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC
 //! is red; each names the slice that discharges it and moves to the test
-//! home §6 gives it.
-
-/// Scenario RFC0069.1 — every depth ingest accepts reads back.
-#[test]
-#[ignore = "RFC0069.1 stub — implemented with the read-depth slice"]
-fn rfc0069_1_every_depth_ingest_accepts_reads_back() {
-    todo!("RFC0069.1 — the #1136 depth matrix, over both transports, queries back whole");
-}
-
-/// Scenario RFC0069.2 — the read bound covers the ingest bound.
-#[test]
-#[ignore = "RFC0069.2 stub — implemented with the read-depth slice"]
-fn rfc0069_2_the_read_bound_covers_the_ingest_bound() {
-    todo!("RFC0069.2 — the deepest admitted value decodes under MAX_READ_DEPTH");
-}
+//! home §6 gives it. RFC0069.1 is in `rfc0069_1_depth_matrix.rs`, and
+//! RFC0069.2 in `ourios-core`'s `otlp/canonical/depth.rs`.
 
 /// Scenario RFC0069.3 — an undecodable cell degrades alone.
 #[test]

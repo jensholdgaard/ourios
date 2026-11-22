@@ -3805,6 +3805,7 @@ dependencies = [
  "ourios-telemetry",
  "p256",
  "proptest",
+ "prost",
  "rand 0.8.8",
  "rsa",
  "serde",

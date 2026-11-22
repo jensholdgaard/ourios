@@ -246,6 +246,11 @@ impl Body {
 /// the encode → store → decode round-trip is asserted at the
 /// `AnyValue` / `Vec<KeyValue>` level (not on bytes).
 pub mod canonical {
+    mod depth;
+
+    pub use depth::MAX_READ_DEPTH;
+    use depth::{from_slice_bounded, json_depth};
+
     use super::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
 
     /// Error returned by the canonical encoders / decoders.
@@ -266,6 +271,12 @@ pub mod canonical {
     pub enum CanonicalJsonError {
         Encode(serde_json::Error),
         Decode(serde_json::Error),
+        /// The stored bytes nest deeper than [`MAX_READ_DEPTH`]
+        /// (RFC 0069 §3.1): refused before the parse, so a corrupt or
+        /// foreign cell cannot exhaust the stack.
+        TooDeep {
+            limit: usize,
+        },
     }
 
     impl core::fmt::Display for CanonicalJsonError {
@@ -273,6 +284,9 @@ pub mod canonical {
             match self {
                 Self::Encode(e) => write!(f, "Ourios-canonical JSON encode: {e}"),
                 Self::Decode(e) => write!(f, "Ourios-canonical JSON decode: {e}"),
+                Self::TooDeep { limit } => {
+                    write!(f, "Ourios-canonical JSON nests deeper than {limit} levels")
+                }
             }
         }
     }
@@ -281,6 +295,7 @@ pub mod canonical {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             match self {
                 Self::Encode(e) | Self::Decode(e) => Some(e),
+                Self::TooDeep { .. } => None,
             }
         }
     }
@@ -320,7 +335,8 @@ pub mod canonical {
     /// corruption or a foreign producer that doesn't honour the
     /// §3.3 spec).
     pub fn decode_any_value(bytes: &[u8]) -> Result<AnyValue, CanonicalJsonError> {
-        match serde_json::from_slice::<AnyValue>(bytes) {
+        refuse_too_deep(bytes)?;
+        match from_slice_bounded::<AnyValue>(bytes) {
             Ok(av) => Ok(av),
             // `opentelemetry-proto`'s deserializer rejects the proto3-JSON
             // non-finite string forms ("invalid type: string, expected
@@ -329,11 +345,22 @@ pub mod canonical {
             // Genuinely corrupt bytes fail the generic parse too → original
             // error.
             Err(fast) => {
-                let json = serde_json::from_slice::<serde_json::Value>(bytes)
+                let json = from_slice_bounded::<serde_json::Value>(bytes)
                     .map_err(|_| CanonicalJsonError::Decode(fast))?;
                 json_to_av(&json).map_err(CanonicalJsonError::Decode)
             }
         }
+    }
+
+    /// [`CanonicalJsonError::TooDeep`] for bytes deeper than
+    /// [`MAX_READ_DEPTH`].
+    fn refuse_too_deep(bytes: &[u8]) -> Result<(), CanonicalJsonError> {
+        if json_depth(bytes) > MAX_READ_DEPTH {
+            return Err(CanonicalJsonError::TooDeep {
+                limit: MAX_READ_DEPTH,
+            });
+        }
+        Ok(())
     }
 
     /// Encode a `Vec<KeyValue>` (the in-memory shape of
@@ -366,10 +393,11 @@ pub mod canonical {
     ///
     /// [`CanonicalJsonError::Decode`] on malformed bytes.
     pub fn decode_attributes(bytes: &[u8]) -> Result<Vec<KeyValue>, CanonicalJsonError> {
-        match serde_json::from_slice::<Vec<KeyValue>>(bytes) {
+        refuse_too_deep(bytes)?;
+        match from_slice_bounded::<Vec<KeyValue>>(bytes) {
             Ok(kvs) => Ok(kvs),
             Err(fast) => {
-                let json = serde_json::from_slice::<serde_json::Value>(bytes)
+                let json = from_slice_bounded::<serde_json::Value>(bytes)
                     .map_err(|_| CanonicalJsonError::Decode(fast))?;
                 let arr = json.as_array().ok_or_else(|| {
                     CanonicalJsonError::Decode(de_err("attributes must be a JSON array"))

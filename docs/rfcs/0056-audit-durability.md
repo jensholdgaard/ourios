@@ -89,7 +89,9 @@ choice is between publishing without the event and holding the records.
 path: a permanent write error on one of the tenant's audit partitions, or
 a derive failure on one of its template events. Audit partitions are
 keyed by tenant, so the set is exact. A denial event lost for good is
-logged and counted as before, and holds no tenant (§3.2).
+handled as before and holds no tenant (§3.2): a permanent write error
+on its partition is logged and counted, and a derive failure is only
+counted, in the sink's derive-error count.
 
 ### 3.2 A held tenant's records do not publish
 

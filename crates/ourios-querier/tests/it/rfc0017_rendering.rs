@@ -273,14 +273,25 @@ fn rfc0017_9_structured_row_with_undecodable_body_falls_back() {
 /// visible.
 #[test]
 fn rfc0017_9_structured_row_with_undecodable_body_renders_its_stored_bytes() {
-    let mut r = record(BodyKind::Structured);
-    r.body = Some("{ this is not canonical AnyValue JSON".to_owned());
-    assert_eq!(
-        render_log_body(&r, &TemplateRegistry::new()),
-        LogBody::Rendered {
-            line: b"{ this is not canonical AnyValue JSON".to_vec(),
-            reconstruction: Reconstruction::RetainedVerbatim,
-        },
-        "an undecodable structured body renders its stored bytes, never Faithful",
-    );
+    for stored in [
+        "{ this is not canonical AnyValue JSON",
+        r#"{"stringValue":"#,
+        r#"{"unknownValue":1}"#,
+    ] {
+        let rendered = render_log_body(
+            &MinedRecord {
+                body: Some(stored.to_owned()),
+                ..record(BodyKind::Structured)
+            },
+            &TemplateRegistry::new(),
+        );
+        assert_eq!(
+            rendered,
+            LogBody::Rendered {
+                line: stored.as_bytes().to_vec(),
+                reconstruction: Reconstruction::RetainedVerbatim,
+            },
+            "{stored:?} renders as its stored bytes, never Faithful",
+        );
+    }
 }

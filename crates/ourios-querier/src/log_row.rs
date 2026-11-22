@@ -201,9 +201,9 @@ pub enum LogBody {
 /// (RFC 0017 §3.3).
 ///
 /// A structured row returns [`LogBody::Structured`] with its decoded
-/// `AnyValue`; a structured row whose `body` is absent or undecodable (a
-/// corrupt row — there is no structure to return) falls back to the
-/// render-contract empty / [`Reconstruction::RetainedVerbatim`], never
+/// `AnyValue`; a structured row whose `body` does not decode returns the
+/// stored bytes, and one whose `body` is absent an empty line, both under
+/// [`Reconstruction::RetainedVerbatim`] (RFC 0069 §3.2), never
 /// `Structured` over nothing. An absent row returns [`LogBody::Absent`]
 /// (RFC 0025 §3.2). A string row renders via its versioned
 /// tokens; when its `(template_id, template_version)` is not in the registry
@@ -229,20 +229,22 @@ fn render_body_from_tokens(record: &MinedRecord, tokens: Option<&[OwnedToken]>) 
         return LogBody::Absent;
     }
     if record.body_kind == BodyKind::Structured {
-        if let Some(body) = record.body.as_deref()
-            && let Ok(value) = decode_any_value(body.as_bytes())
-        {
-            return LogBody::Structured(value);
-        }
-        // Corrupt structured row — body absent OR present-but-undecodable.
-        // No structure to return, and it is *not* faithful, so surface empty /
-        // RetainedVerbatim directly. We must NOT delegate to `render`: its
-        // `BodyKind::Structured` arm returns the raw `body` bytes as `Faithful`
-        // whenever a body is present, which for an *undecodable* body would
-        // falsely claim faithfulness.
-        return LogBody::Rendered {
-            line: Vec::new(),
-            reconstruction: Reconstruction::RetainedVerbatim,
+        // A structured body that does not decode comes back as its stored
+        // bytes (RFC 0069 §3.2), an absent one as an empty line; neither is
+        // faithful. `render` is not used: its structured arm would claim
+        // `Faithful` for any present body, decodable or not.
+        let Some(body) = record.body.as_deref() else {
+            return LogBody::Rendered {
+                line: Vec::new(),
+                reconstruction: Reconstruction::RetainedVerbatim,
+            };
+        };
+        return match decode_any_value(body.as_bytes()) {
+            Ok(value) => LogBody::Structured(value),
+            Err(_) => LogBody::Rendered {
+                line: body.as_bytes().to_vec(),
+                reconstruction: Reconstruction::RetainedVerbatim,
+            },
         };
     }
 
@@ -331,6 +333,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded by RFC0069.3: an undecodable structured body now \
+                renders its stored bytes, see \
+                structured_undecodable_body_renders_its_stored_bytes"]
     fn structured_undecodable_body_is_retained_not_faithful() {
         // Present but not valid canonical JSON — must NOT claim Faithful over
         // the raw bytes; there is no structure to return.
@@ -340,6 +345,21 @@ mod tests {
             render_log_body(&r, &TemplateRegistry::new()),
             LogBody::Rendered {
                 line: Vec::new(),
+                reconstruction: Reconstruction::RetainedVerbatim,
+            },
+        );
+    }
+
+    /// RFC0069.3: a structured body that does not decode comes back as its
+    /// stored bytes, marked as not faithful, instead of an empty line.
+    #[test]
+    fn structured_undecodable_body_renders_its_stored_bytes() {
+        let mut r = record(BodyKind::Structured);
+        r.body = Some("{not valid json".to_owned());
+        assert_eq!(
+            render_log_body(&r, &TemplateRegistry::new()),
+            LogBody::Rendered {
+                line: b"{not valid json".to_vec(),
                 reconstruction: Reconstruction::RetainedVerbatim,
             },
         );

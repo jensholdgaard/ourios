@@ -495,7 +495,7 @@ impl OuriosMcp {
         let elapsed = started.elapsed();
         let result = match result {
             Ok(result) => {
-                self.metrics.record_logs(elapsed, &result);
+                self.metrics.record_logs(&tenant, elapsed, &result);
                 result
             }
             Err(e) => {

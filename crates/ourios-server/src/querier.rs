@@ -171,6 +171,9 @@ pub(crate) struct QuerierMetrics {
     read_size: Histogram<u64>,
     /// `ourios.query.visibility` (RFC 0047 §3.4): queries by two-step branch.
     visibility: Counter<u64>,
+    /// `ourios.reader.cell.undecodable` (RFC 0069 §3.2): stored cells a
+    /// query returned degraded.
+    undecodable: Counter<u64>,
 }
 
 impl QuerierMetrics {
@@ -217,12 +220,18 @@ impl QuerierMetrics {
         ] {
             visibility.add(0, &Self::branch_attrs(branch));
         }
+        let undecodable = meter
+            .u64_counter(semconv::OURIOS_READER_CELL_UNDECODABLE)
+            .with_description(semconv::OURIOS_READER_CELL_UNDECODABLE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_READER_CELL_UNDECODABLE_UNIT)
+            .build();
         Self {
             duration,
             row_groups,
             files,
             read_size,
             visibility,
+            undecodable,
         }
     }
 
@@ -270,9 +279,20 @@ impl QuerierMetrics {
     /// Record a successful logs query. Its bytes include a template-map
     /// acquisition only when this query ran it, so a fold shared by
     /// concurrent queries counts once across them.
-    pub(crate) fn record_logs(&self, elapsed: Duration, result: &QueryResult) {
+    pub(crate) fn record_logs(&self, tenant: &TenantId, elapsed: Duration, result: &QueryResult) {
         let bytes = result.total_bytes_read();
         self.record_ok(QUERY_KIND_LOGS, elapsed, &result.stats, bytes);
+        for (column, cells) in result.stats.undecodable_cells.by_column() {
+            if cells > 0 {
+                self.undecodable.add(
+                    cells,
+                    &[
+                        KeyValue::new(semconv::OURIOS_TENANT, tenant.as_str().to_owned()),
+                        KeyValue::new(semconv::OURIOS_READER_COLUMN_NAME, column),
+                    ],
+                );
+            }
+        }
     }
 
     /// Record a successful drift query.
@@ -980,6 +1000,7 @@ impl From<&LogBody> for LogBodyDto {
                 line: String::from_utf8_lossy(line).into_owned(),
                 reconstruction: match reconstruction {
                     Reconstruction::Faithful => "faithful",
+                    Reconstruction::RetainedLossy => "retained_lossy",
                     // `Reconstruction` is `#[non_exhaustive]`; `RetainedVerbatim`
                     // and any future non-faithful marker serialise as
                     // `"retained_verbatim"`.
@@ -1190,7 +1211,7 @@ async fn run_logs_query(
             QUERY_KIND_LOGS,
             elapsed,
             &LogQueryResponse::from(&result),
-            || state.metrics.record_logs(elapsed, &result),
+            || state.metrics.record_logs(tenant, elapsed, &result),
         ),
         Err(e) => {
             state
@@ -1742,5 +1763,24 @@ mod tests {
         ));
         // Malformed → Err (mapped to 400 by the caller).
         assert!(parse_body(&headers(Some("text/plain"), None), b"not a query").is_err());
+    }
+
+    /// RFC0069.3: a body whose stored bytes are not valid UTF-8 is marked
+    /// `retained_lossy` on the wire, not passed off as `retained_verbatim`.
+    #[test]
+    fn a_lossy_body_is_marked_retained_lossy() {
+        use ourios_miner::reconstruct::Reconstruction;
+        use ourios_querier::LogBody;
+
+        let label = |reconstruction| {
+            let dto = super::LogBodyDto::from(&LogBody::Rendered {
+                line: b"x".to_vec(),
+                reconstruction,
+            });
+            serde_json::to_value(dto).expect("serialise")["reconstruction"].clone()
+        };
+        assert_eq!(label(Reconstruction::RetainedLossy), "retained_lossy");
+        assert_eq!(label(Reconstruction::RetainedVerbatim), "retained_verbatim");
+        assert_eq!(label(Reconstruction::Faithful), "faithful");
     }
 }

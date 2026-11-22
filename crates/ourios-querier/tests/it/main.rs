@@ -48,3 +48,4 @@ mod rfc0047_visibility;
 mod rfc0050_read_path;
 #[cfg(feature = "testing")]
 mod rfc0060_refresh;
+mod rfc0069_3_degraded_query;

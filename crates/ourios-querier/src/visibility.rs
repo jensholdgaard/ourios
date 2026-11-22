@@ -13,6 +13,7 @@ use datafusion::prelude::lit;
 use crate::dsl::ir::{Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, Stage};
 use crate::log_row::{LogBody, LogRow};
 use crate::{QueryError, has_column};
+use ourios_core::otlp::KeyValue;
 use ourios_parquet::promoted;
 
 /// What the principal may see inside the tenant (RFC 0047 §3.4). Column
@@ -160,21 +161,29 @@ impl Visibility {
             .iter()
             .filter_map(|column| column.strip_prefix(promoted::RESOURCE_PREFIX))
             .collect();
+        // An undecodable cell's fallback carries the whole stored cell, which
+        // per-key masking cannot see into (RFC 0069 §3.2).
+        let undecodable = |key: &str| key == ourios_semconv::OURIOS_ATTRIBUTE_UNDECODABLE;
         for row in rows {
             if body {
                 row.body = LogBody::Masked;
             }
-            for kv in &mut row.attributes {
-                if attrs.contains(&kv.key.as_str()) {
-                    kv.value = None;
-                }
-            }
-            for kv in &mut row.resource_attributes {
-                if resources.contains(&kv.key.as_str()) {
-                    kv.value = None;
-                }
-            }
+            unset_values(&mut row.attributes, |key| {
+                attrs.contains(&key) || undecodable(key)
+            });
+            unset_values(&mut row.resource_attributes, |key| {
+                resources.contains(&key) || undecodable(key)
+            });
+            unset_values(&mut row.scope_attributes, undecodable);
         }
+    }
+}
+
+/// Unset the value of every attribute in `list` whose key is `masked`,
+/// keeping the key: the OTLP null.
+fn unset_values(list: &mut [KeyValue], masked: impl Fn(&str) -> bool) {
+    for kv in list.iter_mut().filter(|kv| masked(&kv.key)) {
+        kv.value = None;
     }
 }
 
@@ -480,5 +489,50 @@ mod tests {
         }
         .mask(&mut rows);
         assert_ne!(rows[0].body, LogBody::Masked, "scoped rows are not masked");
+    }
+
+    /// Scenario RFC0069.6: a masked reader gets the reserved fallback
+    /// attribute with its value unset as a whole, in every attribute list,
+    /// so no stored JSON reaches it. An unmasked reader sees the JSON.
+    /// See `docs/rfcs/0069-nested-value-read-depth.md` §5.
+    #[test]
+    fn rfc0069_6_the_fallback_is_masked_for_a_masked_reader() {
+        use ourios_core::otlp::{AnyValue, KeyValue, any_value};
+        let fallback = || KeyValue {
+            key: ourios_semconv::OURIOS_ATTRIBUTE_UNDECODABLE.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(
+                    r#"[{"key":"gen_ai.input.messages""#.to_string(),
+                )),
+            }),
+            ..Default::default()
+        };
+        let degraded = || {
+            let mut row = LogRow::test_row();
+            row.attributes = vec![fallback()];
+            row.resource_attributes = vec![fallback()];
+            row.scope_attributes = vec![fallback()];
+            row
+        };
+
+        let mut rows = vec![degraded()];
+        masked().mask(&mut rows);
+        for list in [
+            &rows[0].attributes,
+            &rows[0].resource_attributes,
+            &rows[0].scope_attributes,
+        ] {
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].key, ourios_semconv::OURIOS_ATTRIBUTE_UNDECODABLE);
+            assert!(list[0].value.is_none(), "the stored JSON is masked whole");
+        }
+
+        let mut rows = vec![degraded()];
+        Visibility::TenantWide.mask(&mut rows);
+        assert_eq!(
+            rows[0].attributes,
+            vec![fallback()],
+            "an unmasked reader sees it"
+        );
     }
 }

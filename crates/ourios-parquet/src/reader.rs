@@ -47,7 +47,11 @@ use parquet::errors::ParquetError;
 
 use crate::columns;
 use crate::partition::{PartitionKey, TimestampOverflowError};
+
+mod cells;
 use crate::store::{Store, StoreError};
+use cells::Cells;
+pub use cells::{DegradedBatch, UndecodableCell};
 
 /// Streaming Parquet reader for one data file.
 ///
@@ -492,13 +496,50 @@ fn store_io_err(op: &'static str, path: &Path, err: StoreError) -> ReaderError {
 /// [`ReaderError::MissingRequiredColumn`] on shape or decode mismatches;
 /// with [`ShapeValidation::Enforce`], additionally rejects rows violating
 /// the §3.2 writer-shape invariants.
-// One linear column-by-column unpack — the length is inherent to the wide
-// RFC 0005 §3.2 row schema (one read per column), not extractable logic.
-#[allow(clippy::too_many_lines)]
 pub fn batch_to_mined_records(
     batch: &RecordBatch,
     row_offset: usize,
     validation: ShapeValidation,
+) -> Result<Vec<MinedRecord>, ReaderError> {
+    decode_batch(
+        batch,
+        row_offset,
+        validation,
+        &mut Cells::strict(row_offset),
+    )
+}
+
+/// [`batch_to_mined_records`] for the query path (RFC 0069 §3.2): a stored
+/// cell that does not decode degrades on its own instead of failing the
+/// batch. An undecodable attribute cell becomes the single reserved
+/// `ourios.attribute.undecodable` attribute holding its stored JSON, and a
+/// body that is not valid UTF-8 converts lossily; each such cell is named
+/// in [`DegradedBatch::undecodable`]. Every other cell decodes as usual.
+///
+/// # Errors
+///
+/// As [`batch_to_mined_records`], except [`ReaderError::AttributeDecode`].
+pub fn batch_to_degraded_records(
+    batch: &RecordBatch,
+    row_offset: usize,
+    validation: ShapeValidation,
+) -> Result<DegradedBatch, ReaderError> {
+    let mut cells = Cells::degrading(row_offset);
+    let records = decode_batch(batch, row_offset, validation, &mut cells)?;
+    Ok(DegradedBatch {
+        records,
+        undecodable: cells.undecodable,
+    })
+}
+
+// One linear column-by-column unpack — the length is inherent to the wide
+// RFC 0005 §3.2 row schema (one read per column), not extractable logic.
+#[allow(clippy::too_many_lines)]
+fn decode_batch(
+    batch: &RecordBatch,
+    row_offset: usize,
+    validation: ShapeValidation,
+    cells: &mut Cells,
 ) -> Result<Vec<MinedRecord>, ReaderError> {
     let n = batch.num_rows();
     let mut records: Vec<MinedRecord> = Vec::with_capacity(n);
@@ -544,36 +585,10 @@ pub fn batch_to_mined_records(
     let separators_lists = decode_separators_column(batch, row_offset)?;
 
     for i in 0..n {
-        // Empty-list short-circuit mirrors the writer's
-        // `append_attributes` — avoids the encoder round-trip
-        // on every clean-attach record (the common case).
-        let attrs_str = attributes[i].as_str();
-        let decoded_attrs = if attrs_str == "[]" {
-            Vec::new()
-        } else {
-            ourios_core::otlp::canonical::decode_attributes(attrs_str.as_bytes()).map_err(
-                |source| ReaderError::AttributeDecode {
-                    column: columns::ATTRIBUTES,
-                    row_index: row_offset + i,
-                    source,
-                },
-            )?
-        };
-        let res_str = resource_attributes[i].as_str();
-        let decoded_resource = if res_str == "[]" {
-            Vec::new()
-        } else {
-            ourios_core::otlp::canonical::decode_attributes(res_str.as_bytes()).map_err(
-                |source| ReaderError::AttributeDecode {
-                    column: columns::RESOURCE_ATTRIBUTES,
-                    row_index: row_offset + i,
-                    source,
-                },
-            )?
-        };
-
-        let decoded_scope_attrs =
-            decode_optional_scope_attributes(scope_attributes.as_ref(), i, row_offset)?;
+        let decoded_attrs = cells.attributes(&attributes[i], columns::ATTRIBUTES, i)?;
+        let decoded_resource =
+            cells.attributes(&resource_attributes[i], columns::RESOURCE_ATTRIBUTES, i)?;
+        let decoded_scope_attrs = cells.scope_attributes(scope_attributes.as_ref(), i)?;
 
         let t_ns = unix_nanos(columns::TIME_UNIX_NANO, time_unix_nano[i])?;
         let observed_t = observed_time
@@ -591,9 +606,7 @@ pub fn batch_to_mined_records(
             // UTF-8 decode keeps the round-trip working for
             // the UTF-8 writes that exist today; non-UTF-8 in
             // bytes-on-disk surface as U+FFFD replacements.
-            Some(col) => col[i]
-                .as_ref()
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+            Some(col) => col[i].as_ref().map(|bytes| cells.body(bytes, i)),
         };
 
         let record = MinedRecord {
@@ -941,31 +954,6 @@ fn decode_separators_column(
 // column's values (REQUIRED columns) or an `Option<Vec<...>>`
 // (OPTIONAL columns — `None` when the file's schema doesn't
 // carry the column, per §3.9's missing-column carve-out).
-
-/// RFC 0018 §3.1 — decode the per-row `scope_attributes` value: an absent
-/// column, a NULL cell, or `"[]"` all mean "no scope attributes" (empty vec);
-/// any other value is canonical JSON to decode.
-fn decode_optional_scope_attributes(
-    scope_attributes: Option<&Vec<Option<String>>>,
-    i: usize,
-    row_offset: usize,
-) -> Result<Vec<ourios_core::otlp::KeyValue>, ReaderError> {
-    let Some(col) = scope_attributes else {
-        return Ok(Vec::new());
-    };
-    match col[i].as_deref() {
-        None | Some("[]") => Ok(Vec::new()),
-        Some(s) => {
-            ourios_core::otlp::canonical::decode_attributes(s.as_bytes()).map_err(|source| {
-                ReaderError::AttributeDecode {
-                    column: columns::SCOPE_ATTRIBUTES,
-                    row_index: row_offset + i,
-                    source,
-                }
-            })
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

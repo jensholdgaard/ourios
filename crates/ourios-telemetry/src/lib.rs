@@ -1037,6 +1037,7 @@ mod tests {
                     name: ourios_semconv::EVENT_OURIOS_SERVER_TELEMETRY_PROTOCOL_UNSUPPORTED,
                     severity,
                     attributes,
+                    int_attributes: std::collections::BTreeSet::new(),
                     body: None,
                 })
                 .collect();

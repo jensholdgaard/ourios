@@ -12,7 +12,7 @@
 //! directory) are set. Only the weaver mode checks against the registry
 //! itself; the other checks against what the caller says it declares.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -28,6 +28,9 @@ pub struct Event {
     pub name: &'static str,
     pub severity: i32,
     pub attributes: BTreeMap<String, String>,
+    /// The attributes recorded as integers. weaver checks each attribute's
+    /// type, so these reach it as numbers rather than their rendered text.
+    pub int_attributes: BTreeSet<String>,
     /// The rendered message. weaver never sees it; a test that asserts
     /// what the message names reads it here.
     pub body: Option<String>,
@@ -41,6 +44,11 @@ impl Event {
             attributes: record
                 .attributes_iter()
                 .map(|(key, value)| (key.as_str().to_owned(), render(value)))
+                .collect(),
+            int_attributes: record
+                .attributes_iter()
+                .filter(|(_, value)| matches!(value, AnyValue::Int(_)))
+                .map(|(key, _)| key.as_str().to_owned())
                 .collect(),
             body: record.body().map(render),
         })
@@ -261,7 +269,15 @@ fn samples_json(events: &[&Event]) -> serde_json::Value {
                 let attributes: Vec<serde_json::Value> = event
                     .attributes
                     .iter()
-                    .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+                    .map(|(name, value)| {
+                        let value = match value.parse::<i64>() {
+                            Ok(int) if event.int_attributes.contains(name) => {
+                                serde_json::json!(int)
+                            }
+                            _ => serde_json::json!(value),
+                        };
+                        serde_json::json!({ "name": name, "value": value })
+                    })
                     .collect();
                 serde_json::json!({ "log": {
                     "event_name": event.name,
@@ -290,9 +306,9 @@ fn collect_violations(value: &serde_json::Value, out: &mut Vec<serde_json::Value
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{Event, EventSpec, check_attributes};
+    use super::{Event, EventSpec, check_attributes, samples_json};
 
     const SPEC: EventSpec = EventSpec {
         name: "ourios.test.event",
@@ -308,6 +324,7 @@ mod tests {
                 .iter()
                 .map(|key| ((*key).to_owned(), "x".to_owned()))
                 .collect::<BTreeMap<_, _>>(),
+            int_attributes: BTreeSet::new(),
             body: None,
         }
     }
@@ -324,5 +341,26 @@ mod tests {
             check_attributes(&event(&["error.type", "error"]), &SPEC).is_err(),
             "an undeclared attribute fails"
         );
+    }
+
+    /// weaver checks an attribute's type, so an integer attribute reaches
+    /// it as a JSON number, not as its rendered text.
+    #[test]
+    fn an_integer_attribute_is_sent_as_a_number() {
+        let mut event = event(&["error.type"]);
+        event
+            .attributes
+            .insert("ourios.test.index".to_owned(), "121".to_owned());
+        event.int_attributes.insert("ourios.test.index".to_owned());
+        let samples = samples_json(&[&event]);
+        let attributes = &samples[0]["log"]["attributes"];
+        let value = |name: &str| {
+            attributes
+                .as_array()
+                .and_then(|all| all.iter().find(|a| a["name"] == name))
+                .map(|a| a["value"].clone())
+        };
+        assert_eq!(value("ourios.test.index"), Some(serde_json::json!(121)));
+        assert_eq!(value("error.type"), Some(serde_json::json!("x")));
     }
 }

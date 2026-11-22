@@ -1,7 +1,7 @@
 ---
 rfc: 0056
 title: Audit-sink durability on permanent write failure
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-15
@@ -11,19 +11,42 @@ superseded-by: —
 
 # RFC 0056 — Audit-sink durability on permanent write failure
 
-> **Status note.** `red`. Every §5 scenario has an `#[ignore]`d `todo!`
-> stub in `ourios-server` (`tests/it/rfc0056_held_tenant.rs`) naming the
-> slice that discharges it. Specified 2026-11-20 (maintainer-approved,
-> with the §7 answers). Tracks #1294. 2026-11-20: the maintainer
-> chose this RFC's per-tenant hold over the alternative of publishing and
-> holding the node's checkpoint (§4.1). §3 below is the design; §9 keeps
-> the RFC 0053 draft's wording it grew from, and §3.7 says where it
-> departs. This RFC **amends accepted RFC 0005 §3.7** (no audit event is
-> lost) by naming what a permanent audit-write failure does. It
-> coordinates with RFC 0052 (`green`), whose `CHECKPOINT` sidecar and
-> recovery routing it extends. It covers the **local** WAL backend; the
-> replicated backend (RFC 0065, `red`) needs its own protocol and is
-> tracked by #1392 (§3.6). **Blocked from `validated` by [#809](https://github.com/jensholdgaard/ourios/issues/809)**,
+> **Status: `green`** (2026-11-21). Every §5 scenario passes on the
+> local backend:
+>
+> - RFC0056.1 and .2: `ourios-ingester/src/publish.rs`, beside the
+>   coordinator.
+> - RFC0056.3: `ourios-ingester/tests/it/rfc0056_3_held_admission.rs`,
+>   over both transports.
+> - RFC0056.4–.7, .9 and .10: `ourios-ingester/tests/it/rfc0056_held_floors.rs`,
+>   on the barrier rig, restarting the node over its roots. The same file
+>   covers .10's re-minted case, a shutdown during a pass, and a pass's
+>   own quarantine (#1407). The floor assigned before a stamp that failed
+>   after its rename is `barrier.rs`'s
+>   `a_floor_is_kept_across_a_stamp_that_failed_after_its_rename`.
+> - RFC0056.8: `ourios-wal`'s `src/checkpoint.rs`,
+>   `tests/it/rfc0052_17_reclaim_record/` and `tests/it/rfc0056_held_floors.rs`.
+> - RFC0056.11: `ourios-ingester`'s `src/audit_sink.rs`,
+>   `tests/audit_sink_metrics.rs` and the live-check leg
+>   `tests/rfc0052_7_telemetry/hold_started.rs`.
+>
+> Specified 2026-11-20 (maintainer-approved, with the §7 answers).
+> Implemented in #1400, #1401, #1403, #1404, #1406 and #1409. Tracks #1294.
+> 2026-11-20: the maintainer chose this RFC's per-tenant hold over the
+> alternative of publishing and holding the node's checkpoint (§4.1).
+>
+> §3 below is the design; §9 keeps the RFC 0053 draft's wording it grew
+> from, and §3.7 says where it departs.
+>
+> This RFC **amends accepted RFC 0005 §3.7** (no audit event is lost) by
+> naming what a permanent audit-write failure does. It coordinates with
+> RFC 0052 (`green`), whose `CHECKPOINT` sidecar and recovery routing it
+> extends.
+>
+> It covers the **local** WAL backend. The replicated backend (RFC 0065,
+> `red`) needs its own protocol and is tracked by #1392 (§3.6).
+>
+> **Blocked from `validated` by [#809](https://github.com/jensholdgaard/ourios/issues/809)**,
 > RFC 0026's denial-audit durability, which §7 explains this RFC cannot
 > close.
 

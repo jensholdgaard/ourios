@@ -491,16 +491,18 @@ impl SharedParquetAuditSink {
 
     /// Drain the internal buffer to durability — the standalone
     /// cadence/shutdown flush, and the first half of [`Self::barrier`].
-    /// Returns whether the buffer was fully drained (nothing retained for
-    /// retry); transient failures are requeued ahead of newly-buffered
-    /// events.
+    /// Returns whether this take retained nothing and its ticket cleared,
+    /// so no earlier take's events are still in limbo. Events a permanent
+    /// failure or a hold dropped count as settled, not durable, and events
+    /// emitted after the take are not covered. Holds gate publication
+    /// separately (`PublishCoordinator::write`). Transient failures are
+    /// requeued ahead of newly-buffered events.
     #[must_use]
     pub fn flush(&self) -> bool {
         let (events, ticket) = self.take_ticketed();
         let retained = self.write_retaining(events);
         if retained.is_empty() {
-            ticket.clear();
-            return true;
+            return ticket.clear();
         }
         self.requeue(retained);
         drop(ticket);
@@ -977,6 +979,31 @@ mod tests {
 
         assert!(handle.held().is_held(&TenantId::new("acme")));
         assert_eq!(events, vec![("acme".to_owned(), "batch".to_owned())]);
+    }
+
+    /// #1396: an earlier take whose events are still in limbo is not
+    /// durable, so a flush that writes everything after it must not report
+    /// that every event is, or a caller that publishes on that answer
+    /// (`flush_then_snapshot`) would publish records ahead of them.
+    #[test]
+    fn a_flush_behind_a_take_in_limbo_does_not_report_durable() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING));
+        let mut emitter = handle.clone();
+        emitter.emit(created_event("acme", 1, "GET <*>"));
+        let (in_limbo, earlier) = handle.take_ticketed();
+        emitter.emit(created_event("acme", 2, "POST <*>"));
+
+        assert!(
+            !handle.flush(),
+            "an earlier take's event is not durable yet"
+        );
+
+        assert!(handle.write_retaining(in_limbo).is_empty());
+        assert!(earlier.clear());
+        emitter.emit(created_event("acme", 3, "PUT <*>"));
+        assert!(handle.flush(), "nothing is in limbo any more");
     }
 
     /// The dropped-partition events one partition write's `result` logs.

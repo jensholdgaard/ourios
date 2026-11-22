@@ -198,7 +198,7 @@ claims they are gone, which keeps RFC 0047 §3.6's rows-before-tuples
 guarantee.
 
 Each degraded cell in a query logs one `WARN` event naming the file,
-row and column, and is counted (§7).
+row and column, and counts once on the degraded-cell counter (§7).
 
 ## 4. Alternatives considered
 
@@ -344,7 +344,17 @@ explicit bound is enough.
   `ourios.reader.row.undecodable` (`WARN`, with `file.path` and the row
   index), and a count of degraded rows, on an existing reader counter
   with `error.type` `undecodable` if one fits, otherwise a new one.
-  Both go through the shared `ourios-semconv` registry.
+  Both go through the shared `ourios-semconv` registry. No reader counter
+  fits, so on 2026-11-22 the maintainer chose a count of degraded
+  **cells**, matching §3.2:
+  - the counter `ourios.reader.cell.undecodable` (`{cell}`, per
+    `ourios.tenant` and `ourios.reader.column.name`);
+  - the event fires once per degraded cell, with `file.path`,
+    `ourios.reader.row.index` (the 0-based row in the file) and
+    `ourios.reader.column.name` (`body`, `attributes`,
+    `resource_attributes` or `scope_attributes`);
+  - OTel has no attribute for a row's position in a file or for a column,
+    so those two are Ourios names.
 
 ## 8. References
 

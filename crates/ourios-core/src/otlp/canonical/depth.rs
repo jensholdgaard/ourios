@@ -85,7 +85,12 @@ mod tests {
 
     /// `layers` arrays, each holding the next, around a string.
     fn array_chain(layers: usize) -> AnyValue {
-        (0..layers).fold(string_av(), |inner, _| AnyValue {
+        array_around(string_av(), layers)
+    }
+
+    /// `layers` arrays, each holding the next, around `leaf`.
+    fn array_around(leaf: AnyValue, layers: usize) -> AnyValue {
+        (0..layers).fold(leaf, |inner, _| AnyValue {
             value: Some(Value::ArrayValue(ArrayValue {
                 values: vec![inner],
             })),
@@ -94,7 +99,12 @@ mod tests {
 
     /// `layers` maps, each holding the next under key `a`, around a string.
     fn map_chain(layers: usize) -> AnyValue {
-        (0..layers).fold(string_av(), |inner, _| AnyValue {
+        map_around(string_av(), layers)
+    }
+
+    /// `layers` maps, each holding the next under key `a`, around `leaf`.
+    fn map_around(leaf: AnyValue, layers: usize) -> AnyValue {
+        (0..layers).fold(leaf, |inner, _| AnyValue {
             value: Some(Value::KvlistValue(KeyValueList {
                 values: vec![KeyValue {
                     key: "a".to_owned(),
@@ -241,6 +251,96 @@ mod tests {
             "{:?}",
             decoded.2
         );
+    }
+
+    /// The deepest cell `build` makes within `MAX_READ_DEPTH`, at most one
+    /// map layer short of it.
+    fn deepest_within_bound(build: impl Fn(usize) -> Vec<u8>) -> Vec<u8> {
+        let cell = (1..MAX_READ_DEPTH)
+            .map(build)
+            .take_while(|cell| json_depth(cell) <= MAX_READ_DEPTH)
+            .last()
+            .expect("one layer fits");
+        assert!(
+            json_depth(&cell) > MAX_READ_DEPTH - 4,
+            "{}",
+            json_depth(&cell)
+        );
+        cell
+    }
+
+    /// Body and attribute cells near `MAX_READ_DEPTH` for every chain and
+    /// leaf. A non-finite double fails the typed decode, so its cells take
+    /// the generic-JSON fallback and its recursive conversion.
+    fn near_bound_cells() -> Vec<(String, Vec<u8>, Vec<u8>)> {
+        let leaves = [
+            ("a string", string_av()),
+            ("an empty value", AnyValue { value: None }),
+            (
+                "NaN",
+                AnyValue {
+                    value: Some(Value::DoubleValue(f64::NAN)),
+                },
+            ),
+        ];
+        let chains = [
+            ("arrays", array_around as fn(AnyValue, usize) -> AnyValue),
+            ("maps", map_around),
+        ];
+        let mut cells = Vec::new();
+        for (chain_name, chain) in chains {
+            for (leaf_name, leaf) in &leaves {
+                let body = deepest_within_bound(|n| {
+                    encode_any_value(&chain(leaf.clone(), n)).expect("encode body")
+                });
+                let attributes = deepest_within_bound(|n| {
+                    let kv = KeyValue {
+                        key: "k".to_owned(),
+                        value: Some(chain(leaf.clone(), n)),
+                        key_strindex: 0,
+                    };
+                    encode_attributes(&[kv]).expect("encode attributes")
+                });
+                cells.push((format!("{chain_name} around {leaf_name}"), body, attributes));
+            }
+        }
+        cells
+    }
+
+    /// RFC0069.2: both decoders, on the typed path and on the generic-JSON
+    /// fallback, read a value near the bound back unchanged on the smallest
+    /// stack.
+    #[test]
+    fn rfc0069_2_every_decode_path_fits_the_smallest_stack_near_the_bound() {
+        let cells = near_bound_cells();
+        let outcomes = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                cells
+                    .into_iter()
+                    .map(|(name, body, attributes)| {
+                        let body_back = decode_any_value(&body)
+                            .ok()
+                            .and_then(|av| encode_any_value(&av).ok());
+                        let attributes_back = decode_attributes(&attributes)
+                            .ok()
+                            .and_then(|kvs| encode_attributes(&kvs).ok());
+                        (
+                            name,
+                            body_back.as_ref() == Some(&body),
+                            attributes_back.as_ref() == Some(&attributes),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .expect("spawn")
+            .join()
+            .expect("no stack overflow");
+
+        for (name, body, attributes) in outcomes {
+            assert!(body, "body of {name} reads back");
+            assert!(attributes, "attributes of {name} read back");
+        }
     }
 
     /// The scan counts nesting outside strings only.

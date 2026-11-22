@@ -352,9 +352,10 @@ fn flush_then_snapshot(
         let audit_events = audit_sink.buffered_events();
         tracing::warn!(
             name: ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_RETAINED,
-            "{cadence}: audit sink retained {audit_events} event(s) (store unavailable?); skipping \
-             the record flush + snapshot this cycle so a clean row isn't exposed before its \
-             template event is durable — no acknowledged data is lost (the WAL is durable)"
+            "{cadence}: audit sink retained {audit_events} event(s) (store unavailable?) or an \
+             earlier write of its events is still in flight; skipping the record flush + \
+             snapshot this cycle so a clean row isn't exposed before its template event is \
+             durable — no acknowledged data is lost (the WAL is durable)"
         );
         return Snapshotted::Skipped;
     }

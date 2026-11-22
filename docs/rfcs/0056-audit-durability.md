@@ -85,10 +85,13 @@ choice is between publishing without the event and holding the records.
 ### 3.1 A third audit outcome, per tenant
 
 `write_retaining` reports, besides the events it retains for retry, the
-**set of tenants** whose events it dropped for good, from either path:
-a permanent write error on one of the tenant's audit partitions, or a
-derive failure on one of its events. Audit partitions are keyed by
-tenant, so the set is exact.
+**set of tenants** whose template events it dropped for good, from either
+path: a permanent write error on one of the tenant's audit partitions, or
+a derive failure on one of its template events. Audit partitions are
+keyed by tenant, so the set is exact. A denial event lost for good is
+handled as before and holds no tenant (§3.2): a permanent write error
+on its partition is logged and counted, and a derive failure is only
+counted, in the sink's derive-error count.
 
 ### 3.2 A held tenant's records do not publish
 
@@ -98,7 +101,7 @@ backend's behaviour.
 The hold lives in the **shared audit sink**, so every path that writes
 audit events marks it, and every path that publishes records reads it.
 A tenant becomes **held** the moment any audit write drops one of its
-events for good, whoever triggered that write: the coordinator's drain,
+template events for good, whoever triggered that write: the coordinator's drain,
 or a record sink's inline size or ceiling flush, which writes the audit
 sink first through its barrier (`audit_sink.rs`).
 
@@ -117,13 +120,24 @@ buy nothing, and could not be bounded: a restart into an unrepaired
 fault replays the whole tail above the floor, and several tenants can be
 held at once.
 
-**Its audit events go too.** The audit sink drops a held tenant's
-retained events and every event emitted for it afterwards, and releases
-the publication ticket they held (`audit_sink.rs`'s ledger), so a held
-tenant's events never block another tenant's records, whether they were
-retained after a transient failure or are still in the sink. A restart
-regenerates them with the records (§3.5). Another tenant's transient
-failure still holds that drain's records, as today.
+**Its template events go too.** The audit sink drops a held tenant's
+retained template events and every template event emitted for it
+afterwards, and releases the publication ticket they held
+(`audit_sink.rs`'s ledger), so a held tenant's events never block
+another tenant's records, whether they were retained after a transient
+failure or are still in the sink. A restart regenerates them with the
+records (§3.5). Another tenant's transient failure still holds that
+drain's records, as today.
+
+A held tenant's **denial events** (RFC 0026 `IngestDenied`) are not
+dropped: a denied batch never reaches the WAL, so no restart can
+regenerate its denial (#809). They stay on their own path, buffered,
+retried and requeued as before the hold. A denial lost for good holds
+no tenant, since a hold exists to stop records publishing ahead of their
+template events, and a denial has no records. A held tenant's denial
+that fails transiently is retained like any other event, so the drain
+it was taken with still holds its records, every tenant's, until a later
+drain writes it.
 
 **Recovery publishes in bounded passes.** Recovery runs the
 coordinator's write whenever **either** sink reaches its bound while it
@@ -317,11 +331,14 @@ would stall the node, so the hold is per tenant.
 >   byte total falls by A's buffered bytes, and B's later appends flush
 >   by the size and age triggers as they would without A
 > - **And** when the same drain also retains one of A's events after a
->   transient failure, A's retained events are dropped with its hold,
+>   transient failure, A's retained template events are dropped with its hold,
 >   and B's records publish on the next drain
+> - **And** A's denial events, buffered before the hold, emitted after
+>   it or requeued, are kept and written, and a denial lost for good
+>   holds no tenant
 
 > **Scenario RFC0056.2 — a derive failure takes the same path `[§3.1]`**
-> - **Given** an audit event for tenant A whose `derive_audit_partition`
+> - **Given** a template event for tenant A whose `derive_audit_partition`
 >   fails (a pre-epoch or overflowing timestamp)
 > - **When** the coordinator writes the drain
 > - **Then** A is held exactly as in RFC0056.1, and B publishes
@@ -410,7 +427,8 @@ would stall the node, so the hold is per tenant.
 
 - RFC0056.1 and .2: coordinator tests with a fault-injected audit store
   for one tenant, and an event stamped before the epoch for the derive
-  path.
+  path; the denial clause by a hold beside denial events, kept and then
+  read back from the store, and by a denial that alone is lost for good.
 - RFC0056.3: receiver tests over both transports.
 - RFC0056.11: the audit sink's hold-event test and its exported-metrics
   test in `ourios-ingester`, and the refusal's count beside RFC0056.3.

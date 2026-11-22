@@ -537,7 +537,7 @@ impl Store {
     /// This handle, its every call cut off at `deadline`: past it the
     /// request is dropped and the call fails as a backend error, which the
     /// sinks treat as transient and retry. A caller that must not wait on
-    /// the client's own limits (object_store retries for minutes) sets it.
+    /// the client's own limits (`object_store` retries for minutes) sets it.
     #[must_use]
     pub fn with_deadline(self, deadline: std::time::Duration) -> Self {
         Self {
@@ -1837,7 +1837,7 @@ mod tests {
 
     /// #1337: a call against a store that never answers returns once the
     /// handle's deadline has passed, rather than when the client gives up
-    /// (object_store retries for minutes).
+    /// (`object_store` retries for minutes).
     #[test]
     fn a_call_past_the_handle_deadline_returns_an_error() {
         let port = super::test_support::serve(1, |_| None);

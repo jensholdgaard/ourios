@@ -71,7 +71,7 @@ pub struct Publishing {
 /// run inside the miner step, the age sweep and the checkpoint, and a call
 /// that hangs until the client gives up would hold the step, the stop that
 /// waits for it, and the applied events behind it. Well above a large
-/// partition's put, and inside object_store's own retry budget, so a slow
+/// partition's put, and inside `object_store`'s own retry budget, so a slow
 /// store still retries within it; a cut-off call fails as transient and
 /// the next step retries.
 pub(super) const STORE_CALL_DEADLINE: Duration = Duration::from_secs(60);

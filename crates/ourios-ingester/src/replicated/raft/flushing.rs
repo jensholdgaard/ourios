@@ -67,6 +67,15 @@ pub struct Publishing {
     pub graph_emitter: Option<std::sync::Arc<crate::graph_emitter::GraphEmitter>>,
 }
 
+/// The most one store call from the flusher may take (#1337). Its calls
+/// run inside the miner step, the age sweep and the checkpoint, and a call
+/// that hangs until the client gives up would hold the step, the stop that
+/// waits for it, and the applied events behind it. Well above a large
+/// partition's put, and inside object_store's own retry budget, so a slow
+/// store still retries within it; a cut-off call fails as transient and
+/// the next step retries.
+pub(super) const STORE_CALL_DEADLINE: Duration = Duration::from_secs(60);
+
 /// The age sweep's most: a partition flushes within its age plus this
 /// (RFC 0063 §3.2, as the local receiver's sweep).
 const SWEEP_TICK: Duration = Duration::from_secs(30);
@@ -82,7 +91,7 @@ impl Publishing {
     #[must_use]
     pub fn source(&self, group: u32) -> Option<Source> {
         Some(Source {
-            store: self.store.clone(),
+            store: self.store.clone().with_deadline(STORE_CALL_DEADLINE),
             voters: self.voters.get(&group)?.clone(),
             flush: self.flush.clone(),
             promoted: self.promoted.clone(),

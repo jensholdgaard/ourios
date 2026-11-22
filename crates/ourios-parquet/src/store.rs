@@ -127,6 +127,9 @@ pub struct Store {
     http: bool,
     /// The subsystem this handle's calls are attributed to.
     caller: Caller,
+    /// The most any one call through this handle may take (see
+    /// [`Self::with_deadline`]); `None` leaves it to the client's own limits.
+    deadline: Option<std::time::Duration>,
     metrics: Metrics,
     /// Reserved key prefix (the store root). Always empty at `red`; honoured
     /// once the consumers migrate onto [`Store`] at `green`.
@@ -295,6 +298,14 @@ impl StoreConfig {
             Self::S3(cfg) => Store::s3(cfg.clone()),
         }
     }
+}
+
+/// The error of a call cut off at its handle's deadline.
+fn past_deadline(deadline: std::time::Duration) -> StoreError {
+    StoreError::Backend(object_store::Error::Generic {
+        store: "deadline",
+        source: format!("the call did not finish within {deadline:?}").into(),
+    })
 }
 
 /// Errors from constructing or addressing a [`Store`].
@@ -523,13 +534,39 @@ impl Store {
             })
     }
 
-    /// Run `fut` on the bridge (see [`block_on_off_runtime`]) as an `op` call.
+    /// This handle, its every call cut off at `deadline`: past it the
+    /// request is dropped and the call fails as a backend error, which the
+    /// sinks treat as transient and retry. A caller that must not wait on
+    /// the client's own limits (object_store retries for minutes) sets it.
+    #[must_use]
+    pub fn with_deadline(self, deadline: std::time::Duration) -> Self {
+        Self {
+            deadline: Some(deadline),
+            ..self
+        }
+    }
+
+    /// The deadline [`Self::with_deadline`] set, if any.
+    #[must_use]
+    pub fn deadline(&self) -> Option<std::time::Duration> {
+        self.deadline
+    }
+
+    /// Run `fut` on the bridge (see [`block_on_off_runtime`]) as an `op` call,
+    /// within this handle's deadline.
     fn bridge<T: Send + 'static>(
         &self,
         op: Operation,
         fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
     ) -> Result<T, StoreError> {
-        block_on_off_runtime(&self.metrics, op, fut)
+        let Some(deadline) = self.deadline else {
+            return block_on_off_runtime(&self.metrics, op, fut);
+        };
+        block_on_off_runtime(&self.metrics, op, async move {
+            tokio::time::timeout(deadline, fut)
+                .await
+                .unwrap_or_else(|_| Err(past_deadline(deadline)))
+        })
     }
 
     /// Resolve a `/`-delimited `key` to an absolute object path under the
@@ -1796,5 +1833,30 @@ mod tests {
             .unwrap_or_default();
         assert!(msg.contains("bridged future panicked"), "payload: {msg:?}");
         assert_eq!(bridged(async { Ok(1_u8) }).expect("after panic"), 1);
+    }
+
+    /// #1337: a call against a store that never answers returns once the
+    /// handle's deadline has passed, rather than when the client gives up
+    /// (object_store retries for minutes).
+    #[test]
+    fn a_call_past_the_handle_deadline_returns_an_error() {
+        let port = super::test_support::serve(1, |_| None);
+        let store = Store::s3(super::test_support::s3_config(port))
+            .expect("store")
+            .with_deadline(std::time::Duration::from_millis(200));
+        assert_eq!(
+            store.deadline(),
+            Some(std::time::Duration::from_millis(200))
+        );
+
+        let started = std::time::Instant::now();
+        let put = store.put_blocking("held/key", b"v".to_vec());
+
+        assert!(matches!(put, Err(StoreError::Backend(_))), "{put:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "returned after {:?}",
+            started.elapsed()
+        );
     }
 }

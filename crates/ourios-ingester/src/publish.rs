@@ -963,6 +963,33 @@ mod tests {
         );
     }
 
+    /// #1396: the denials a hold keeps reach the store — buffered before
+    /// it, emitted after it and requeued — while the tenant stays held.
+    #[test]
+    fn rfc0056_1_a_held_tenants_denials_are_written() {
+        let stores = Stores::new(usize::MAX);
+        stores.audit.clone().emit(unwritable_event("acme"));
+        let holding = stores.coord.drain_aged();
+        stores.audit.clone().emit(denial_event("acme"));
+        let _ = stores.coord.write_ordered(holding, "age");
+        stores.audit.clone().emit(denial_event("acme"));
+        stores.audit.requeue(vec![denial_event("acme")]);
+
+        assert!(stores.audit.flush());
+        assert!(stores.audit.held().is_held(&TenantId::new("acme")));
+        let denials = data_files(&stores.audit_root)
+            .iter()
+            .flat_map(|path| {
+                ourios_parquet::AuditReader::open_file(path)
+                    .expect("open audit file")
+                    .read_all()
+                    .expect("read audit file")
+            })
+            .filter(|e| matches!(e.payload, AuditPayload::IngestDenied { .. }))
+            .count();
+        assert_eq!(denials, 3, "every kept denial is written");
+    }
+
     /// #1396: a denial that is lost for good holds no tenant, since a hold
     /// exists to stop records publishing ahead of their template events.
     #[test]

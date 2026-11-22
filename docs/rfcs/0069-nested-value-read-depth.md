@@ -17,7 +17,9 @@ superseded-by: —
 > SDK's depth of 64, is a follow-up (§4.1). This RFC **amends accepted
 > RFC 0017 §3.3–§3.4**, which require a structured body and decoded
 > attributes on every row with only an absent-body fallback: §3.2 adds
-> the undecodable-value exceptions. RFC 0017 gets a dated pointer here
+> the undecodable-value exceptions, and a `RetainedLossy` reconstruction
+> for stored body bytes that are not valid UTF-8. 2026-11-22: the
+> maintainer settled #1399's three review findings in §3.2 and §5. RFC 0017 gets a dated pointer here
 > once this RFC is accepted. The fallback keeps RFC 0047 §3.4's masking
 > guarantee (§3.2). It coordinates with RFC 0062 (`green`), whose §3.3
 > fails a query on an unreadable cell (§3.2), and leaves RFC 0022 §3.3's
@@ -97,7 +99,15 @@ one bad cell does not affect the row's other cells or other rows.
 - **Structured body.** `render_log_body` returns the stored body bytes
   as the line under `Reconstruction::RetainedVerbatim`, instead of an
   empty line under the same label. This is the exception to RFC 0017
-  §3.3's structured-body rule.
+  §3.3's structured-body rule. A query answers in JSON, whose strings
+  are UTF-8, so stored bytes that are not valid UTF-8 cannot be returned
+  as they are: the line is then their lossy conversion, each invalid
+  sequence replaced by U+FFFD, under a new `Reconstruction::RetainedLossy`,
+  which the query endpoint (RFC 0016) serialises as `retained_lossy`. The
+  row says it is not byte-exact rather than passing the conversion off
+  as the stored bytes; storage keeps the exact bytes, and compaction
+  carries them unchanged (below). Decided by the maintainer on
+  2026-11-22 (#1399).
 - **Attributes.** An undecodable attribute cell is replaced by a single
   attribute whose key is reserved (§7) and whose string value is the
   stored canonical JSON, so the data stays visible and the row says why
@@ -119,7 +129,12 @@ one bad cell does not affect the row's other cells or other rows.
   stays unmatched under `not` too. The guard covers **only comparisons
   that read the raw JSON cell**, RFC 0062's scanner path. A comparison
   on a promoted key reads its typed column (RFC 0022 §3.3, RFC 0042
-  §3.4) and is unchanged, whatever the row's raw attributes cell holds.
+  §3.4) and that typed arm is unchanged, whatever the row's raw
+  attributes cell holds. A promoted string or `i64` equality or
+  inequality also has a JSON arm, taken when the promoted column is
+  `NULL`; that arm reads the raw cell, so it is guarded the same way,
+  outside its prefilter, and an undecodable cell does not match it under
+  `not` either (#1399).
 - **Result-set compatibility.** Excluding an undecodable cell under
   `not` changes a result that succeeds today: `not (attr.k == "x") |
   count` counts a row whose attributes cell is malformed. RFC 0002 §6.6
@@ -146,6 +161,17 @@ carried forward byte for byte, not only its bad cell, and the partition
 compacts. Rows that decode in full are compacted as today. That covers a body whose bytes are not valid
 UTF-8 as well: compaction never routes a raw cell through a string
 conversion.
+
+**The preservation boundary.** RFC 0022 §3.4 and RFC 0042 §3.5
+(`accepted`) re-project a compacted row's promoted columns under the
+current declaration, and that still holds for a degraded row. What is
+carried byte for byte is every **raw** cell: the body, the three
+attribute cells and every other stored column. The **promoted** columns
+are re-projected from what can be read. A key the current declaration
+still promotes keeps the row's existing typed value, since its
+undecodable attributes cell cannot supply a better one, and a key only
+the current declaration promotes is `NULL`. So neither accepted RFC is
+amended. Decided by the maintainer on 2026-11-22 (#1399).
 
 **Erasure stays pending past an undecodable identity.** Erasure (RFC
 0047 §3.6) runs through the same rewrite and finds the rows to erase by
@@ -210,7 +236,9 @@ explicit bound is enough.
 >   scope attributes alone are, with a body that is not valid UTF-8
 > - **When** a query reads the file
 > - **Then** it returns every row: the bad body as its stored bytes
->   under `RetainedVerbatim`, each bad attribute cell as the reserved
+>   under `RetainedVerbatim`, or, for the body that is not valid UTF-8,
+>   as their lossy conversion under `RetainedLossy` (`retained_lossy` on
+>   the query endpoint), each bad attribute cell as the reserved
 >   attribute holding its stored JSON, and every valid cell of those
 >   rows decoded as usual; one `WARN` event names each bad cell
 
@@ -221,6 +249,10 @@ explicit bound is enough.
 > - **Then** compaction succeeds, every bad cell's stored bytes are
 >   unchanged in the output, the non-UTF-8 body included, and no output
 >   row carries the reserved attribute
+> - **And** when the promoted declaration changed since the file was
+>   written, and the run spills: every raw cell of a degraded row is
+>   unchanged, a key still promoted keeps the row's typed value, and a
+>   newly promoted key is `NULL` on it
 
 > **Scenario RFC0069.5 — erasure stays pending past an undecodable identity `[§3.7]`**
 > - **Given** a partition under an erasure request for a conversation,
@@ -248,6 +280,10 @@ explicit bound is enough.
 >   either
 > - **And** a comparison on a promoted key matches the bad row when its
 >   promoted column matches, whatever its raw attributes cell holds
+> - **And** when the bad row's promoted column is `NULL`, a promoted
+>   string or `i64` comparison and its negation, both of which fall back
+>   to the undecodable JSON cell, match neither the comparison nor its
+>   negation
 
 ## 6. Testing strategy
 
@@ -263,7 +299,8 @@ explicit bound is enough.
   of an empty line, as a superseded test kept `#[ignore]`d beside its
   successor.
 - RFC0069.4: compaction tests in `ourios-parquet` beside RFC0009.2's,
-  with a spill forced by a small memory budget.
+  with a spill forced by a small memory budget, and a mixed-schema case
+  whose promoted declaration changed between the input and the rewrite.
 - RFC0069.5: an erasure test in `ourios-ingester`'s compactor beside
   RFC 0047 §3.6's erasure tests.
 - RFC0069.6: a visibility test in `ourios-querier` beside RFC 0047's

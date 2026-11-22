@@ -153,12 +153,12 @@ one bad cell does not affect the row's other cells or other rows.
   match.
 
 **In compaction, nothing degrades.** The query fallback never reaches
-the compaction path. A row with **any** undecodable cell is read
-**whole** as its stored bytes, every cell of it raw, the valid ones
-included, carried through sorting, spills and the final write in a
-dedicated raw form, and written back unchanged, so the whole row is
-carried forward byte for byte, not only its bad cell, and the partition
-compacts. Rows that decode in full are compacted as today. That covers a body whose bytes are not valid
+the compaction path. A row with **any** undecodable cell is read with
+every raw cell as its stored bytes, the valid ones included, carried
+through sorting, spills and the final write in a dedicated raw form,
+and written back with those raw cells unchanged, not only its bad cell,
+so the partition compacts; its promoted columns follow the boundary
+below. Rows that decode in full are compacted as today. That covers a body whose bytes are not valid
 UTF-8 as well: compaction never routes a raw cell through a string
 conversion.
 
@@ -166,12 +166,24 @@ conversion.
 (`accepted`) re-project a compacted row's promoted columns under the
 current declaration, and that still holds for a degraded row. What is
 carried byte for byte is every **raw** cell: the body, the three
-attribute cells and every other stored column. The **promoted** columns
-are re-projected from what can be read. A key the current declaration
-still promotes keeps the row's existing typed value, since its
-undecodable attributes cell cannot supply a better one, and a key only
-the current declaration promotes is `NULL`. So neither accepted RFC is
-amended. Decided by the maintainer on 2026-11-22 (#1399).
+attribute cells and every stored column that is not a promoted column.
+The **promoted** columns are re-projected under the current declaration
+from what can be read. When the attribute cell a key is promoted from
+decodes, the key is projected from it exactly as for a healthy row,
+whatever else in the row is undecodable. When that cell is the
+undecodable one:
+
+- a key the current declaration still promotes **at the same type**
+  keeps the row's existing typed value, since the cell cannot supply a
+  better one;
+- a key it promotes **at a different type**, or **newly** promotes, is
+  `NULL`: RFC 0042 §3.4 forbids coercing the old value, and the cell
+  cannot supply a new one;
+- a key it **no longer** promotes has no column, as for any row.
+
+So neither accepted RFC is amended. Decided by the maintainer on
+2026-11-22 (#1399), the boundary refined in review to keep projecting
+from every cell that decodes.
 
 **Erasure stays pending past an undecodable identity.** Erasure (RFC
 0047 §3.6) runs through the same rewrite and finds the rows to erase by
@@ -250,15 +262,20 @@ explicit bound is enough.
 >   unchanged in the output, the non-UTF-8 body included, and no output
 >   row carries the reserved attribute
 > - **And** when the promoted declaration changed since the file was
->   written, and the run spills: every raw cell of a degraded row is
->   unchanged, a key still promoted keeps the row's typed value, and a
->   newly promoted key is `NULL` on it
+>   written, re-typing one key and newly promoting another, and the run
+>   spills: every raw cell of a degraded row is unchanged; on a row whose
+>   source attribute cell decodes (only its body or scope attributes are
+>   bad), both keys are projected from that cell as on a healthy row; on
+>   a row whose source attribute cell is undecodable, a key still
+>   promoted at the same type keeps its typed value, and the re-typed
+>   and the newly promoted key are `NULL`
 
 > **Scenario RFC0069.5 — erasure stays pending past an undecodable identity `[§3.7]`**
 > - **Given** a partition under an erasure request for a conversation,
 >   holding a row whose attributes cell does not decode
 > - **When** the erasure rewrite runs
-> - **Then** the row is carried forward byte for byte, the erasure's
+> - **Then** the row's raw cells are carried forward byte for byte, its
+>   promoted columns follow §3.2's preservation boundary, the erasure's
 >   marker for that partition does not advance, the erasure is not
 >   reported complete, and the row is logged
 

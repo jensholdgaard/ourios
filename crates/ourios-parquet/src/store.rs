@@ -534,10 +534,13 @@ impl Store {
             })
     }
 
-    /// This handle, its every call cut off at `deadline`: past it the
-    /// request is dropped and the call fails as a backend error, which the
-    /// sinks treat as transient and retry. A caller that must not wait on
-    /// the client's own limits (`object_store` retries for minutes) sets it.
+    /// This handle, its bridged `*_blocking` calls cut off at `deadline`:
+    /// past it the request is dropped and the call fails as a backend error,
+    /// which the sinks treat as transient and retry. A caller that must not
+    /// wait on the client's own limits (`object_store` retries for minutes)
+    /// sets it. The async methods, the raw handle from
+    /// [`Self::object_store`] and [`Self::sync_local_blocking`] do not go
+    /// through the bridge and keep the backend's own limits.
     #[must_use]
     pub fn with_deadline(self, deadline: std::time::Duration) -> Self {
         Self {

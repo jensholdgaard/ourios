@@ -5161,7 +5161,7 @@ Used by:
 - `fixedbitset` 0.5.7 — <https://github.com/petgraph/fixedbitset>
 - `flate2` 1.1.11 — <https://github.com/rust-lang/flate2-rs>
 - `fnv` 1.0.7 — <https://github.com/servo/rust-fnv>
-- `form_urlencoded` 1.2.2 — <https://github.com/servo/rust-url>
+- `form_urlencoded` 1.2.3 — <https://github.com/servo/rust-url>
 - `glob` 0.3.3 — <https://github.com/rust-lang/glob>
 - `group` 0.13.0 — <https://github.com/zkcrypto/group>
 - `hashbrown` 0.14.5 — <https://github.com/rust-lang/hashbrown>
@@ -5227,7 +5227,7 @@ Used by:
 - `unicode-segmentation` 1.13.3 — <https://github.com/unicode-rs/unicode-segmentation>
 - `unicode-width` 0.2.2 — <https://github.com/unicode-rs/unicode-width>
 - `unicode-xid` 0.2.6 — <https://github.com/unicode-rs/unicode-xid>
-- `url` 2.5.8 — <https://github.com/servo/rust-url>
+- `url` 2.5.9 — <https://github.com/servo/rust-url>
 - `uuid` 1.29.2 — <https://github.com/uuid-rs/uuid>
 - `validit` 0.2.6 — <https://github.com/drmingdrmer/validit>
 - `version_check` 0.9.5 — <https://github.com/SergioBenitez/version_check>

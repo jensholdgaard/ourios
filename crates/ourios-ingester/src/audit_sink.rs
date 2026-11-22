@@ -491,10 +491,12 @@ impl SharedParquetAuditSink {
 
     /// Drain the internal buffer to durability — the standalone
     /// cadence/shutdown flush, and the first half of [`Self::barrier`].
-    /// Returns whether every event emitted so far is durable: nothing was
-    /// retained for retry, and no earlier take's events are still in
-    /// limbo. Transient failures are requeued ahead of newly-buffered
-    /// events.
+    /// Returns whether this take retained nothing and its ticket cleared,
+    /// so no earlier take's events are still in limbo. Events a permanent
+    /// failure or a hold dropped count as settled, not durable, and events
+    /// emitted after the take are not covered. Holds gate publication
+    /// separately (`PublishCoordinator::write`). Transient failures are
+    /// requeued ahead of newly-buffered events.
     #[must_use]
     pub fn flush(&self) -> bool {
         let (events, ticket) = self.take_ticketed();

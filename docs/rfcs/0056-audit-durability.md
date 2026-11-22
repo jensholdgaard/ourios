@@ -19,9 +19,11 @@ superseded-by: —
 > - RFC0056.3: `ourios-ingester/tests/it/rfc0056_3_held_admission.rs`,
 >   over both transports.
 > - RFC0056.4–.7, .9 and .10: `ourios-ingester/tests/it/rfc0056_held_floors.rs`,
->   on the barrier rig, restarting the node over its roots. The floor
->   assigned before a stamp that failed after its rename is
->   `barrier.rs`'s `a_floor_is_kept_across_a_stamp_that_failed_after_its_rename`.
+>   on the barrier rig, restarting the node over its roots. The same file
+>   covers .10's re-minted case, a shutdown during a pass, and a pass's
+>   own quarantine (#1407). The floor assigned before a stamp that failed
+>   after its rename is `barrier.rs`'s
+>   `a_floor_is_kept_across_a_stamp_that_failed_after_its_rename`.
 > - RFC0056.8: `ourios-wal`'s `src/checkpoint.rs`,
 >   `tests/it/rfc0052_17_reclaim_record/` and `tests/it/rfc0056_held_floors.rs`.
 > - RFC0056.11: `ourios-ingester`'s `src/audit_sink.rs`,
@@ -29,7 +31,7 @@ superseded-by: —
 >   `tests/rfc0052_7_telemetry/hold_started.rs`.
 >
 > Specified 2026-11-20 (maintainer-approved, with the §7 answers).
-> Implemented in #1400, #1401, #1403, #1404 and #1406. Tracks #1294.
+> Implemented in #1400, #1401, #1403, #1404, #1406 and #1409. Tracks #1294.
 > 2026-11-20: the maintainer chose this RFC's per-tenant hold over the
 > alternative of publishing and holding the node's checkpoint (§4.1).
 >
@@ -42,9 +44,7 @@ superseded-by: —
 > extends.
 >
 > It covers the **local** WAL backend. The replicated backend (RFC 0065,
-> `red`) needs its own protocol and is tracked by #1392 (§3.6). A
-> recovery pass's own quarantine events can briefly exceed the audit
-> bound by one drain; that is tracked by #1407.
+> `red`) needs its own protocol and is tracked by #1392 (§3.6).
 >
 > **Blocked from `validated` by [#809](https://github.com/jensholdgaard/ourios/issues/809)**,
 > RFC 0026's denial-audit durability, which §7 explains this RFC cannot

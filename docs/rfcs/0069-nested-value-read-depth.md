@@ -1,7 +1,7 @@
 ---
 rfc: 0069
 title: Reading back every nested value ingest accepts
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-20
@@ -11,7 +11,9 @@ superseded-by: —
 
 # RFC 0069 — Reading back every nested value ingest accepts
 
-> **Status: `specified`** (2026-11-21, maintainer-approved, with the
+> **Status: `red`** (2026-11-22). Every §5 scenario has an `#[ignore]`d
+> `todo!` stub in `ourios-server` (`tests/it/rfc0069_nested_read_depth.rs`)
+> naming the slice that discharges it. Specified 2026-11-21 (maintainer-approved, with the
 > §7 names). Tracks #1136, options A and C, which the
 > maintainer chose on 2026-11-20; option B, ingest conformance at the
 > SDK's depth of 64, is a follow-up (§4.1). This RFC **amends accepted

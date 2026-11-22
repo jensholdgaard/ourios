@@ -49,4 +49,5 @@ mod rfc0060_refresh_config;
 mod rfc0062_8_engine_names;
 mod rfc0063_flush_age;
 mod rfc0065_replicated_wal;
+mod rfc0069_nested_read_depth;
 mod server_bin;

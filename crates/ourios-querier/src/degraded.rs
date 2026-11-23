@@ -228,14 +228,9 @@ mod tests {
         );
     }
 
-    /// A string row the miner reconstructs exactly (`lossy_flag = false`)
-    /// whose retained body cell is not valid UTF-8 keeps its `Faithful`
-    /// line: the line is rebuilt from the template, never read from that
-    /// body, so the bad cell is reported and counted but not shown in its
-    /// place.
-    #[test]
-    fn a_faithful_line_is_kept_over_a_corrupt_retained_body() {
-        let record = MinedRecord {
+    /// A row of `body_kind` with every other field at its zero value.
+    fn record(body_kind: BodyKind) -> MinedRecord {
+        MinedRecord {
             tenant_id: TenantId::new("t"),
             template_id: 1,
             template_version: 1,
@@ -255,13 +250,28 @@ mod tests {
             span_id: None,
             flags: 0,
             event_name: None,
-            body_kind: BodyKind::String,
+            body_kind,
             params: Vec::new(),
             separators: Vec::new(),
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+            ingest_position: None,
+        }
+    }
+
+    /// A string row the miner reconstructs exactly (`lossy_flag = false`)
+    /// whose retained body cell is not valid UTF-8 keeps its `Faithful`
+    /// line: the line is rebuilt from the template, never read from that
+    /// body, so the bad cell is reported and counted but not shown in its
+    /// place.
+    #[test]
+    fn a_faithful_line_is_kept_over_a_corrupt_retained_body() {
+        let record = MinedRecord {
             body: Some(String::from_utf8_lossy(b"user \xff").into_owned()),
             confidence: 0.4,
             lossy_flag: false,
-            ingest_position: None,
+            ..record(BodyKind::String)
         };
         let faithful = LogBody::Rendered {
             line: b"user bob".to_vec(),
@@ -275,5 +285,34 @@ mod tests {
 
         assert_eq!(rows[0].body, faithful, "the reconstructed line stands");
         assert_eq!(counts.body, 1, "the corrupt body cell is still counted");
+    }
+
+    /// A structured body whose stored bytes are not valid UTF-8 is corrupt
+    /// even when its lossy conversion parses as canonical JSON: it is
+    /// returned as that conversion under `RetainedLossy`, never as
+    /// `Structured` over altered content, and counted once.
+    #[test]
+    fn a_structured_body_that_is_not_utf8_is_returned_lossy_not_structured() {
+        let lossy = String::from_utf8_lossy(b"{\"stringValue\":\"\xff\"}").into_owned();
+        let parsed = ourios_core::otlp::canonical::decode_any_value(lossy.as_bytes())
+            .expect("the lossy conversion parses");
+        let record = MinedRecord {
+            body: Some(lossy.clone()),
+            ..record(BodyKind::Structured)
+        };
+        let mut rows = vec![LogRow::test_row()];
+        rows[0].body = LogBody::Structured(parsed);
+
+        let decoded = Decoded::over(&[], vec![record], vec![(0, columns::BODY)]);
+        let counts = decoded.settle(&mut rows);
+
+        assert_eq!(
+            rows[0].body,
+            LogBody::Rendered {
+                line: lossy.into_bytes(),
+                reconstruction: Reconstruction::RetainedLossy,
+            }
+        );
+        assert_eq!(counts.body, 1, "one body cell, counted once");
     }
 }

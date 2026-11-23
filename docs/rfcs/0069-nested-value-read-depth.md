@@ -124,8 +124,13 @@ one bad cell does not affect the row's other cells or other rows.
   (`ourios_attr_cmp`, RFC 0062 §3.3). A predicate over a cell the
   filter cannot read evaluates as SQL `NULL`, so it does not match, and
   the query no longer fails. The filter cannot read a cell that is not a
-  closed `[...]` list, as every cell the encoder writes is, or one whose
-  scan along the key's path fails. It checks that shape rather than
+  closed `[...]` list (JSON whitespace around it allowed), as every cell
+  the encoder writes is, or, where the comparison runs, one whose scan
+  along the key's path fails. Under `not`, a row the `LIKE` prefilter
+  rules out is checked for its shape only, since scanning each such row
+  doubled the cost of a negation: there, a cell corrupted inside a map
+  but still closed can match `not (attr.a.b == "x")` while
+  `attr.a.b != "x"` is `NULL` (maintainer, 2026-11-23). It checks that shape rather than
   decoding the cell: a full decode of each row a comparison would match
   costs about ten times RFC0062.6's per-row budget for `!=`, so a cell
   corrupted inside but still a closed list is read by its text, and is

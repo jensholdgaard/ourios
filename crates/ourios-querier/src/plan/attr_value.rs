@@ -96,20 +96,16 @@ impl ScalarUDFImpl for AttrCmp {
         let cmp = Cmp::new(key, expected, *eq);
         let array = match json {
             ColumnarValue::Scalar(json) => {
-                let hit = json
-                    .try_as_str()
-                    .flatten()
-                    .and_then(|j| cmp.answer(j))
-                    .transpose()?;
+                let hit = json.try_as_str().flatten().and_then(|j| cmp.answer(j));
                 return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(hit)));
             }
             ColumnarValue::Array(array) => array,
         };
         let mut out = BooleanBuilder::with_capacity(array.len());
         match array.data_type() {
-            DataType::Utf8 => cmp.fill(array.as_string::<i32>().iter(), &mut out)?,
-            DataType::LargeUtf8 => cmp.fill(array.as_string::<i64>().iter(), &mut out)?,
-            DataType::Utf8View => cmp.fill(array.as_string_view().iter(), &mut out)?,
+            DataType::Utf8 => cmp.fill(array.as_string::<i32>().iter(), &mut out),
+            DataType::LargeUtf8 => cmp.fill(array.as_string::<i64>().iter(), &mut out),
+            DataType::Utf8View => cmp.fill(array.as_string_view().iter(), &mut out),
             other => return exec_err!("{NAME} takes a string column, got {other}"),
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -202,22 +198,20 @@ impl<'a> Cmp<'a> {
         }
     }
 
-    fn fill<'s>(
-        &self,
-        rows: impl Iterator<Item = Option<&'s str>>,
-        out: &mut BooleanBuilder,
-    ) -> Result<()> {
+    fn fill<'s>(&self, rows: impl Iterator<Item = Option<&'s str>>, out: &mut BooleanBuilder) {
         for row in rows {
-            out.append_option(row.and_then(|json| self.answer(json)).transpose()?);
+            out.append_option(row.and_then(|json| self.answer(json)));
         }
-        Ok(())
     }
 
     /// The comparison on one stored cell; `None` (SQL `NULL`) for a cell
-    /// that does not decode, whose text can hold a pair it never stored
-    /// (RFC 0069 §3.2).
-    fn answer(&self, json: &str) -> Option<Result<bool>> {
-        super::attr_guard::decodable(json).then(|| self.eval(json))
+    /// the filter cannot read: one that is not a closed list, whose text
+    /// can hold a pair it never stored, or one whose scan along the key's
+    /// path fails (RFC 0069 §3.2).
+    fn answer(&self, json: &str) -> Option<bool> {
+        super::attr_guard::readable(json)
+            .then(|| self.eval(json).ok())
+            .flatten()
     }
 
     /// The key's first occurrence is the first top-level one unless a map

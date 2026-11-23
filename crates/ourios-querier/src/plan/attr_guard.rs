@@ -1,14 +1,13 @@
 //! RFC 0069 §3.2's predicate guard: a comparison over an attribute cell
-//! that does not decode is SQL `NULL`, so neither it nor its negation
+//! the filter cannot read is SQL `NULL`, so neither it nor its negation
 //! matches the row, and the query does not fail.
 //!
 //! [`attr_cmp`](super::attr_cmp) answers `NULL` itself for such a cell. Its
 //! `LIKE` prefilter does not: a cell the prefilter rules out is `false`
 //! before the comparison runs, and `not` would turn that into a match. Under
 //! an odd number of `not`s, [`guard_negations`] therefore makes the whole
-//! JSON arm `NULL` for a cell that does not decode. Elsewhere `NULL` and
-//! `false` filter out the same rows, so the arm stays as compiled and only
-//! the rows the prefilter keeps are decoded.
+//! JSON arm `NULL` for a cell the filter cannot read. Elsewhere `NULL` and
+//! `false` filter out the same rows, so the arm stays as compiled.
 
 use std::sync::{Arc, LazyLock};
 
@@ -21,25 +20,27 @@ use datafusion::logical_expr::{
     Signature, Volatility, when,
 };
 use datafusion::prelude::lit;
-use ourios_core::otlp::canonical;
 
 use super::attr_value;
 
-const NAME: &str = "ourios_attrs_decodable";
+const NAME: &str = "ourios_attrs_readable";
 
 static UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
-    Arc::new(ScalarUDF::from(Decodable {
+    Arc::new(ScalarUDF::from(Readable {
         signature: Signature::any(1, Volatility::Immutable),
     }))
 });
 
-/// Whether a stored attribute cell decodes, as the reader decodes it.
-pub(super) fn decodable(json: &str) -> bool {
-    json == "[]" || canonical::decode_attributes(json.as_bytes()).is_ok()
+/// Whether the filter can read a stored attribute cell: a closed JSON
+/// list, as every cell the encoder writes is. A full decode would cost
+/// several times RFC0062.6's budget per row, so a cell corrupted inside
+/// but still closed is read by its text (maintainer, 2026-11-23).
+pub(super) fn readable(json: &str) -> bool {
+    json.starts_with('[') && json.ends_with(']')
 }
 
 /// `expr` with every JSON-arm comparison under an odd number of `not`s
-/// made `NULL` for an attribute cell that does not decode.
+/// made `NULL` for an attribute cell the filter cannot read.
 pub(super) fn guard_negations(expr: Expr) -> Result<Expr> {
     guard(expr, false)
 }
@@ -58,8 +59,8 @@ fn guard(expr: Expr, negated: bool) -> Result<Expr> {
     }
 }
 
-/// `prefilter AND cmp` as `CASE WHEN prefilter THEN cmp WHEN <cell
-/// decodes> THEN false END`: `NULL` for a cell that does not decode,
+/// `prefilter AND cmp` as `CASE WHEN prefilter THEN cmp WHEN <cell is
+/// readable> THEN false END`: `NULL` for a cell the filter cannot read,
 /// whichever branch it reaches.
 fn guarded(prefilter: Expr, cmp: Expr) -> Result<Expr> {
     let Some(cell) = attr_value::cell_of(&cmp) else {
@@ -71,11 +72,11 @@ fn guarded(prefilter: Expr, cmp: Expr) -> Result<Expr> {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct Decodable {
+struct Readable {
     signature: Signature,
 }
 
-impl ScalarUDFImpl for Decodable {
+impl ScalarUDFImpl for Readable {
     fn name(&self) -> &str {
         NAME
     }
@@ -94,7 +95,7 @@ impl ScalarUDFImpl for Decodable {
         };
         let array = match json {
             ColumnarValue::Scalar(json) => {
-                let answer = json.try_as_str().flatten().map(decodable);
+                let answer = json.try_as_str().flatten().map(readable);
                 return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(answer)));
             }
             ColumnarValue::Array(array) => array,
@@ -112,7 +113,7 @@ impl ScalarUDFImpl for Decodable {
 
 fn fill<'s>(rows: impl Iterator<Item = Option<&'s str>>, out: &mut BooleanBuilder) {
     for row in rows {
-        out.append_option(row.map(decodable));
+        out.append_option(row.map(readable));
     }
 }
 
@@ -171,5 +172,23 @@ mod tests {
             1,
             "a promoted fallback under its presence check"
         );
+    }
+
+    /// A cell is readable when it is a closed list, as the encoder writes
+    /// every cell; a cell corrupted inside but still closed is the known
+    /// gap the cheap check accepts.
+    #[test]
+    fn a_cell_is_readable_when_it_is_a_closed_list() {
+        use super::readable;
+        assert!(readable("[]"));
+        assert!(readable(r#"[{"key":"k","value":{"stringValue":"x"}}]"#));
+        assert!(
+            !readable(r#"[{"key":"k","value":{"stringValue":"x"}}"#),
+            "truncated"
+        );
+        assert!(!readable("not json"));
+        assert!(!readable(r#"{"key":"k"}"#), "not a list");
+        assert!(!readable(""));
+        assert!(readable(r#"[{"key":"k",garbage]"#), "the accepted gap");
     }
 }

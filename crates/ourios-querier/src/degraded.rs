@@ -36,6 +36,8 @@ pub(crate) fn located(df: DataFrame) -> Result<DataFrame, QueryError> {
 /// The materialization scan's rows, decoded.
 pub(crate) struct Decoded<'a> {
     batches: &'a [RecordBatch],
+    /// The record index each batch starts at, ascending.
+    starts: Vec<usize>,
     /// Every returned row, in scan order.
     pub(crate) records: Vec<MinedRecord>,
     /// Each cell the reader degraded, as (record index, column).
@@ -62,14 +64,31 @@ pub(crate) fn decode(batches: &[RecordBatch]) -> Result<Decoded<'_>, QueryError>
         );
         records.extend(decoded.records);
     }
-    Ok(Decoded {
-        batches,
-        records,
-        cells,
-    })
+    Ok(Decoded::over(batches, records, cells))
 }
 
-impl Decoded<'_> {
+impl<'a> Decoded<'a> {
+    fn over(
+        batches: &'a [RecordBatch],
+        records: Vec<MinedRecord>,
+        cells: Vec<(usize, &'static str)>,
+    ) -> Self {
+        let starts = batches
+            .iter()
+            .scan(0, |start, batch| {
+                let this = *start;
+                *start += batch.num_rows();
+                Some(this)
+            })
+            .collect();
+        Self {
+            batches,
+            starts,
+            records,
+            cells,
+        }
+    }
+
     /// Finish `rows`, rendered one per record: mark each body that is not
     /// valid UTF-8 as [`Reconstruction::RetainedLossy`], add each structured
     /// body that did not decode, then report every degraded cell and count
@@ -117,20 +136,21 @@ impl Decoded<'_> {
     /// The source file and row of record `record`, from the scan's own
     /// columns. `None` only for a batch that did not come from a file scan.
     fn locate(&self, record: usize) -> Option<(String, i64)> {
-        let mut start = 0;
-        for batch in self.batches {
-            let row = record - start;
-            if row < batch.num_rows() {
-                let file = batch.column_by_name(FILE)?.as_string_opt::<i32>()?;
-                let index = batch
-                    .column_by_name(FILE_ROW)?
-                    .as_primitive_opt::<Int64Type>()?;
-                return (file.is_valid(row) && index.is_valid(row))
-                    .then(|| (file.value(row).to_owned(), index.value(row)));
-            }
-            start += batch.num_rows();
+        let at = self
+            .starts
+            .partition_point(|&start| start <= record)
+            .checked_sub(1)?;
+        let batch = &self.batches[at];
+        let row = record - self.starts[at];
+        if row >= batch.num_rows() {
+            return None;
         }
-        None
+        let file = batch.column_by_name(FILE)?.as_string_opt::<i32>()?;
+        let index = batch
+            .column_by_name(FILE_ROW)?
+            .as_primitive_opt::<Int64Type>()?;
+        (file.is_valid(row) && index.is_valid(row))
+            .then(|| (file.value(row).to_owned(), index.value(row)))
     }
 }
 
@@ -160,5 +180,45 @@ fn mark_lossy(record: &MinedRecord, row: &mut LogRow) {
             };
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::record_batch::RecordBatch;
+
+    use super::{Decoded, FILE, FILE_ROW};
+
+    /// A scan batch whose rows came from `file`, starting at file row `from`.
+    fn batch(file: &str, from: i64, rows: usize) -> RecordBatch {
+        let files: ArrayRef = Arc::new(StringArray::from(vec![file; rows]));
+        let indexes: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (0..rows).map(|i| from + i64::try_from(i).expect("small")),
+        ));
+        RecordBatch::try_from_iter([(FILE, files), (FILE_ROW, indexes)]).expect("batch")
+    }
+
+    /// A record is located in the batch holding it, however many batches
+    /// precede it, and a record past the last batch has no location.
+    #[test]
+    fn a_record_is_located_in_its_own_batch() {
+        let batches = [batch("a", 0, 2), batch("a", 2, 1), batch("b", 0, 3)];
+        let decoded = Decoded::over(&batches, Vec::new(), Vec::new());
+        let located: Vec<_> = (0..7).map(|record| decoded.locate(record)).collect();
+        assert_eq!(
+            located,
+            vec![
+                Some(("a".to_owned(), 0)),
+                Some(("a".to_owned(), 1)),
+                Some(("a".to_owned(), 2)),
+                Some(("b".to_owned(), 0)),
+                Some(("b".to_owned(), 1)),
+                Some(("b".to_owned(), 2)),
+                None,
+            ]
+        );
     }
 }

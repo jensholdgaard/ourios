@@ -94,10 +94,12 @@ a producer other than Ourios, can hold attributes that do not decode. A
 query returns such a record anyway (RFC 0069): the unreadable attributes
 come back as one attribute, `ourios.attribute.undecodable`, holding the
 stored text, and the rest of the record is read as usual. A comparison
-on an unreadable attribute matches neither way: `attr.k == "x"` and
-`not (attr.k == "x")` both skip the record, so a negated query no longer
-counts it. A promoted key still answers from its column when the record
-has a value there.
+on attributes that are cut short or not a list at all matches neither
+way: `attr.k == "x"` and `not (attr.k == "x")` both skip the record, so
+a negated query no longer counts it. Attributes damaged inside but still
+a complete list are matched by their text, so a comparison can still
+answer for them. A promoted key still answers from its column when the
+record has a value there.
 
 ## The samples
 

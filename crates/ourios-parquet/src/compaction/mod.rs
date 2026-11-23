@@ -42,7 +42,9 @@ use crate::manifest::{
     LiveSet, MANIFEST_FILENAME, Manifest, ManifestError, Published, compacted_generation,
 };
 use crate::partition::{PartitionKey, percent_encode_tenant};
-use crate::promoted::{PromotedAttributes, SERVICE_NAME_KEY, project_string_value};
+use crate::promoted::PromotedAttributes;
+#[cfg(test)]
+use crate::promoted::SERVICE_NAME_KEY;
 use crate::reader::{Reader, ReaderError};
 use crate::record_batch::IngestColumns;
 use crate::store::{Store, StoreError};
@@ -132,6 +134,21 @@ pub struct CompactionOutcome {
     /// The rewritten rows' decoded size as the RFC 0036 §3.2 budget
     /// estimates it; `0` on a no-op.
     pub decoded_bytes_estimate: u64,
+    /// Rows a [`RowHooks::drop`] filter could not judge, because a cell
+    /// that names a row did not decode (RFC 0069 §3.2): each is carried
+    /// forward unchanged. Empty without a filter.
+    pub unidentified: Vec<UnidentifiedRow>,
+}
+
+/// A row carried past a [`RowHooks::drop`] filter unjudged (RFC 0069 §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnidentifiedRow {
+    /// The object key of the input file holding it.
+    pub file: String,
+    /// Its 0-based row in that file.
+    pub row: u64,
+    /// The columns whose cell did not decode.
+    pub columns: Vec<&'static str>,
 }
 
 /// The committed result of a compaction.
@@ -302,7 +319,9 @@ pub struct RowHooks<'a> {
 
 /// A [`RowHooks::observe`] callback.
 pub type RowObserver<'a> = dyn FnMut(&[MinedRecord]) + 'a;
-/// A [`RowHooks::drop`] predicate.
+/// A [`RowHooks::drop`] predicate. A row whose log or resource attributes
+/// did not decode is never offered to it, and is kept (RFC 0069 §3.2;
+/// see [`CompactionOutcome::unidentified`]).
 pub type RowFilter<'a> = dyn Fn(&MinedRecord) -> bool + 'a;
 /// A [`RowHooks::on_commit`] callback.
 pub type CommitHook<'a> = dyn FnMut(&CompactionOutcome) + 'a;
@@ -608,6 +627,7 @@ fn committed_outcome(
         bytes_read: totals.bytes_read,
         bytes_written,
         decoded_bytes_estimate: totals.decoded_bytes,
+        unidentified: totals.unidentified.clone(),
     }
 }
 

@@ -9,7 +9,10 @@
 use super::*;
 use std::collections::HashMap;
 
-use ourios_parquet::partition_snapshot;
+use ourios_parquet::{UnidentifiedRow, partition_snapshot};
+
+/// The OpenTelemetry `file.path` attribute key.
+const FILE_PATH: &str = "file.path";
 
 /// One pending RFC 0047 §3.6 erasure: a durable request marker in the
 /// store (`erasure/tenant_id=<enc>/conversation=<enc>`, written by an
@@ -441,13 +444,45 @@ fn erase_partition(
                 outcome.partitions_rewritten += 1;
                 outcome.rows_dropped += o.rows_dropped;
                 sweep.report.gc_failures += o.gc_failures;
-                Some(committed.generation)
+                if o.unidentified.is_empty() {
+                    return Some(committed.generation);
+                }
+                // RFC 0069 §3.2: a row whose attributes cannot be read may
+                // be the conversation's, so the erasure stays pending.
+                log_unidentified(&o.unidentified);
+                sweep.report.errors.push(format!(
+                    "{}: {} row(s) whose attributes cannot be read were kept — request \
+                     left pending",
+                    context(),
+                    o.unidentified.len()
+                ));
+                None
             }
             None => Some(before.generation),
         },
         Err(e) => {
             e.record(&mut sweep.report, &context());
             None
+        }
+    }
+}
+
+/// Log each undecodable cell of the rows an erasure could not judge.
+fn log_unidentified(rows: &[UnidentifiedRow]) {
+    for row in rows {
+        for &column in &row.columns {
+            tracing::warn!(
+                name: ourios_semconv::EVENT_OURIOS_READER_ROW_UNDECODABLE,
+                {
+                    { FILE_PATH } = row.file.as_str(),
+                    { ourios_semconv::OURIOS_READER_ROW_INDEX } = row.row,
+                    { ourios_semconv::OURIOS_READER_COLUMN_NAME } = column,
+                },
+                "erasure: row {} of {} has an undecodable {column} cell; it is kept and the \
+                 erasure stays pending",
+                row.row,
+                row.file,
+            );
         }
     }
 }

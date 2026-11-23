@@ -15,7 +15,9 @@ use ourios_core::record::Param;
 
 use super::repeats::Repeats;
 
+use crate::reader::{DegradedBatch, DegradedRead};
 use crate::record_batch::{IngestColumns, mined_records_to_batch_in};
+use crate::row::{Carried, Row, rows_of, service_name, stored_footprint};
 
 /// The fixed inputs of one RFC 0036 §3.2 sort of a partition.
 #[derive(Clone, Copy)]
@@ -37,6 +39,7 @@ pub(super) struct SortTotals {
     pub(super) rows_dropped: u64,
     pub(super) rows_deduplicated: u64,
     pub(super) decoded_bytes: u64,
+    pub(super) unidentified: Vec<UnidentifiedRow>,
 }
 
 /// Phases 1–2 of the RFC 0036 §3.2 external merge sort: stream
@@ -151,7 +154,7 @@ struct Output<'w, 'c> {
 /// Append `rows` to `writer`, charging its in-progress row group.
 fn append(
     writer: &mut Writer,
-    rows: &[MinedRecord],
+    rows: &[Row],
     charge: &WriteCharge<'_>,
 ) -> Result<(), CompactionError> {
     writer
@@ -170,8 +173,8 @@ fn read_input(
     let gauges = formation.plan.gauges;
     let mut reader = open_input(formation.plan, input, totals)?;
     formation.positioned |= reader.declares_ingest_columns();
-    while let Some(batch) = reader.next_batch().map_err(CompactionError::Read)? {
-        formation.push(apply_hooks(hooks, batch, totals));
+    while let Some(read) = reader.next_degraded().map_err(CompactionError::Read)? {
+        formation.push(apply_hooks(hooks, read, input, totals));
     }
     drop(reader);
     gauges.set(MemoryPhase::Read, 0);
@@ -198,24 +201,62 @@ fn open_input(
 }
 
 /// RFC 0047 §3.3/§3.6: the graph feed sees every row once, before any
-/// drop; an erasure removes its rows before the sort.
+/// drop; an erasure removes its rows before the sort. A row whose cell that
+/// names it did not decode is kept unjudged and recorded (RFC 0069 §3.2).
 fn apply_hooks(
     hooks: &mut RowHooks<'_>,
-    mut batch: Vec<MinedRecord>,
+    read: DegradedRead,
+    input: &str,
     totals: &mut SortTotals,
-) -> Vec<MinedRecord> {
+) -> Vec<Row> {
+    let DegradedRead {
+        batch,
+        decoded: DegradedBatch {
+            records,
+            undecodable,
+        },
+        first_row,
+    } = read;
     if let Some(observe) = hooks.observe.as_deref_mut() {
-        observe(&batch);
+        observe(&records);
     }
+    let mut rows = rows_of(&batch, records, &undecodable);
     if let Some(drop) = hooks.drop {
-        let before = batch.len();
-        batch.retain(|record| !drop(record));
+        let before = rows.len();
+        rows = judge(rows, drop, (input, first_row), totals);
         totals.rows_dropped = totals
             .rows_dropped
-            .saturating_add(widen(before - batch.len()));
+            .saturating_add(widen(before - rows.len()));
     }
-    totals.rows = totals.rows.saturating_add(widen(batch.len()));
-    batch
+    totals.rows = totals.rows.saturating_add(widen(rows.len()));
+    rows
+}
+
+/// `rows` less those `drop` matches. A row without an identity is never
+/// offered to it: it is kept, and recorded by its file and row, the first
+/// of `rows` being row `first_row` of `input`.
+fn judge(
+    rows: Vec<Row>,
+    drop: &RowFilter<'_>,
+    (input, first_row): (&str, usize),
+    totals: &mut SortTotals,
+) -> Vec<Row> {
+    let mut kept = Vec::with_capacity(rows.len());
+    for (i, row) in rows.into_iter().enumerate() {
+        match row.identity() {
+            Some(record) if drop(record) => {}
+            Some(_) => kept.push(row),
+            None => {
+                totals.unidentified.push(UnidentifiedRow {
+                    file: input.to_owned(),
+                    row: widen(first_row.saturating_add(i)),
+                    columns: row.undecodable().to_vec(),
+                });
+                kept.push(row);
+            }
+        }
+    }
+    kept
 }
 
 /// `usize <= u64` on every supported target; saturate rather than panic
@@ -236,7 +277,7 @@ fn widen(n: usize) -> u64 {
 /// rows were cut into runs.
 struct RunFormation<'a> {
     plan: SortPlan<'a>,
-    buffer: Vec<MinedRecord>,
+    buffer: Vec<Row>,
     buffered_bytes: u64,
     /// The widest buffered row's [`decoded_footprint`], carried onto the
     /// run the buffer spills as.
@@ -261,7 +302,7 @@ impl<'a> RunFormation<'a> {
         }
     }
 
-    fn push(&mut self, batch: Vec<MinedRecord>) {
+    fn push(&mut self, batch: Vec<Row>) {
         #[cfg(test)]
         residency::add(batch.len());
         let mut bytes = 0_u64;
@@ -344,7 +385,7 @@ impl<'a> RunFormation<'a> {
 
 fn emit_in_memory(
     plan: SortPlan<'_>,
-    mut rows: Vec<MinedRecord>,
+    mut rows: Vec<Row>,
     output: &mut Output<'_, '_>,
 ) -> Result<(), CompactionError> {
     sort_records(plan.keys, &mut rows);
@@ -412,7 +453,7 @@ impl Spill {
             repeats,
             charge,
         } = output;
-        let keep = |row: &MinedRecord| repeats.keep(row);
+        let keep = |row: &Row| repeats.keep(row);
         merge_runs(&runs, plan, keep, |chunk| append(writer, chunk, charge))
     }
 }
@@ -422,7 +463,8 @@ impl Spill {
 /// sort's in-memory budget, so it tracks what decoding allocates rather
 /// than what the row costs on disk — small, well-compressed inputs
 /// decode to many times their encoded size.
-pub(super) fn decoded_footprint(record: &MinedRecord) -> u64 {
+pub(super) fn decoded_footprint<R: Carried>(row: &R) -> u64 {
+    let record = row.record();
     let strings: usize = [
         &record.severity_text,
         &record.scope_name,
@@ -455,7 +497,7 @@ pub(super) fn decoded_footprint(record: &MinedRecord) -> u64 {
     .map(|kvs| key_values_footprint(kvs))
     .sum();
     let fixed = size_of::<MinedRecord>() + record.tenant_id.as_str().len();
-    widen(fixed + strings + params + separators + attributes)
+    widen(fixed + strings + params + separators + attributes + stored_footprint(row))
 }
 
 fn key_values_footprint(kvs: &[KeyValue]) -> usize {
@@ -484,20 +526,14 @@ fn any_value_footprint(value: &AnyValue) -> usize {
 /// `service.name` value (lexicographic UTF-8 bytes, absent/null first)
 /// then `time_unix_nano` — stability preserves pre-sort row ordinals,
 /// the second half of the §3.1 tie-break.
-pub(super) fn sort_records(keys: ClusterKeys, records: &mut [MinedRecord]) {
+pub(super) fn sort_records<R: Carried>(keys: ClusterKeys, records: &mut [R]) {
     match keys {
         ClusterKeys::ServiceThenTime => records.sort_by(|a, b| {
-            let ka = (
-                project_string_value(&a.resource_attributes, SERVICE_NAME_KEY),
-                a.time_unix_nano,
-            );
-            let kb = (
-                project_string_value(&b.resource_attributes, SERVICE_NAME_KEY),
-                b.time_unix_nano,
-            );
+            let ka = (service_name(a), a.record().time_unix_nano);
+            let kb = (service_name(b), b.record().time_unix_nano);
             ka.cmp(&kb)
         }),
-        ClusterKeys::TimeOnly => records.sort_by_key(|r| r.time_unix_nano),
+        ClusterKeys::TimeOnly => records.sort_by_key(|r| r.record().time_unix_nano),
     }
 }
 
@@ -539,7 +575,7 @@ impl<'a> RunWriter<'a> {
         })
     }
 
-    fn append(&mut self, records: &[MinedRecord]) -> Result<(), CompactionError> {
+    fn append(&mut self, records: &[Row]) -> Result<(), CompactionError> {
         for chunk in records.chunks(SUB_BATCH_ROWS) {
             // Cap the buffered row group so writing an intermediate
             // merge run never holds the whole merged output encoded in
@@ -568,7 +604,7 @@ impl<'a> RunWriter<'a> {
 pub(super) fn spill_run(
     dir: &Path,
     index: usize,
-    records: &[MinedRecord],
+    records: &[Row],
     plan: SortPlan<'_>,
 ) -> Result<PathBuf, CompactionError> {
     let path = dir.join(format!("run-{index:06}.parquet"));
@@ -638,8 +674,8 @@ pub(super) fn merge_runs<K, F>(
     mut emit: F,
 ) -> Result<(), CompactionError>
 where
-    K: FnMut(&MinedRecord) -> Result<bool, CompactionError>,
-    F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
+    K: FnMut(&Row) -> Result<bool, CompactionError>,
+    F: FnMut(&[Row]) -> Result<(), CompactionError>,
 {
     let (keys, budget) = (plan.keys, plan.tuning.in_memory_max_bytes);
     let charge = MergeCharge::new(plan.gauges, runs);
@@ -652,7 +688,7 @@ where
     for (run, cursor) in cursors.iter_mut().enumerate() {
         refill(cursor, run, keys, &mut heap)?;
     }
-    let mut out: Vec<MinedRecord> = Vec::with_capacity(SUB_BATCH_ROWS);
+    let mut out: Vec<Row> = Vec::with_capacity(SUB_BATCH_ROWS);
     while let Some(Reverse(entry)) = heap.pop() {
         let run = entry.run;
         if keep(&entry.record)? {
@@ -681,13 +717,13 @@ fn refill(
 
 /// Add `record` to the output chunk, emitting the chunk once it is full.
 fn collect<F>(
-    out: &mut Vec<MinedRecord>,
-    record: MinedRecord,
+    out: &mut Vec<Row>,
+    record: Row,
     emit: &mut F,
     charge: &MergeCharge<'_>,
 ) -> Result<(), CompactionError>
 where
-    F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
+    F: FnMut(&[Row]) -> Result<(), CompactionError>,
 {
     #[cfg(test)]
     {
@@ -703,12 +739,12 @@ where
 }
 
 fn emit_chunk<F>(
-    out: &mut Vec<MinedRecord>,
+    out: &mut Vec<Row>,
     emit: &mut F,
     charge: &MergeCharge<'_>,
 ) -> Result<(), CompactionError>
 where
-    F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
+    F: FnMut(&[Row]) -> Result<(), CompactionError>,
 {
     charge.fill(out.len());
     charge.publish();
@@ -736,21 +772,18 @@ pub(super) struct MergeEntry {
     service: Option<String>,
     time: u64,
     run: usize,
-    record: MinedRecord,
+    record: Row,
 }
 
 impl MergeEntry {
-    fn new(keys: ClusterKeys, run: usize, record: MinedRecord) -> Self {
+    fn new(keys: ClusterKeys, run: usize, record: Row) -> Self {
         let service = match keys {
-            ClusterKeys::ServiceThenTime => {
-                project_string_value(&record.resource_attributes, SERVICE_NAME_KEY)
-                    .map(str::to_owned)
-            }
+            ClusterKeys::ServiceThenTime => service_name(&record).map(str::to_owned),
             ClusterKeys::TimeOnly => None,
         };
         Self {
             service,
-            time: record.time_unix_nano,
+            time: record.record().time_unix_nano,
             run,
             record,
         }
@@ -827,7 +860,7 @@ impl<'a> MergeCharge<'a> {
 /// merge holds exactly one decoded batch per open run.
 pub(super) struct RunCursor<'c> {
     reader: Reader,
-    batch: std::vec::IntoIter<MinedRecord>,
+    batch: std::vec::IntoIter<Row>,
     widest_row: u64,
     /// This cursor's batch in [`MergeCharge`] bytes.
     charged: u64,
@@ -867,12 +900,12 @@ impl<'c> RunCursor<'c> {
         })
     }
 
-    fn next_record(&mut self) -> Result<Option<MinedRecord>, CompactionError> {
+    fn next_record(&mut self) -> Result<Option<Row>, CompactionError> {
         loop {
             if let Some(record) = self.batch.next() {
                 return Ok(Some(record));
             }
-            if let Some(batch) = self.reader.next_batch().map_err(CompactionError::Read)? {
+            if let Some(batch) = self.reader.next_rows().map_err(CompactionError::Read)? {
                 #[cfg(test)]
                 {
                     residency::sub(self.batch_len);

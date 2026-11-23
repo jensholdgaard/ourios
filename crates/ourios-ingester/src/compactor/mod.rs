@@ -191,6 +191,8 @@ mod reclaim;
 #[cfg(test)]
 mod reclaim_tests;
 #[cfg(test)]
+mod rfc0069_erasure_tests;
+#[cfg(test)]
 mod sweep_progress_tests;
 #[cfg(test)]
 mod tenant_metrics_tests;

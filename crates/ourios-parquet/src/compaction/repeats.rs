@@ -21,6 +21,8 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 use ourios_core::record::IngestPosition;
 
+use crate::row::{Carried, service_name};
+
 /// Bytes one position takes in a run file: `group`, `seq` and `index`,
 /// big-endian, so the bytes order as the positions do.
 const RECORD: usize = 16;
@@ -213,7 +215,10 @@ impl<'c> Repeats<'c> {
 
     /// Drop from `rows`, in place, each one that repeats a position
     /// already seen.
-    pub(super) fn drop_from(&mut self, rows: &mut Vec<MinedRecord>) -> Result<(), CompactionError> {
+    pub(super) fn drop_from<R: Carried>(
+        &mut self,
+        rows: &mut Vec<R>,
+    ) -> Result<(), CompactionError> {
         let mut failed = None;
         rows.retain(|row| {
             if failed.is_some() {
@@ -228,9 +233,9 @@ impl<'c> Repeats<'c> {
     }
 
     /// Whether `row` is the first with its position among its equal keys.
-    pub(super) fn keep(&mut self, row: &MinedRecord) -> Result<bool, CompactionError> {
+    pub(super) fn keep<R: Carried>(&mut self, row: &R) -> Result<bool, CompactionError> {
         self.follow_key(row);
-        let Some(position) = row.ingest_position else {
+        let Some(position) = row.record().ingest_position else {
             return Ok(true);
         };
         if self.seen(position)? {
@@ -252,21 +257,20 @@ impl<'c> Repeats<'c> {
     }
 
     /// Forget every position once `row`'s key differs from the last.
-    fn follow_key(&mut self, row: &MinedRecord) {
+    fn follow_key<R: Carried>(&mut self, row: &R) {
         let service = match self.keys {
-            ClusterKeys::ServiceThenTime => {
-                project_string_value(&row.resource_attributes, SERVICE_NAME_KEY)
-            }
+            ClusterKeys::ServiceThenTime => service_name(row),
             ClusterKeys::TimeOnly => None,
         };
+        let time = row.record().time_unix_nano;
         let same = self
             .key
             .as_ref()
-            .is_some_and(|(s, time)| *time == row.time_unix_nano && s.as_deref() == service);
+            .is_some_and(|(s, t)| *t == time && s.as_deref() == service);
         if same {
             return;
         }
-        self.key = Some((service.map(str::to_owned), row.time_unix_nano));
+        self.key = Some((service.map(str::to_owned), time));
         if self.held.capacity() > KEPT_SLOTS {
             self.held = HashSet::new();
             self.publish();

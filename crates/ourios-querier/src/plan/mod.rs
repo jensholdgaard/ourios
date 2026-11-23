@@ -588,6 +588,7 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
         // `false` ⇒ match-none ⇒ short-circuit to an empty result.
         PredExpr::None => return Ok(None),
         PredExpr::Filter(expr) => {
+            let expr = attr_guard::guard_negations(expr).map_err(crate::storage_err)?;
             df = df.filter(expr).map_err(crate::storage_err)?;
         }
     }
@@ -630,6 +631,7 @@ fn resolve_window(
     }
 }
 
+mod attr_guard;
 mod attr_value;
 mod group;
 mod predicate;

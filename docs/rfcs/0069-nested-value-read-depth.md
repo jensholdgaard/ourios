@@ -126,7 +126,8 @@ one bad cell does not affect the row's other cells or other rows.
   longer fails. The filter itself logs nothing: it does not know the
   file or row it reads, and a query runs it in both its count scan and
   its row scan. The cell is logged and counted when its row is returned
-  (below) or rewritten by compaction (maintainer, 2026-11-23). The guard wraps the
+  (below), and an erasure that carries it forward logs it (RFC0069.5)
+  (maintainer, 2026-11-23). The guard wraps the
   **whole** compiled comparison, outside any prefilter: a JSON-attribute
   comparison compiles to a `LIKE` prefilter `AND` the UDF, and a false
   prefilter would otherwise make the comparison false, so that `not`
@@ -306,6 +307,8 @@ explicit bound is enough.
 >   string or `i64` comparison and its negation, both of which fall back
 >   to the undecodable JSON cell, match neither the comparison nor its
 >   negation
+> - **And** a query that only filters on the bad cell, returning none of
+>   its rows, logs no undecodable cell and counts none
 
 ## 6. Testing strategy
 

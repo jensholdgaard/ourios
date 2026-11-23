@@ -19,7 +19,7 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 379 |
+| `Apache-2.0` | 377 |
 | `MIT` | 78 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 12 |
@@ -1172,15 +1172,15 @@ License: http://www.apache.org/licenses/LICENSE-2.0
 
 Used by:
 
-- `arrow-array` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-buffer` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-cast` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-data` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-ipc` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-ord` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-schema` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `arrow-select` 59.3.2 — <https://github.com/apache/arrow-rs>
-- `parquet` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 59.3.3 — <https://github.com/apache/arrow-rs>
+- `arrow-buffer` 59.3.3 — <https://github.com/apache/arrow-rs>
+- `arrow-cast` 59.3.3 — <https://github.com/apache/arrow-rs>
+- `arrow-data` 59.3.3 — <https://github.com/apache/arrow-rs>
+- `arrow-ipc` 59.3.3 — <https://github.com/apache/arrow-rs>
+- `arrow-ord` 59.3.3 — <https://github.com/apache/arrow-rs>
+- `arrow-schema` 59.3.3 — <https://github.com/apache/arrow-rs>
+- `arrow-select` 59.3.3 — <https://github.com/apache/arrow-rs>
+- `parquet` 59.3.3 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -1411,7 +1411,6 @@ Used by:
 - `windows-result` 0.4.1 — <https://github.com/microsoft/windows-rs>
 - `windows-strings` 0.5.1 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.52.0 — <https://github.com/microsoft/windows-rs>
-- `windows-sys` 0.59.0 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.61.2 — <https://github.com/microsoft/windows-rs>
 - `windows-targets` 0.52.6 — <https://github.com/microsoft/windows-rs>
 - `windows_aarch64_gnullvm` 0.52.6 — <https://github.com/microsoft/windows-rs>
@@ -5174,7 +5173,6 @@ Used by:
 - `idna` 1.1.0 — <https://github.com/servo/rust-url/>
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
-- `itertools` 0.13.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.15.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
@@ -9898,7 +9896,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `arrow-array` 59.3.2 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 59.3.3 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>

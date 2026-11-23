@@ -3,59 +3,18 @@
 //! names each bad cell once with its file and row. The reader leg lives in
 //! `ourios-parquet/tests/it/rfc0069_3_undecodable_cells.rs`.
 
-use std::sync::{Arc, Mutex};
-
 use ourios_core::otlp::KeyValue;
 use ourios_core::tenant::TenantId;
 use ourios_miner::reconstruct::Reconstruction;
 use ourios_parquet::columns;
 use ourios_querier::{LogBody, LogRow, Querier, QueryRequest};
 
-#[path = "../support/rfc0069_degraded.rs"]
-mod fixture;
+use crate::rfc0069_fixture as fixture;
 
 use fixture::{
-    BAD_ATTRIBUTES, BAD_RESOURCE, BAD_SCOPE, BAD_STRUCTURED, NOT_UTF8, TS0, kv, record,
+    BAD_ATTRIBUTES, BAD_RESOURCE, BAD_SCOPE, BAD_STRUCTURED, Events, NOT_UTF8, TS0, kv, record,
     write_fixture,
 };
-
-/// One `ourios.reader.row.undecodable` event's (file, row, column).
-type Seen = (String, String, String);
-
-#[derive(Clone, Default)]
-struct Events(Arc<Mutex<Vec<Seen>>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        struct Fields(Vec<(String, String)>);
-        impl tracing::field::Visit for Fields {
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                self.0.push((field.name().to_owned(), value.to_owned()));
-            }
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push((field.name().to_owned(), format!("{value:?}")));
-            }
-        }
-        if event.metadata().name() != ourios_semconv::EVENT_OURIOS_READER_ROW_UNDECODABLE {
-            return;
-        }
-        let mut fields = Fields(Vec::new());
-        event.record(&mut fields);
-        let get = |name: &str| {
-            fields
-                .0
-                .iter()
-                .find(|(field, _)| field == name)
-                .map(|(_, value)| value.clone())
-                .unwrap_or_default()
-        };
-        self.0.lock().expect("events").push((
-            get("file.path"),
-            get(ourios_semconv::OURIOS_READER_ROW_INDEX),
-            get(ourios_semconv::OURIOS_READER_COLUMN_NAME),
-        ));
-    }
-}
 
 fn row_at(rows: &[LogRow], i: u64) -> &LogRow {
     rows.iter()

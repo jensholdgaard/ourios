@@ -8,7 +8,8 @@
 //! `ourios-parquet`'s `tests/it/rfc0069_3_undecodable_cells.rs` (the reader)
 //! and `ourios-querier`'s `tests/it/rfc0069_3_degraded_query.rs` (the
 //! query), with its event live-checked by `tests/rfc0069_reader_events.rs`;
-//! RFC0069.6 is in `ourios-querier`'s `visibility.rs`.
+//! RFC0069.6 is in `ourios-querier`'s `visibility.rs`, and RFC0069.7 in
+//! its `tests/it/rfc0069_7_predicate_guard.rs`.
 
 /// Scenario RFC0069.4 — compaction carries an undecodable cell byte for byte.
 #[test]
@@ -25,14 +26,4 @@ fn rfc0069_4_compaction_carries_an_undecodable_cell_byte_for_byte() {
 #[ignore = "RFC0069.5 stub — implemented with the compaction raw-form slice"]
 fn rfc0069_5_erasure_stays_pending_past_an_undecodable_identity() {
     todo!("RFC0069.5 — the row is carried forward and the erasure's marker does not advance");
-}
-
-/// Scenario RFC0069.7 — a filter over an undecodable cell does not fail the query.
-#[test]
-#[ignore = "RFC0069.7 stub — implemented with the predicate-guard slice"]
-fn rfc0069_7_a_filter_over_an_undecodable_cell_does_not_fail_the_query() {
-    todo!(
-        "RFC0069.7 — neither a comparison nor its negation matches the bad cell, the promoted \
-         JSON fallback included; the query does not fail"
-    );
 }

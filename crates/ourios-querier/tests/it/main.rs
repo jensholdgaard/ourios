@@ -49,3 +49,6 @@ mod rfc0050_read_path;
 #[cfg(feature = "testing")]
 mod rfc0060_refresh;
 mod rfc0069_3_degraded_query;
+mod rfc0069_7_predicate_guard;
+#[path = "../support/rfc0069_degraded.rs"]
+mod rfc0069_fixture;

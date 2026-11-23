@@ -38,6 +38,19 @@ pub(super) fn attr_cmp(column: Expr, key: &str, expected: &str, eq: bool) -> Exp
     UDF.call(vec![column, lit(key), lit(expected), lit(eq)])
 }
 
+/// Whether `expr` is an [`attr_cmp`] call.
+pub(super) fn is_attr_cmp(expr: &Expr) -> bool {
+    matches!(expr, Expr::ScalarFunction(call) if call.name() == NAME)
+}
+
+/// The attribute cell an [`attr_cmp`] call reads.
+pub(super) fn cell_of(expr: &Expr) -> Option<Expr> {
+    match expr {
+        Expr::ScalarFunction(call) if call.name() == NAME => call.args.first().cloned(),
+        _ => None,
+    }
+}
+
 /// The canonical JSON a stored value of `value` has, so a comparison is
 /// byte-aligned with the stored text.
 pub(super) fn canonical_value(
@@ -86,7 +99,7 @@ impl ScalarUDFImpl for AttrCmp {
                 let hit = json
                     .try_as_str()
                     .flatten()
-                    .map(|j| cmp.eval(j))
+                    .and_then(|j| cmp.answer(j))
                     .transpose()?;
                 return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(hit)));
             }
@@ -195,9 +208,16 @@ impl<'a> Cmp<'a> {
         out: &mut BooleanBuilder,
     ) -> Result<()> {
         for row in rows {
-            out.append_option(row.map(|json| self.eval(json)).transpose()?);
+            out.append_option(row.and_then(|json| self.answer(json)).transpose()?);
         }
         Ok(())
+    }
+
+    /// The comparison on one stored cell; `None` (SQL `NULL`) for a cell
+    /// that does not decode, whose text can hold a pair it never stored
+    /// (RFC 0069 §3.2).
+    fn answer(&self, json: &str) -> Option<Result<bool>> {
+        super::attr_guard::decodable(json).then(|| self.eval(json))
     }
 
     /// The key's first occurrence is the first top-level one unless a map

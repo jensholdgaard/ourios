@@ -93,13 +93,15 @@ A query on a record that holds the literal key answers as before.
 a producer other than Ourios, can hold attributes that do not decode. A
 query returns such a record anyway (RFC 0069): the unreadable attributes
 come back as one attribute, `ourios.attribute.undecodable`, holding the
-stored text, and the rest of the record is read as usual. A comparison
-on attributes that are cut short or not a list at all matches neither
-way: `attr.k == "x"` and `not (attr.k == "x")` both skip the record, so
-a negated query no longer counts it. Attributes damaged inside but still
-a complete list are matched by their text, so a comparison can still
-answer for them. A promoted key still answers from its column when the
-record has a value there.
+stored text, and the rest of the record is read as usual. A filter
+checks only the shape of the stored attributes: when they do not start
+with `[` and end with `]` (surrounding whitespace aside), a comparison
+on them matches neither way, so `attr.k == "x"` and
+`not (attr.k == "x")` both skip the record and a negated query no
+longer counts it. Damaged attributes that still start with `[` and end
+with `]`, a truncated list included, are matched by their text, so a
+comparison can still answer for them. A promoted key still answers from
+its column when the record has a value there.
 
 ## The samples
 

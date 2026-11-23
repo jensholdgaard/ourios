@@ -77,6 +77,53 @@ pub struct QueryStats {
     /// the scan (each one's footer is read even when every row group is
     /// pruned). A drift query counts the audit files of each of its scans.
     pub files_opened: u64,
+    /// Stored cells the returned rows could not decode, each returned
+    /// degraded instead of failing the query (RFC 0069 §3.2).
+    pub undecodable_cells: UndecodableCells,
+}
+
+/// Degraded cells by the Parquet column holding them (RFC 0069 §3.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UndecodableCells {
+    /// Structured bodies that did not decode, and bodies that are not
+    /// valid UTF-8.
+    pub body: u64,
+    /// Log attribute cells.
+    pub attributes: u64,
+    /// Resource attribute cells.
+    pub resource_attributes: u64,
+    /// Scope attribute cells.
+    pub scope_attributes: u64,
+}
+
+impl UndecodableCells {
+    /// Each column's count, by its Parquet column name.
+    #[must_use]
+    pub fn by_column(&self) -> [(&'static str, u64); 4] {
+        [
+            (ourios_parquet::columns::BODY, self.body),
+            (ourios_parquet::columns::ATTRIBUTES, self.attributes),
+            (
+                ourios_parquet::columns::RESOURCE_ATTRIBUTES,
+                self.resource_attributes,
+            ),
+            (
+                ourios_parquet::columns::SCOPE_ATTRIBUTES,
+                self.scope_attributes,
+            ),
+        ]
+    }
+
+    /// Count one degraded cell of `column`.
+    pub(crate) fn add(&mut self, column: &str) {
+        match column {
+            ourios_parquet::columns::BODY => self.body += 1,
+            ourios_parquet::columns::ATTRIBUTES => self.attributes += 1,
+            ourios_parquet::columns::RESOURCE_ATTRIBUTES => self.resource_attributes += 1,
+            _ => self.scope_attributes += 1,
+        }
+    }
 }
 
 /// Additive execution options for [`Querier::run_query_with`]. The

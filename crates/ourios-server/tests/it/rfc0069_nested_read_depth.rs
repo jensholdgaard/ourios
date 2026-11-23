@@ -4,17 +4,11 @@
 //! Stubs are `#[ignore]`d so the default run stays green while the RFC
 //! is red; each names the slice that discharges it and moves to the test
 //! home §6 gives it. RFC0069.1 is in `rfc0069_1_depth_matrix.rs`, and
-//! RFC0069.2 in `ourios-core`'s `otlp/canonical/depth.rs`.
-
-/// Scenario RFC0069.3 — an undecodable cell degrades alone.
-#[test]
-#[ignore = "RFC0069.3 stub — implemented with the per-cell degradation slice"]
-fn rfc0069_3_an_undecodable_cell_degrades_alone() {
-    todo!(
-        "RFC0069.3 — every row returns: a bad body verbatim, or retained_lossy when not UTF-8; \
-         each bad attribute cell as ourios.attribute.undecodable; one WARN per bad cell"
-    );
-}
+//! RFC0069.2 in `ourios-core`'s `otlp/canonical/depth.rs`. RFC0069.3 is in
+//! `ourios-parquet`'s `tests/it/rfc0069_3_undecodable_cells.rs` (the reader)
+//! and `ourios-querier`'s `tests/it/rfc0069_3_degraded_query.rs` (the
+//! query), with its event live-checked by `tests/rfc0069_reader_events.rs`;
+//! RFC0069.6 is in `ourios-querier`'s `visibility.rs`.
 
 /// Scenario RFC0069.4 — compaction carries an undecodable cell byte for byte.
 #[test]
@@ -31,13 +25,6 @@ fn rfc0069_4_compaction_carries_an_undecodable_cell_byte_for_byte() {
 #[ignore = "RFC0069.5 stub — implemented with the compaction raw-form slice"]
 fn rfc0069_5_erasure_stays_pending_past_an_undecodable_identity() {
     todo!("RFC0069.5 — the row is carried forward and the erasure's marker does not advance");
-}
-
-/// Scenario RFC0069.6 — the fallback is masked for a masked reader.
-#[test]
-#[ignore = "RFC0069.6 stub — implemented with the per-cell degradation slice"]
-fn rfc0069_6_the_fallback_is_masked_for_a_masked_reader() {
-    todo!("RFC0069.6 — a masked reader gets the reserved attribute masked whole");
 }
 
 /// Scenario RFC0069.7 — a filter over an undecodable cell does not fail the query.

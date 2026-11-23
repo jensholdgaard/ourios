@@ -99,6 +99,7 @@ use ourios_parquet::{MANIFEST_FILENAME, Manifest, Store, StoreConfig};
 
 mod api;
 mod decode;
+mod degraded;
 mod exec;
 mod fetch_count;
 mod file_set;
@@ -115,7 +116,10 @@ mod test_support;
 // Scope glue for the split (epic #745 wave 1): every pre-split
 // `crate::X` path — the sibling modules' imports included — resolves
 // unchanged through these re-exports.
-pub use api::{AggregateGroup, QueryError, QueryOptions, QueryRequest, QueryResult, QueryStats};
+pub use api::{
+    AggregateGroup, QueryError, QueryOptions, QueryRequest, QueryResult, QueryStats,
+    UndecodableCells,
+};
 #[allow(unused_imports, clippy::wildcard_imports)]
 pub(crate) use decode::*;
 #[allow(unused_imports, clippy::wildcard_imports)]
@@ -962,7 +966,10 @@ impl Querier {
         }
         Ok(QueryResult {
             rows,
-            stats,
+            stats: QueryStats {
+                undecodable_cells: collected.scan.undecodable_cells,
+                ..stats
+            },
             records,
             aggregate: None,
             materialize_bytes_read: collected.scan.bytes_read,
@@ -1048,7 +1055,9 @@ impl Querier {
             .with_config(config)
             .build();
         let df = unpositioned(datafusion::dataframe::DataFrame::new(state, logical_plan))?;
-        let limited = df.limit(0, Some(limit)).map_err(storage_err)?;
+        let limited = degraded::located(df)?
+            .limit(0, Some(limit))
+            .map_err(storage_err)?;
         // Plan + collect by hand (rather than `DataFrame::collect`) so this
         // scan's metrics can be read off the retained plan. The caller folds
         // only the bytes into its accounting — this scan's row-group counts
@@ -1059,21 +1068,10 @@ impl Querier {
         // The single RFC 0005 decode path (RFC 0021 §3.1 / RFC0021.4):
         // `ShapeValidation::Skip` because `render_log_body` handles every
         // record shape safely — this path renders rather than rejects
-        // (foreign/degraded files still serve queries; RFC 0017).
-        let mut mined = Vec::new();
-        let mut row_offset = 0usize;
-        for batch in &batches {
-            let records = ourios_parquet::batch_to_mined_records(
-                batch,
-                row_offset,
-                ourios_parquet::ShapeValidation::Skip,
-            )
-            .map_err(|e| QueryError::Storage {
-                detail: format!("decode rows: {e}"),
-            })?;
-            row_offset += batch.num_rows();
-            mined.extend(records);
-        }
+        // (foreign/degraded files still serve queries; RFC 0017), and a
+        // cell that does not decode degrades on its own (RFC 0069 §3.2).
+        let decoded = degraded::decode(&batches)?;
+        let mined = &decoded.records;
         if mined.is_empty() {
             return Ok(CollectedRecords {
                 scan,
@@ -1087,7 +1085,7 @@ impl Querier {
         // tenant. Returning row *contents*, refuse to render such a row rather
         // than expose another tenant's data — fail loudly, mirroring the
         // alias-map / template-registry derivations.
-        for record in &mined {
+        for record in mined {
             if record.tenant_id != *tenant {
                 return Err(QueryError::Storage {
                     detail: format!(
@@ -1113,12 +1111,16 @@ impl Querier {
             let fetched = acquired.fetched;
             (acquired, fetched)
         };
+        // The batch constructor memoises per-(id, version) work — one lookup
+        // + one formatted string per distinct template, not per row.
+        let mut records = LogRow::from_records(mined, acquired.map.registry());
+        let undecodable_cells = decoded.settle(&mut records);
         Ok(CollectedRecords {
-            // The batch constructor memoises per-(id, version) work —
-            // one lookup + one formatted string per distinct template,
-            // not per row.
-            records: LogRow::from_records(&mined, acquired.map.registry()),
-            scan,
+            records,
+            scan: QueryStats {
+                undecodable_cells,
+                ..scan
+            },
             registry_bytes_read: acquired.bytes,
             map_fetched,
         })

@@ -251,6 +251,9 @@ fn rfc0017_9_structured_row_with_absent_body_falls_back() {
 /// raw bytes: it falls back to empty / `RetainedVerbatim`, like the absent-body
 /// case.
 #[test]
+#[ignore = "superseded by RFC 0069 §3.2, which amends RFC 0017 §3.3: an \
+            undecodable structured body now renders its stored bytes, see \
+            rfc0017_9_structured_row_with_undecodable_body_renders_its_stored_bytes"]
 fn rfc0017_9_structured_row_with_undecodable_body_falls_back() {
     let mut r = record(BodyKind::Structured);
     r.body = Some("{ this is not canonical AnyValue JSON".to_owned());
@@ -262,4 +265,33 @@ fn rfc0017_9_structured_row_with_undecodable_body_falls_back() {
         },
         "an undecodable structured body falls back to empty/RetainedVerbatim, never Faithful",
     );
+}
+
+/// RFC0017.9 (edge) under RFC 0069 §3.2 — a structured row whose `body` is
+/// present but not valid canonical JSON still never claims `Faithful`, and
+/// now returns its stored bytes rather than an empty line, so the data stays
+/// visible.
+#[test]
+fn rfc0017_9_structured_row_with_undecodable_body_renders_its_stored_bytes() {
+    for stored in [
+        "{ this is not canonical AnyValue JSON",
+        r#"{"stringValue":"#,
+        r#"{"unknownValue":1}"#,
+    ] {
+        let rendered = render_log_body(
+            &MinedRecord {
+                body: Some(stored.to_owned()),
+                ..record(BodyKind::Structured)
+            },
+            &TemplateRegistry::new(),
+        );
+        assert_eq!(
+            rendered,
+            LogBody::Rendered {
+                line: stored.as_bytes().to_vec(),
+                reconstruction: Reconstruction::RetainedVerbatim,
+            },
+            "{stored:?} renders as its stored bytes, never Faithful",
+        );
+    }
 }

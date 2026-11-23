@@ -168,6 +168,10 @@ pub enum Reconstruction {
     /// Bytes are the retained `body` column, returned verbatim
     /// without invoking `reconstruct`.
     RetainedVerbatim,
+    /// Bytes are the lossy UTF-8 conversion of a retained `body` that is
+    /// not valid UTF-8, each invalid sequence replaced by U+FFFD: what a
+    /// text answer can carry, not the stored bytes (RFC 0069 §3.2).
+    RetainedLossy,
 }
 
 /// Render a stored row per the §6.6 *Reader render contract*,

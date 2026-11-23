@@ -121,13 +121,29 @@ one bad cell does not affect the row's other cells or other rows.
   value masked as a whole, never the stored JSON, so no protected value
   leaks through a fallback.
 - **Predicates.** A filter runs before the fallback, over the raw cell
-  (`ourios_attr_cmp`, RFC 0062 §3.3). A predicate over an undecodable
-  cell evaluates as SQL `NULL`, so it does not match, and the cell is
-  logged as undecodable; the query no longer fails. The guard wraps the
+  (`ourios_attr_cmp`, RFC 0062 §3.3). A predicate over a cell the
+  filter cannot read evaluates as SQL `NULL`, so it does not match, and
+  the query no longer fails. The filter cannot read a cell that is not a
+  closed `[...]` list (JSON whitespace around it allowed), as every cell
+  the encoder writes is, or, where the comparison runs, one whose scan
+  along the key's path fails. Under `not`, a row the `LIKE` prefilter
+  rules out is checked for its shape only, since scanning each such row
+  doubled the cost of a negation: there, a cell corrupted inside a map
+  but still closed can match `not (attr.a.b == "x")` while
+  `attr.a.b != "x"` is `NULL` (maintainer, 2026-11-23). It checks that shape rather than
+  decoding the cell: a full decode of each row a comparison would match
+  costs about ten times RFC0062.6's per-row budget for `!=`, so a cell
+  corrupted inside but still a closed list is read by its text, and is
+  shown as degraded only when its row is returned (maintainer,
+  2026-11-23). The filter itself logs nothing: it does not know the
+  file or row it reads, and a query runs it in both its count scan and
+  its row scan. The cell is logged and counted when its row is returned
+  (below), and an erasure that carries it forward logs it (RFC0069.5)
+  (maintainer, 2026-11-23). The guard wraps the
   **whole** compiled comparison, outside any prefilter: a JSON-attribute
   comparison compiles to a `LIKE` prefilter `AND` the UDF, and a false
   prefilter would otherwise make the comparison false, so that `not`
-  matches the undecodable row. Wrapped, the comparison is `NULL` and
+  matches the unreadable row. Wrapped, the comparison is `NULL` and
   stays unmatched under `not` too. The guard covers **only comparisons
   that read the raw JSON cell**, RFC 0062's scanner path. A comparison
   on a promoted key reads its typed column (RFC 0022 §3.3, RFC 0042
@@ -135,9 +151,9 @@ one bad cell does not affect the row's other cells or other rows.
   attributes cell holds. A promoted string or `i64` equality or
   inequality also has a JSON arm, taken when the promoted column is
   `NULL`; that arm reads the raw cell, so it is guarded the same way,
-  outside its prefilter, and an undecodable cell does not match it under
+  outside its prefilter, and an unreadable cell does not match it under
   `not` either (#1399).
-- **Result-set compatibility.** Excluding an undecodable cell under
+- **Result-set compatibility.** Excluding an unreadable cell under
   `not` changes a result that succeeds today: `not (attr.k == "x") |
   count` counts a row whose attributes cell is malformed. RFC 0002 §6.6
   asks for that change to be handled explicitly: there is **no
@@ -288,9 +304,10 @@ explicit bound is enough.
 > - **Then** the reserved attribute's value is masked as a whole, and the
 >   stored JSON appears nowhere in the result
 
-> **Scenario RFC0069.7 — a filter over an undecodable cell does not fail the query**
+> **Scenario RFC0069.7 — a filter over an unreadable cell does not fail the query**
 > - **Given** RFC0069.3's file, with valid rows matching an attribute
->   predicate and the bad row's attributes cell undecodable
+>   predicate and the bad row's attributes cell unreadable to the filter
+>   (not a closed list)
 > - **When** a query filters on that attribute
 > - **Then** it returns the valid matching rows, the bad row does not
 >   match, and the query does not fail
@@ -301,8 +318,10 @@ explicit bound is enough.
 >   promoted column matches, whatever its raw attributes cell holds
 > - **And** when the bad row's promoted column is `NULL`, a promoted
 >   string or `i64` comparison and its negation, both of which fall back
->   to the undecodable JSON cell, match neither the comparison nor its
+>   to the unreadable JSON cell, match neither the comparison nor its
 >   negation
+> - **And** a query that only filters on the bad cell, returning none of
+>   its rows, logs no undecodable cell and counts none
 
 ## 6. Testing strategy
 

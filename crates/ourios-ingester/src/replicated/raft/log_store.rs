@@ -35,10 +35,11 @@ use super::controls::ControlHistory;
 pub use super::controls::{HeldControls, LogControls};
 use super::gate::SyncGate;
 use super::mining::GroupLogRead;
+use super::retry;
 use super::telemetry::{Component, Storage, Takeovers};
 use super::types::{Entry, GroupEntry, LogId, RaftTypes, Vote};
 use super::vote_log::VoteLog;
-use super::{Flush, OWNER_WAIT, Owner, WalFailure as _, sync_through, take_ownership, writer_gone};
+use super::{Flush, OWNER_WAIT, Owner, sync_through, take_ownership, writer_gone};
 
 /// The group's ownership lock, inside its WAL root (the WAL reads only
 /// `*.wal` names there).
@@ -220,6 +221,9 @@ fn recover(config: WalConfig, gate: &SyncGate) -> io::Result<(Wal, Index, WalOff
     let mut replay = Replay(Index::default());
     wal.replay(&mut replay)
         .map_err(|e| wal_error("replay the group WAL", e))?;
+    if let Some(heal) = wal.healed_tail() {
+        crate::tail_heal::report(heal, &ourios_core::telemetry::meter("ourios.wal"));
+    }
     wal.rebuild_ledger()
         .map_err(|e| wal_error("rebuild the group WAL ledger", e))?;
     let sync = || {
@@ -673,15 +677,15 @@ impl Writer {
         }
         let started = Instant::now();
         for frame in batch.iter().flat_map(Command::frames) {
-            if let Err(e) = self.wal.append(FrameKind::ReplicatedEntry, frame) {
-                return self.fail(started, e.to_io());
+            if let Err(e) = retry::append(&mut self.wal, frame) {
+                return self.fail(started, e);
             }
         }
         if !batch.iter().any(Command::needs_sync) {
             return Flush::Done;
         }
         let wal = &mut self.wal;
-        let sync = || wal.sync().map_err(|e| e.to_io());
+        let sync = || retry::sync(wal);
         match sync_through(&self.gate, sync) {
             None => Flush::Crashed,
             Some(Ok(offset)) => {

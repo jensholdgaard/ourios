@@ -402,6 +402,7 @@ impl ReclaimError {
                 ..
             } => "io",
             Self::Checkpoint(CheckpointError::NonMonotonic { .. }) => "non_monotonic",
+            Self::Checkpoint(CheckpointError::Unencodable { .. }) => "unencodable",
             Self::Housekeeping {
                 source: HousekeepingError::ModeDisagreement { .. },
                 ..

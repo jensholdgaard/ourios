@@ -153,3 +153,63 @@ fn rfc0008_2_audit_event_frames_survive_alongside_otlp_batches() {
         "fsync'd AuditEvent frames survive a SIGKILL alongside OtlpBatch frames, in order",
     );
 }
+
+/// The newest segment under `root` and the end `B` of its last complete
+/// frame, found by walking the §6.2.2 length prefixes.
+fn newest_segment_and_frame_end(root: &Path) -> (std::path::PathBuf, u64) {
+    const SEGMENT_HEADER_LEN: usize = 24;
+    const FRAME_HEADER_LEN: usize = 12;
+    let mut segments: Vec<_> = std::fs::read_dir(root)
+        .expect("read_dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "wal"))
+        .collect();
+    segments.sort();
+    let newest = segments.pop().expect("a segment");
+    let bytes = std::fs::read(&newest).expect("read segment");
+    let mut end = SEGMENT_HEADER_LEN;
+    while let Some(len) = bytes.get(end..end + 4) {
+        let len = u32::from_le_bytes(len.try_into().expect("four bytes")) as usize;
+        let next = end + FRAME_HEADER_LEN + len;
+        if next > bytes.len() {
+            break;
+        }
+        end = next;
+    }
+    (newest, end as u64)
+}
+
+/// RFC0068.4: after the kill, the newest segment is cut back to the end
+/// `B` of its last frame and zero-extended, as delayed allocation leaves
+/// a file whose size reached the journal ahead of its data. Recovery
+/// opens, keeps every acknowledged frame, and cuts the zeros.
+#[test]
+fn rfc0068_4_sigkill_then_a_zero_extended_tail_loses_no_fsynced_frame() {
+    for zeros in [2 * 512, 2 * 512 + 100] {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        run_fixture_then_sigkill(tmp.path(), &["otlp:AA", "audit:BB", "SYNC", "otlp:CC"]);
+        let (segment, boundary) = newest_segment_and_frame_end(tmp.path());
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment)
+            .expect("open segment");
+        file.set_len(boundary).expect("cut back to B");
+        file.set_len(boundary + zeros).expect("zero-extend past B");
+        drop(file);
+
+        let frames = recover(tmp.path());
+        assert_eq!(
+            frames[..2],
+            [
+                (FrameKind::OtlpBatch, vec![0xAA]),
+                (FrameKind::AuditEvent, vec![0xBB]),
+            ],
+            "every fsync'd frame survives a zero-extended tail ({zeros} zero bytes)",
+        );
+        assert_eq!(
+            std::fs::metadata(&segment).expect("stat").len(),
+            boundary,
+            "the zero tail is cut back to B",
+        );
+    }
+}

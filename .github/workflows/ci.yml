@@ -152,7 +152,7 @@ jobs:
       # (12x the warm suite wall time locally — epic #382). Doctests are not
       # in nextest's model, so `cargo test --doc` keeps them covered — the
       # pair preserves the exact suite inventory (RFC0028.5).
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: cargo-nextest
       - run: >-
@@ -351,7 +351,7 @@ jobs:
       # mdbook-mermaid: RFC diagrams are Mermaid (docs/rfcs/README.md).
       # The preprocessor is declared in book.toml, so the binary must be
       # on PATH or `mdbook build` fails with "preprocessor not found".
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: mdbook@0.5.2,mdbook-mermaid@0.17.0
       - run: mdbook build
@@ -714,12 +714,14 @@ jobs:
             echo "::error::ourios-server exited with status $server_status"
           fi
           [ "$unexpected" -eq 0 ] && [ "$server_status" -eq 0 ] && [ -z "$missing_client" ]
-      # The WAL's rotation, floor and latch events (RFC0052.7) and the
-      # listener events (#873) fire only when a disk fails, a tenant pins
-      # the floor, an accept fails or a certificate goes bad, which the
-      # served binary above never reaches. These test binaries drive each
-      # one and hand what they emitted to weaver, so an event is never
-      # registered without also being live-checked.
+      # The WAL's rotation, floor and latch events (RFC0052.7), the
+      # listener events (#873), the held-tenant event (RFC0056.11) and the
+      # undecodable-cell event (RFC0069.3) fire only when a disk fails, a
+      # tenant pins the floor, an accept fails, a certificate goes bad, a
+      # template event cannot be written or a stored cell does not decode,
+      # which the served binary above never reaches. These test binaries
+      # drive each one and hand what they emitted to weaver, so an event is
+      # never registered without also being live-checked.
       - name: Live-check the fault-path events
         env:
           OURIOS_LIVE_CHECK_WEAVER: weaver
@@ -727,6 +729,7 @@ jobs:
         run: |
           cargo test -p ourios-ingester --test rfc0052_7_telemetry
           cargo test -p ourios-serving --test listener_events
+          cargo test -p ourios-querier --test rfc0069_reader_events
       - name: Upload live-check report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -751,7 +754,7 @@ jobs:
       # schema, advisory handling) can't change under us when a new release
       # lands; bump deliberately (Renovate/manual) alongside any deny.toml
       # changes the new version needs.
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: cargo-deny@0.19.8
       - run: cargo deny check
@@ -892,7 +895,7 @@ jobs:
           rustup toolchain install
           rustup component add llvm-tools-preview
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
       # Collect once (runs the test suite under instrumentation), then

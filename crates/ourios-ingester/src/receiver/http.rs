@@ -429,7 +429,7 @@ fn ingest_error_status(error: &ReceiveError) -> StatusCode {
         // tell the client to drop a batch that was never acked (RFC 0018
         // §3.2, as RFC 0052 §3.3 amends it). The `Status` message, not
         // the code, carries the distinction.
-        IngestFailure::Unavailable | IngestFailure::ServerTerminal => {
+        IngestFailure::Unavailable | IngestFailure::ServerTerminal | IngestFailure::Held => {
             StatusCode::SERVICE_UNAVAILABLE
         }
         IngestFailure::Internal => StatusCode::INTERNAL_SERVER_ERROR,

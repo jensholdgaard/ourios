@@ -69,7 +69,10 @@ pub use partition::{
     percent_decode_tenant, percent_encode_tenant,
 };
 pub use promoted::{PromotedAttributes, PromotedClass, PromotedKey, SERVICE_NAME_KEY};
-pub use reader::{Reader, ReaderError, ShapeValidation, batch_to_mined_records};
+pub use reader::{
+    DegradedBatch, Reader, ReaderError, ShapeValidation, UndecodableCell,
+    batch_to_degraded_records, batch_to_mined_records,
+};
 pub use record_batch::{
     BatchError, IngestColumns, mined_records_to_batch, mined_records_to_batch_with_promoted,
 };

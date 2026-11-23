@@ -88,7 +88,7 @@ pub fn validate_tenant_id(value: &str) -> Result<(), TenantIdError> {
 /// no validation. If a downstream caller wants validation
 /// (reject empty, reject control characters), it can layer a
 /// `try_new` constructor on top; we don't preempt that contract.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TenantId(String);
 
 impl TenantId {

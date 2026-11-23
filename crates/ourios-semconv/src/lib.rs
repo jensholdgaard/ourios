@@ -533,6 +533,15 @@ pub const OURIOS_QUERY_VISIBILITY_DESCRIPTION: &str = "Queries answered under RF
 /// `ourios.query.visibility` unit (UCUM).
 pub const OURIOS_QUERY_VISIBILITY_UNIT: &str = "{query}";
 
+/// `ourios.reader.cell.undecodable` (counter, unit `{cell}`).
+pub const OURIOS_READER_CELL_UNDECODABLE: &str = "ourios.reader.cell.undecodable";
+
+/// `ourios.reader.cell.undecodable` description (the registry `brief`).
+pub const OURIOS_READER_CELL_UNDECODABLE_DESCRIPTION: &str = "Stored cells a query read but could not decode, returned degraded instead of failing the query (RFC 0069 §3.2).";
+
+/// `ourios.reader.cell.undecodable` unit (UCUM).
+pub const OURIOS_READER_CELL_UNDECODABLE_UNIT: &str = "{cell}";
+
 /// `ourios.receiver.tenant.divergences` (counter, unit `{divergence}`).
 pub const OURIOS_RECEIVER_TENANT_DIVERGENCES: &str = "ourios.receiver.tenant.divergences";
 
@@ -541,6 +550,15 @@ pub const OURIOS_RECEIVER_TENANT_DIVERGENCES_DESCRIPTION: &str = "ResourceLogs g
 
 /// `ourios.receiver.tenant.divergences` unit (UCUM).
 pub const OURIOS_RECEIVER_TENANT_DIVERGENCES_UNIT: &str = "{divergence}";
+
+/// `ourios.receiver.tenant.held` (updowncounter, unit `{tenant}`).
+pub const OURIOS_RECEIVER_TENANT_HELD: &str = "ourios.receiver.tenant.held";
+
+/// `ourios.receiver.tenant.held` description (the registry `brief`).
+pub const OURIOS_RECEIVER_TENANT_HELD_DESCRIPTION: &str = "Tenants currently held because their template events could not be written for good (RFC 0056 §3.2).";
+
+/// `ourios.receiver.tenant.held` unit (UCUM).
+pub const OURIOS_RECEIVER_TENANT_HELD_UNIT: &str = "{tenant}";
 
 /// `ourios.receiver.tls.handshake_failures` (counter, unit `{failure}`).
 pub const OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES: &str = "ourios.receiver.tls.handshake_failures";
@@ -1071,6 +1089,9 @@ pub const DATAFUSION_OPERATOR_ROW_GROUPS_PRUNED: &str = "datafusion.operator.row
 /// `log.record.template` attribute key.
 pub const LOG_RECORD_TEMPLATE: &str = "log.record.template";
 
+/// `ourios.attribute.undecodable` attribute key.
+pub const OURIOS_ATTRIBUTE_UNDECODABLE: &str = "ourios.attribute.undecodable";
+
 /// `ourios.audit_sink.flush.outcome` attribute key.
 pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outcome";
 
@@ -1145,6 +1166,12 @@ pub const OURIOS_QUERY_ROW_GROUP_STATE: &str = "ourios.query.row_group.state";
 
 /// `ourios.query.visibility.branch` attribute key.
 pub const OURIOS_QUERY_VISIBILITY_BRANCH: &str = "ourios.query.visibility.branch";
+
+/// `ourios.reader.column.name` attribute key.
+pub const OURIOS_READER_COLUMN_NAME: &str = "ourios.reader.column.name";
+
+/// `ourios.reader.row.index` attribute key.
+pub const OURIOS_READER_ROW_INDEX: &str = "ourios.reader.row.index";
 
 /// `ourios.receiver.template_ids.audit_max` attribute key.
 pub const OURIOS_RECEIVER_TEMPLATE_IDS_AUDIT_MAX: &str = "ourios.receiver.template_ids.audit_max";
@@ -1275,6 +1302,9 @@ pub const EVENT_OURIOS_GRAPH_BACKFILL_PROGRESS: &str = "ourios.graph.backfill.pr
 /// `ourios.querier.shutdown.error` log event name.
 pub const EVENT_OURIOS_QUERIER_SHUTDOWN_ERROR: &str = "ourios.querier.shutdown.error";
 
+/// `ourios.reader.row.undecodable` log event name.
+pub const EVENT_OURIOS_READER_ROW_UNDECODABLE: &str = "ourios.reader.row.undecodable";
+
 /// `ourios.receiver.audit_sink.dropped` log event name.
 pub const EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED: &str = "ourios.receiver.audit_sink.dropped";
 
@@ -1320,6 +1350,9 @@ pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_STOPPED: &str =
 
 /// `ourios.receiver.tenant.divergence` log event name.
 pub const EVENT_OURIOS_RECEIVER_TENANT_DIVERGENCE: &str = "ourios.receiver.tenant.divergence";
+
+/// `ourios.receiver.tenant.hold.started` log event name.
+pub const EVENT_OURIOS_RECEIVER_TENANT_HOLD_STARTED: &str = "ourios.receiver.tenant.hold.started";
 
 /// `ourios.receiver.tenant.watch_saturated` log event name.
 pub const EVENT_OURIOS_RECEIVER_TENANT_WATCH_SATURATED: &str =

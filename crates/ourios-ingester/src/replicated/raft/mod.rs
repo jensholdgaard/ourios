@@ -32,6 +32,7 @@ pub mod reads;
 pub mod replay;
 mod reporting;
 mod restoring;
+pub(crate) mod retry;
 mod snapshot_record;
 pub mod state_machine;
 pub mod tailing;

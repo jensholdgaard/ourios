@@ -1,7 +1,7 @@
 ---
 rfc: 0068
 title: WAL recovery from a zero-filled tail
-status: drafted
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-04
@@ -11,10 +11,16 @@ superseded-by: —
 
 # RFC 0068 — WAL recovery from a zero-filled tail
 
-> **Status: `drafted`.** Tracks #1165. This RFC **amends RFC 0008**
+> **Status: `green`.** Every §5 scenario passes: RFC0068.1–.3 and .6
+> and the §6 partition property in `ourios-wal`
+> (`tests/it/rfc0068_zero_tail.rs`), RFC0068.4 in
+> `tests/it/rfc0008_2_crash_recovery.rs`, and RFC0068.5 in
+> `ourios-ingester` (`src/tail_heal/tests.rs`). Red 2026-11-19.
+> Specified 2026-11-19 (maintainer-approved:
+> the strict rule, which heals only a zero run that reaches EOF). Tracks #1165. This RFC **amends RFC 0008**
 > (`accepted`). It amends the three-bucket rule of §5 RFC0008.2 and
 > §8's testing text for it, and §5 RFC0008.4 and RFC0008.5, and §6.6
-> steps 3 and 4. RFC 0008 gets a dated pointer here once this RFC is
+> step 3. RFC 0008 gets a dated pointer here once this RFC is
 > accepted. RFC 0065 (`red`) inherits the change, because its
 > per-group WALs are RFC 0008 segments.
 
@@ -271,9 +277,6 @@ but the outage lasts until someone runs it, which is what #1165 asks to
 remove. It may still be worth having for real corruption, separately.
 
 ## 5. Acceptance criteria
-
-> Drafted ahead of `specified`, so review can check that they are
-> testable.
 
 > **Scenario RFC0068.1 — a zero tail at a frame boundary is healed `[H3]`**
 > - **Given** a newest segment with valid frames ending at `B`, followed

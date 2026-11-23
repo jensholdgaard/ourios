@@ -90,9 +90,21 @@ fn rfc0052_17_legacy_root_rotation_stays_openable_without_a_checkpoint() {
 /// Scenario RFC0052.17 — a deleted record on a post-RFC root fails open.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
+#[ignore = "superseded: RFC 0056 §3.4 writes every CHECKPOINT at version 3, so the version-2 assertion is no longer the contract; rfc0052_17_deleted_record_on_a_post_rfc_root_fails_open_at_version_3 covers this"]
 fn rfc0052_17_deleted_record_on_a_post_rfc_root_fails_open() {
+    rfc0052_17_deleted_record_on_a_post_rfc_root_fails_open_with(2);
+}
+
+/// Scenario RFC0052.17 — a deleted record on a post-RFC root fails open.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[test]
+fn rfc0052_17_deleted_record_on_a_post_rfc_root_fails_open_at_version_3() {
+    rfc0052_17_deleted_record_on_a_post_rfc_root_fails_open_with(3);
+}
+
+fn rfc0052_17_deleted_record_on_a_post_rfc_root_fails_open_with(version: u16) {
     // Given: a root that has checkpointed — so its `CHECKPOINT` is
-    // version 2 — and whose `RECLAIM` is then deleted.
+    // the current version — and whose `RECLAIM` is then deleted.
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
     let mut wal = open(root);
@@ -100,7 +112,7 @@ fn rfc0052_17_deleted_record_on_a_post_rfc_root_fails_open() {
     wal.sync().expect("sync");
     wal.checkpoint(mark).expect("checkpoint");
     drop(wal);
-    assert_eq!(checkpoint_version(root), 2, "the sidecar is post-RFC");
+    assert_eq!(checkpoint_version(root), version, "the sidecar is post-RFC");
     std::fs::remove_file(root.join(RECLAIM)).expect("delete the record");
 
     // When: the node starts.
@@ -223,12 +235,24 @@ fn rfc0052_17_fresh_open_writes_the_record_before_the_initial_segment() {
 /// Scenario RFC0052.17 — the `checkpoint_armed` / `checkpoint_seen` flag rows.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
+#[ignore = "superseded: RFC 0056 §3.4 writes every CHECKPOINT at version 3, so the version-2 assertion is no longer the contract; rfc0052_17_checkpoint_flags_beside_a_missing_or_stale_checkpoint_at_version_3 covers this"]
 fn rfc0052_17_checkpoint_flags_beside_a_missing_or_stale_checkpoint() {
     seen_without_a_checkpoint_fails_closed();
     armed_without_segments_opens_fresh_and_empty();
     armed_with_segments_retains_the_arming_and_mode();
     armed_beside_a_version_2_checkpoint_is_promoted_at_open();
     armed_beside_a_version_1_checkpoint_retries_the_upgrade();
+}
+
+/// Scenario RFC0052.17 — the `checkpoint_armed` / `checkpoint_seen` flag rows.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[test]
+fn rfc0052_17_checkpoint_flags_beside_a_missing_or_stale_checkpoint_at_version_3() {
+    seen_without_a_checkpoint_fails_closed();
+    armed_without_segments_opens_fresh_and_empty();
+    armed_with_segments_retains_the_arming_and_mode();
+    armed_beside_a_version_2_checkpoint_is_promoted_at_open();
+    armed_beside_a_version_1_checkpoint_retries_the_upgrade_at_version_3();
 }
 
 /// `checkpoint_seen` with `CHECKPOINT` missing is a lost checkpoint and
@@ -341,6 +365,19 @@ fn armed_beside_a_version_2_checkpoint_is_promoted_at_open() {
 /// checkpoint retries the upgrade, and that retry succeeds against the
 /// arming already on disk.
 fn armed_beside_a_version_1_checkpoint_retries_the_upgrade() {
+    armed_beside_a_version_1_checkpoint_retries_the_upgrade_with(2);
+}
+
+/// An armed record beside a still-**version-1** `CHECKPOINT` is the
+/// upgrade write failing between the arming and the rename: the root
+/// opens on the legacy branch, reclaims nothing until the next
+/// checkpoint retries the upgrade, and that retry succeeds against the
+/// arming already on disk.
+fn armed_beside_a_version_1_checkpoint_retries_the_upgrade_at_version_3() {
+    armed_beside_a_version_1_checkpoint_retries_the_upgrade_with(3);
+}
+
+fn armed_beside_a_version_1_checkpoint_retries_the_upgrade_with(version: u16) {
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
     build_closed_segment(root, &[b"a1"]);
@@ -369,8 +406,8 @@ fn armed_beside_a_version_1_checkpoint_retries_the_upgrade() {
         .expect("the next checkpoint retries the upgrade");
     assert_eq!(
         checkpoint_version(root),
-        2,
-        "the sidecar is rewritten at version 2"
+        version,
+        "the sidecar is rewritten at the current version"
     );
     assert!(
         wal.reclaim_state().reclaimable,
@@ -427,7 +464,21 @@ fn rfc0052_17_absent_record_and_absent_checkpoint_opens_and_seeds_an_empty_recor
 /// Scenario RFC0052.17 — the legacy-root migration window.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
+#[ignore = "superseded: RFC 0056 §3.4 writes every CHECKPOINT at version 3, so the version-2 assertion is no longer the contract; rfc0052_17_version_1_checkpoint_opens_legacy_and_upgrades_on_first_checkpoint_at_version_3 covers this"]
 fn rfc0052_17_version_1_checkpoint_opens_legacy_and_upgrades_on_first_checkpoint() {
+    rfc0052_17_version_1_checkpoint_opens_legacy_and_upgrades_on_first_checkpoint_with(2);
+}
+
+/// Scenario RFC0052.17 — the legacy-root migration window.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[test]
+fn rfc0052_17_version_1_checkpoint_opens_legacy_and_upgrades_on_first_checkpoint_at_version_3() {
+    rfc0052_17_version_1_checkpoint_opens_legacy_and_upgrades_on_first_checkpoint_with(3);
+}
+
+fn rfc0052_17_version_1_checkpoint_opens_legacy_and_upgrades_on_first_checkpoint_with(
+    version: u16,
+) {
     // Given: a root holding a version-1 `CHECKPOINT` — an RFC0008.7
     // fixture — and no `RECLAIM`.
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -458,7 +509,7 @@ fn rfc0052_17_version_1_checkpoint_opens_legacy_and_upgrades_on_first_checkpoint
     // creates the record armed on the same path, **even when the mark
     // equals the one on disk** — the idle-node case.
     wal.checkpoint(mark).expect("the upgrade");
-    assert_eq!(checkpoint_version(root), 2);
+    assert_eq!(checkpoint_version(root), version);
     assert_eq!(
         live_slot(&std::fs::read(root.join(RECLAIM)).expect("read RECLAIM")).1,
         CHECKPOINT_ARMED | CHECKPOINT_SEEN,
@@ -603,5 +654,59 @@ fn rfc0055_5_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve()
          confirmed and PUBLISHED absent leaves the next start free to \
          seed again, while the same record with PUBLISHED present is \
          promoted to confirmed durably at open, never read as a fault"
+    );
+}
+
+/// RFC0056.8: an idle node offers an unchanged mark on every barrier, so
+/// the version upgrade must not ride on a new mark. A root whose sidecar
+/// is still version 2 is rewritten at version 3 by the next checkpoint of
+/// the same mark.
+#[test]
+fn rfc0056_8_an_unchanged_mark_upgrades_a_version_2_sidecar() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let mut wal = open(root);
+    let mark = wal.append(FrameKind::OtlpBatch, b"x").expect("append");
+    wal.sync().expect("sync");
+    wal.checkpoint(mark).expect("checkpoint");
+    drop(wal);
+    // Rewrite the sidecar as RFC 0052 wrote it: the 32 B header, version 2.
+    let mut header = std::fs::read(root.join(CHECKPOINT)).expect("read")[..32].to_vec();
+    header[4..6].copy_from_slice(&2u16.to_le_bytes());
+    std::fs::write(root.join(CHECKPOINT), &header).expect("downgrade to version 2");
+    assert_eq!(checkpoint_version(root), 2);
+
+    let mut wal = open(root);
+    wal.checkpoint(mark).expect("the same mark again");
+
+    assert_eq!(
+        checkpoint_version(root),
+        3,
+        "the unchanged mark upgrades the sidecar"
+    );
+}
+
+/// RFC0056.8: a witnessed version-2 checkpoint is a complete RFC 0052
+/// checkpoint, so housekeeping may reclaim under it before the version-3
+/// upgrade. Gating reclamation on that write would let a full disk, which
+/// fails the write, block the only thing that frees space.
+#[test]
+fn rfc0056_8_a_witnessed_version_2_checkpoint_is_reclaimable_before_the_upgrade() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let mut wal = open(root);
+    let mark = wal.append(FrameKind::OtlpBatch, b"x").expect("append");
+    wal.sync().expect("sync");
+    wal.checkpoint(mark).expect("checkpoint");
+    drop(wal);
+    let mut header = std::fs::read(root.join(CHECKPOINT)).expect("read")[..32].to_vec();
+    header[4..6].copy_from_slice(&2u16.to_le_bytes());
+    std::fs::write(root.join(CHECKPOINT), &header).expect("downgrade to version 2");
+
+    let wal = open(root);
+
+    assert!(
+        wal.reclaim_state().reclaimable,
+        "reclaimable under the version-2 checkpoint, no write needed",
     );
 }

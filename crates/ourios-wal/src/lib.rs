@@ -29,6 +29,7 @@ use std::io::{BufReader, ErrorKind};
 use std::path::PathBuf;
 
 pub(crate) mod checkpoint;
+mod checkpointing;
 mod export;
 // `frame` is crate-internal, but the `fuzzing` feature exposes it so the
 // `fuzz/` cargo-fuzz targets can drive `read_frame` and `write_frame`
@@ -42,6 +43,7 @@ pub mod frame;
 pub(crate) mod housekeeping;
 pub(crate) mod ledger;
 pub(crate) mod pass;
+mod tail;
 // The codec's tombstone and union entry points land ahead of their
 // callers: tenant removal and RFC 0053's `PUBLISHED` dictionary are
 // the slices that reach them.
@@ -54,6 +56,7 @@ pub(crate) mod retain;
 pub(crate) mod rotation;
 pub(crate) mod segment;
 
+pub use checkpoint::{HeldFloor, HeldFloors};
 pub use ledger::LedgerError;
 pub use pass::{
     HousekeepingProgress, PassId, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome,
@@ -73,6 +76,8 @@ use rotation::DirFsync;
 pub use rotation::{RotationFault, RotationFaults, RotationKind, RotationSite, RotationState};
 pub use segment::SEGMENT_HEADER_LEN;
 use segment::{SegmentHeader, write_header};
+use tail::zero_to_eof;
+pub use tail::{TailHeal, TailShape};
 
 // -----------------------------------------------------------
 // Public types (RFC 0008 §6.1 + §6.2.2)
@@ -439,6 +444,9 @@ pub struct Wal {
     /// mark, decides whether that rewrite happens, so an idle node
     /// offering an unchanged mark still reaches version 2.
     checkpoint_version: Option<checkpoint::SidecarVersion>,
+    /// The held floors (RFC 0056 §3.4) the `CHECKPOINT` on disk
+    /// carries: read at `open`, replaced by every write.
+    floors: HeldFloors,
     /// The `RECLAIM` sidecar (RFC 0052 §3.2), when this root has one.
     /// A legacy root opens without a record and the first checkpoint
     /// creates it on the upgrade path. Shared with every plan this WAL
@@ -496,6 +504,8 @@ pub struct Wal {
     syncs_total: u64,
     unflushed_bytes: u64,
     corrupt_frames_total: u64,
+    /// The torn tail the last [`Self::replay`] cut off the newest segment.
+    healed_tail: Option<TailHeal>,
 }
 
 impl Wal {
@@ -553,7 +563,7 @@ impl Wal {
                 detail: other.to_string(),
             },
         })?;
-        let witness = reconcile::root(&config, sidecar, &existing_segments)?;
+        let witness = reconcile::root(&config, sidecar.as_ref(), &existing_segments)?;
         let (current_segment, current_segment_path, current_segment_uuid) =
             append_target(&config.root, existing_segments)?;
         let max_unlinks_per_pass = config.max_unlinks_per_pass;
@@ -569,8 +579,12 @@ impl Wal {
             dir_fsync: DirFsync::PendingOpen,
             rotation: RotationState::Healthy,
             faults: RotationFaults::default(),
-            checkpoint: sidecar.map(|s| s.offset),
-            checkpoint_version: sidecar.map(|s| s.version),
+            checkpoint: sidecar.as_ref().map(|s| s.offset),
+            checkpoint_version: sidecar.as_ref().map(|s| s.version),
+            floors: sidecar
+                .as_ref()
+                .map(|s| s.floors.clone())
+                .unwrap_or_default(),
             // The instance number is minted here and never reused in
             // the process, so a [`PassId`] cannot be mistaken for one
             // another instance on the same root — a reopen — handed
@@ -595,6 +609,7 @@ impl Wal {
             syncs_total: 0,
             unflushed_bytes: 0,
             corrupt_frames_total: 0,
+            healed_tail: None,
         })
     }
 
@@ -1161,120 +1176,6 @@ impl Wal {
         })
     }
 
-    /// Record that records ≤ `durable_to` are on object
-    /// storage; segments wholly below this offset may be
-    /// reclaimed by [`Self::housekeeping`]. Persists the offset
-    /// to the `CHECKPOINT` sidecar per §6.7 (atomic write +
-    /// fsync + parent-dir fsync) — durability of the checkpoint
-    /// itself is what lets the post-restart recovery driver
-    /// suppress already-published records on its Parquet path
-    /// (replay is at-least-once and delivers every surviving
-    /// frame; the driver's suppression is the only dedup).
-    ///
-    /// Advance is monotonic: a `durable_to` below the current
-    /// checkpoint is rejected. Re-asserting the current value never
-    /// moves the mark, but it is a no-op only once the checkpoint is
-    /// *settled* — sidecar at version 2, its directory entry fsynced,
-    /// and `checkpoint_seen` in the RFC 0052 §3.2 record beside it.
-    /// Until then an equal mark rewrites all three, which is how a
-    /// version-1 root reaches version 2 and how a durability step a
-    /// previous call owed and failed is retried; callers that repeat
-    /// an equal mark to finish either get that, at the cost of the
-    /// writes.
-    ///
-    /// # Errors
-    ///
-    /// See [`CheckpointError`]. When the **sidecar write** fails the
-    /// in-memory checkpoint is not advanced — the WAL conservatively
-    /// keeps all segments rather than risk a post-crash data-side
-    /// dup. When the sidecar write succeeded and RFC 0052 §3.2's
-    /// `checkpoint_seen` write then failed, the mark *is* durable and
-    /// the in-memory checkpoint tracks it: leaving it behind would let
-    /// a later, lower mark pass the monotonicity check and rewrite the
-    /// sidecar backwards. The error still surfaces, and the next
-    /// [`Self::open`] promotes the witness.
-    pub fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), CheckpointError> {
-        if let Some(current) = self.checkpoint {
-            if durable_to < current {
-                return Err(CheckpointError::NonMonotonic {
-                    current,
-                    attempted: durable_to,
-                });
-            }
-            // RFC 0052 §3.2's upgrade is version-aware, not
-            // mark-aware: an idle node offers an unchanged mark on
-            // every barrier after the first, so a root whose sidecar
-            // is still version 1 would never reach version 2 and
-            // housekeeping would stay gated forever. Only an equal
-            // mark on an already-version-2 sidecar takes the no-write
-            // fast path.
-            if durable_to == current && self.checkpoint_is_settled() {
-                return Ok(());
-            }
-        }
-        reconcile::arm(&mut self.reclaim.lock(), &self.config)?;
-        // Split at the rename, because the two halves need opposite
-        // answers. A failure inside `write` leaves nothing visible
-        // under the final name, so nothing advances. A failure of the
-        // parent fsync leaves the new mark already visible, so the
-        // in-memory mark must follow it: a later call that found a
-        // stale mark here would pass the monotonicity check against it
-        // and rewrite the sidecar *backwards*, which recovery reads as
-        // a lower Parquet suppression horizon and republishes every
-        // row above it.
-        checkpoint::write(&self.config.root, durable_to)?;
-        self.checkpoint = Some(durable_to);
-        self.checkpoint_version = Some(checkpoint::SidecarVersion::Current);
-        // Advancing the mark is not the same as being allowed to
-        // reclaim under it: the rename is visible but its directory
-        // entry is not durable until the fsync below returns.
-        self.reclaim_gate = ReclaimGate::FsyncPending;
-        checkpoint::sync_root(&self.config.root)?;
-        self.reclaim_gate = ReclaimGate::Open;
-        // The witness is a third durable write and its own failure:
-        // reported, never rolled back. `checkpoint_seen` governs only
-        // the open-time matrix, and an armed record beside a version-2
-        // sidecar is promoted at the next open, so a failure here
-        // loses nothing.
-        reconcile::witness(&mut self.reclaim.lock())
-    }
-
-    /// Every part of the last checkpoint is on disk: the sidecar at
-    /// version 2, its directory entry fsynced, and `checkpoint_seen`
-    /// in the record beside it. Two callers want exactly this, and for
-    /// the same reason — the checkpoint is only as good as the weakest
-    /// of the three:
-    ///
-    /// - the equal-mark no-write path, which must not skip a write a
-    ///   previous call owed and failed, or it would skip it for the
-    ///   life of the process;
-    /// - a housekeeping pass, which must not unlink under a checkpoint
-    ///   whose entry a crash could lose, nor under one whose startup
-    ///   loss witness is still only `Armed` — RFC 0052 §3.2's matrix
-    ///   reads a later missing `CHECKPOINT` as a fresh root without
-    ///   `checkpoint_seen`, and by then the frames are gone.
-    ///
-    /// A legacy root has no witness and is never settled, so a pass
-    /// plans nothing until the version-aware upgrade lands.
-    fn checkpoint_is_settled(&self) -> bool {
-        if self.reclaim_gate != ReclaimGate::Open {
-            return false;
-        }
-        if self.checkpoint_version != Some(checkpoint::SidecarVersion::Current) {
-            return false;
-        }
-        self.reclaim.checkpoint_witnessed()
-    }
-
-    /// The `CHECKPOINT` sidecar's offset (`None` =
-    /// pre-first-checkpoint). The recovery driver reads it once
-    /// at startup as its Parquet-side suppression horizon
-    /// (§6.6) — `replay` itself delivers every surviving frame.
-    #[must_use]
-    pub fn last_checkpoint(&self) -> Option<WalOffset> {
-        self.checkpoint
-    }
-
     /// Reclaim disk (§6.7): unlink every segment whose
     /// **highest** frame offset is ≤ the checkpoint **and**,
     /// when `retain_floor` is `Some`, ≤ the floor — i.e. wholly
@@ -1411,8 +1312,9 @@ impl Wal {
     /// `kind`, `_pad`, and `len`; a corrupt frame on **any**
     /// segment halts the whole walk ([`RecoveryError::Corrupt`])
     /// because the high-water-mark logic needs a contiguous log.
-    /// A torn (partial) *tail* frame is the one exception: on the
-    /// newest segment it is RFC0008.4 clean truncation, so the
+    /// A torn *tail* is the one exception: on the newest segment a
+    /// partial frame (RFC0008.4) or a run of zeros from the last
+    /// valid frame to EOF (RFC 0068 §3.1) is clean truncation, so the
     /// scan stops cleanly and the segment is healed —
     /// `ftruncate` to the last valid boundary, a data sync, and
     /// `fsync` the parent dir — so the next `append` resumes on a
@@ -1435,6 +1337,7 @@ impl Wal {
     ///
     /// See [`RecoveryError`].
     pub fn replay<S: FrameSink>(&mut self, sink: &mut S) -> Result<(), RecoveryError> {
+        self.healed_tail = None;
         let segments = list_segments(&self.config.root).map_err(|e| match e {
             OpenError::Io { op, source } => RecoveryError::Io { op, source },
             // `list_segments` only ever surfaces `Io` (it does no
@@ -1449,7 +1352,10 @@ impl Wal {
             let is_newest = Some(idx) == newest_idx;
             match replay_segment(path, is_newest, sink) {
                 Ok(SegmentScan::CleanTail) => {}
-                Ok(SegmentScan::TornTail { valid_to }) => self.heal_newest_segment(valid_to)?,
+                Ok(SegmentScan::TornTail(heal)) => {
+                    self.heal_newest_segment(heal.offset)?;
+                    self.healed_tail = Some(heal);
+                }
                 Err(e) => {
                     if matches!(e, RecoveryError::Corrupt { .. }) {
                         self.corrupt_frames_total += 1;
@@ -1459,6 +1365,14 @@ impl Wal {
             }
         }
         Ok(())
+    }
+
+    /// The torn tail the last [`Self::replay`] healed, if it healed one
+    /// (RFC 0068 §3.3). Only the newest segment can hold one, so there is
+    /// at most one per replay.
+    #[must_use]
+    pub fn healed_tail(&self) -> Option<&TailHeal> {
+        self.healed_tail.as_ref()
     }
 
     /// RFC0008.4 / §6.6 step 4: truncate a torn tail off the
@@ -1894,11 +1808,12 @@ enum SegmentScan {
     /// Frames ended on a clean frame boundary (the scan reached
     /// end-of-file exactly between frames). No healing needed.
     CleanTail,
-    /// The newest segment stopped on a torn (partial) tail frame
-    /// at byte `valid_to` — RFC0008.4. The caller truncates the
-    /// segment to `valid_to`. Only ever returned for the newest
-    /// segment; a torn tail on a closed segment is corruption.
-    TornTail { valid_to: u64 },
+    /// The newest segment stopped on a torn tail: a partial frame
+    /// (RFC0008.4) or a run of zeros reaching EOF (RFC 0068 §3.1 T2).
+    /// The caller truncates the segment to the heal's offset. Only ever
+    /// returned for the newest segment; a torn tail on a closed segment
+    /// is corruption.
+    TornTail(TailHeal),
 }
 
 /// Scan one segment's frames left-to-right (§6.6 step 3),
@@ -1907,87 +1822,38 @@ enum SegmentScan {
 /// segment is clean truncation ([`SegmentScan::TornTail`]); on
 /// any closed segment it is [`CorruptionReason::TornOnClosedSegment`].
 /// A complete-but-invalid frame (CRC, `kind`, `_pad`, `len`)
-/// is corruption on every segment.
+/// is corruption on every segment, except that on the newest one a
+/// malformed header followed by nothing but zeros to EOF is a torn
+/// tail too (RFC 0068 §3.1 T2).
 fn replay_segment<S: FrameSink>(
     path: &std::path::Path,
     is_newest: bool,
     sink: &mut S,
 ) -> Result<SegmentScan, RecoveryError> {
-    let file = File::open(path).map_err(|source| RecoveryError::Io {
-        op: "open(segment for replay)",
-        source,
-    })?;
-    let file_len = file
-        .metadata()
-        .map_err(|source| RecoveryError::Io {
-            op: "stat(segment for replay)",
-            source,
-        })?
-        .len();
-    let mut reader = BufReader::new(file);
-    let segment_uuid = match segment::read_header(&mut reader) {
-        Ok(header) => header.segment_uuid,
-        Err(segment::HeaderError::Io(source)) => {
-            return Err(RecoveryError::Io {
-                op: "read_header(segment for replay)",
-                source,
-            });
-        }
-        // Bad magic / unknown version on a `*.wal` file is
-        // corruption. Full per-reason classification (a dedicated
-        // `CorruptionReason`) is RFC0008.5's remit; here it
-        // surfaces as an unreadable segment so recovery halts
-        // rather than silently skipping the file's data.
-        Err(other) => {
-            return Err(RecoveryError::Io {
-                op: "validate_header(segment for replay)",
-                // Pass the typed `HeaderError` straight through as
-                // the `io::Error` source so the structured variant
-                // (bad magic vs unknown version, with its bytes)
-                // survives in the error chain rather than being
-                // flattened to a string.
-                source: std::io::Error::new(ErrorKind::InvalidData, other),
-            });
-        }
-    };
+    let (mut reader, scan) = Scan::open(path, is_newest)?;
     let mut pos = SEGMENT_HEADER_LEN as u64;
-    loop {
-        if pos >= file_len {
-            // Reached end-of-file aligned on a frame boundary —
-            // the legitimate clean end of a segment.
-            return Ok(SegmentScan::CleanTail);
-        }
+    // Reaching end-of-file on a frame boundary is the clean end.
+    while pos < scan.file_len {
         let frame_start = pos;
-        match frame::read_frame(&mut reader) {
+        let reason = match frame::read_frame(&mut reader) {
             Ok((kind, payload)) => {
                 pos += frame::FRAME_HEADER_LEN as u64
                     + u64::try_from(payload.len())
                         .expect("payload.len() fits u64 (read_frame capped it at MAX_FRAME_BYTES)");
                 // Post-frame byte = the append-offset `append`
                 // returned for this frame (§6.1).
-                sink.consume(
-                    WalOffset {
-                        segment: segment_uuid,
-                        byte: pos,
-                    },
-                    kind,
-                    &payload,
-                )?;
+                let offset = WalOffset {
+                    segment: scan.segment_uuid,
+                    byte: pos,
+                };
+                sink.consume(offset, kind, &payload)?;
+                continue;
             }
             // Short read with bytes still remaining (`pos <
-            // file_len`, guaranteed by the guard above) = a torn
+            // file_len`, guaranteed by the loop guard) = a torn
             // tail frame.
             Err(frame::FrameError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => {
-                if is_newest {
-                    return Ok(SegmentScan::TornTail {
-                        valid_to: frame_start,
-                    });
-                }
-                return Err(RecoveryError::Corrupt {
-                    segment: segment_uuid,
-                    byte: frame_start,
-                    reason: CorruptionReason::TornOnClosedSegment,
-                });
+                return scan.torn(frame_start, TailShape::PartialFrame);
             }
             Err(frame::FrameError::Io(source)) => {
                 return Err(RecoveryError::Io {
@@ -1996,34 +1862,104 @@ fn replay_segment<S: FrameSink>(
                 });
             }
             Err(frame::FrameError::CrcMismatch { .. }) => {
-                return Err(RecoveryError::Corrupt {
-                    segment: segment_uuid,
-                    byte: frame_start,
-                    reason: CorruptionReason::CrcMismatch,
-                });
+                return Err(scan.corrupt(frame_start, CorruptionReason::CrcMismatch));
             }
-            Err(frame::FrameError::UnknownKind { .. }) => {
-                return Err(RecoveryError::Corrupt {
-                    segment: segment_uuid,
-                    byte: frame_start,
-                    reason: CorruptionReason::UnknownKind,
-                });
-            }
-            Err(frame::FrameError::NonZeroPad { .. }) => {
-                return Err(RecoveryError::Corrupt {
-                    segment: segment_uuid,
-                    byte: frame_start,
-                    reason: CorruptionReason::NonZeroPad,
-                });
-            }
-            Err(frame::FrameError::OversizeLen { .. }) => {
-                return Err(RecoveryError::Corrupt {
-                    segment: segment_uuid,
-                    byte: frame_start,
-                    reason: CorruptionReason::OversizeLen,
-                });
-            }
+            Err(frame::FrameError::UnknownKind { .. }) => CorruptionReason::UnknownKind,
+            Err(frame::FrameError::NonZeroPad { .. }) => CorruptionReason::NonZeroPad,
+            Err(frame::FrameError::OversizeLen { .. }) => CorruptionReason::OversizeLen,
+        };
+        // RFC 0068 §3.1 T2: a zero header fails these field checks, so the
+        // zero-tail check sits on this path only. A CRC mismatch stays
+        // corruption whatever its bytes.
+        if is_newest && zero_to_eof(reader.get_mut(), frame_start)? {
+            return scan.torn(frame_start, TailShape::ZeroTail);
         }
+        return Err(scan.corrupt(frame_start, reason));
+    }
+    Ok(SegmentScan::CleanTail)
+}
+
+/// One segment as [`replay_segment`] scans it.
+struct Scan<'a> {
+    path: &'a std::path::Path,
+    is_newest: bool,
+    file_len: u64,
+    segment_uuid: uuid::Uuid,
+}
+
+impl<'a> Scan<'a> {
+    /// Open the segment and validate its header, leaving the reader at
+    /// its first frame.
+    fn open(
+        path: &'a std::path::Path,
+        is_newest: bool,
+    ) -> Result<(BufReader<File>, Self), RecoveryError> {
+        let file = File::open(path).map_err(|source| RecoveryError::Io {
+            op: "open(segment for replay)",
+            source,
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| RecoveryError::Io {
+                op: "stat(segment for replay)",
+                source,
+            })?
+            .len();
+        let mut reader = BufReader::new(file);
+        let segment_uuid = match segment::read_header(&mut reader) {
+            Ok(header) => header.segment_uuid,
+            Err(segment::HeaderError::Io(source)) => {
+                return Err(RecoveryError::Io {
+                    op: "read_header(segment for replay)",
+                    source,
+                });
+            }
+            // Bad magic / unknown version on a `*.wal` file is
+            // corruption. Full per-reason classification (a dedicated
+            // `CorruptionReason`) is RFC0008.5's remit; here it
+            // surfaces as an unreadable segment so recovery halts
+            // rather than silently skipping the file's data.
+            Err(other) => {
+                return Err(RecoveryError::Io {
+                    op: "validate_header(segment for replay)",
+                    // Pass the typed `HeaderError` straight through as
+                    // the `io::Error` source so the structured variant
+                    // (bad magic vs unknown version, with its bytes)
+                    // survives in the error chain rather than being
+                    // flattened to a string.
+                    source: std::io::Error::new(ErrorKind::InvalidData, other),
+                });
+            }
+        };
+        let scan = Self {
+            path,
+            is_newest,
+            file_len,
+            segment_uuid,
+        };
+        Ok((reader, scan))
+    }
+
+    fn corrupt(&self, byte: u64, reason: CorruptionReason) -> RecoveryError {
+        RecoveryError::Corrupt {
+            segment: self.segment_uuid,
+            byte,
+            reason,
+        }
+    }
+
+    /// A torn tail starting at `offset`: healed on the newest segment,
+    /// corruption on a closed one, whose rotation fsync completed.
+    fn torn(&self, offset: u64, shape: TailShape) -> Result<SegmentScan, RecoveryError> {
+        if !self.is_newest {
+            return Err(self.corrupt(offset, CorruptionReason::TornOnClosedSegment));
+        }
+        Ok(SegmentScan::TornTail(TailHeal {
+            segment: self.path.to_path_buf(),
+            shape,
+            offset,
+            size: self.file_len,
+        }))
     }
 }
 
@@ -2286,6 +2222,9 @@ pub enum CheckpointError {
         current: WalOffset,
         attempted: WalOffset,
     },
+    /// The held floors do not fit the sidecar (RFC 0056 §3.4); nothing
+    /// was written and the mark did not advance.
+    Unencodable { detail: String },
 }
 
 impl std::fmt::Display for CheckpointError {
@@ -2297,6 +2236,7 @@ impl std::fmt::Display for CheckpointError {
                 "WAL checkpoint is monotonic: segment {} byte {} is below the current segment {} byte {}",
                 attempted.segment, attempted.byte, current.segment, current.byte,
             ),
+            Self::Unencodable { detail } => write!(f, "WAL checkpoint does not encode: {detail}"),
         }
     }
 }
@@ -2305,7 +2245,7 @@ impl std::error::Error for CheckpointError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::NonMonotonic { .. } => None,
+            Self::NonMonotonic { .. } | Self::Unencodable { .. } => None,
         }
     }
 }

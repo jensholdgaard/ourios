@@ -42,6 +42,7 @@ impl Store {
             backend: store,
             http,
             caller: Caller::default(),
+            deadline: None,
             metrics,
             prefix,
             conditional_update,

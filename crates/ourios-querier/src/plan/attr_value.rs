@@ -38,6 +38,19 @@ pub(super) fn attr_cmp(column: Expr, key: &str, expected: &str, eq: bool) -> Exp
     UDF.call(vec![column, lit(key), lit(expected), lit(eq)])
 }
 
+/// Whether `expr` is an [`attr_cmp`] call.
+pub(super) fn is_attr_cmp(expr: &Expr) -> bool {
+    matches!(expr, Expr::ScalarFunction(call) if call.name() == NAME)
+}
+
+/// The attribute cell an [`attr_cmp`] call reads.
+pub(super) fn cell_of(expr: &Expr) -> Option<Expr> {
+    match expr {
+        Expr::ScalarFunction(call) if call.name() == NAME => call.args.first().cloned(),
+        _ => None,
+    }
+}
+
 /// The canonical JSON a stored value of `value` has, so a comparison is
 /// byte-aligned with the stored text.
 pub(super) fn canonical_value(
@@ -83,20 +96,16 @@ impl ScalarUDFImpl for AttrCmp {
         let cmp = Cmp::new(key, expected, *eq);
         let array = match json {
             ColumnarValue::Scalar(json) => {
-                let hit = json
-                    .try_as_str()
-                    .flatten()
-                    .map(|j| cmp.eval(j))
-                    .transpose()?;
+                let hit = json.try_as_str().flatten().and_then(|j| cmp.answer(j));
                 return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(hit)));
             }
             ColumnarValue::Array(array) => array,
         };
         let mut out = BooleanBuilder::with_capacity(array.len());
         match array.data_type() {
-            DataType::Utf8 => cmp.fill(array.as_string::<i32>().iter(), &mut out)?,
-            DataType::LargeUtf8 => cmp.fill(array.as_string::<i64>().iter(), &mut out)?,
-            DataType::Utf8View => cmp.fill(array.as_string_view().iter(), &mut out)?,
+            DataType::Utf8 => cmp.fill(array.as_string::<i32>().iter(), &mut out),
+            DataType::LargeUtf8 => cmp.fill(array.as_string::<i64>().iter(), &mut out),
+            DataType::Utf8View => cmp.fill(array.as_string_view().iter(), &mut out),
             other => return exec_err!("{NAME} takes a string column, got {other}"),
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -189,15 +198,20 @@ impl<'a> Cmp<'a> {
         }
     }
 
-    fn fill<'s>(
-        &self,
-        rows: impl Iterator<Item = Option<&'s str>>,
-        out: &mut BooleanBuilder,
-    ) -> Result<()> {
+    fn fill<'s>(&self, rows: impl Iterator<Item = Option<&'s str>>, out: &mut BooleanBuilder) {
         for row in rows {
-            out.append_option(row.map(|json| self.eval(json)).transpose()?);
+            out.append_option(row.and_then(|json| self.answer(json)));
         }
-        Ok(())
+    }
+
+    /// The comparison on one stored cell; `None` (SQL `NULL`) for a cell
+    /// the filter cannot read: one that is not a closed list, whose text
+    /// can hold a pair it never stored, or one whose scan along the key's
+    /// path fails (RFC 0069 §3.2).
+    fn answer(&self, json: &str) -> Option<bool> {
+        super::attr_guard::readable(json)
+            .then(|| self.eval(json).ok())
+            .flatten()
     }
 
     /// The key's first occurrence is the first top-level one unless a map

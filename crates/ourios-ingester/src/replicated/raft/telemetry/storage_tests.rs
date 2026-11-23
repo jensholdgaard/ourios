@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use openraft::EntryPayload;
-use openraft::storage::{IOFlushed, RaftLogStorage};
+use openraft::storage::{IOFlushed, RaftLogReader, RaftLogStorage};
 use openraft::type_config::TypeConfigExt;
 use ourios_semconv as semconv;
 use ourios_wal::TenantBatch;
@@ -16,6 +16,7 @@ use crate::replicated::raft::cluster::wal_config;
 use crate::replicated::raft::codec::raft_id;
 use crate::replicated::raft::gate::SyncGate;
 use crate::replicated::raft::log_store::{Disk, GroupLog, group_dir};
+use crate::replicated::raft::retry;
 use crate::replicated::raft::types::{Entry, NodeId, RaftTypes, TenantBatchBytes, Vote};
 use crate::replicated::raft::vote_log::{self, VoteLog};
 
@@ -324,4 +325,170 @@ fn a_miner_stop_is_the_registered_event_with_its_cause() {
         "purged",
     ];
     assert_eq!(types, registered);
+}
+
+/// An entry carrying a 1 MiB record, so a few cross a segment rotation.
+fn large_entry(index: u64) -> Entry {
+    let batch = TenantBatch::encode("acme", &vec![0x5A; 1024 * 1024]).expect("batch");
+    Entry {
+        log_id: raft_id(ourios_wal::RaftLogId { term: 1, index }),
+        payload: EntryPayload::Normal(TenantBatchBytes::new(batch).expect("valid").into()),
+    }
+}
+
+/// Appends enough 1 MiB entries to `log` to cross a segment rotation,
+/// returning each write's outcome.
+async fn across_a_rotation(log: &mut GroupLog) -> Vec<io::Result<()>> {
+    let entries = ourios_wal::MIN_SEGMENT_SIZE_BYTES / (1024 * 1024) + 2;
+    let mut outcomes = Vec::new();
+    for index in 0..entries {
+        let (tx, rx) = RaftTypes::oneshot();
+        let appended = log
+            .append([large_entry(index)], IOFlushed::<RaftTypes>::signal(tx))
+            .await;
+        let flushed = match appended {
+            Ok(()) => rx
+                .await
+                .unwrap_or_else(|_| Err(io::Error::other("callback dropped"))),
+            Err(e) => Err(e),
+        };
+        outcomes.push(flushed);
+    }
+    outcomes
+}
+
+/// A rotation-fault case: the group it runs on, which no other test uses,
+/// the faults armed on its WAL, and RFC 0052's retry budget.
+struct Faulted {
+    group: u32,
+    faults: ourios_wal::RotationFaults,
+    attempts: u32,
+}
+
+impl Faulted {
+    fn config(&self, dir: &Path) -> ourios_wal::WalConfig {
+        ourios_wal::WalConfig {
+            rotation_retry_attempts: self.attempts,
+            ..wal_config(&group_dir(dir, self.group))
+        }
+    }
+
+    /// The group's log with the faults armed, metered on `reader`.
+    fn open(self, dir: &Path, reader: &Reader) -> GroupLog {
+        vote_log::create(dir).expect("create");
+        let votes = VoteLog::open(dir).expect("vote log");
+        let config = self.config(dir);
+        let disk = Disk {
+            gate: Arc::new(SyncGate::default()),
+            storage: Meters::on(&reader.meter()).storage(),
+        };
+        retry::injected::on_group(self.group, self.faults);
+        GroupLog::open_metered(config, self.group, votes, disk).expect("group log")
+    }
+}
+
+/// RFC0065.34's healing arm: every write across the rotation succeeds,
+/// the group does not stop, and once the log is shut down and reopened
+/// from its WAL every entry is there, in order.
+async fn retried_without_stopping(case: Faulted) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reader = Reader::new();
+    let (group, config) = (case.group, case.config(dir.path()));
+    let mut log = case.open(dir.path(), &reader);
+
+    let outcomes = across_a_rotation(&mut log).await;
+
+    let failed: Vec<_> = outcomes.iter().filter(|o| o.is_err()).collect();
+    assert!(failed.is_empty(), "every write succeeds: {failed:?}");
+    assert!(reader.points(STOPS).is_empty(), "the group did not stop");
+    log.shutdown();
+    let votes = VoteLog::open(dir.path()).expect("vote log");
+    let mut reopened = GroupLog::open(config, group, votes).expect("reopen");
+    let count = u64::try_from(outcomes.len()).expect("count");
+    let mut read = reopened.get_log_reader().await;
+    let entries = read.try_get_log_entries(0..count).await.expect("read");
+    let indexes: Vec<u64> = entries.iter().map(|e| e.log_id.index).collect();
+    assert_eq!(indexes, (0..count).collect::<Vec<_>>(), "durable, in order");
+}
+
+/// RFC0065.34's budget arm: the fault outlasts the budget, so a write
+/// after the rotation fails and the group stops, counted once.
+async fn stopped_once(case: Faulted) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reader = Reader::new();
+    let mut log = case.open(dir.path(), &reader);
+
+    let outcomes = across_a_rotation(&mut log).await;
+
+    assert!(
+        outcomes.first().is_some_and(Result::is_ok),
+        "before the rotation"
+    );
+    assert!(outcomes.last().is_some_and(Result::is_err), "after it");
+    let stops: u64 = reader.points(STOPS).iter().map(|(_, n)| n).sum();
+    assert_eq!(stops, 1, "stopped once");
+}
+
+const DEFAULT_ATTEMPTS: u32 = ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS;
+
+/// RFC0065.34: an append whose rotation fails once is retried in place.
+#[tokio::test]
+async fn a_transient_rotation_fault_is_retried_without_stopping_the_group() {
+    let faults = ourios_wal::RotationFaults::failing(ourios_wal::RotationSite::Create, 1);
+    retried_without_stopping(Faulted {
+        group: 12_651,
+        faults,
+        attempts: DEFAULT_ATTEMPTS,
+    })
+    .await;
+}
+
+/// RFC0065.34: the WAL's budget, not the writer's backoff, ends the
+/// retries, so a larger budget heals more failures.
+#[tokio::test]
+async fn the_wal_budget_decides_how_often_a_rotation_is_retried() {
+    let faults = ourios_wal::RotationFaults::failing(ourios_wal::RotationSite::Create, 5);
+    retried_without_stopping(Faulted {
+        group: 12_653,
+        faults,
+        attempts: 6,
+    })
+    .await;
+}
+
+/// RFC0065.34: a sync whose rotation-owed directory fsync fails is retried
+/// in place too.
+#[tokio::test]
+async fn a_transient_parent_fsync_fault_is_retried_without_stopping_the_group() {
+    let faults = ourios_wal::RotationFaults::failing(ourios_wal::RotationSite::ParentFsync, 2);
+    retried_without_stopping(Faulted {
+        group: 12_654,
+        faults,
+        attempts: DEFAULT_ATTEMPTS,
+    })
+    .await;
+}
+
+/// RFC0065.34: a rotation fault that outlasts RFC 0052's budget stops the
+/// group, once, as any other write fault does.
+#[tokio::test]
+async fn a_rotation_fault_past_the_budget_stops_the_group_once() {
+    stopped_once(Faulted {
+        group: 12_652,
+        faults: ourios_wal::RotationFaults::always(ourios_wal::RotationSite::Create),
+        attempts: DEFAULT_ATTEMPTS,
+    })
+    .await;
+}
+
+/// RFC0065.34: a directory fsync that keeps failing exhausts the same
+/// budget through `sync` and stops the group once.
+#[tokio::test]
+async fn a_parent_fsync_fault_past_the_budget_stops_the_group_once() {
+    stopped_once(Faulted {
+        group: 12_655,
+        faults: ourios_wal::RotationFaults::always(ourios_wal::RotationSite::ParentFsync),
+        attempts: DEFAULT_ATTEMPTS,
+    })
+    .await;
 }

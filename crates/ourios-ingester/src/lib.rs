@@ -51,6 +51,7 @@ pub mod compactor;
 pub mod encode_pool;
 #[cfg(feature = "openfga")]
 pub mod graph_emitter;
+pub mod held;
 pub mod housekeeping;
 mod lane;
 pub mod metrics;
@@ -62,6 +63,7 @@ pub mod record_sink;
 pub mod recovery;
 pub mod replicated;
 pub mod snapshot_store;
+mod tail_heal;
 pub mod template_ids;
 
 pub use compactor::{Compactor, IngestError, SweepReport, SweepTarget, run_sweep};

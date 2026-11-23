@@ -235,7 +235,7 @@ receiver:
       listen_addr: 0.0.0.0:4320                 # the peer listener
       peers: "${env:OURIOS_RECEIVER_WAL_PEERS}"           # voting replicas: id=host:port,…
       tail_peers: "${env:OURIOS_RECEIVER_WAL_TAIL_PEERS}" # tail pool: id=host:port,… (B24)
-      groups: 16
+      groups: 16                                # 1 to 256
       replication_factor: 3                     # voters per group: 3 or 5
       tail_replicas: 1                          # learners per group from the tail pool, ≥ 1
       tail_clients: "${env:OURIOS_RECEIVER_WAL_TAIL_CLIENTS}" # querier certificate identities allowed to call Tail
@@ -251,7 +251,10 @@ bare env under `OURIOS_RECEIVER_WAL_*`. A node is a voter if its
 never both, so no id appears in both lists; each list is a
 comma-separated `id=host:port` string, so one `${env:…}` carries it.
 The peer port defaults to 4320, beside OTLP's 4317 and 4318 and the
-querier's 4319. `replication_factor` is 3 or 5 and at most `peers`; its
+querier's 4319. `groups` is `1..=256`: every start walks all of them,
+so a ceiling makes a mistyped count fail naming the field rather than
+stall the start, and 256 is sixteen times the default and twice the 128
+groups §4.7 failed over (#1351). `replication_factor` is 3 or 5 and at most `peers`; its
 majority is the write quorum (B1), so the durability floor is derived,
 not set (an even factor would add a copy without raising the floor, and
 1 is the local backend). `tail_replicas` is `1..=tail_peers`: one tail
@@ -616,8 +619,8 @@ the mass-failover time and vote-log batching as tuning signals.
 > - **Given** `receiver.wal.backend` unset, `local`, and `replicated`
 >   with every field set, and then `replicated` without `peers`, with a
 >   `node_id` in neither `peers` nor `tail_peers`, with
->   `replication_factor` 4 or above `peers`, with `tail_replicas` 0, and
->   without `tls`
+>   `replication_factor` 4 or above `peers`, with `tail_replicas` 0, with
+>   `groups` above 256, and without `tls`
 > - **When** the server resolves its config and starts
 > - **Then** the first three start (local, local, replicated), and each
 >   of the rest fails startup with an error naming the field
@@ -1140,6 +1143,16 @@ the mass-failover time and vote-log batching as tuning signals.
 >   that matches at least one row, exactly those rows less the ones it
 >   matched
 
+> **Scenario RFC0065.34 — a transient rotation fault does not stop a replica (B4)**
+> - **Given** a group's log whose WAL rotation fails once with
+>   `RotationRetrying`
+> - **When** the replica appends entries across the rotation
+> - **Then** each write's callback reports success only after its
+>   frames are synced, the entries read back in order, and nothing is
+>   counted on `ourios.wal.replication.stops`
+> - **And** a rotation fault that exhausts RFC 0052's budget stops the
+>   replica, counted once, as any other write fault does
+
 ## 6. Proposed design
 
 > **`openraft` is the design (§4.3, §4.4).** §6.2–§6.4 below
@@ -1457,6 +1470,19 @@ Each group has one object, `<bucket>/wal/replicated/groups/<g>/state.json`:
 - **Corruption (B4).** A replica whose group WAL fails RFC 0008's CRC
   checks leaves `in_sync` (if leader, it stops leading), discards that
   group's log, and catches up from an in-sync member.
+- **A write fault on a group's log.** A failed append or sync on a
+  group's WAL stops that replica in the group until the node restarts,
+  counted on `ourios.wal.replication.stops`, except a **transient
+  rotation fault**: an append or sync that reports RFC 0052 §3.3's
+  `RotationRetrying`. The group's writer retries that inside itself,
+  after a short backoff, resuming at the frame that failed, before it
+  reports the write to `openraft`, because `openraft` treats a storage
+  error as fatal for the group. Nothing is acknowledged while it
+  retries: the write's callback fires only once its frames are synced.
+  RFC 0052's budget bounds the retries, and a fault that exhausts it
+  (`RotationTerminal`), or any other error, stops the replica as above.
+  So a brief rotation fault, such as a short `ENOSPC`, delays one
+  replica's writes instead of taking it out of the group (#1265).
 
 ### 6.5 Mining, checkpoints and recovery
 
@@ -2631,7 +2657,7 @@ signal that tunes it:
 |---|---|---|
 | Backlog limit (B25) | 90 % of the WAL volume, sized for 24 h | backlog bytes and age per group, time to the 50 % alert in real outages |
 | Catch-up rate (B26) | ≥ 2× the sized ingest rate | flush throughput against ingest throughput per group, measured drain times |
-| Groups | 16 (about 0.06 cores of heartbeats; §4.6) | per-group CPU, memory and heartbeat cost; ingest skew across groups |
+| Groups | 16 (about 0.06 cores of heartbeats; §4.6), at most 256 | per-group CPU, memory and heartbeat cost; ingest skew across groups |
 | `tail_replicas` | 1 | tail call latency and saturation per tail replica |
 | Tail memory before local Parquet | the record sink's size and age triggers | tail replica memory, local file count and query bytes read |
 | Tail volume | 2 × 24 h of the stated ingest rate (a node hosting every group); alerts at 50 % and 80 % | groups hosted and tail WAL and cache bytes per node during real outages |
@@ -2772,6 +2798,8 @@ from rows.
 - RFC0065.16: the existing suites, unchanged.
 - RFC0065.33: compaction and erasure tests in `ourios-parquet` beside
   RFC0009.2's, on files written with and without the ingest columns.
+- RFC0065.34: group-log tests beside the storage telemetry tests,
+  arming RFC 0052's rotation fault injection on the group's WAL.
 - RFC0065.31's lock arms (two replicated starts, a crashed
   bootstrapper, a deletion with groups holding blocks): the in-process
   cluster on the in-memory store, with failpoints between the lock,

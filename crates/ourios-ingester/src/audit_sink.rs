@@ -56,6 +56,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ourios_core::audit::{AuditEvent, AuditSink};
+use ourios_core::tenant::TenantId;
 use ourios_parquet::{AuditWriter, AuditWriterError, PartitionKey, Store, derive_audit_partition};
 use tokio::sync::Notify;
 
@@ -72,6 +73,10 @@ struct FlushSummary {
     transient_errors: u64,
     permanent_errors: u64,
     derive_errors: u64,
+    /// Tenants whose template events were dropped for good, by a permanent
+    /// write error or a failed derive (RFC 0056 §3.1), with the first loss's
+    /// `error.type`.
+    lost_templates: std::collections::BTreeMap<TenantId, &'static str>,
 }
 
 /// Classify a failed audit partition flush (issue #302 fix #2): a store-I/O
@@ -115,6 +120,12 @@ fn route_partition_result(
         }
         Err(err) => {
             summary.permanent_errors = summary.permanent_errors.saturating_add(1);
+            if batch.iter().any(crate::held::is_template_event) {
+                summary
+                    .lost_templates
+                    .entry(TenantId::new(partition.tenant_id.clone()))
+                    .or_insert(permanent_error_type(&err));
+            }
             tracing::error!(
                 name: ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED,
                 {
@@ -140,9 +151,18 @@ fn write_events(store: &Store, events: Vec<AuditEvent>) -> (Vec<AuditEvent>, Flu
     let mut summary = FlushSummary::default();
     let mut groups: HashMap<PartitionKey, Vec<AuditEvent>> = HashMap::new();
     for event in events {
-        let Ok(partition) = derive_audit_partition(&event) else {
-            summary.derive_errors = summary.derive_errors.saturating_add(1);
-            continue;
+        let partition = match derive_audit_partition(&event) {
+            Ok(partition) => partition,
+            Err(err) => {
+                summary.derive_errors = summary.derive_errors.saturating_add(1);
+                if crate::held::is_template_event(&event) {
+                    summary
+                        .lost_templates
+                        .entry(event.tenant_id.clone())
+                        .or_insert(permanent_error_type(&err));
+                }
+                continue;
+            }
         };
         groups.entry(partition).or_default().push(event);
     }
@@ -291,6 +311,12 @@ impl BufferingAuditSink {
     /// `emit` buffered during the unlocked I/O, then refresh the gauge. Never
     /// drops — the buffer is retained for retry (the WAL is the durability of
     /// record).
+    /// Drop the buffered events a hold drops (RFC 0056 §3.2).
+    fn purge_held(&mut self, held: &crate::held::HeldTenants) {
+        self.buffer.retain(|event| !held.drops(event));
+        self.metrics.set_buffered(self.buffer.len());
+    }
+
     fn requeue_ahead(&mut self, mut retained: Vec<AuditEvent>) {
         if !retained.is_empty() {
             retained.append(&mut self.buffer);
@@ -322,6 +348,8 @@ pub struct SharedParquetAuditSink {
     inner: Arc<Mutex<BufferingAuditSink>>,
     /// Every take out of the buffer not yet settled.
     takes: Arc<Takes>,
+    /// RFC 0056 §3.2's held tenants.
+    held: crate::held::HeldTenants,
 }
 
 impl SharedParquetAuditSink {
@@ -331,7 +359,24 @@ impl SharedParquetAuditSink {
         Self {
             inner: Arc::new(Mutex::new(sink)),
             takes: Arc::new(Takes::default()),
+            held: crate::held::HeldTenants::default(),
         }
+    }
+
+    /// This sink, holding a tenant whose template events it cannot write
+    /// for good (RFC 0056 §3.2). Without it, such events are dropped and
+    /// their records publish, as the replicated backend still does (§3.6).
+    #[must_use]
+    pub fn holding(mut self) -> Self {
+        self.held = crate::held::HeldTenants::enabled();
+        self
+    }
+
+    /// The tenants this sink holds (RFC 0056 §3.2), shared with whatever
+    /// publishes their records.
+    #[must_use]
+    pub fn held(&self) -> crate::held::HeldTenants {
+        self.held.clone()
     }
 
     /// Lock the sink, recovering a poisoned mutex. A poison means a past panic
@@ -363,6 +408,13 @@ impl SharedParquetAuditSink {
         self.lock().flushes()
     }
 
+    /// Partition writes that failed transiently so far — observability +
+    /// tests.
+    #[must_use]
+    pub fn flush_errors_transient(&self) -> u64 {
+        self.lock().flush_errors_transient()
+    }
+
     /// Atomically take the whole buffer (a cheap memory move, no I/O) with
     /// its place in the take order. The
     /// [`crate::publish::PublishCoordinator`] calls this under the pipeline's
@@ -391,9 +443,34 @@ impl SharedParquetAuditSink {
         if events.is_empty() {
             return events;
         }
+        let mut events = events;
+        events.retain(|event| !self.held.drops(event));
         let store = self.lock().store.clone();
-        let (retained, summary) = write_events(&store, events);
-        self.lock().settle(&summary);
+        let (mut retained, summary) = write_events(&store, events);
+        let mut sink = self.lock();
+        sink.settle(&summary);
+        let mut newly_held = false;
+        for (tenant, error_type) in &summary.lost_templates {
+            if self.held.hold(tenant) {
+                newly_held = true;
+                sink.metrics.record_tenant_held(tenant);
+                tracing::warn!(
+                    name: ourios_semconv::EVENT_OURIOS_RECEIVER_TENANT_HOLD_STARTED,
+                    {
+                        { ourios_semconv::OURIOS_TENANT } = tenant.as_str(),
+                        { ERROR_TYPE } = *error_type,
+                    },
+                    "audit sink: holding tenant {:?}: a template event could not be \
+                     written, so its records stop publishing and its batches are \
+                     refused until a restart after the fault is repaired",
+                    tenant.as_str(),
+                );
+            }
+        }
+        if newly_held {
+            sink.purge_held(&self.held);
+        }
+        retained.retain(|event| !self.held.drops(event));
         retained
     }
 
@@ -404,21 +481,28 @@ impl SharedParquetAuditSink {
         if events.is_empty() {
             return;
         }
-        self.lock().requeue_ahead(events);
+        let mut events = events;
+        // RFC 0056 §3.2: a held tenant's events are not restored, so they
+        // cannot block another tenant's barrier.
+        let mut sink = self.lock();
+        events.retain(|event| !self.held.drops(event));
+        sink.requeue_ahead(events);
     }
 
     /// Drain the internal buffer to durability — the standalone
     /// cadence/shutdown flush, and the first half of [`Self::barrier`].
-    /// Returns whether the buffer was fully drained (nothing retained for
-    /// retry); transient failures are requeued ahead of newly-buffered
-    /// events.
+    /// Returns whether this take retained nothing and its ticket cleared,
+    /// so no earlier take's events are still in limbo. Events a permanent
+    /// failure or a hold dropped count as settled, not durable, and events
+    /// emitted after the take are not covered. Holds gate publication
+    /// separately (`PublishCoordinator::write`). Transient failures are
+    /// requeued ahead of newly-buffered events.
     #[must_use]
     pub fn flush(&self) -> bool {
         let (events, ticket) = self.take_ticketed();
         let retained = self.write_retaining(events);
         if retained.is_empty() {
-            ticket.clear();
-            return true;
+            return ticket.clear();
         }
         self.requeue(retained);
         drop(ticket);
@@ -617,7 +701,12 @@ impl Takes {
 
 impl AuditSink for SharedParquetAuditSink {
     fn emit(&mut self, event: AuditEvent) {
-        self.lock().buffer_event(event);
+        // Checked under the sink lock, which a hold and its purge also take,
+        // so an event cannot land just after the purge.
+        let mut sink = self.lock();
+        if !self.held.drops(&event) {
+            sink.buffer_event(event);
+        }
     }
 }
 
@@ -813,10 +902,18 @@ mod tests {
 
     /// The `(tenant, error.type)` of each dropped-partition event `run` logs.
     fn dropped_events(run: impl FnOnce()) -> Vec<(String, String)> {
+        events_named(
+            ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED,
+            run,
+        )
+    }
+
+    /// The `(tenant, error.type)` of each event named `name` that `run` logs.
+    fn events_named(name: &'static str, run: impl FnOnce()) -> Vec<(String, String)> {
         use std::sync::{Arc, Mutex, PoisonError};
         use tracing_subscriber::prelude::*;
 
-        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+        struct Capture(&'static str, Arc<Mutex<Vec<(String, String)>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
             fn on_event(
                 &self,
@@ -836,14 +933,12 @@ mod tests {
                     fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
                     }
                 }
-                if event.metadata().name()
-                    != ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_DROPPED
-                {
+                if event.metadata().name() != self.0 {
                     return;
                 }
                 let mut fields = Fields::default();
                 event.record(&mut fields);
-                self.0
+                self.1
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push(fields.0);
@@ -852,12 +947,63 @@ mod tests {
 
         crate::global_subscriber();
         let events: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
-        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+        let subscriber = tracing_subscriber::registry().with(Capture(name, Arc::clone(&events)));
         tracing::subscriber::with_default(subscriber, run);
         events
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// RFC 0056 §3.2: holding a tenant logs `hold.started` once, with the
+    /// lost write's `error.type`; a second loss for the held tenant logs
+    /// nothing more.
+    #[test]
+    fn a_hold_logs_hold_started_once() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let handle =
+            SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING)).holding();
+        let pre_epoch = || AuditEvent {
+            timestamp: std::time::UNIX_EPOCH - std::time::Duration::from_secs(1),
+            ..created_event("acme", 1, "GET <*>")
+        };
+
+        let events = events_named(
+            ourios_semconv::EVENT_OURIOS_RECEIVER_TENANT_HOLD_STARTED,
+            || {
+                let _ = handle.write_retaining(vec![pre_epoch()]);
+                let _ = handle.write_retaining(vec![pre_epoch()]);
+            },
+        );
+
+        assert!(handle.held().is_held(&TenantId::new("acme")));
+        assert_eq!(events, vec![("acme".to_owned(), "batch".to_owned())]);
+    }
+
+    /// #1396: an earlier take whose events are still in limbo is not
+    /// durable, so a flush that writes everything after it must not report
+    /// that every event is, or a caller that publishes on that answer
+    /// (`flush_then_snapshot`) would publish records ahead of them.
+    #[test]
+    fn a_flush_behind_a_take_in_limbo_does_not_report_durable() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING));
+        let mut emitter = handle.clone();
+        emitter.emit(created_event("acme", 1, "GET <*>"));
+        let (in_limbo, earlier) = handle.take_ticketed();
+        emitter.emit(created_event("acme", 2, "POST <*>"));
+
+        assert!(
+            !handle.flush(),
+            "an earlier take's event is not durable yet"
+        );
+
+        assert!(handle.write_retaining(in_limbo).is_empty());
+        assert!(earlier.clear());
+        emitter.emit(created_event("acme", 3, "PUT <*>"));
+        assert!(handle.flush(), "nothing is in limbo any more");
     }
 
     /// The dropped-partition events one partition write's `result` logs.

@@ -895,3 +895,24 @@ fn conversation(tenant: &str, id: &str) -> GroupEntry {
     };
     super::super::mining::tests::framed(tenant, &request.encode_to_vec())
 }
+
+/// #1337: the flusher's store handle bounds every call, so a hung store
+/// cannot hold the miner step, its stop, or the applied events behind it.
+#[test]
+fn a_flushers_store_calls_have_a_deadline() {
+    let publishing = Publishing {
+        store: Store::in_memory(),
+        voters: BTreeMap::from([(7, vec!["a".to_owned()])]),
+        flush: FlushConfig {
+            target_bytes: usize::MAX,
+            max_buffer_age: Duration::from_millis(50),
+            ceiling_bytes: usize::MAX,
+        },
+        promoted: PromotedAttributes::default(),
+        audit_ceiling: 1 << 20,
+        #[cfg(feature = "openfga")]
+        graph_emitter: None,
+    };
+    let source = publishing.source(7).expect("a known group");
+    assert_eq!(source.store.deadline(), Some(STORE_CALL_DEADLINE));
+}

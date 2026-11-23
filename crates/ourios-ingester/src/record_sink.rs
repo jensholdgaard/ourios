@@ -206,6 +206,10 @@ pub struct ParquetRecordSink {
     /// `None` (tests / minimal wiring) quarantines silently to the
     /// counter only.
     audit: Option<Box<dyn ourios_core::audit::AuditSink + Send>>,
+    /// RFC 0056 §3.2's held tenants, whose records are dropped rather than
+    /// buffered or published; the WAL keeps them for the restart that
+    /// clears the hold. The default holds nothing.
+    held: crate::held::HeldTenants,
     /// RFC 0014 §6.3 instruments (flush throughput/latency by trigger,
     /// errors, buffer occupancy). No-op when no meter provider is installed.
     metrics: SinkMetrics,
@@ -304,8 +308,64 @@ impl ParquetRecordSink {
             derive_errors: 0,
             audit_barrier: None,
             audit: None,
+            held: crate::held::HeldTenants::default(),
             metrics: SinkMetrics::new(),
             promoted: PromotedAttributes::default(),
+        }
+    }
+
+    /// Whether `tenant` is held (RFC 0056 §3.2).
+    fn holds(&self, tenant: &str) -> bool {
+        self.held
+            .is_held(&ourios_core::tenant::TenantId::new(tenant))
+    }
+
+    /// `batches` without a held tenant's partitions: every boundary a
+    /// partition crosses (publish, requeue, park) applies this, so a hold
+    /// that began while it was in flight still stops it (RFC 0056 §3.2).
+    fn without_held(
+        &self,
+        batches: Vec<(PartitionKey, Vec<MinedRecord>)>,
+    ) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        if !self.held.any() {
+            return batches;
+        }
+        batches
+            .into_iter()
+            .filter(|(key, _)| !self.holds(&key.tenant_id))
+            .collect()
+    }
+
+    /// The ceiling (RFC0014.4): flush the largest partition inline to make
+    /// room for `est` more bytes. Then whether `key`'s tenant may still be
+    /// buffered: the barrier that runs before each inline publish can be
+    /// where its hold begins (RFC 0056 §3.2).
+    fn make_room(&mut self, est: usize, key: &PartitionKey) -> bool {
+        while self.total_bytes.saturating_add(est) > self.config.ceiling_bytes
+            && self.inline_publish_allowed()
+            && self.flush_largest()
+        {}
+        !self.holds(&key.tenant_id)
+    }
+
+    /// Drop every buffered partition of a held tenant, out of the byte
+    /// accounting with it (RFC 0056 §3.2).
+    fn purge_held(&mut self) {
+        if !self.held.any() {
+            return;
+        }
+        let held: Vec<PartitionKey> = self
+            .buffers
+            .keys()
+            .filter(|key| self.holds(&key.tenant_id))
+            .cloned()
+            .collect();
+        for key in held {
+            if let Some(buf) = self.buffers.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(buf.est_bytes);
+                self.metrics
+                    .add_buffered(-i64::try_from(buf.est_bytes).unwrap_or(i64::MAX));
+            }
         }
     }
 
@@ -342,10 +402,14 @@ impl ParquetRecordSink {
     /// Whether an inline publish may proceed: with a barrier installed, flush
     /// the audit sink first and require it to fully drain; without one, always.
     fn inline_publish_allowed(&mut self) -> bool {
-        match &mut self.audit_barrier {
+        let allowed = match &mut self.audit_barrier {
             Some(barrier) => barrier(),
             None => true,
-        }
+        };
+        // The barrier's audit write is where a hold begins, so a held
+        // tenant's partitions leave before the trigger picks one.
+        self.purge_held();
+        allowed
     }
 
     /// Total estimated bytes currently buffered across all partitions.
@@ -381,6 +445,7 @@ impl ParquetRecordSink {
     /// Force-flush every buffered partition — the WAL-segment-rotation trigger
     /// (RFC0014.3), including sub-threshold low-volume partitions.
     pub fn flush_all(&mut self) {
+        self.purge_held();
         let keys: Vec<PartitionKey> = self.buffers.keys().cloned().collect();
         for key in keys {
             self.flush_partition_swallow(&key, "rotation");
@@ -625,6 +690,7 @@ impl ParquetRecordSink {
         batches: Vec<(PartitionKey, Vec<MinedRecord>)>,
         audit_watermark: u64,
     ) {
+        let batches = self.without_held(batches);
         let keys: Vec<PartitionKey> = batches.iter().map(|(key, _)| key.clone()).collect();
         self.requeue(batches);
         for key in keys {
@@ -639,6 +705,7 @@ impl ParquetRecordSink {
     /// of anything `emit` buffered for the same partition meanwhile, and the
     /// byte accounting + gauge are restored.
     pub fn requeue(&mut self, batches: Vec<(PartitionKey, Vec<MinedRecord>)>) {
+        let batches = self.without_held(batches);
         // These records were drained because they had aged; keep the partition
         // aged so the retry isn't deferred behind newer records that arrived
         // during the off-lock publish (which carry a newer `oldest`). Pin
@@ -721,6 +788,9 @@ impl ParquetRecordSink {
                 break;
             };
             ceiling_taken.absorb(self.take_partitions(vec![largest]));
+        }
+        if self.holds(&key.tenant_id) {
+            return (ceiling_taken, TakenPartitions::default());
         }
 
         let buf = self
@@ -1172,6 +1242,12 @@ impl SharedParquetSink {
         self.lock().buffered_records()
     }
 
+    /// Estimated bytes currently buffered across all partitions.
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        self.lock().buffered_bytes()
+    }
+
     /// Atomically take the aged partitions as owned batches (issue #302). The
     /// [`crate::publish::PublishCoordinator`] calls this under the pipeline's
     /// miner lock so the drain is atomic w.r.t. `miner.ingest`, then publishes
@@ -1255,13 +1331,17 @@ impl SharedParquetSink {
         mut on_stored: impl FnMut(&PartitionKey, &[MinedRecord]),
     ) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
         let mut requeue = Vec::new();
+        let (store, promoted, batches) = {
+            let sink = self.lock();
+            (
+                sink.store(),
+                sink.promoted.clone(),
+                sink.without_held(batches),
+            )
+        };
         if batches.is_empty() {
             return requeue;
         }
-        let (store, promoted) = {
-            let sink = self.lock();
-            (sink.store(), sink.promoted.clone())
-        };
         for (key, records) in batches {
             let start = Instant::now();
             match publish_partition(&store, &key, &records, &promoted) {
@@ -1327,6 +1407,12 @@ impl SharedParquetSink {
     /// durable write, a requeue, or a park.
     #[must_use]
     pub fn detach_concurrent(&self, record: MinedRecord) -> [(&'static str, TakenPartitions); 2] {
+        if self.lock().holds(record.tenant_id.as_str()) {
+            return [
+                ("ceiling", TakenPartitions::default()),
+                ("size", TakenPartitions::default()),
+            ];
+        }
         let Ok(key) = PartitionKey::derive(&record) else {
             let mut sink = self.lock();
             sink.derive_errors += 1;
@@ -1342,9 +1428,26 @@ impl SharedParquetSink {
     }
 }
 
+impl SharedParquetSink {
+    /// Share RFC 0056 §3.2's held tenants with this sink, so it drops
+    /// their records.
+    pub fn hold_from(&self, held: crate::held::HeldTenants) {
+        self.lock().held = held;
+    }
+
+    /// Drop every buffered partition of a held tenant.
+    pub fn purge_held(&self) {
+        self.lock().purge_held();
+    }
+}
+
 impl RecordSink for SharedParquetSink {
     fn emit(&mut self, record: MinedRecord) {
-        self.lock().emit(record);
+        let mut sink = self.lock();
+        // RFC 0056 §3.2: a held tenant's record is dropped; the WAL keeps it.
+        if !sink.holds(record.tenant_id.as_str()) {
+            sink.emit(record);
+        }
     }
 }
 
@@ -1372,10 +1475,9 @@ impl RecordSink for ParquetRecordSink {
         // durable; if it can't drain (transient store error), stop rather than
         // publish, leaving the record buffered (the WAL is the durability of
         // record) and the ceiling transiently exceeded.
-        while self.total_bytes.saturating_add(est) > self.config.ceiling_bytes
-            && self.inline_publish_allowed()
-            && self.flush_largest()
-        {}
+        if !self.make_room(est, &key) {
+            return;
+        }
 
         let buf = self
             .buffers

@@ -161,6 +161,9 @@ pub(crate) const ERROR_TYPE: &str = "error.type";
 /// The domain-specific `error.type` value for an out-of-`0..=24`
 /// `SeverityNumber` (RFC 0018 §3.5). `error.type`'s value space is open.
 const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
+/// The `error.type` of a batch refused because its tenant is held
+/// (RFC 0056 §3.3).
+pub(crate) const ERROR_TYPE_TENANT_HELD: &str = "tenant_held";
 /// The `error.type` value for an Export rejected as too big (RFC 0061
 /// §3.5): over `receiver.max_request_bytes` on either listener, or over the
 /// WAL frame (`AppendError::TooLarge`).
@@ -545,6 +548,8 @@ pub struct AuditSinkMetrics {
     flush_events: Counter<u64>,
     flush_errors: Counter<u64>,
     derive_errors: Counter<u64>,
+    /// RFC 0056 §3.2: one per held tenant; a hold ends only at a restart.
+    tenants_held: UpDownCounter<i64>,
     /// Absolute current buffered-event count, kept up to date by the sink and
     /// read by the `buffer.usage` observable's callback at collect time — the
     /// `ourios.compaction.backlog` pattern (an observable gauge of the absolute
@@ -580,6 +585,12 @@ impl AuditSinkMetrics {
             .with_unit(semconv::OURIOS_AUDIT_SINK_DERIVE_ERRORS_UNIT)
             .build();
 
+        let tenants_held = meter
+            .i64_up_down_counter(semconv::OURIOS_RECEIVER_TENANT_HELD)
+            .with_description(semconv::OURIOS_RECEIVER_TENANT_HELD_DESCRIPTION)
+            .with_unit(semconv::OURIOS_RECEIVER_TENANT_HELD_UNIT)
+            .build();
+
         // `buffer.usage` is an **observable** UpDownCounter reporting the
         // absolute buffered-event count at collect time (the backlog pattern).
         let buffered_state = Arc::new(AtomicI64::new(0));
@@ -604,6 +615,7 @@ impl AuditSinkMetrics {
             flush_events,
             flush_errors,
             derive_errors,
+            tenants_held,
             buffered_state,
             buffer_usage,
         }
@@ -633,6 +645,17 @@ impl AuditSinkMetrics {
     /// pre-epoch / overflowing timestamp).
     pub fn record_derive_error(&self) {
         self.derive_errors.add(1, &[]);
+    }
+
+    /// `tenant` is now held (RFC 0056 §3.2).
+    pub fn record_tenant_held(&self, tenant: &TenantId) {
+        self.tenants_held.add(
+            1,
+            &[KeyValue::new(
+                semconv::OURIOS_TENANT,
+                tenant.as_str().to_owned(),
+            )],
+        );
     }
 
     /// Update the observable buffer gauge to the absolute `events` now buffered.

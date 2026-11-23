@@ -150,3 +150,50 @@ async fn rfc0069_7_a_filter_over_an_undecodable_cell_does_not_fail_the_query() {
     assert_eq!(result.stats.undecodable_cells, UndecodableCells::default());
     assert!(events.0.lock().expect("events").is_empty());
 }
+
+/// Two rows the `LIKE` prefilter misses for `a.b == "x"`: row 0 holds a
+/// healthy `a = {b: "y"}`, row 1 a closed list whose scan along `a.b` hits
+/// an unterminated string, and row 2 a healthy list wrapped in JSON
+/// whitespace, which the reader accepts.
+fn write_paths(bucket: &std::path::Path) {
+    let records = [
+        with_attributes(0, Vec::new()),
+        with_attributes(1, Vec::new()),
+        with_attributes(2, vec![kv("k", "x")]),
+    ];
+    let batch = ourios_parquet::mined_records_to_batch(&records).expect("batch");
+    let healthy = r#"[{"key":"a","value":{"kvlistValue":{"values":[{"key":"b","value":{"stringValue":"y"}}]}}}]"#;
+    let broken =
+        r#"[{"key":"a","value":{"kvlistValue":{"values":[{"key":"b","value":{"stringValue":"y]"#;
+    let spaced = " \n[{\"key\":\"k\",\"value\":{\"stringValue\":\"x\"}}]\t";
+    let batch = fixture::corrupt(&batch, columns::ATTRIBUTES, 0, healthy.as_bytes());
+    let batch = fixture::corrupt(&batch, columns::ATTRIBUTES, 1, broken.as_bytes());
+    let batch = fixture::corrupt(&batch, columns::ATTRIBUTES, 2, spaced.as_bytes());
+    fixture::write_batch(bucket, &records[0], &batch);
+}
+
+/// A cell whose scan along the key's path fails is `NULL` where the
+/// comparison runs. The branch a negation takes for a row its prefilter
+/// rules out checks only that the cell is a closed list, so the same cell
+/// matches there (RFC 0069 §3.2, maintainer, 2026-11-23). A healthy cell
+/// wrapped in JSON whitespace is readable.
+#[tokio::test]
+async fn a_path_scan_failure_is_null_where_the_comparison_runs() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_paths(bucket.path());
+    let q = Querier::new(bucket.path());
+
+    let cases: [(&str, &[u64]); 4] = [
+        (r#"attr.a.b != "x""#, &[0]),
+        // The prefilter rules row 1 out, and its cell is a closed list.
+        (r#"not (attr.a.b == "x")"#, &[0, 1, 2]),
+        (r#"attr.k == "x""#, &[2]),
+        // Row 1's broken map is not on `k`'s path, so its scan for `k` does
+        // not fail: a cell corrupted inside but closed is read by its text
+        // (RFC 0069 §3.2), and holds no `k`.
+        (r#"not (attr.k == "x")"#, &[0, 1]),
+    ];
+    for (src, want) in cases {
+        assert_eq!(matching(&q, src).await, want, "{src}");
+    }
+}

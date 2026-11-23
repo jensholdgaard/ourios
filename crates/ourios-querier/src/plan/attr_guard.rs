@@ -36,7 +36,8 @@ static UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 /// several times RFC0062.6's budget per row, so a cell corrupted inside
 /// but still closed is read by its text (maintainer, 2026-11-23).
 pub(super) fn readable(json: &str) -> bool {
-    json.starts_with('[') && json.ends_with(']')
+    let list = json.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    list.starts_with('[') && list.ends_with(']')
 }
 
 /// `expr` with every JSON-arm comparison under an odd number of `not`s
@@ -60,8 +61,11 @@ fn guard(expr: Expr, negated: bool) -> Result<Expr> {
 }
 
 /// `prefilter AND cmp` as `CASE WHEN prefilter THEN cmp WHEN <cell is
-/// readable> THEN false END`: `NULL` for a cell the filter cannot read,
-/// whichever branch it reaches.
+/// readable> THEN false END`: `NULL` for a cell that is not a closed list,
+/// whichever branch it reaches. Only the branch the prefilter keeps runs
+/// the comparison, so only there does a failed scan along the key's path
+/// make it `NULL`; scanning every row the prefilter rules out would cost
+/// a negation about as much again (maintainer, 2026-11-23).
 fn guarded(prefilter: Expr, cmp: Expr) -> Result<Expr> {
     let Some(cell) = attr_value::cell_of(&cmp) else {
         return Ok(prefilter.and(cmp));
@@ -190,5 +194,9 @@ mod tests {
         assert!(!readable(r#"{"key":"k"}"#), "not a list");
         assert!(!readable(""));
         assert!(readable(r#"[{"key":"k",garbage]"#), "the accepted gap");
+        assert!(
+            readable(" \n[{\"key\":\"k\",\"value\":{\"stringValue\":\"x\"}}]\t\r"),
+            "JSON whitespace around a list, which the reader accepts"
+        );
     }
 }

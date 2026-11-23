@@ -178,7 +178,10 @@ The JSON arm keeps its two steps:
    queried key in place, so checking a key against its map heads
    allocates nothing per head.
 
-A row the scan cannot read fails the query, as in #1137. The UDF keeps
+A row the scan cannot read fails the query, as in #1137. (2026-11-23:
+RFC 0069 §3.2 changes this: a comparison over an attribute cell that
+does not decode is SQL `NULL`, so neither it nor its negation matches,
+and the query does not fail.) The UDF keeps
 no call stack: the token scan tracks only a depth count, and the maps
 on a path are opened from a heap worklist. Value depth is therefore not
 limited by the lookup.

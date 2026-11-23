@@ -89,6 +89,16 @@ three ways a saved query can lose rows:
 
 A query on a record that holds the literal key answers as before.
 
+**Attribute cells that cannot be read.** A record written corrupt, or by
+a producer other than Ourios, can hold attributes that do not decode. A
+query returns such a record anyway (RFC 0069): the unreadable attributes
+come back as one attribute, `ourios.attribute.undecodable`, holding the
+stored text, and the rest of the record is read as usual. A comparison
+on an unreadable attribute matches neither way: `attr.k == "x"` and
+`not (attr.k == "x")` both skip the record, so a negated query no longer
+counts it. A promoted key still answers from its column when the record
+has a value there.
+
 ## The samples
 
 1. Every error or worse in the last hour:

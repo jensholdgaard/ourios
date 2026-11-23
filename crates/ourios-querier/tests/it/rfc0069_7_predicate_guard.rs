@@ -108,7 +108,7 @@ async fn rfc0069_7_a_filter_over_an_undecodable_cell_does_not_fail_the_query() {
     write(bucket.path());
     let q = Querier::new(bucket.path());
 
-    let cases: [(&str, &[u64]); 8] = [
+    let cases: [(&str, &[u64]); 12] = [
         // The JSON arm alone: the bad rows' text holds `k = "x"`, yet
         // neither the comparison nor its negation matches them.
         (r#"attr.k == "x""#, &[0]),
@@ -121,6 +121,18 @@ async fn rfc0069_7_a_filter_over_an_undecodable_cell_does_not_fail_the_query() {
         (r#"not (attr.p != "x")"#, &[0, 2]),
         ("attr.i == 1", &[0, 2]),
         ("not (attr.i == 1)", &[1]),
+        // Polarity through nesting and compounds, by SQL three-valued
+        // logic: a bad cell's comparison is NULL however it is combined.
+        (r#"not (not (attr.k == "x"))"#, &[0]),
+        (r#"not (attr.k == "x" or attr.k == "y")"#, &[]),
+        // A healthy cell without the key is a plain false, so its negation
+        // matches; the bad cells stay NULL.
+        (r#"not (attr.q == "x")"#, &[0, 1]),
+        // The resource cells all decode, so only the attribute arm is NULL.
+        (
+            r#"not (attr.k == "x") and not (resource.service.name == "nope")"#,
+            &[1],
+        ),
     ];
     for (src, want) in cases {
         assert_eq!(matching(&q, src).await, want, "{src}");

@@ -115,3 +115,61 @@ fn fill<'s>(rows: impl Iterator<Item = Option<&'s str>>, out: &mut BooleanBuilde
         out.append_option(row.map(decodable));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{Expr, not};
+    use datafusion::prelude::{col, lit};
+
+    use super::guard_negations;
+    use crate::plan::attr_value::attr_cmp;
+
+    /// A JSON arm as `json_arm` compiles it: a prefilter `AND` the UDF.
+    fn arm(key: &str) -> Expr {
+        col("attributes").like(lit("%x%")).and(attr_cmp(
+            col("attributes"),
+            key,
+            r#"{"stringValue":"x"}"#,
+            true,
+        ))
+    }
+
+    /// How many arms `guard_negations` guarded in `expr`.
+    fn guards(expr: Expr) -> usize {
+        let mut cases = 0;
+        guard_negations(expr)
+            .expect("guard")
+            .apply(|node| {
+                if matches!(node, Expr::Case(_)) {
+                    cases += 1;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("walk");
+        cases
+    }
+
+    /// An arm is guarded exactly when an odd number of `not`s sit above it,
+    /// through any `and` / `or` between them.
+    #[test]
+    fn only_arms_under_an_odd_number_of_nots_are_guarded() {
+        assert_eq!(guards(arm("k")), 0, "a positive arm keeps its plan");
+        assert_eq!(guards(not(arm("k"))), 1);
+        assert_eq!(guards(not(not(arm("k")))), 0, "two nots cancel");
+        assert_eq!(guards(not(not(not(arm("k"))))), 1);
+        assert_eq!(guards(not(arm("k").or(arm("j")))), 2, "both under the not");
+        assert_eq!(guards(not(arm("k").and(arm("j")))), 2);
+        assert_eq!(
+            guards(arm("k").and(not(arm("j")))),
+            1,
+            "only the negated arm"
+        );
+        assert_eq!(guards(not(lit(true).and(not(arm("k"))))), 0, "even again");
+        assert_eq!(
+            guards(not(col("p").is_null().and(arm("k")))),
+            1,
+            "a promoted fallback under its presence check"
+        );
+    }
+}

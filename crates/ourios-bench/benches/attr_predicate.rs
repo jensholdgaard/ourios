@@ -50,12 +50,18 @@ const ROUTES: [&str; 20] = [
     "/api/v1/users",
 ];
 
-const QUERIES: [(&str, &str); 5] = [
+const QUERIES: [(&str, &str); 6] = [
     ("literal-eq", r#"attr.http.route == "/cart" | count"#),
     ("literal-ne", r#"attr.http.route != "/cart" | count"#),
     ("literal-miss", r#"attr.http.route == "/nope" | count"#),
     ("path-eq", r#"attr.user.id == "u7" | count"#),
     ("path-ne", r#"attr.user.id != "u7" | count"#),
+    // RFC 0069 §3.2: a negated JSON comparison decodes the cells its
+    // prefilter rules out, so an undecodable one stays unmatched.
+    (
+        "literal-not-eq",
+        r#"not (attr.http.route == "/cart") | count"#,
+    ),
 ];
 
 fn string(key: &str, value: impl Into<String>) -> KeyValue {

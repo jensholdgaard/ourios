@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, StringArray};
 use ourios_core::otlp::any_value::Value;
@@ -128,13 +128,55 @@ pub(crate) fn write_fixture(bucket: &Path) {
     let batch = corrupt(&batch, columns::SCOPE_ATTRIBUTES, 2, BAD_SCOPE.as_bytes());
     let batch = corrupt(&batch, columns::BODY, 2, NOT_UTF8);
     let batch = corrupt(&batch, columns::BODY, 3, BAD_STRUCTURED.as_bytes());
+    write_batch(bucket, &records[0], &batch);
+}
 
-    let dir = PartitionKey::derive(&records[0])
+/// Write `batch` as `degraded.parquet` in the partition `record` derives to.
+pub(crate) fn write_batch(bucket: &Path, record: &MinedRecord, batch: &RecordBatch) {
+    let dir = PartitionKey::derive(record)
         .expect("partition")
         .data_path(bucket);
     std::fs::create_dir_all(&dir).expect("mkdir");
     let file = File::create(dir.join("degraded.parquet")).expect("create");
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("writer");
-    writer.write(&batch).expect("write");
+    writer.write(batch).expect("write");
     writer.close().expect("close");
+}
+
+/// One `ourios.reader.row.undecodable` event's (file, row, column).
+pub(crate) type Seen = (String, String, String);
+
+#[derive(Clone, Default)]
+pub(crate) struct Events(pub(crate) Arc<Mutex<Vec<Seen>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Fields(Vec<(String, String)>);
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.push((field.name().to_owned(), value.to_owned()));
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push((field.name().to_owned(), format!("{value:?}")));
+            }
+        }
+        if event.metadata().name() != ourios_semconv::EVENT_OURIOS_READER_ROW_UNDECODABLE {
+            return;
+        }
+        let mut fields = Fields(Vec::new());
+        event.record(&mut fields);
+        let get = |name: &str| {
+            fields
+                .0
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        self.0.lock().expect("events").push((
+            get("file.path"),
+            get(ourios_semconv::OURIOS_READER_ROW_INDEX),
+            get(ourios_semconv::OURIOS_READER_COLUMN_NAME),
+        ));
+    }
 }

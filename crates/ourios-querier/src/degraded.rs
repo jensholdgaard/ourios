@@ -190,7 +190,13 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
     use datafusion::arrow::record_batch::RecordBatch;
 
+    use ourios_core::record::{BodyKind, MinedRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::reconstruct::Reconstruction;
+    use ourios_parquet::columns;
+
     use super::{Decoded, FILE, FILE_ROW};
+    use crate::log_row::{LogBody, LogRow};
 
     /// A scan batch whose rows came from `file`, starting at file row `from`.
     fn batch(file: &str, from: i64, rows: usize) -> RecordBatch {
@@ -220,5 +226,54 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    /// A string row the miner reconstructs exactly (`lossy_flag = false`)
+    /// whose retained body cell is not valid UTF-8 keeps its `Faithful`
+    /// line: the line is rebuilt from the template, never read from that
+    /// body, so the bad cell is reported and counted but not shown in its
+    /// place.
+    #[test]
+    fn a_faithful_line_is_kept_over_a_corrupt_retained_body() {
+        let record = MinedRecord {
+            tenant_id: TenantId::new("t"),
+            template_id: 1,
+            template_version: 1,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            scope_attributes: Vec::new(),
+            resource_schema_url: None,
+            scope_schema_url: None,
+            time_unix_nano: 0,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::String,
+            params: Vec::new(),
+            separators: Vec::new(),
+            body: Some(String::from_utf8_lossy(b"user \xff").into_owned()),
+            confidence: 0.4,
+            lossy_flag: false,
+            ingest_position: None,
+        };
+        let faithful = LogBody::Rendered {
+            line: b"user bob".to_vec(),
+            reconstruction: Reconstruction::Faithful,
+        };
+        let mut rows = vec![LogRow::test_row()];
+        rows[0].body = faithful.clone();
+
+        let decoded = Decoded::over(&[], vec![record], vec![(0, columns::BODY)]);
+        let counts = decoded.settle(&mut rows);
+
+        assert_eq!(rows[0].body, faithful, "the reconstructed line stands");
+        assert_eq!(counts.body, 1, "the corrupt body cell is still counted");
     }
 }

@@ -1165,22 +1165,22 @@ License: http://www.apache.org/licenses/LICENSE-2.0
 
 Used by:
 
-- `arrow-arith` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-array` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-buffer` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-cast` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-cmp` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-csv` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-data` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-ipc` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-json` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-ord` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-row` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-schema` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-select` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow-string` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `arrow` 60.1.0 — <https://github.com/apache/arrow-rs>
-- `parquet` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-arith` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-buffer` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-cast` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-cmp` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-csv` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-data` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ipc` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-json` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ord` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-row` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-schema` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-select` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-string` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow` 60.2.0 — <https://github.com/apache/arrow-rs>
+- `parquet` 60.2.0 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -9954,7 +9954,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Used by:
 
-- `arrow-array` 60.1.0 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 60.2.0 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>

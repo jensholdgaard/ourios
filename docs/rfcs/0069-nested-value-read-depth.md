@@ -122,8 +122,12 @@ one bad cell does not affect the row's other cells or other rows.
   leaks through a fallback.
 - **Predicates.** A filter runs before the fallback, over the raw cell
   (`ourios_attr_cmp`, RFC 0062 §3.3). A predicate over an undecodable
-  cell evaluates as SQL `NULL`, so it does not match, and the cell is
-  logged as undecodable; the query no longer fails. The guard wraps the
+  cell evaluates as SQL `NULL`, so it does not match, and the query no
+  longer fails. The filter itself logs nothing: it does not know the
+  file or row it reads, and a query runs it in both its count scan and
+  its row scan. The cell is logged and counted when its row is returned
+  (below), and an erasure that carries it forward logs it (RFC0069.5)
+  (maintainer, 2026-11-23). The guard wraps the
   **whole** compiled comparison, outside any prefilter: a JSON-attribute
   comparison compiles to a `LIKE` prefilter `AND` the UDF, and a false
   prefilter would otherwise make the comparison false, so that `not`
@@ -303,6 +307,8 @@ explicit bound is enough.
 >   string or `i64` comparison and its negation, both of which fall back
 >   to the undecodable JSON cell, match neither the comparison nor its
 >   negation
+> - **And** a query that only filters on the bad cell, returning none of
+>   its rows, logs no undecodable cell and counts none
 
 ## 6. Testing strategy
 

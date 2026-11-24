@@ -59,6 +59,7 @@ use crate::promoted::PromotedAttributes;
 use crate::record_batch::{
     BatchError, IngestColumns, mined_records_to_batch_in, mined_records_to_batch_with_promoted,
 };
+use crate::row::Carried;
 use crate::store::Store;
 use crate::{data_schema_with_promoted, with_ingest_columns};
 
@@ -583,9 +584,9 @@ impl Writer {
     /// [`Self::append_records`], telling `on_sub_batch` the in-progress
     /// row group's estimated encoded size as each sub-batch lands — what
     /// the rotation threshold ([`Self::flush_bytes`]) is checked against.
-    pub(crate) fn append_records_observed(
+    pub(crate) fn append_records_observed<R: Carried>(
         &mut self,
-        records: &[MinedRecord],
+        records: &[R],
         on_sub_batch: &mut dyn FnMut(usize),
     ) -> Result<(), WriterError> {
         // Poisoned fail-fast comes before validation so a doomed
@@ -596,7 +597,8 @@ impl Writer {
             return Ok(());
         }
         for (idx, r) in records.iter().enumerate() {
-            let derived = PartitionKey::derive(r).map_err(|e| WriterError::Batch(e.into()))?;
+            let derived =
+                PartitionKey::derive(r.record()).map_err(|e| WriterError::Batch(e.into()))?;
             if derived != self.partition {
                 return Err(WriterError::PartitionMismatch {
                     row_index: idx,
@@ -606,7 +608,7 @@ impl Writer {
             }
         }
         let declared = self.columns.ingest;
-        if let Some(row_index) = records.iter().position(|r| !declared.admits(r)) {
+        if let Some(row_index) = records.iter().position(|r| !declared.admits(r.record())) {
             return Err(WriterError::IngestColumnsMismatch {
                 row_index,
                 declared,

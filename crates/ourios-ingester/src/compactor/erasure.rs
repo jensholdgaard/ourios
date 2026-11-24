@@ -9,7 +9,10 @@
 use super::*;
 use std::collections::HashMap;
 
-use ourios_parquet::partition_snapshot;
+use ourios_parquet::{UnidentifiedRow, partition_snapshot};
+
+/// The OpenTelemetry `file.path` attribute key.
+const FILE_PATH: &str = "file.path";
 
 /// One pending RFC 0047 §3.6 erasure: a durable request marker in the
 /// store (`erasure/tenant_id=<enc>/conversation=<enc>`, written by an
@@ -435,13 +438,25 @@ fn erase_partition(
             return None;
         }
     };
-    match sweep.rewrite(target, None, Some(drop)) {
+    let mut tell = |row: &UnidentifiedRow<'_>| log_unidentified(row);
+    match sweep.rewrite(target, None, Some(drop), Some(&mut tell)) {
         Ok(o) => match o.committed {
             Some(committed) => {
                 outcome.partitions_rewritten += 1;
                 outcome.rows_dropped += o.rows_dropped;
                 sweep.report.gc_failures += o.gc_failures;
-                Some(committed.generation)
+                if o.rows_unidentified == 0 {
+                    return Some(committed.generation);
+                }
+                // RFC 0069 §3.2: a row whose attributes cannot be read may
+                // be the conversation's, so the erasure stays pending.
+                sweep.report.errors.push(format!(
+                    "{}: {} row(s) whose attributes cannot be read were kept — request \
+                     left pending",
+                    context(),
+                    o.rows_unidentified
+                ));
+                None
             }
             None => Some(before.generation),
         },
@@ -449,6 +464,24 @@ fn erase_partition(
             e.record(&mut sweep.report, &context());
             None
         }
+    }
+}
+
+/// Log each undecodable cell of a row an erasure could not judge.
+fn log_unidentified(row: &UnidentifiedRow<'_>) {
+    for &column in row.columns {
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_READER_ROW_UNDECODABLE,
+            {
+                { FILE_PATH } = row.file,
+                { ourios_semconv::OURIOS_READER_ROW_INDEX } = row.row,
+                { ourios_semconv::OURIOS_READER_COLUMN_NAME } = column,
+            },
+            "erasure: row {} of {} has an undecodable {column} cell; it is kept and the \
+             erasure stays pending",
+            row.row,
+            row.file,
+        );
     }
 }
 

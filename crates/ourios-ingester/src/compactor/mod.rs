@@ -22,8 +22,8 @@ use ourios_core::tenant::TenantId;
 use ourios_parquet::{
     Committed, CompactionError, CompactionOutcome, CompactionPlan, CompactionPolicy,
     CompactionStats, PartitionKey, PlanCounts, PromotedAttributes, RowFilter, RowHooks,
-    RowObserver, Store, compact_partition_hooked, hour_partitions, percent_decode_tenant,
-    percent_encode_tenant, plan_compaction_counted,
+    RowObserver, Store, UnidentifiedObserver, compact_partition_hooked, hour_partitions,
+    percent_decode_tenant, percent_encode_tenant, plan_compaction_counted,
 };
 
 #[cfg(feature = "openfga")]
@@ -190,6 +190,8 @@ pub(crate) mod graph_tests;
 mod reclaim;
 #[cfg(test)]
 mod reclaim_tests;
+#[cfg(test)]
+mod rfc0069_erasure_tests;
 #[cfg(test)]
 mod sweep_progress_tests;
 #[cfg(test)]
@@ -674,7 +676,7 @@ impl Sweep<'_, '_> {
         let observe = observe
             .as_mut()
             .map(|observe| observe as &mut dyn FnMut(&[MinedRecord]));
-        match self.rewrite(target, observe, None) {
+        match self.rewrite(target, observe, None, None) {
             Ok(outcome) => {
                 self.report.gc_failures += outcome.gc_failures;
                 outcome.committed.is_some()
@@ -696,6 +698,7 @@ impl Sweep<'_, '_> {
         target: Target<'_>,
         observe: Option<&mut RowObserver<'_>>,
         drop: Option<&RowFilter<'_>>,
+        unidentified: Option<&mut UnidentifiedObserver<'_>>,
     ) -> Result<CompactionOutcome, Uncommitted> {
         let Self {
             store,
@@ -720,6 +723,8 @@ impl Sweep<'_, '_> {
         let mut hooks = RowHooks {
             observe: observe.map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
             drop: drop.map(|drop| drop as &dyn Fn(&MinedRecord) -> bool),
+            unidentified: unidentified
+                .map(|tell| tell as &mut dyn FnMut(&ourios_parquet::UnidentifiedRow<'_>)),
             on_commit: Some(&mut record),
             stats: *stats,
         };

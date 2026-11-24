@@ -325,7 +325,7 @@ pub struct RowHooks<'a> {
 pub type RowObserver<'a> = dyn FnMut(&[MinedRecord]) + 'a;
 /// A [`RowHooks::drop`] predicate. A row whose log or resource attributes
 /// did not decode is never offered to it, and is kept (RFC 0069 §3.2;
-/// see [`CompactionOutcome::unidentified`]).
+/// see [`CompactionOutcome::rows_unidentified`]).
 pub type RowFilter<'a> = dyn Fn(&MinedRecord) -> bool + 'a;
 /// A [`RowHooks::unidentified`] callback.
 pub type UnidentifiedObserver<'a> = dyn FnMut(&UnidentifiedRow<'_>) + 'a;

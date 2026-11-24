@@ -663,8 +663,7 @@ impl Builders {
                 }
             }
         }
-        append_params(&mut self.params, &r.params);
-        append_separators(&mut self.separators, &r.separators);
+        self.append_list_cells(r, stored);
 
         self.confidence.append_value(r.confidence);
         self.lossy_flag.append_value(r.lossy_flag);
@@ -705,6 +704,20 @@ impl Builders {
             columns::SCOPE_ATTRIBUTES,
             &r.scope_attributes,
         )
+    }
+
+    /// The `params` and `separators` cells: from `r`, or with the item
+    /// bytes `stored` holds.
+    fn append_list_cells(&mut self, r: &MinedRecord, stored: Option<&StoredRow>) {
+        if let Some(stored) = stored {
+            let values = stored.param_values().iter().map(Vec::as_slice);
+            append_params(&mut self.params, &r.params, values);
+            append_separators(&mut self.separators, stored.separators());
+        } else {
+            let values = r.params.iter().map(|p| p.value.as_bytes());
+            append_params(&mut self.params, &r.params, values);
+            append_separators(&mut self.separators, &r.separators);
+        }
     }
 
     fn finish(mut self) -> Vec<ArrayRef> {
@@ -764,21 +777,24 @@ fn body_kind_ordinal(k: BodyKind) -> u8 {
     }
 }
 
-fn append_params(
+/// Append `params`, each with its value cell from `values`: the decoded
+/// value, or the stored bytes of a row carried as stored.
+fn append_params<'v>(
     builder: &mut GenericListBuilder<i32, StructBuilder>,
     params: &[ourios_core::record::Param],
+    values: impl Iterator<Item = &'v [u8]>,
 ) {
-    let values = builder.values();
-    for p in params {
-        values
+    let cells = builder.values();
+    for (p, value) in params.iter().zip(values) {
+        cells
             .field_builder::<Int32Builder>(0)
             .expect("type_tag field index 0")
             .append_value(param_type_ordinal(p.type_tag));
-        values
+        cells
             .field_builder::<BinaryBuilder>(1)
             .expect("value field index 1")
-            .append_value(p.value.as_bytes());
-        values.append(true);
+            .append_value(value);
+        cells.append(true);
     }
     builder.append(true);
 }
@@ -813,9 +829,12 @@ const fn param_type_ordinal(t: ParamType) -> i32 {
     }
 }
 
-fn append_separators(builder: &mut GenericListBuilder<i32, BinaryBuilder>, separators: &[String]) {
+fn append_separators<S: AsRef<[u8]>>(
+    builder: &mut GenericListBuilder<i32, BinaryBuilder>,
+    separators: &[S],
+) {
     for s in separators {
-        builder.values().append_value(s.as_bytes());
+        builder.values().append_value(s);
     }
     builder.append(true);
 }

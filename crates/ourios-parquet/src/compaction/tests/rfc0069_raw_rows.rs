@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::TimestampNanosecondType;
-use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, ListArray, RecordBatch, StringArray, StructArray};
 use arrow_schema::DataType;
 use ourios_core::otlp::any_value::Value;
 use ourios_core::otlp::{AnyValue, KeyValue};
@@ -23,6 +23,7 @@ const BAD_ATTRIBUTES: &str = r#"[{"key":"k","value":{"stringValue":"x"}"#;
 const BAD_RESOURCE: &str = "{";
 const BAD_SCOPE: &str = "not json";
 const NOT_UTF8: &[u8] = b"line \xff\xfe";
+const NOT_UTF8_ITEM: &[u8] = b"\xff";
 
 /// The healthy row, the row whose log and resource attribute cells do
 /// not decode, and the row whose body and scope attributes do not.
@@ -131,7 +132,54 @@ fn degraded_batch() -> RecordBatch {
         BAD_RESOURCE.as_bytes(),
     );
     let batch = corrupt(&batch, columns::SCOPE_ATTRIBUTES, 2, BAD_SCOPE.as_bytes());
+    let batch = corrupt_item(&batch, (columns::PARAMS, Some("value")), 1, NOT_UTF8_ITEM);
+    let batch = corrupt_item(&batch, (columns::SEPARATORS, None), 1, NOT_UTF8_ITEM);
     corrupt(&batch, columns::BODY, 2, NOT_UTF8)
+}
+
+/// `batch` with the first item of row `row`'s list cell in `column` (its
+/// `field`, when the items are structs) replaced by `stored`.
+fn corrupt_item(
+    batch: &RecordBatch,
+    (column, field): (&str, Option<&str>),
+    row: usize,
+    stored: &[u8],
+) -> RecordBatch {
+    let index = batch.schema().index_of(column).expect("column");
+    let list = batch.column(index).as_list::<i32>();
+    let first = usize::try_from(list.value_offsets()[row]).expect("offset");
+    let replace = |items: &ArrayRef| -> ArrayRef {
+        let items = items.as_binary::<i32>();
+        Arc::new(BinaryArray::from(
+            (0..items.len())
+                .map(|j| if j == first { stored } else { items.value(j) })
+                .collect::<Vec<_>>(),
+        ))
+    };
+    let values: ArrayRef = match field {
+        None => replace(list.values()),
+        Some(field) => {
+            let (fields, mut children, nulls) = list.values().as_struct().clone().into_parts();
+            let k = fields
+                .iter()
+                .position(|f| f.name() == field)
+                .expect("field");
+            children[k] = replace(&children[k]);
+            Arc::new(StructArray::new(fields, children, nulls))
+        }
+    };
+    let DataType::List(item) = list.data_type() else {
+        panic!("{column} is a list");
+    };
+    let replaced = ListArray::new(
+        item.clone(),
+        list.offsets().clone(),
+        values,
+        list.nulls().cloned(),
+    );
+    let mut arrays = batch.columns().to_vec();
+    arrays[index] = Arc::new(replaced);
+    RecordBatch::try_new(batch.schema(), arrays).expect("batch")
 }
 
 fn put_batch(store: &Store, batch: &RecordBatch) {
@@ -196,6 +244,36 @@ fn by_time<T>(
             arrow_cast::cast(batch.column_by_name(column).expect("column"), to).expect("cast");
         for (i, t) in times(batch).into_iter().enumerate() {
             cells_by_time.insert(t, cells.is_valid(i).then(|| value(&cells, i)));
+        }
+    }
+    cells_by_time
+}
+
+/// The binary items of `column`'s list cells (their `field`, when the
+/// items are structs) by row time.
+fn items(
+    batches: &[RecordBatch],
+    column: &str,
+    field: Option<&str>,
+) -> BTreeMap<u64, Vec<Vec<u8>>> {
+    let mut cells_by_time = BTreeMap::new();
+    for batch in batches {
+        let list = batch
+            .column_by_name(column)
+            .expect("column")
+            .as_list::<i32>();
+        for (i, t) in times(batch).into_iter().enumerate() {
+            let cell = list.value(i);
+            let cell = match field {
+                Some(field) => cell
+                    .as_struct()
+                    .column_by_name(field)
+                    .expect("field")
+                    .clone(),
+                None => cell,
+            };
+            let cell = cell.as_binary::<i32>();
+            cells_by_time.insert(t, (0..cell.len()).map(|j| cell.value(j).to_vec()).collect());
         }
     }
     cells_by_time
@@ -273,6 +351,33 @@ fn rfc0069_4_compaction_carries_an_undecodable_cell_byte_for_byte() {
                 !cell.contains(ourios_semconv::OURIOS_ATTRIBUTE_UNDECODABLE),
                 "{how}: row {t} carries the reserved attribute: {cell}"
             );
+        }
+    }
+}
+
+/// Scenario RFC0069.4: a stored row's parameter values and separators,
+/// stored columns too, come back byte for byte, a non-UTF-8 item included,
+/// rather than through their decoded strings.
+#[test]
+fn rfc0069_4_a_stored_row_keeps_its_parameter_and_separator_bytes() {
+    for (how, tuning) in tunings() {
+        let (input, output) = compact(tuning);
+        let input = std::slice::from_ref(&input);
+        for (column, field) in [
+            (columns::PARAMS, Some("value")),
+            (columns::SEPARATORS, None),
+        ] {
+            let (before, after) = (items(input, column, field), items(&output, column, field));
+            assert_eq!(
+                before[&BAD_ATTRS][0], NOT_UTF8_ITEM,
+                "{how}: the fixture's {column}"
+            );
+            for t in [BAD_ATTRS, BAD_BODY] {
+                assert_eq!(
+                    after[&t], before[&t],
+                    "{how}: {column} of row {t} byte for byte"
+                );
+            }
         }
     }
 }

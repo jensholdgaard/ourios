@@ -42,6 +42,9 @@ struct StoredCells {
     resource_attributes: String,
     scope_attributes: Option<String>,
     body: Option<Vec<u8>>,
+    /// Each parameter's value cell, in the decoded parameters' order.
+    param_values: Vec<Vec<u8>>,
+    separators: Vec<Vec<u8>>,
 }
 
 /// A stored promoted cell, by the Arrow type of its column.
@@ -135,6 +138,14 @@ impl StoredRow {
         self.cells.body.as_deref()
     }
 
+    pub(crate) fn param_values(&self) -> &[Vec<u8>] {
+        &self.cells.param_values
+    }
+
+    pub(crate) fn separators(&self) -> &[Vec<u8>] {
+        &self.cells.separators
+    }
+
     pub(crate) fn is_undecodable(&self, family: Family) -> bool {
         self.undecodable.contains(&family.column())
     }
@@ -155,7 +166,8 @@ impl StoredRow {
             .map(|(_, kept)| kept)
     }
 
-    /// Heap bytes beyond the decoded record.
+    /// Heap bytes beyond the decoded record: the box, its vectors' slots,
+    /// and the bytes they hold.
     fn stored_bytes(&self) -> usize {
         let cells = &self.cells;
         let kept: usize = self
@@ -169,10 +181,20 @@ impl StoredRow {
                     }
             })
             .sum();
-        cells.attributes.len()
+        let lists = [&cells.param_values, &cells.separators]
+            .into_iter()
+            .map(|list| {
+                list.capacity() * size_of::<Vec<u8>>() + list.iter().map(Vec::len).sum::<usize>()
+            })
+            .sum::<usize>();
+        size_of::<Self>()
+            + self.undecodable.capacity() * size_of::<&str>()
+            + self.kept.capacity() * size_of::<(String, Kept)>()
+            + cells.attributes.len()
             + cells.resource_attributes.len()
             + cells.scope_attributes.as_ref().map_or(0, String::len)
             + cells.body.as_ref().map_or(0, Vec::len)
+            + lists
             + kept
     }
 }
@@ -215,7 +237,7 @@ pub(crate) fn rows_of(
             if !bad.contains(&columns::BODY) && structured_body_undecodable(&record) {
                 bad.push(columns::BODY);
             }
-            let stored = (!bad.is_empty()).then(|| Box::new(stored_row(batch, i, bad)));
+            let stored = (!bad.is_empty()).then(|| Box::new(stored_row(batch, i, &record, bad)));
             Row { record, stored }
         })
         .collect()
@@ -232,7 +254,12 @@ fn structured_body_undecodable(record: &MinedRecord) -> bool {
             .is_some_and(|body| decode_any_value(body.as_bytes()).is_err())
 }
 
-fn stored_row(batch: &RecordBatch, i: usize, undecodable: Vec<&'static str>) -> StoredRow {
+fn stored_row(
+    batch: &RecordBatch,
+    i: usize,
+    record: &MinedRecord,
+    undecodable: Vec<&'static str>,
+) -> StoredRow {
     let text = |column| {
         batch
             .column_by_name(column)
@@ -245,6 +272,20 @@ fn stored_row(batch: &RecordBatch, i: usize, undecodable: Vec<&'static str>) -> 
         body: batch
             .column_by_name(columns::BODY)
             .and_then(|cells| binary_cell(cells, i)),
+        param_values: list_cell(batch, columns::PARAMS, i, Some("value")).unwrap_or_else(|| {
+            record
+                .params
+                .iter()
+                .map(|p| p.value.clone().into_bytes())
+                .collect()
+        }),
+        separators: list_cell(batch, columns::SEPARATORS, i, None).unwrap_or_else(|| {
+            record
+                .separators
+                .iter()
+                .map(|s| s.clone().into_bytes())
+                .collect()
+        }),
     };
     let mut row = StoredRow {
         cells,
@@ -261,6 +302,23 @@ fn stored_row(batch: &RecordBatch, i: usize, undecodable: Vec<&'static str>) -> 
         }
     }
     row
+}
+
+/// The binary items of row `i`'s list cell in `column`, or of their
+/// `field` when the items are structs. `None` when the cell is not that
+/// shape, which the reader has already rejected.
+fn list_cell(
+    batch: &RecordBatch,
+    column: &str,
+    i: usize,
+    field: Option<&str>,
+) -> Option<Vec<Vec<u8>>> {
+    let items = batch.column_by_name(column)?.as_list_opt::<i32>()?.value(i);
+    let items = match field {
+        Some(field) => items.as_struct_opt()?.column_by_name(field)?.clone(),
+        None => items,
+    };
+    (0..items.len()).map(|j| binary_cell(&items, j)).collect()
 }
 
 fn text_cell(cells: &ArrayRef, i: usize) -> Option<String> {

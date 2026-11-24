@@ -909,7 +909,6 @@ Used by:
 
 Used by:
 
-- `datafusion` 56.0.0 — <https://github.com/apache/datafusion>
 - `datafusion-catalog-listing` 56.0.0 — <https://github.com/apache/datafusion>
 - `datafusion-catalog` 56.0.0 — <https://github.com/apache/datafusion>
 - `datafusion-common-runtime` 56.0.0 — <https://github.com/apache/datafusion>
@@ -939,6 +938,7 @@ Used by:
 - `datafusion-physical-plan` 56.0.0 — <https://github.com/apache/datafusion>
 - `datafusion-pruning` 56.0.0 — <https://github.com/apache/datafusion>
 - `datafusion-session` 56.0.0 — <https://github.com/apache/datafusion>
+- `datafusion` 56.0.0 — <https://github.com/apache/datafusion>
 
 <details>
 <summary>Full license text</summary>

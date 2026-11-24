@@ -67,29 +67,28 @@ fn key(key: &str, class: PromotedClass) -> PromotedKey {
     }
 }
 
+/// `service.name` and the log keys `log`, promoted.
+fn declared(log: &[(&str, PromotedClass)]) -> PromotedAttributes {
+    PromotedAttributes::new_typed(
+        [key("service.name", PromotedClass::String)],
+        log.iter().map(|&(name, class)| key(name, class)),
+    )
+}
+
 /// The declaration the degraded file was written under: `k` as a string
 /// and `n` as an integer.
 fn written_under() -> PromotedAttributes {
-    PromotedAttributes::new_typed(
-        [key("service.name", PromotedClass::String)],
-        [
-            key("k", PromotedClass::String),
-            key("n", PromotedClass::I64),
-        ],
-    )
+    declared(&[("k", PromotedClass::String), ("n", PromotedClass::I64)])
 }
 
 /// The declaration the rewrite runs under: `k` unchanged, `n` re-typed
 /// to a double and `m` newly promoted.
 fn rewritten_under() -> PromotedAttributes {
-    PromotedAttributes::new_typed(
-        [key("service.name", PromotedClass::String)],
-        [
-            key("k", PromotedClass::String),
-            key("n", PromotedClass::F64),
-            key("m", PromotedClass::String),
-        ],
-    )
+    declared(&[
+        ("k", PromotedClass::String),
+        ("n", PromotedClass::F64),
+        ("m", PromotedClass::String),
+    ])
 }
 
 /// `batch` with `column`'s cell at `row` replaced by `stored`.
@@ -157,9 +156,15 @@ fn compact(tuning: SortTuning) -> (RecordBatch, Vec<RecordBatch>) {
     put_batch(&store, &input);
     write_file(&store, &[row(TS0 + 3)]);
     write_file(&store, &[row(TS0 + 4)]);
+    (input, compacted(&store, tuning))
+}
+
+/// The partition in `store` compacted under [`rewritten_under`], as the
+/// output file's batches.
+fn compacted(store: &Store, tuning: SortTuning) -> Vec<RecordBatch> {
     let promoted = rewritten_under();
     let outcome = compact_sorted(
-        &store,
+        store,
         &partition(),
         &promoted,
         ClusterKeys::for_promoted(&promoted),
@@ -169,47 +174,45 @@ fn compact(tuning: SortTuning) -> (RecordBatch, Vec<RecordBatch>) {
     let committed = outcome.committed.expect("committed");
     let key = format!("{}/{}", partition_data_prefix(&partition()), committed.file);
     let bytes = store.get_blocking(&key).expect("output");
-    let output = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
+    ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
         .expect("open output")
         .build()
         .expect("reader")
         .collect::<Result<_, _>>()
-        .expect("batches");
-    (input, output)
+        .expect("batches")
+}
+
+/// `column`'s cells of `batches` by row time, cast to `to` and read by
+/// `value`.
+fn by_time<T>(
+    batches: &[RecordBatch],
+    column: &str,
+    to: &DataType,
+    value: impl Fn(&ArrayRef, usize) -> T,
+) -> BTreeMap<u64, Option<T>> {
+    let mut cells_by_time = BTreeMap::new();
+    for batch in batches {
+        let cells =
+            arrow_cast::cast(batch.column_by_name(column).expect("column"), to).expect("cast");
+        for (i, t) in times(batch).into_iter().enumerate() {
+            cells_by_time.insert(t, cells.is_valid(i).then(|| value(&cells, i)));
+        }
+    }
+    cells_by_time
 }
 
 /// `column`'s cells of `batches` by row time, as stored bytes.
 fn stored(batches: &[RecordBatch], column: &str) -> BTreeMap<u64, Option<Vec<u8>>> {
-    let mut by_time = BTreeMap::new();
-    for batch in batches {
-        let cells = arrow_cast::cast(
-            batch.column_by_name(column).expect("column"),
-            &DataType::Binary,
-        )
-        .expect("as binary");
-        let cells = cells.as_binary::<i32>();
-        for (i, t) in times(batch).into_iter().enumerate() {
-            by_time.insert(t, cells.is_valid(i).then(|| cells.value(i).to_vec()));
-        }
-    }
-    by_time
+    by_time(batches, column, &DataType::Binary, |cells, i| {
+        cells.as_binary::<i32>().value(i).to_vec()
+    })
 }
 
 /// `column`'s cells of `batches` by row time, as text.
 fn text(batches: &[RecordBatch], column: &str) -> BTreeMap<u64, Option<String>> {
-    let mut by_time = BTreeMap::new();
-    for batch in batches {
-        let cells = arrow_cast::cast(
-            batch.column_by_name(column).expect("column"),
-            &DataType::Utf8,
-        )
-        .expect("as text");
-        let cells = cells.as_string::<i32>();
-        for (i, t) in times(batch).into_iter().enumerate() {
-            by_time.insert(t, cells.is_valid(i).then(|| cells.value(i).to_owned()));
-        }
-    }
-    by_time
+    by_time(batches, column, &DataType::Utf8, |cells, i| {
+        cells.as_string::<i32>().value(i).to_owned()
+    })
 }
 
 fn times(batch: &RecordBatch) -> Vec<u64> {
@@ -338,8 +341,13 @@ fn a_drop_filter_keeps_and_reports_a_row_it_cannot_identify() {
     let input = degraded_batch();
     put_batch(&store, &input);
     let drop_all: &RowFilter<'_> = &|_| true;
+    let mut told = Vec::new();
+    let mut tell = |row: &UnidentifiedRow<'_>| {
+        told.push((row.file.to_owned(), row.row, row.columns.to_vec()));
+    };
     let mut hooks = RowHooks {
         drop: Some(drop_all),
+        unidentified: Some(&mut tell),
         ..RowHooks::default()
     };
 
@@ -351,19 +359,54 @@ fn a_drop_filter_keeps_and_reports_a_row_it_cannot_identify() {
         outcome.rows_dropped, 2,
         "the healthy row and the bad body's row"
     );
-    let [unidentified] = outcome.unidentified.as_slice() else {
-        panic!("one unidentified row, got {:?}", outcome.unidentified);
+    assert_eq!(outcome.rows_unidentified, 1);
+    let [(file, row, columns)] = told.as_slice() else {
+        panic!("one unidentified row, got {told:?}");
     };
-    assert!(
-        unidentified.file.ends_with(".parquet"),
-        "{}",
-        unidentified.file
-    );
-    assert_eq!(unidentified.row, 1);
+    assert!(file.ends_with(".parquet"), "{file}");
+    assert_eq!(*row, 1);
     assert_eq!(
-        unidentified.columns,
+        columns.as_slice(),
         [columns::ATTRIBUTES, columns::RESOURCE_ATTRIBUTES]
     );
+}
+
+/// RFC 0069 §3.2: a structured body that is valid UTF-8 but does not
+/// decode is an undecodable cell, so its row is carried as stored: its
+/// attribute cell, readable but not in the encoder's canonical form, comes
+/// back as stored rather than re-encoded.
+#[test]
+fn a_structured_body_that_does_not_decode_carries_its_row_as_stored() {
+    const NOT_CANONICAL: &str = r#"[ {"key":"k","value":{"stringValue":"x"}} ]"#;
+    const MALFORMED: &str = r#"{"stringValue":"#;
+    let structured = MinedRecord {
+        body_kind: BodyKind::Structured,
+        body: Some(r#"{"stringValue":"ok"}"#.to_owned()),
+        lossy_flag: false,
+        confidence: 1.0,
+        ..row(HEALTHY)
+    };
+    let batch =
+        mined_records_to_batch_with_promoted(&[structured], &written_under()).expect("batch");
+    let batch = corrupt(&batch, columns::ATTRIBUTES, 0, NOT_CANONICAL.as_bytes());
+    let batch = corrupt(&batch, columns::BODY, 0, MALFORMED.as_bytes());
+    for (how, tuning) in tunings() {
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = store_at(bucket.path());
+        put_batch(&store, &batch);
+        write_file(&store, &[row(TS0 + 3)]);
+        let output = compacted(&store, tuning);
+        assert_eq!(
+            stored(&output, columns::ATTRIBUTES)[&HEALTHY].as_deref(),
+            Some(NOT_CANONICAL.as_bytes()),
+            "{how}: the attribute cell as stored"
+        );
+        assert_eq!(
+            stored(&output, columns::BODY)[&HEALTHY].as_deref(),
+            Some(MALFORMED.as_bytes()),
+            "{how}: the body as stored"
+        );
+    }
 }
 
 /// RFC 0036 §3.1 holds for a row whose resource attributes did not
@@ -380,29 +423,13 @@ fn a_row_with_unreadable_resource_attributes_sorts_by_its_kept_service() {
         let store = store_at(bucket.path());
         put_batch(&store, &degraded_batch());
         write_file(&store, &[in_service_a(TS0 + 3), in_service_a(TS0 + 4)]);
-        let promoted = rewritten_under();
-        let outcome = compact_sorted(
-            &store,
-            &partition(),
-            &promoted,
-            ClusterKeys::for_promoted(&promoted),
-            tuning,
-        )
-        .expect("compaction succeeds");
-        let committed = outcome.committed.expect("committed");
-        let key = format!("{}/{}", partition_data_prefix(&partition()), committed.file);
-        let bytes = store.get_blocking(&key).expect("output");
+        let output = compacted(&store, tuning);
         let mut services = Vec::new();
-        for batch in ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
-            .expect("open output")
-            .build()
-            .expect("reader")
-        {
-            let batch = batch.expect("batch");
+        for batch in &output {
             let column = batch
                 .column_by_name("resource.service.name")
-                .expect("column");
-            let column = column.as_string::<i32>();
+                .expect("column")
+                .as_string::<i32>();
             services.extend((0..column.len()).map(|i| column.value(i).to_owned()));
         }
         assert_eq!(

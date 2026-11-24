@@ -6,7 +6,8 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::DataType;
-use ourios_core::record::MinedRecord;
+use ourios_core::otlp::canonical::decode_any_value;
+use ourios_core::record::{BodyKind, MinedRecord};
 
 use crate::columns;
 use crate::promoted::{ATTR_PREFIX, RESOURCE_PREFIX, SERVICE_NAME_KEY, project_string_value};
@@ -207,14 +208,28 @@ pub(crate) fn rows_of(
         .into_iter()
         .enumerate()
         .map(|(i, record)| {
-            let mut columns = Vec::new();
+            let mut bad = Vec::new();
             while let Some(cell) = cells.next_if(|cell| cell.row == i) {
-                columns.push(cell.column);
+                bad.push(cell.column);
             }
-            let stored = (!columns.is_empty()).then(|| Box::new(stored_row(batch, i, columns)));
+            if !bad.contains(&columns::BODY) && structured_body_undecodable(&record) {
+                bad.push(columns::BODY);
+            }
+            let stored = (!bad.is_empty()).then(|| Box::new(stored_row(batch, i, bad)));
             Row { record, stored }
         })
         .collect()
+}
+
+/// Whether `record` is structured and its stored body does not decode: it
+/// is valid UTF-8, so the reader kept it, but it is not a canonical JSON
+/// value the query path can return (RFC 0069 §3.2).
+fn structured_body_undecodable(record: &MinedRecord) -> bool {
+    record.body_kind == BodyKind::Structured
+        && record
+            .body
+            .as_deref()
+            .is_some_and(|body| decode_any_value(body.as_bytes()).is_err())
 }
 
 fn stored_row(batch: &RecordBatch, i: usize, undecodable: Vec<&'static str>) -> StoredRow {

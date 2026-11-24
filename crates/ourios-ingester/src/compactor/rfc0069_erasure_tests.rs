@@ -121,38 +121,11 @@ fn undecodable_events(run: impl FnOnce()) -> Vec<EventFields> {
 fn rfc0069_5_erasure_stays_pending_past_an_undecodable_identity() {
     let bucket = tempfile::TempDir::new().expect("temp");
     let store = store_at(bucket.path());
-    let unreadable = MinedRecord {
-        attributes: vec![too_deep()],
-        ..rec("a", 1, TS0 + 1)
-    };
-    let rows = [rec("a", 1, TS0), unreadable, rec("a", 2, TS0 + 2)];
-    let partition = PartitionKey::derive(&rows[0]).expect("derive");
-    let mut writer = Writer::open_in(&store, partition).expect("open writer");
-    writer.append_records(&rows).expect("append");
-    let input = writer.close().expect("close").key;
+    let input = seed_partition(&store);
     let stored = ourios_core::otlp::canonical::encode_attributes(&[too_deep()]).expect("encode");
     request_erasure(&store, "a", "c-1").expect("request");
 
-    let mut report = None;
-    let events = undecodable_events(|| {
-        let mut hooks = SweepHooks {
-            observe: None,
-            erasure_match: Some(&erase_template_1),
-            gauges: None,
-        };
-        report = Some(
-            run_sweep_committing(
-                &store,
-                SweepClock::sealed_at(NOW_SEALED),
-                &CompactionPolicy::default(),
-                &PromotedAttributes::default(),
-                &mut hooks,
-                &mut |_: &PartitionCommitted<'_>| {},
-            )
-            .expect("sweep"),
-        );
-    });
-    let report = report.expect("swept");
+    let (report, events) = sweep_logged(&store);
 
     let [outcome] = report.erasures.as_slice() else {
         panic!("one erasure, got {:?}", report.erasures);
@@ -168,7 +141,6 @@ fn rfc0069_5_erasure_stays_pending_past_an_undecodable_identity() {
         ErasurePhase::Rows,
         "the stored marker is still in the rows phase"
     );
-
     let kept = stored_rows(&store);
     let templates: Vec<u64> = kept.iter().map(|r| r.template_id).collect();
     assert_eq!(
@@ -176,15 +148,11 @@ fn rfc0069_5_erasure_stays_pending_past_an_undecodable_identity() {
         [1, 2],
         "the readable conversation row is dropped"
     );
-    let Some(Value::StringValue(cell)) = kept[0].attributes[0]
-        .value
-        .as_ref()
-        .and_then(|v| v.value.as_ref())
-    else {
-        panic!("the unreadable row is degraded: {:?}", kept[0].attributes);
-    };
-    assert_eq!(cell.as_bytes(), stored.as_slice(), "carried byte for byte");
-
+    assert_eq!(
+        degraded_cell(&kept[0]),
+        stored.as_slice(),
+        "carried byte for byte"
+    );
     let expected: EventFields = vec![
         ("file.path".to_owned(), input),
         (
@@ -196,7 +164,47 @@ fn rfc0069_5_erasure_stays_pending_past_an_undecodable_identity() {
             ourios_parquet::columns::ATTRIBUTES.to_owned(),
         ),
     ];
-    let logged: Vec<EventFields> = events
+    assert_eq!(events, [expected], "the row is logged once, by its cell");
+}
+
+/// One flush file holding a readable row of the conversation, its row 1
+/// whose attributes do not decode, and a row of another conversation; its
+/// key.
+fn seed_partition(store: &Store) -> String {
+    let unreadable = MinedRecord {
+        attributes: vec![too_deep()],
+        ..rec("a", 1, TS0 + 1)
+    };
+    let rows = [rec("a", 1, TS0), unreadable, rec("a", 2, TS0 + 2)];
+    let partition = PartitionKey::derive(&rows[0]).expect("derive");
+    let mut writer = Writer::open_in(store, partition).expect("open writer");
+    writer.append_records(&rows).expect("append");
+    writer.close().expect("close").key
+}
+
+/// One sweep erasing template 1's rows, and the fields of each
+/// undecodable-row event it logs, less the message.
+fn sweep_logged(store: &Store) -> (SweepReport, Vec<EventFields>) {
+    let mut report = None;
+    let events = undecodable_events(|| {
+        let mut hooks = SweepHooks {
+            observe: None,
+            erasure_match: Some(&erase_template_1),
+            gauges: None,
+        };
+        report = Some(
+            run_sweep_committing(
+                store,
+                SweepClock::sealed_at(NOW_SEALED),
+                &CompactionPolicy::default(),
+                &PromotedAttributes::default(),
+                &mut hooks,
+                &mut |_: &PartitionCommitted<'_>| {},
+            )
+            .expect("sweep"),
+        );
+    });
+    let events = events
         .into_iter()
         .map(|fields| {
             fields
@@ -205,5 +213,17 @@ fn rfc0069_5_erasure_stays_pending_past_an_undecodable_identity() {
                 .collect()
         })
         .collect();
-    assert_eq!(logged, [expected], "the row is logged once, by its cell");
+    (report.expect("swept"), events)
+}
+
+/// The stored JSON a degraded row's reserved attribute holds.
+fn degraded_cell(row: &MinedRecord) -> &[u8] {
+    match row.attributes[0]
+        .value
+        .as_ref()
+        .and_then(|v| v.value.as_ref())
+    {
+        Some(Value::StringValue(cell)) => cell.as_bytes(),
+        _ => panic!("the unreadable row is degraded: {:?}", row.attributes),
+    }
 }

@@ -136,19 +136,20 @@ pub struct CompactionOutcome {
     pub decoded_bytes_estimate: u64,
     /// Rows a [`RowHooks::drop`] filter could not judge, because a cell
     /// that names a row did not decode (RFC 0069 §3.2): each is carried
-    /// forward unchanged. Empty without a filter.
-    pub unidentified: Vec<UnidentifiedRow>,
+    /// forward unchanged, and told to [`RowHooks::unidentified`]. `0`
+    /// without a filter.
+    pub rows_unidentified: u64,
 }
 
 /// A row carried past a [`RowHooks::drop`] filter unjudged (RFC 0069 §3.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnidentifiedRow {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnidentifiedRow<'a> {
     /// The object key of the input file holding it.
-    pub file: String,
+    pub file: &'a str,
     /// Its 0-based row in that file.
     pub row: u64,
     /// The columns whose cell did not decode.
-    pub columns: Vec<&'static str>,
+    pub columns: &'a [&'static str],
 }
 
 /// The committed result of a compaction.
@@ -307,6 +308,9 @@ pub struct RowHooks<'a> {
     pub observe: Option<&'a mut RowObserver<'a>>,
     /// Rows for which this returns `true` are not written back.
     pub drop: Option<&'a RowFilter<'a>>,
+    /// Told of each row `drop` could not judge, as it is read, so a
+    /// partition of them costs no memory beyond its count.
+    pub unidentified: Option<&'a mut UnidentifiedObserver<'a>>,
     /// Called once the commit is won, before the superseded inputs are
     /// deleted, with the outcome as it stands then (`gc_failures` is 0).
     /// A crash during that cleanup leaves the partition committed, so a
@@ -323,6 +327,8 @@ pub type RowObserver<'a> = dyn FnMut(&[MinedRecord]) + 'a;
 /// did not decode is never offered to it, and is kept (RFC 0069 §3.2;
 /// see [`CompactionOutcome::unidentified`]).
 pub type RowFilter<'a> = dyn Fn(&MinedRecord) -> bool + 'a;
+/// A [`RowHooks::unidentified`] callback.
+pub type UnidentifiedObserver<'a> = dyn FnMut(&UnidentifiedRow<'_>) + 'a;
 /// A [`RowHooks::on_commit`] callback.
 pub type CommitHook<'a> = dyn FnMut(&CompactionOutcome) + 'a;
 
@@ -627,7 +633,7 @@ fn committed_outcome(
         bytes_read: totals.bytes_read,
         bytes_written,
         decoded_bytes_estimate: totals.decoded_bytes,
-        unidentified: totals.unidentified.clone(),
+        rows_unidentified: totals.rows_unidentified,
     }
 }
 

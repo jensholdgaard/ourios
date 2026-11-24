@@ -107,7 +107,7 @@ pub(super) fn no_op_outcome(files_before: usize) -> CompactionOutcome {
         bytes_read: 0,
         bytes_written: 0,
         decoded_bytes_estimate: 0,
-        unidentified: Vec::new(),
+        rows_unidentified: 0,
     }
 }
 

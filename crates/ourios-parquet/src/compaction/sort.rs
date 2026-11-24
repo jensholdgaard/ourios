@@ -39,7 +39,7 @@ pub(super) struct SortTotals {
     pub(super) rows_dropped: u64,
     pub(super) rows_deduplicated: u64,
     pub(super) decoded_bytes: u64,
-    pub(super) unidentified: Vec<UnidentifiedRow>,
+    pub(super) rows_unidentified: u64,
 }
 
 /// Phases 1–2 of the RFC 0036 §3.2 external merge sort: stream
@@ -221,9 +221,9 @@ fn apply_hooks(
         observe(&records);
     }
     let mut rows = rows_of(&batch, records, &undecodable);
-    if let Some(drop) = hooks.drop {
+    if hooks.drop.is_some() {
         let before = rows.len();
-        rows = judge(rows, drop, (input, first_row), totals);
+        rows = judge(rows, hooks, (input, first_row), totals);
         totals.rows_dropped = totals
             .rows_dropped
             .saturating_add(widen(before - rows.len()));
@@ -232,26 +232,34 @@ fn apply_hooks(
     rows
 }
 
-/// `rows` less those `drop` matches. A row without an identity is never
-/// offered to it: it is kept, and recorded by its file and row, the first
-/// of `rows` being row `first_row` of `input`.
+/// `rows` less those [`RowHooks::drop`] matches. A row without an
+/// identity is never offered to it: it is kept, counted, and told to
+/// [`RowHooks::unidentified`] by its file and row, the first of `rows`
+/// being row `first_row` of `input`.
 fn judge(
     rows: Vec<Row>,
-    drop: &RowFilter<'_>,
+    hooks: &mut RowHooks<'_>,
     (input, first_row): (&str, usize),
     totals: &mut SortTotals,
 ) -> Vec<Row> {
+    let Some(drop) = hooks.drop else {
+        return rows;
+    };
+    let mut tell = hooks.unidentified.as_deref_mut();
     let mut kept = Vec::with_capacity(rows.len());
     for (i, row) in rows.into_iter().enumerate() {
         match row.identity() {
             Some(record) if drop(record) => {}
             Some(_) => kept.push(row),
             None => {
-                totals.unidentified.push(UnidentifiedRow {
-                    file: input.to_owned(),
-                    row: widen(first_row.saturating_add(i)),
-                    columns: row.undecodable().to_vec(),
-                });
+                totals.rows_unidentified = totals.rows_unidentified.saturating_add(1);
+                if let Some(tell) = tell.as_deref_mut() {
+                    tell(&UnidentifiedRow {
+                        file: input,
+                        row: widen(first_row.saturating_add(i)),
+                        columns: row.undecodable(),
+                    });
+                }
                 kept.push(row);
             }
         }

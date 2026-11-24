@@ -423,7 +423,7 @@ fn outcome(files_before: usize, commit_lost: bool) -> CompactionOutcome {
         bytes_read: 0,
         bytes_written: 0,
         decoded_bytes_estimate: 0,
-        unidentified: Vec::new(),
+        rows_unidentified: 0,
     }
 }
 

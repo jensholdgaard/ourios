@@ -593,8 +593,14 @@ impl Builders {
         // uses (RFC 0005 §3.2 amendment 2026-06-11), so the stored
         // column and the partition bucket can never disagree. Always
         // populated — NULL appears only in pre-amendment files.
-        self.effective_time_unix_nano
-            .append_value(effective_time_unix_nano(r)?);
+        match stored {
+            Some(stored) => self
+                .effective_time_unix_nano
+                .append_option(stored.effective_time_unix_nano()),
+            None => self
+                .effective_time_unix_nano
+                .append_value(effective_time_unix_nano(r)?),
+        }
 
         self.severity_number.append_value(r.severity_number);
         append_option_str(&mut self.severity_text, r.severity_text.as_deref());

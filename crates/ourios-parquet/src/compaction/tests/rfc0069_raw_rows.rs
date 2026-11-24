@@ -134,7 +134,25 @@ fn degraded_batch() -> RecordBatch {
     let batch = corrupt(&batch, columns::SCOPE_ATTRIBUTES, 2, BAD_SCOPE.as_bytes());
     let batch = corrupt_item(&batch, (columns::PARAMS, Some("value")), 1, NOT_UTF8_ITEM);
     let batch = corrupt_item(&batch, (columns::SEPARATORS, None), 1, NOT_UTF8_ITEM);
+    let batch = null_cell(&batch, columns::EFFECTIVE_TIME_UNIX_NANO, 1);
     corrupt(&batch, columns::BODY, 2, NOT_UTF8)
+}
+
+/// `batch` with `column`'s nanosecond timestamp cell at `row` `NULL`.
+fn null_cell(batch: &RecordBatch, column: &str, row: usize) -> RecordBatch {
+    let index = batch.schema().index_of(column).expect("column");
+    let DataType::Timestamp(_, zone) = batch.schema().field(index).data_type().clone() else {
+        panic!("{column} is a timestamp");
+    };
+    let old = batch
+        .column(index)
+        .as_primitive::<TimestampNanosecondType>();
+    let cells: arrow_array::TimestampNanosecondArray = (0..old.len())
+        .map(|i| (i != row && old.is_valid(i)).then(|| old.value(i)))
+        .collect();
+    let mut arrays = batch.columns().to_vec();
+    arrays[index] = Arc::new(cells.with_timezone_opt(zone));
+    RecordBatch::try_new(batch.schema(), arrays).expect("batch")
 }
 
 /// `batch` with the first item of row `row`'s list cell in `column` (its
@@ -286,6 +304,21 @@ fn stored(batches: &[RecordBatch], column: &str) -> BTreeMap<u64, Option<Vec<u8>
     })
 }
 
+/// `column`'s timestamp cells of `batches` by row time, as nanoseconds.
+fn nanos(batches: &[RecordBatch], column: &str) -> BTreeMap<u64, Option<i64>> {
+    let mut cells_by_time = BTreeMap::new();
+    for batch in batches {
+        let cells = batch
+            .column_by_name(column)
+            .expect("column")
+            .as_primitive::<TimestampNanosecondType>();
+        for (i, t) in times(batch).into_iter().enumerate() {
+            cells_by_time.insert(t, cells.is_valid(i).then(|| cells.value(i)));
+        }
+    }
+    cells_by_time
+}
+
 /// `column`'s cells of `batches` by row time, as text.
 fn text(batches: &[RecordBatch], column: &str) -> BTreeMap<u64, Option<String>> {
     by_time(batches, column, &DataType::Utf8, |cells, i| {
@@ -379,6 +412,30 @@ fn rfc0069_4_a_stored_row_keeps_its_parameter_and_separator_bytes() {
                 );
             }
         }
+    }
+}
+
+/// Scenario RFC0069.4: `effective_time_unix_nano`, the one stored column
+/// the writer derives rather than copies, is carried as stored for a
+/// stored row, `NULL` included, as in a file written before it existed; a
+/// healthy row's is derived as before.
+#[test]
+fn rfc0069_4_a_stored_row_keeps_its_effective_time_cell() {
+    for (how, tuning) in tunings() {
+        let (input, output) = compact(tuning);
+        let column = columns::EFFECTIVE_TIME_UNIX_NANO;
+        let (before, after) = (
+            nanos(std::slice::from_ref(&input), column),
+            nanos(&output, column),
+        );
+        assert_eq!(before[&BAD_ATTRS], None, "{how}: the fixture's NULL");
+        for t in [BAD_ATTRS, BAD_BODY] {
+            assert_eq!(after[&t], before[&t], "{how}: row {t} as stored");
+        }
+        assert!(
+            after[&HEALTHY].is_some(),
+            "{how}: a healthy row's is derived"
+        );
     }
 }
 

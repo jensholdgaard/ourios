@@ -3,7 +3,7 @@
 //! as the bytes the file holds so the rewrite changes none of them.
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int64Type};
+use arrow_array::types::{Float64Type, Int64Type, TimestampNanosecondType};
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::DataType;
 use ourios_core::otlp::canonical::decode_any_value;
@@ -45,6 +45,9 @@ struct StoredCells {
     /// Each parameter's value cell, in the decoded parameters' order.
     param_values: Vec<Vec<u8>>,
     separators: Vec<Vec<u8>>,
+    /// The stored cell of the one column the writer derives rather than
+    /// copies; `NULL` in a file written before it existed.
+    effective_time_unix_nano: Option<i64>,
 }
 
 /// A stored promoted cell, by the Arrow type of its column.
@@ -144,6 +147,10 @@ impl StoredRow {
 
     pub(crate) fn separators(&self) -> &[Vec<u8>] {
         &self.cells.separators
+    }
+
+    pub(crate) fn effective_time_unix_nano(&self) -> Option<i64> {
+        self.cells.effective_time_unix_nano
     }
 
     pub(crate) fn is_undecodable(&self, family: Family) -> bool {
@@ -286,6 +293,10 @@ fn stored_row(
                 .map(|s| s.clone().into_bytes())
                 .collect()
         }),
+        effective_time_unix_nano: batch
+            .column_by_name(columns::EFFECTIVE_TIME_UNIX_NANO)
+            .and_then(|cells| cells.as_primitive_opt::<TimestampNanosecondType>())
+            .and_then(|cells| cells.is_valid(i).then(|| cells.value(i))),
     };
     let mut row = StoredRow {
         cells,

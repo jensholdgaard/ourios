@@ -44,6 +44,7 @@ pub mod partition;
 pub mod promoted;
 pub mod reader;
 pub mod record_batch;
+mod row;
 pub mod store;
 pub mod writer;
 
@@ -54,10 +55,11 @@ pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile, derive_a
 pub use compaction::{
     CommitHook, Committed, CompactionError, CompactionOutcome, CompactionPlan, CompactionPolicy,
     CompactionStats, MemoryPhase, OrphanGc, PartitionSnapshot, PlanCounts, RowFilter, RowHooks,
-    RowObserver, compact_partition, compact_partition_hooked,
-    compact_partition_with_flush_threshold, compact_partition_with_promoted,
-    compact_partition_with_sort_budget, gc_orphans, hour_partitions, partition_snapshot,
-    plan_candidates, plan_candidates_counted, plan_compaction_counted,
+    RowObserver, UnidentifiedObserver, UnidentifiedRow, compact_partition,
+    compact_partition_hooked, compact_partition_with_flush_threshold,
+    compact_partition_with_promoted, compact_partition_with_sort_budget, gc_orphans,
+    hour_partitions, partition_snapshot, plan_candidates, plan_candidates_counted,
+    plan_compaction_counted,
 };
 pub use id_max::{FooterMax, IdColumns, IdMaxError, decoded_max, footer_max, object_max_id};
 pub use manifest::{

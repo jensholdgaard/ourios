@@ -14,6 +14,7 @@ mod late_writes;
 mod plan_cost;
 mod plan_reclaim;
 mod positions;
+mod rfc0069_raw_rows;
 
 /// 2026-04-02T10:58:00 UTC — offsets stay within hour 10, so
 /// every record shares one partition.

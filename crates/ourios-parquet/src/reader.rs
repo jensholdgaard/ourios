@@ -47,6 +47,7 @@ use parquet::errors::ParquetError;
 
 use crate::columns;
 use crate::partition::{PartitionKey, TimestampOverflowError};
+use crate::row::{Row, rows_of};
 
 mod cells;
 use crate::store::{Store, StoreError};
@@ -230,6 +231,41 @@ impl Reader {
         }
         self.row_offset += batch.num_rows();
         Ok(Some(records))
+    }
+
+    /// [`Self::next_batch`] for compaction (RFC 0069 §3.2): a row with a
+    /// cell that does not decode comes back in its stored form rather than
+    /// failing the batch.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::next_batch`], except [`ReaderError::AttributeDecode`].
+    pub(crate) fn next_rows(&mut self) -> Result<Option<Vec<Row>>, ReaderError> {
+        Ok(self
+            .next_degraded()?
+            .map(|read| rows_of(&read.batch, read.decoded.records, &read.decoded.undecodable)))
+    }
+
+    /// The next batch decoded as [`batch_to_degraded_records`] decodes it,
+    /// with the batch itself and the file row its first row is.
+    pub(crate) fn next_degraded(&mut self) -> Result<Option<DegradedRead>, ReaderError> {
+        let Some(batch) = self.inner.next_batch(&self.file_path) else {
+            return Ok(None);
+        };
+        let batch = batch?;
+        let first_row = self.row_offset;
+        let decoded = batch_to_degraded_records(&batch, first_row, ShapeValidation::Enforce)?;
+        if let Some(p) = &self.partition {
+            for (idx_in_batch, r) in decoded.records.iter().enumerate() {
+                validate_row_vs_partition(r, p, first_row + idx_in_batch, &self.file_path)?;
+            }
+        }
+        self.row_offset += batch.num_rows();
+        Ok(Some(DegradedRead {
+            batch,
+            decoded,
+            first_row,
+        }))
     }
 
     /// Read every row in the file as a `MinedRecord`. Applies
@@ -476,6 +512,14 @@ fn store_io_err(op: &'static str, path: &Path, err: StoreError) -> ReaderError {
         path: path.to_path_buf(),
         source: io::Error::other(err),
     }
+}
+
+/// One batch read by [`Reader::next_degraded`].
+pub(crate) struct DegradedRead {
+    pub(crate) batch: RecordBatch,
+    pub(crate) decoded: DegradedBatch,
+    /// The file row of the batch's first row.
+    pub(crate) first_row: usize,
 }
 
 /// Convert one Arrow `RecordBatch` to a `Vec<MinedRecord>` per

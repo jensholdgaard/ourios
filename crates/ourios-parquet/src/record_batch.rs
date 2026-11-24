@@ -39,6 +39,7 @@ use ourios_core::record::{BodyKind, MinedRecord};
 
 use crate::partition::{TimestampOverflowError, effective_time_unix_nano};
 use crate::promoted::{self, PromotedAttributes};
+use crate::row::{Carried, Family, Kept, StoredRow};
 use crate::{columns, data_schema, data_schema_with_promoted, with_ingest_columns};
 
 /// Build an Arrow `RecordBatch` matching `data_schema()` from a
@@ -82,8 +83,13 @@ pub fn mined_records_to_batch_with_promoted(
 /// [`mined_records_to_batch_with_promoted`] in a layout the caller
 /// declares rather than one derived from `records`, which must each be
 /// one [`IngestColumns::admits`].
-pub(crate) fn mined_records_to_batch_in(
-    records: &[MinedRecord],
+///
+/// A row in its stored form (RFC 0069 §3.2) is written back with its body
+/// and attribute cells as stored. A promoted column projected from one of
+/// its undecodable attribute cells keeps the stored value when its type is
+/// unchanged, and is `NULL` otherwise.
+pub(crate) fn mined_records_to_batch_in<R: Carried>(
+    records: &[R],
     promoted: &PromotedAttributes,
     ingest: IngestColumns,
 ) -> Result<RecordBatch, BatchError> {
@@ -91,12 +97,12 @@ pub(crate) fn mined_records_to_batch_in(
     arrays.extend(project_promoted_columns(
         records,
         promoted.resource_keys(),
-        |r| r.resource_attributes.as_slice(),
+        Family::Resource,
     ));
     arrays.extend(project_promoted_columns(
         records,
         promoted.log_keys(),
-        |r| r.attributes.as_slice(),
+        Family::Log,
     ));
     arrays.extend(ingest_position_columns(records, ingest));
     RecordBatch::try_new(
@@ -106,10 +112,10 @@ pub(crate) fn mined_records_to_batch_in(
     .map_err(BatchError::Arrow)
 }
 
-fn base_columns(records: &[MinedRecord]) -> Result<Vec<ArrayRef>, BatchError> {
+fn base_columns<R: Carried>(records: &[R]) -> Result<Vec<ArrayRef>, BatchError> {
     let mut b = Builders::with_capacity(records.len());
     for r in records {
-        b.append(r)?;
+        b.append(r.record(), r.stored())?;
     }
     Ok(b.finish())
 }
@@ -175,11 +181,11 @@ impl IngestColumns {
 
 /// The three ingest-position arrays for `records` under `ingest`, in
 /// [`crate::columns::INGEST_POSITION`] order; none when omitted.
-fn ingest_position_columns(records: &[MinedRecord], ingest: IngestColumns) -> Vec<ArrayRef> {
+fn ingest_position_columns<R: Carried>(records: &[R], ingest: IngestColumns) -> Vec<ArrayRef> {
     match ingest {
         IngestColumns::Omitted => Vec::new(),
         IngestColumns::Written | IngestColumns::Optional => {
-            let positions = || records.iter().map(|r| r.ingest_position);
+            let positions = || records.iter().map(|r| r.record().ingest_position);
             let group: UInt32Array = positions().map(|p| p.map(|p| p.group)).collect();
             let seq: UInt64Array = positions().map(|p| p.map(|p| p.seq)).collect();
             let index: UInt32Array = positions().map(|p| p.map(|p| p.index)).collect();
@@ -218,6 +224,18 @@ impl PromotedBuilder {
         }
     }
 
+    /// Append a stored cell, `NULL` unless its type is this column's.
+    fn append_kept(&mut self, kept: Option<&Kept>) {
+        match (self, kept) {
+            (Self::Str(b), Some(Kept::Str(v))) => b.append_value(v),
+            (Self::I64(b), Some(Kept::I64(v))) => b.append_value(*v),
+            (Self::F64(b), Some(Kept::F64(v))) => b.append_value(*v),
+            (Self::Str(b), _) => b.append_null(),
+            (Self::I64(b), _) => b.append_null(),
+            (Self::F64(b), _) => b.append_null(),
+        }
+    }
+
     fn finish(self) -> ArrayRef {
         match self {
             Self::Str(mut b) => Arc::new(b.finish()),
@@ -234,10 +252,10 @@ impl PromotedBuilder {
 /// (RFC 0022 §3.1 / RFC 0042 §3.1) — matching
 /// [`promoted::project_string_value`]'s first-match semantics per
 /// column.
-fn project_promoted_columns(
-    records: &[MinedRecord],
+fn project_promoted_columns<R: Carried>(
+    records: &[R],
     keys: &[promoted::PromotedKey],
-    attrs_of: impl Fn(&MinedRecord) -> &[KeyValue],
+    family: Family,
 ) -> Vec<ArrayRef> {
     if keys.is_empty() {
         return Vec::new();
@@ -253,19 +271,43 @@ fn project_promoted_columns(
         .collect();
     let mut cells: Vec<Option<&KeyValue>> = vec![None; keys.len()];
     for r in records {
-        cells.fill(None);
-        for kv in attrs_of(r) {
-            if let Some(&i) = index.get(kv.key.as_str())
-                && cells[i].is_none()
-            {
-                cells[i] = Some(kv);
+        if let Some(stored) = r.stored().filter(|stored| stored.is_undecodable(family)) {
+            for (b, key) in builders.iter_mut().zip(keys) {
+                b.append_kept(stored.kept(family, &key.key));
             }
-        }
-        for (b, cell) in builders.iter_mut().zip(&cells) {
-            b.append(*cell);
+        } else {
+            first_occurrences(&mut cells, &index, family_of(r.record(), family));
+            for (b, cell) in builders.iter_mut().zip(&cells) {
+                b.append(*cell);
+            }
         }
     }
     builders.into_iter().map(PromotedBuilder::finish).collect()
+}
+
+/// The attribute list `family`'s promoted columns are projected from.
+fn family_of(record: &MinedRecord, family: Family) -> &[KeyValue] {
+    match family {
+        Family::Resource => &record.resource_attributes,
+        Family::Log => &record.attributes,
+    }
+}
+
+/// Fill `cells`, by `index`, with the first attribute of `attrs` under
+/// each promoted key.
+fn first_occurrences<'a>(
+    cells: &mut [Option<&'a KeyValue>],
+    index: &HashMap<&str, usize>,
+    attrs: &'a [KeyValue],
+) {
+    cells.fill(None);
+    for kv in attrs {
+        if let Some(&i) = index.get(kv.key.as_str())
+            && cells[i].is_none()
+        {
+            cells[i] = Some(kv);
+        }
+    }
 }
 
 /// Errors produced by [`mined_records_to_batch`].
@@ -523,7 +565,9 @@ impl Builders {
         }
     }
 
-    fn append(&mut self, r: &MinedRecord) -> Result<(), BatchError> {
+    /// Append `r`, with the body and attribute cells of `stored` as they
+    /// are when the row is in its stored form.
+    fn append(&mut self, r: &MinedRecord, stored: Option<&StoredRow>) -> Result<(), BatchError> {
         self.tenant_id.append_value(r.tenant_id.as_str());
         self.template_id.append_value(r.template_id);
         self.template_version.append_value(r.template_version);
@@ -549,22 +593,23 @@ impl Builders {
         // uses (RFC 0005 §3.2 amendment 2026-06-11), so the stored
         // column and the partition bucket can never disagree. Always
         // populated — NULL appears only in pre-amendment files.
-        self.effective_time_unix_nano
-            .append_value(effective_time_unix_nano(r)?);
+        match stored {
+            Some(stored) => self
+                .effective_time_unix_nano
+                .append_option(stored.effective_time_unix_nano()),
+            None => self
+                .effective_time_unix_nano
+                .append_value(effective_time_unix_nano(r)?),
+        }
 
         self.severity_number.append_value(r.severity_number);
         append_option_str(&mut self.severity_text, r.severity_text.as_deref());
         append_option_str(&mut self.scope_name, r.scope_name.as_deref());
         append_option_str(&mut self.scope_version, r.scope_version.as_deref());
 
-        append_attributes(&mut self.attributes, columns::ATTRIBUTES, &r.attributes)?;
+        self.append_attribute_cells(r, stored)?;
         self.dropped_attributes_count
             .append_value(r.dropped_attributes_count);
-        append_attributes(
-            &mut self.resource_attributes,
-            columns::RESOURCE_ATTRIBUTES,
-            &r.resource_attributes,
-        )?;
 
         match r.trace_id {
             Some(b) => self.trace_id.append_value(b).map_err(BatchError::Arrow)?,
@@ -591,8 +636,8 @@ impl Builders {
         if r.body_kind == BodyKind::Absent && r.body.is_some() {
             return Err(BatchError::NonNullBodyForAbsent);
         }
-        match r.body.as_deref() {
-            Some(s) => self.body.append_value(s.as_bytes()),
+        match stored.map_or_else(|| r.body.as_deref().map(str::as_bytes), StoredRow::body) {
+            Some(bytes) => self.body.append_value(bytes),
             None => self.body.append_null(),
         }
 
@@ -624,20 +669,12 @@ impl Builders {
                 }
             }
         }
-        append_params(&mut self.params, &r.params);
-        append_separators(&mut self.separators, &r.separators);
+        self.append_list_cells(r, stored);
 
         self.confidence.append_value(r.confidence);
         self.lossy_flag.append_value(r.lossy_flag);
 
-        // RFC 0018 §3.1 — scope attributes ride the canonical-JSON encoding
-        // (`[]` when empty, like `attributes`); the two schema_urls are plain
-        // optional strings.
-        append_attributes(
-            &mut self.scope_attributes,
-            columns::SCOPE_ATTRIBUTES,
-            &r.scope_attributes,
-        )?;
+        // The two schema_urls are plain optional strings (RFC 0018 §3.1).
         append_option_str(
             &mut self.resource_schema_url,
             r.resource_schema_url.as_deref(),
@@ -645,6 +682,48 @@ impl Builders {
         append_option_str(&mut self.scope_schema_url, r.scope_schema_url.as_deref());
 
         Ok(())
+    }
+
+    /// The three attribute cells: encoded from `r`, or as `stored` holds
+    /// them. Scope attributes ride the canonical-JSON encoding too, `[]`
+    /// when empty (RFC 0018 §3.1).
+    fn append_attribute_cells(
+        &mut self,
+        r: &MinedRecord,
+        stored: Option<&StoredRow>,
+    ) -> Result<(), BatchError> {
+        if let Some(stored) = stored {
+            self.attributes.append_value(stored.attributes());
+            self.resource_attributes
+                .append_value(stored.resource_attributes());
+            append_option_str(&mut self.scope_attributes, stored.scope_attributes());
+            return Ok(());
+        }
+        append_attributes(&mut self.attributes, columns::ATTRIBUTES, &r.attributes)?;
+        append_attributes(
+            &mut self.resource_attributes,
+            columns::RESOURCE_ATTRIBUTES,
+            &r.resource_attributes,
+        )?;
+        append_attributes(
+            &mut self.scope_attributes,
+            columns::SCOPE_ATTRIBUTES,
+            &r.scope_attributes,
+        )
+    }
+
+    /// The `params` and `separators` cells: from `r`, or with the item
+    /// bytes `stored` holds.
+    fn append_list_cells(&mut self, r: &MinedRecord, stored: Option<&StoredRow>) {
+        if let Some(stored) = stored {
+            let values = stored.param_values().iter().map(Vec::as_slice);
+            append_params(&mut self.params, &r.params, values);
+            append_separators(&mut self.separators, stored.separators());
+        } else {
+            let values = r.params.iter().map(|p| p.value.as_bytes());
+            append_params(&mut self.params, &r.params, values);
+            append_separators(&mut self.separators, &r.separators);
+        }
     }
 
     fn finish(mut self) -> Vec<ArrayRef> {
@@ -704,21 +783,24 @@ fn body_kind_ordinal(k: BodyKind) -> u8 {
     }
 }
 
-fn append_params(
+/// Append `params`, each with its value cell from `values`: the decoded
+/// value, or the stored bytes of a row carried as stored.
+fn append_params<'v>(
     builder: &mut GenericListBuilder<i32, StructBuilder>,
     params: &[ourios_core::record::Param],
+    values: impl Iterator<Item = &'v [u8]>,
 ) {
-    let values = builder.values();
-    for p in params {
-        values
+    let cells = builder.values();
+    for (p, value) in params.iter().zip(values) {
+        cells
             .field_builder::<Int32Builder>(0)
             .expect("type_tag field index 0")
             .append_value(param_type_ordinal(p.type_tag));
-        values
+        cells
             .field_builder::<BinaryBuilder>(1)
             .expect("value field index 1")
-            .append_value(p.value.as_bytes());
-        values.append(true);
+            .append_value(value);
+        cells.append(true);
     }
     builder.append(true);
 }
@@ -753,9 +835,12 @@ const fn param_type_ordinal(t: ParamType) -> i32 {
     }
 }
 
-fn append_separators(builder: &mut GenericListBuilder<i32, BinaryBuilder>, separators: &[String]) {
+fn append_separators<S: AsRef<[u8]>>(
+    builder: &mut GenericListBuilder<i32, BinaryBuilder>,
+    separators: &[S],
+) {
     for s in separators {
-        builder.values().append_value(s.as_bytes());
+        builder.values().append_value(s);
     }
     builder.append(true);
 }

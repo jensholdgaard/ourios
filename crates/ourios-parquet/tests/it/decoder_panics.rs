@@ -54,6 +54,16 @@ const DATA_FIXTURES: [&str; 3] = [
     "data-divide-by-zero.parquet",
 ];
 
+/// The data-file fixtures whose decoder panic parquet 60.2 still has.
+const PANICKING_DATA_FIXTURES: [&str; 2] = [
+    "data-dict-decoder-unset.parquet",
+    "data-negative-column-range.parquet",
+];
+
+/// The data-file fixture parquet 60.2 rejects with an error of its own
+/// where earlier versions panicked.
+const REJECTED_DATA_FIXTURES: [&str; 1] = ["data-divide-by-zero.parquet"];
+
 fn fixture(name: &str) -> bytes::Bytes {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/corrupt-parquet")
@@ -113,7 +123,7 @@ fn both_readers_turn_the_remaining_decoder_panics_into_typed_errors() {
     let cases = PANICKING_AUDIT_FIXTURES
         .map(|name| (Via::AuditReader, name))
         .into_iter()
-        .chain(DATA_FIXTURES.map(|name| (Via::DataReader, name)));
+        .chain(PANICKING_DATA_FIXTURES.map(|name| (Via::DataReader, name)));
     for (via, name) in cases {
         // Act
         let named = decode_via(via, name);
@@ -238,7 +248,7 @@ fn record(i: u64) -> MinedRecord {
 
 #[test]
 fn compaction_reports_a_corrupt_input_instead_of_aborting() {
-    for name in DATA_FIXTURES {
+    for name in PANICKING_DATA_FIXTURES {
         // Arrange: two committed inputs, one then overwritten by a corrupt
         // object.
         let bucket = tempfile::TempDir::new().expect("temp dir");
@@ -265,6 +275,26 @@ fn compaction_reports_a_corrupt_input_instead_of_aborting() {
                     if path == Path::new(&keys[1])
             ),
             "{name}: {compacted:?}",
+        );
+    }
+}
+
+/// A zero divisor in the byte-array reader no longer panics in parquet
+/// 60.2: the data file is still refused, with parquet's own error.
+#[test]
+fn data_fixtures_parquet_now_rejects_are_parquet_errors() {
+    for name in REJECTED_DATA_FIXTURES {
+        // Arrange
+        let partition = PartitionKey::derive(&record(0)).expect("derive partition");
+
+        // Act
+        let read =
+            Reader::open_partition_bytes(fixture(name), partition, name).and_then(Reader::read_all);
+
+        // Assert
+        assert!(
+            matches!(read, Err(ReaderError::Parquet(_))),
+            "{name}: {read:?}"
         );
     }
 }

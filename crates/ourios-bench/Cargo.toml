@@ -106,10 +106,10 @@ ourios-wal = { path = "../ourios-wal", features = ["fault-injection"] }
 # (the Ourios half stays sync — `ourios_query_lines` owns its runtime).
 testcontainers-modules = "=0.15.0"
 reqwest = { version = "=0.12.28", default-features = false }
-prost = "=0.14.4"
+prost = "=0.14.6"
 # Refcounted request bodies for the corpus replay's retrying pusher (a
 # per-attempt Vec clone would copy ~2 MB per push across thousands).
-bytes = { version = "=1.12.1", default-features = false }
+bytes = { version = "=1.12.2", default-features = false }
 tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
 # Footer-level schema assertion for the RFC 0022 promoted-service parity
 # tests: opens a comparative-store file's Parquet footer directly to
@@ -134,7 +134,7 @@ criterion = "=0.8.2"
 flate2 = "=1.1.11"
 # Builds `WalOffset`s by hand in the reclamation harness's unit tests; the
 # same `uuid` the WAL already pulls into the lock tree.
-uuid = { version = "=1.29.2", default-features = false }
+uuid = { version = "=1.29.3", default-features = false }
 
 [[bench]]
 name = "b1"

@@ -264,7 +264,7 @@ tokio = { version = "=1.54.1", default-features = false, features = ["rt", "rt-m
 # no sink lock held. Both are already in the tree via ourios-parquet, as
 # are object_store and async-trait (regular dependencies, above).
 futures = { version = "=0.3.34", default-features = false, features = ["std"] }
-bytes = "=1.12.1"
+bytes = "=1.12.2"
 
 [lints]
 workspace = true

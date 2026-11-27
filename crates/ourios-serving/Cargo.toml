@@ -87,7 +87,7 @@ tempfile = "=3.27.0"
 # Self-dependency: turns `fault-injection` on for this crate's own test
 # targets only (`cargo build` does not resolve dev-dependencies).
 ourios-serving = { path = ".", features = ["fault-injection"] }
-hyper = { version = "=1.12.0", default-features = false, features = ["client", "http2"] }
+hyper = { version = "=1.13.0", default-features = false, features = ["client", "http2"] }
 
 [features]
 # The RFC 0029 OIDC bearer layer (verifier + JWKS cache) — moved here

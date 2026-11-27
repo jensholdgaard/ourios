@@ -1,7 +1,7 @@
 ---
 rfc: 0069
 title: Reading back every nested value ingest accepts
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-11-20
@@ -11,10 +11,18 @@ superseded-by: —
 
 # RFC 0069 — Reading back every nested value ingest accepts
 
-> **Status: `red`** (2026-11-22). Every §5 scenario has an `#[ignore]`d
-> `todo!` stub in `ourios-server` (`tests/it/rfc0069_nested_read_depth.rs`)
-> naming the slice that discharges it. Specified 2026-11-21 (maintainer-approved, with the
-> §7 names). Tracks #1136, options A and C, which the
+> **Status: `green`** (2026-11-27). Every §5 scenario passes:
+> RFC0069.1 in `ourios-server` (`tests/it/rfc0069_1_depth_matrix.rs`),
+> RFC0069.2 in `ourios-core` (`src/otlp/canonical/depth.rs`), RFC0069.3
+> in `ourios-parquet` (`tests/it/rfc0069_3_undecodable_cells.rs`) and
+> `ourios-querier` (`tests/it/rfc0069_3_degraded_query.rs`, its events
+> live-checked by `tests/rfc0069_reader_events.rs`), RFC0069.4 in
+> `ourios-parquet` (`src/compaction/tests/rfc0069_raw_rows.rs`),
+> RFC0069.5 in `ourios-ingester` (`src/compactor/rfc0069_erasure_tests.rs`),
+> RFC0069.6 in `ourios-querier` (`tests/it/rfc0069_6_masked_query.rs`,
+> the masking rule unit-tested in `src/visibility.rs`), and RFC0069.7 in
+> its `tests/it/rfc0069_7_predicate_guard.rs`. Red 2026-11-22. Specified
+> 2026-11-21 (maintainer-approved, with the §7 names). Tracks #1136, options A and C, which the
 > maintainer chose on 2026-11-20; option B, ingest conformance at the
 > SDK's depth of 64, is a follow-up (§4.1). This RFC **amends accepted
 > RFC 0017 §3.3–§3.4**, which require a structured body and decoded

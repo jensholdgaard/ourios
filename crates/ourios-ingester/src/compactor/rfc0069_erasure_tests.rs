@@ -349,17 +349,17 @@ fn raw_cells(store: &Store, time: u64) -> Cells {
 }
 
 /// The partition's string `column` cells by row time, `None` when `NULL`.
+/// Each cell is read from its one-row array's `Debug` rendering, which
+/// quotes the value: `StringArray\n[\n  "x",\n]`.
 fn promoted(store: &Store, column: &str) -> Vec<(u64, Option<String>)> {
     rows_with_cells(store, &[column])
         .into_iter()
-        .map(|(record, cells)| (record.time_unix_nano, cells[0].as_deref().map(string_value)))
+        .map(|(record, cells)| {
+            let value = cells[0].as_deref().and_then(|rendered| {
+                let (start, end) = (rendered.find('"')?, rendered.rfind('"')?);
+                Some(rendered[start + 1..end].to_owned())
+            });
+            (record.time_unix_nano, value)
+        })
         .collect()
-}
-
-/// The value in a one-row string array's `Debug` rendering, which quotes
-/// it: `StringArray\n[\n  "x",\n]`.
-fn string_value(rendered: &str) -> String {
-    let start = rendered.find('"').expect("a quoted value") + 1;
-    let end = rendered.rfind('"').expect("a quoted value");
-    rendered[start..end].to_owned()
 }

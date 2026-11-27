@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use ourios_core::otlp::any_value::Value;
 use ourios_core::otlp::{AnyValue, KeyValue, KeyValueList};
 use ourios_core::record::MinedRecord;
-use ourios_parquet::{PartitionKey, ShapeValidation, Store, Writer, batch_to_degraded_records};
+use ourios_parquet::{
+    DEFAULT_ZSTD_LEVEL, PartitionKey, ShapeValidation, Store, Writer, batch_to_degraded_records,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing_subscriber::prelude::*;
 
@@ -43,26 +45,55 @@ fn erase_template_1(record: &MinedRecord, _: &str) -> bool {
 }
 
 /// The partition's rows, each undecodable cell degraded, read from every
-/// object under it.
+/// object under it, by row time.
 fn stored_rows(store: &Store) -> Vec<MinedRecord> {
+    rows_with_cells(store, &[])
+        .into_iter()
+        .map(|(record, _)| record)
+        .collect()
+}
+
+/// A row's cells of the requested columns: each as its one-row array's
+/// `Debug` rendering, equal exactly when the stored values are, or `None`
+/// when `NULL`.
+type Cells = Vec<Option<String>>;
+
+/// The partition's rows by row time, each undecodable cell degraded, with
+/// their cells of `columns`.
+fn rows_with_cells(store: &Store, columns: &[&str]) -> Vec<(MinedRecord, Cells)> {
+    let mut rows: Vec<(MinedRecord, Cells)> = store
+        .list_blocking(Some("data/"))
+        .expect("list")
+        .into_iter()
+        .filter(|key| key.ends_with(".parquet"))
+        .flat_map(|key| object_rows(store, &key, columns))
+        .collect();
+    rows.sort_by_key(|(record, _)| record.time_unix_nano);
+    rows
+}
+
+/// The rows of object `key`, as [`rows_with_cells`] gives them.
+fn object_rows(store: &Store, key: &str, columns: &[&str]) -> Vec<(MinedRecord, Cells)> {
+    let bytes = store.get_blocking(key).expect("get");
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+        .expect("open")
+        .build()
+        .expect("reader");
     let mut rows = Vec::new();
-    for key in store.list_blocking(Some("data/")).expect("list") {
-        if !key.ends_with(".parquet") {
-            continue;
-        }
-        let bytes = store.get_blocking(&key).expect("get");
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
-            .expect("open")
-            .build()
-            .expect("reader");
-        for batch in reader {
-            let batch = batch.expect("batch");
-            let decoded =
-                batch_to_degraded_records(&batch, 0, ShapeValidation::Skip).expect("decode");
-            rows.extend(decoded.records);
+    for batch in reader {
+        let batch = batch.expect("batch");
+        let decoded = batch_to_degraded_records(&batch, 0, ShapeValidation::Skip).expect("decode");
+        for (i, record) in decoded.records.into_iter().enumerate() {
+            let cells = columns
+                .iter()
+                .map(|column| {
+                    let cells = batch.column_by_name(column).expect("column");
+                    (!cells.is_null(i)).then(|| format!("{:?}", cells.slice(i, 1)))
+                })
+                .collect();
+            rows.push((record, cells));
         }
     }
-    rows.sort_by_key(|r| r.time_unix_nano);
     rows
 }
 
@@ -125,7 +156,7 @@ fn rfc0069_5_erasure_stays_pending_past_an_undecodable_identity() {
     let stored = ourios_core::otlp::canonical::encode_attributes(&[too_deep()]).expect("encode");
     request_erasure(&store, "a", "c-1").expect("request");
 
-    let (report, events) = sweep_logged(&store);
+    let (report, events) = sweep_logged(&store, &PromotedAttributes::default());
 
     let [outcome] = report.erasures.as_slice() else {
         panic!("one erasure, got {:?}", report.erasures);
@@ -184,7 +215,7 @@ fn seed_partition(store: &Store) -> String {
 
 /// One sweep erasing template 1's rows, and the fields of each
 /// undecodable-row event it logs, less the message.
-fn sweep_logged(store: &Store) -> (SweepReport, Vec<EventFields>) {
+fn sweep_logged(store: &Store, promoted: &PromotedAttributes) -> (SweepReport, Vec<EventFields>) {
     let mut report = None;
     let events = undecodable_events(|| {
         let mut hooks = SweepHooks {
@@ -197,7 +228,7 @@ fn sweep_logged(store: &Store) -> (SweepReport, Vec<EventFields>) {
                 store,
                 SweepClock::sealed_at(NOW_SEALED),
                 &CompactionPolicy::default(),
-                &PromotedAttributes::default(),
+                promoted,
                 &mut hooks,
                 &mut |_: &PartitionCommitted<'_>| {},
             )
@@ -226,4 +257,109 @@ fn degraded_cell(row: &MinedRecord) -> &[u8] {
         Some(Value::StringValue(cell)) => cell.as_bytes(),
         _ => panic!("the unreadable row is degraded: {:?}", row.attributes),
     }
+}
+
+/// Scenario RFC0069.5, the rewrite's other half: under a declaration that
+/// keeps `k` and newly promotes `m`, the erasure carries the unreadable
+/// row's every other cell unchanged, keeps its stored `k`, and leaves its
+/// `m` `NULL`, while a readable row projects both from its attributes.
+#[test]
+fn rfc0069_5_the_erasure_rewrite_keeps_the_row_and_its_promoted_boundary() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let store = store_at(bucket.path());
+    let with_keys = |template, ts, mut attributes: Vec<KeyValue>| {
+        attributes.extend([string("k", "x"), string("m", "y")]);
+        MinedRecord {
+            attributes,
+            ..rec("a", template, ts)
+        }
+    };
+    let rows = [
+        with_keys(1, TS0, Vec::new()),
+        with_keys(1, TS0 + 1, vec![too_deep()]),
+        with_keys(2, TS0 + 2, Vec::new()),
+    ];
+    let written = PromotedAttributes::new(Vec::<String>::new(), ["k".to_owned()]);
+    let partition = PartitionKey::derive(&rows[0]).expect("derive");
+    let mut writer = Writer::open_in_with_promoted(&store, partition, DEFAULT_ZSTD_LEVEL, written)
+        .expect("open writer");
+    writer.append_records(&rows).expect("append");
+    writer.close().expect("close");
+    let before = stored_rows(&store);
+    let before_cells = raw_cells(&store, TS0 + 1);
+    request_erasure(&store, "a", "c-1").expect("request");
+
+    let current = PromotedAttributes::new(Vec::<String>::new(), ["k".to_owned(), "m".to_owned()]);
+    let (report, _) = sweep_logged(&store, &current);
+
+    assert_eq!(
+        report.erasures[0].phase,
+        ErasurePhase::Rows,
+        "still pending"
+    );
+    let after = stored_rows(&store);
+    assert_eq!(after.len(), 2, "the readable conversation row is dropped");
+    assert_eq!(after[0], before[1], "the unreadable row, decoded");
+    assert_eq!(
+        raw_cells(&store, TS0 + 1),
+        before_cells,
+        "the unreadable row's raw cells, as stored"
+    );
+    let x = || Some("x".to_owned());
+    let y = || Some("y".to_owned());
+    assert_eq!(
+        promoted(&store, "attr.k"),
+        [(TS0 + 1, x()), (TS0 + 2, x())],
+        "k kept on the unreadable row, projected on the readable one"
+    );
+    assert_eq!(
+        promoted(&store, "attr.m"),
+        [(TS0 + 1, None), (TS0 + 2, y())],
+        "m newly promoted: NULL where its cell cannot be read"
+    );
+}
+
+fn string(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_owned(),
+        value: Some(AnyValue {
+            value: Some(Value::StringValue(value.to_owned())),
+        }),
+        key_strindex: 0,
+    }
+}
+
+/// The columns every row carries as stored bytes (RFC 0069 §3.2).
+const RAW_COLUMNS: [&str; 6] = [
+    "body",
+    "attributes",
+    "resource_attributes",
+    "scope_attributes",
+    "params",
+    "separators",
+];
+
+/// The raw cells of the partition's row at `time`.
+fn raw_cells(store: &Store, time: u64) -> Cells {
+    rows_with_cells(store, &RAW_COLUMNS)
+        .into_iter()
+        .find(|(record, _)| record.time_unix_nano == time)
+        .map(|(_, cells)| cells)
+        .expect("the row")
+}
+
+/// The partition's string `column` cells by row time, `None` when `NULL`.
+/// Each cell is read from its one-row array's `Debug` rendering, which
+/// quotes the value: `StringArray\n[\n  "x",\n]`.
+fn promoted(store: &Store, column: &str) -> Vec<(u64, Option<String>)> {
+    rows_with_cells(store, &[column])
+        .into_iter()
+        .map(|(record, cells)| {
+            let value = cells[0].as_deref().and_then(|rendered| {
+                let (start, end) = (rendered.find('"')?, rendered.rfind('"')?);
+                Some(rendered[start + 1..end].to_owned())
+            });
+            (record.time_unix_nano, value)
+        })
+        .collect()
 }

@@ -74,7 +74,7 @@ serde = { version = "1", default-features = false }
 [dev-dependencies]
 # RFC0069.2 probes the receiver's protobuf decode for the deepest body it
 # admits. Already in the tree via the ingester and server.
-prost = { version = "=0.14.4", default-features = false, features = ["std"] }
+prost = { version = "=0.14.6", default-features = false, features = ["std"] }
 # `init_in_memory` collects the alias counters' exported metric stream
 # through an in-memory reader (no OTLP endpoint) in the §6.8 telemetry
 # unit test — same pattern as the compaction-metrics test.

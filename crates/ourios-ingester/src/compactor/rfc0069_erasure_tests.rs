@@ -305,14 +305,16 @@ fn rfc0069_5_the_erasure_rewrite_keeps_the_row_and_its_promoted_boundary() {
         before_cells,
         "the unreadable row's raw cells, as stored"
     );
+    let x = || Some("x".to_owned());
+    let y = || Some("y".to_owned());
     assert_eq!(
-        promoted_nulls(&store, "attr.k"),
-        [(TS0 + 1, false), (TS0 + 2, false)],
+        promoted(&store, "attr.k"),
+        [(TS0 + 1, x()), (TS0 + 2, x())],
         "k kept on the unreadable row, projected on the readable one"
     );
     assert_eq!(
-        promoted_nulls(&store, "attr.m"),
-        [(TS0 + 1, true), (TS0 + 2, false)],
+        promoted(&store, "attr.m"),
+        [(TS0 + 1, None), (TS0 + 2, y())],
         "m newly promoted: NULL where its cell cannot be read"
     );
 }
@@ -346,10 +348,18 @@ fn raw_cells(store: &Store, time: u64) -> Cells {
         .expect("the row")
 }
 
-/// Whether each of the partition's `column` cells is `NULL`, by row time.
-fn promoted_nulls(store: &Store, column: &str) -> Vec<(u64, bool)> {
+/// The partition's string `column` cells by row time, `None` when `NULL`.
+fn promoted(store: &Store, column: &str) -> Vec<(u64, Option<String>)> {
     rows_with_cells(store, &[column])
         .into_iter()
-        .map(|(record, cells)| (record.time_unix_nano, cells[0].is_none()))
+        .map(|(record, cells)| (record.time_unix_nano, cells[0].as_deref().map(string_value)))
         .collect()
+}
+
+/// The value in a one-row string array's `Debug` rendering, which quotes
+/// it: `StringArray\n[\n  "x",\n]`.
+fn string_value(rendered: &str) -> String {
+    let start = rendered.find('"').expect("a quoted value") + 1;
+    let end = rendered.rfind('"').expect("a quoted value");
+    rendered[start..end].to_owned()
 }

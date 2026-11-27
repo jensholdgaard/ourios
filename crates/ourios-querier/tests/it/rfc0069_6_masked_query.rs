@@ -4,7 +4,7 @@
 //! unit-tested in `src/visibility.rs`.
 
 use ourios_core::tenant::TenantId;
-use ourios_querier::{LogRow, Querier, QueryOptions, Visibility};
+use ourios_querier::{LogBody, LogRow, Querier, QueryOptions, Visibility};
 
 use crate::common::{DEFAULT_WINDOW_NS, NOW, no_aliases};
 use crate::rfc0069_fixture as fixture;
@@ -62,6 +62,10 @@ async fn rfc0069_6_a_masked_reader_gets_no_stored_json_from_a_query() {
     let rows = query(bucket.path(), masked).await;
 
     assert_eq!(rows.len(), 4, "every row returns");
+    assert!(
+        rows.iter().all(|row| row.body == LogBody::Masked),
+        "every body masked, the undecodable ones included"
+    );
     assert_eq!(
         fallbacks(&rows),
         [
